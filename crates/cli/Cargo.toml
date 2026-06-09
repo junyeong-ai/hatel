@@ -1,0 +1,20 @@
+[package]
+name = "hatel-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The human-facing binary: the OTLP receiver (serve), reports, doctor, and
+# registry introspection. Links the async stack; never wired as a hook.
+[[bin]]
+name = "hatel"
+path = "src/main.rs"
+
+[dependencies]
+hatel-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio.workspace = true
+axum.workspace = true
