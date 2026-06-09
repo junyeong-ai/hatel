@@ -1,0 +1,88 @@
+# Built-in, domain-agnostic telemetry schema. Plugins merge additional `[[kind]]`
+# and `[[binding]]` tables through the same loader (see schema.rs). Every field a
+# binding can write is present in the matching hook's documented stdin — no field
+# is ever fabricated.
+
+# Native OpenTelemetry signals the receiver folds (metrics) and counts (events).
+# Only metrics the live view surfaces are tracked — adding one here without a
+# matching view column would decode and retain series that nothing ever reads.
+tracked_metrics = [
+    "claude_code.token.usage",
+    "claude_code.cost.usage",
+    "claude_code.active_time.total",
+    "claude_code.lines_of_code.count",
+]
+counted_events = [
+    "claude_code.user_prompt",
+    "claude_code.tool_decision",
+    "claude_code.skill_activated",
+]
+
+# ── Kinds (all hook-written) ──
+
+[[kind]]
+name = "tool"
+fields = ["session_id", "project", "tool_name"]
+group_key = "tool_name"
+
+[[kind]]
+name = "prompt"
+fields = ["session_id", "project", "prompt_len"]
+group_key = "session_id"
+
+[[kind]]
+name = "memory"
+fields = ["session_id", "project", "memory_id", "memory_type", "load_reason"]
+group_key = "memory_id"
+
+[[kind]]
+name = "subagent"
+fields = ["session_id", "project", "subagent_type"]
+group_key = "subagent_type"
+
+[[kind]]
+name = "compaction"
+fields = ["session_id", "project", "trigger"]
+group_key = "session_id"
+
+# Native-OTel cost/tokens are a snapshot, not a hook event — they live in a
+# rewritten snapshot file (see cost.rs), not as a Kind in the append-only sink.
+
+# ── Hook bindings (event → kind, with declarative field maps) ──
+# `project` is injected by the hook from the cwd; it is never mapped here.
+
+[[binding]]
+event = "PostToolUse"
+kind = "tool"
+map.session_id = { from = "session_id" }
+map.tool_name = { from = "tool_name" }
+
+[[binding]]
+event = "UserPromptSubmit"
+kind = "prompt"
+map.session_id = { from = "session_id" }
+map.prompt_len = { from = "prompt", len = true }
+
+[[binding]]
+event = "InstructionsLoaded"
+kind = "memory"
+map.session_id = { from = "session_id" }
+map.memory_id = { from = "file_path", basename = true }
+map.memory_type = { from = "memory_type" }
+map.load_reason = { from = "load_reason" }
+
+[[binding]]
+event = "SubagentStop"
+kind = "subagent"
+map.session_id = { from = "session_id" }
+map.subagent_type = { from = "agent_type" }
+
+# One compaction fires both PreCompact and PostCompact, so only one is bound — one
+# record per compaction. PreCompact is chosen because it always fires (a compaction
+# that is interrupted may never reach PostCompact). The trigger key name is not fixed
+# in the docs, so both known spellings are tried.
+[[binding]]
+event = "PreCompact"
+kind = "compaction"
+map.session_id = { from = "session_id" }
+map.trigger = { from = ["trigger", "compact_trigger"] }
