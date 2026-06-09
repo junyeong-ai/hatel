@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Local state (telemetry ledgers, snapshots) if a dev points the state dir into the repo
+/.hatel
+
+# Claude Code's local scheduler lock — a harness artifact, not project content.
+# The project skill under .claude/skills/ is intentionally tracked.
+.claude/scheduled_tasks.lock
+
+# OS / editor cruft
+.DS_Store
+*.swp
