@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/hook", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+jiff = "0.2"
+regex = "1.12"
+blake3 = "1.8"
+etcetera = "0.11"
+rusqlite = { version = "0.40", features = ["bundled"] }
+thiserror = "2.0"
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+axum = "0.8"
+
+# The hook binary is spawned on every lifecycle event; a fat, single-codegen-unit,
+# abort-on-panic, stripped build minimises both size and cold-start.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
