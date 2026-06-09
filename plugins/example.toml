@@ -1,0 +1,31 @@
+# Example plugin — illustrative custom Kinds. This file references no real project;
+# copy it and define your own. Load it with HATEL_PLUGINS=plugins/example.toml.
+#
+# A custom Kind is filled by one of two paths, chosen by where the signal originates:
+#   • a signal the Claude Code lifecycle can observe → a hook binding (zero code);
+#   • a signal only your own tooling knows → `hatel emit`.
+# The allow-list, redaction, group_key, and measures apply to either path.
+
+# emit-based: a project-origin signal (a CI check rollup). It is not a Claude Code
+# event, so your CI records it with `emit`. `measures` are numeric fields a report
+# sums per group (the first, `runs`, is the primary metric groups are ranked by);
+# `redact` hashes the actor before it is stored.
+[[kind]]
+name = "ci_check"
+fields = ["check", "date", "project", "runs", "failures", "actor"]
+group_key = "check"
+measures = ["runs", "failures"]
+redact = ["actor"]
+
+# hook-bound: zero-code attribution by spec branch. The hook reads the git branch
+# only because this binding maps from it (a `spec/<slug>` branch → the slug).
+[[kind]]
+name = "branch_work"
+fields = ["session_id", "project", "spec"]
+group_key = "spec"
+
+[[binding]]
+event = "SessionEnd"
+kind = "branch_work"
+map.session_id = { from = "session_id" }
+map.spec = { from = "git_branch", capture = "^spec/(.+)$" }
