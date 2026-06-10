@@ -3,6 +3,7 @@
 
 mod claude_settings;
 mod doctor;
+mod export;
 mod init;
 mod otlp;
 mod serve;
@@ -14,10 +15,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use hatel_core::cost;
 use hatel_core::schema::build_registry;
-use hatel_core::{Config, Payload, Registry, report, render};
+use hatel_core::{Config, Payload, Registry, render, report};
 
 #[derive(Parser)]
-#[command(name = "hatel", version, about = "Local Claude Code telemetry collector")]
+#[command(
+    name = "hatel",
+    version,
+    about = "Local Claude Code telemetry collector"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -68,6 +73,15 @@ enum Command {
         /// Remove this collector's wiring from the scope (leaves the native telemetry env).
         #[arg(long)]
         remove: bool,
+        /// Insert hatel in front of an existing corporate OTLP endpoint: capture it as a
+        /// `config.toml` export target and repoint Claude Code at the local receiver — so you keep
+        /// the corporate collector and gain hatel. Operates on whichever scope sets the endpoint.
+        #[arg(long, conflicts_with_all = ["remove", "print"])]
+        insert: bool,
+        /// The transform for the captured endpoint when `--insert`ing (default: enriched, so the
+        /// corporate collector gains the project label too).
+        #[arg(long, value_enum, default_value_t = init::InsertMode::Enriched, requires = "insert")]
+        mode: init::InsertMode,
     },
     /// Install or remove the receiver as a background user service (launchd on macOS,
     /// systemd --user on Linux) for gap-free collection — the unit runs `serve --all`.
@@ -119,10 +133,26 @@ fn main() {
 fn run() -> i32 {
     match Cli::parse().command {
         Command::Serve { port, project, all } => serve::run(port, project, all),
-        Command::Report { window, format, project, kind, top } => {
-            report_cmd(&window, format, top, project.as_deref(), kind.as_deref())
+        Command::Report {
+            window,
+            format,
+            project,
+            kind,
+            top,
+        } => report_cmd(&window, format, top, project.as_deref(), kind.as_deref()),
+        Command::Init {
+            scope,
+            print,
+            remove,
+            insert,
+            mode,
+        } => {
+            if insert {
+                init::insert(mode)
+            } else {
+                init::run(scope, print, remove)
+            }
         }
-        Command::Init { scope, print, remove } => init::run(scope, print, remove),
         Command::Service { remove, print } => service::run(remove, print),
         Command::Doctor => doctor::run(),
         Command::Kinds { json } => kinds_cmd(json),
@@ -144,7 +174,10 @@ fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
     };
     if reg.kind(kind).is_none() {
         let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        eprintln!("emit: unknown kind {kind:?}; registered: {}", known.join(", "));
+        eprintln!(
+            "emit: unknown kind {kind:?}; registered: {}",
+            known.join(", ")
+        );
         return 2;
     }
     let payload = match build_payload(fields, json) {
@@ -235,7 +268,13 @@ fn parse_pairs(fields: &[String]) -> Result<Payload, String> {
     Ok(payload)
 }
 
-fn report_cmd(window: &str, format: Format, top: usize, project: Option<&str>, kind: Option<&str>) -> i32 {
+fn report_cmd(
+    window: &str,
+    format: Format,
+    top: usize,
+    project: Option<&str>,
+    kind: Option<&str>,
+) -> i32 {
     let cfg = Config::load();
     let reg = match build_registry(&cfg) {
         Ok(r) => r,
@@ -248,7 +287,10 @@ fn report_cmd(window: &str, format: Format, top: usize, project: Option<&str>, k
         && reg.kind(k).is_none()
     {
         let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        eprintln!("report: unknown kind {k:?}; registered: {}", known.join(", "));
+        eprintln!(
+            "report: unknown kind {k:?}; registered: {}",
+            known.join(", ")
+        );
         return 2;
     }
     let Some(window_secs) = report::parse_window(window) else {
@@ -261,15 +303,24 @@ fn report_cmd(window: &str, format: Format, top: usize, project: Option<&str>, k
     // `--kind` scopes the rollup to one Kind; the native cost snapshot is not a Kind, so it
     // is shown only for the full report.
     match format {
-        Format::Json => print!("{}", report_json(&reg, &cfg, since, window, top, project, kind)),
+        Format::Json => print!(
+            "{}",
+            report_json(&reg, &cfg, since, window, top, project, kind)
+        ),
         Format::Md => {
-            print!("{}", render::format_markdown(&reg, &cfg, since, window, top, project, kind));
+            print!(
+                "{}",
+                render::format_markdown(&reg, &cfg, since, window, top, project, kind)
+            );
             if kind.is_none() {
                 print!("{}", cost_section(&cfg.state_dir, true, since, project));
             }
         }
         Format::Text => {
-            print!("{}", render::format_table(&reg, &cfg, since, window, top, project, kind));
+            print!(
+                "{}",
+                render::format_table(&reg, &cfg, since, window, top, project, kind)
+            );
             if kind.is_none() {
                 print!("{}", cost_section(&cfg.state_dir, false, since, project));
             }
@@ -326,7 +377,13 @@ fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&s
     if rows.is_empty() {
         return String::new();
     }
-    let project = |p: &str| if p.is_empty() { "(unknown)".to_string() } else { p.to_string() };
+    let project = |p: &str| {
+        if p.is_empty() {
+            "(unknown)".to_string()
+        } else {
+            p.to_string()
+        }
+    };
     let short = |s: &str| s.chars().take(8).collect::<String>();
     let mut out = String::new();
     if markdown {
@@ -336,7 +393,12 @@ fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&s
         for r in &rows {
             out.push_str(&format!(
                 "| {} | {} | {} | {:.4} | {:.1} | {} |\n",
-                short(&r.session_id), project(&r.project), r.tokens, r.cost_usd, r.active_time_s, r.lines
+                short(&r.session_id),
+                project(&r.project),
+                r.tokens,
+                r.cost_usd,
+                r.active_time_s,
+                r.lines
             ));
         }
     } else {
@@ -344,7 +406,12 @@ fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&s
         for r in &rows {
             out.push_str(&format!(
                 "{} {} tokens={} cost={:.4} active={:.1} lines={}\n",
-                short(&r.session_id), project(&r.project), r.tokens, r.cost_usd, r.active_time_s, r.lines
+                short(&r.session_id),
+                project(&r.project),
+                r.tokens,
+                r.cost_usd,
+                r.active_time_s,
+                r.lines
             ));
         }
     }
@@ -470,16 +537,31 @@ mod tests {
         // filter is observable without seeding records.
         let full: serde_json::Value =
             serde_json::from_str(&report_json(&reg, &cfg, 0, "7d", 0, None, None)).unwrap();
-        let full_kinds: Vec<&str> =
-            full["kinds"].as_array().unwrap().iter().map(|k| k["kind"].as_str().unwrap()).collect();
-        assert!(full_kinds.contains(&"tool"), "full report lists every Kind: {full_kinds:?}");
+        let full_kinds: Vec<&str> = full["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["kind"].as_str().unwrap())
+            .collect();
+        assert!(
+            full_kinds.contains(&"tool"),
+            "full report lists every Kind: {full_kinds:?}"
+        );
         assert!(full_kinds.len() > 1);
 
         let scoped: serde_json::Value =
             serde_json::from_str(&report_json(&reg, &cfg, 0, "7d", 0, None, Some("tool"))).unwrap();
-        let scoped_kinds: Vec<&str> =
-            scoped["kinds"].as_array().unwrap().iter().map(|k| k["kind"].as_str().unwrap()).collect();
-        assert_eq!(scoped_kinds, vec!["tool"], "--kind scopes to exactly that Kind");
+        let scoped_kinds: Vec<&str> = scoped["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            scoped_kinds,
+            vec!["tool"],
+            "--kind scopes to exactly that Kind"
+        );
         // the native cost section is not a Kind, so a scoped report drops it
         assert_eq!(scoped["cost"].as_array().unwrap().len(), 0);
         std::fs::remove_dir_all(&dir).ok();

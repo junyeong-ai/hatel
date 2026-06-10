@@ -7,11 +7,13 @@
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Write as _;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::{Command, Stdio};
 
 /// launchd label / systemd unit name. Short, matching the command.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_NAME: &str = "hatel";
 
 pub fn run(remove: bool, print: bool) -> i32 {

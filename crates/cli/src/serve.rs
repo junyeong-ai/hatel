@@ -11,17 +11,21 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
-use hatel_core::{Config, SessionIndex, now_iso_utc, resolve_project};
+use hatel_core::{Config, ExportConfig, SessionIndex, now_iso_utc, resolve_project};
 
+use crate::export::{Exporter, OtlpSignal};
 use crate::otlp::{Accumulator, SessionTotals, parse_events, parse_metrics};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+/// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
+/// a dead downstream can't hang the receiver's exit.
+const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// OTLP/HTTP body cap. Far above any real batch (axum's 2 MB default would silently
 /// 413 a large export and lose it), but bounded so a runaway body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -42,10 +46,16 @@ struct AppState {
     /// An explicit `--project` override, matched against the display label.
     project_filter: Option<String>,
     show_all: bool,
+    /// The egress forwarder, present only when `[[export]]` destinations are configured. Each
+    /// received body is queued here (fire-and-forget) before local decode.
+    exporter: Option<Exporter>,
 }
 
 pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("serve: failed to build runtime: {e}");
@@ -64,6 +74,15 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             return 1;
         }
     };
+    // A misconfigured export file is fatal at startup (like a bad registry) — fail fast rather
+    // than silently drop a destination the operator asked for. Never reached by the hook.
+    let export_cfg = match ExportConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return 1;
+        }
+    };
     let current_key = std::env::current_dir()
         .ok()
         .map(|d| resolve_project(&d.to_string_lossy()).key);
@@ -71,6 +90,12 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         .into_iter()
         .map(|r| (r.session_id.clone(), r))
         .collect();
+    let (exporter, export_handle) = if export_cfg.targets.is_empty() {
+        (None, None)
+    } else {
+        let (e, h) = Exporter::spawn(export_cfg.targets.clone(), cfg.state_dir.clone());
+        (Some(e), Some(h))
+    };
     let state = AppState {
         acc: Arc::new(Mutex::new(Accumulator::default())),
         tracked: Arc::new(registry.tracked_metrics.clone()),
@@ -80,6 +105,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         current_key,
         project_filter: project,
         show_all,
+        exporter,
     };
 
     let app = Router::new()
@@ -96,11 +122,20 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             return 1;
         }
     };
-    let scope = if show_all { "all projects" } else { "this project only" };
+    let scope = if show_all {
+        "all projects"
+    } else {
+        "this project only"
+    };
     println!(
         "hatel receiver on http://{addr} ({scope}) — point \
          OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop"
     );
+    // Announce egress so a forwarding deployment is visible in the log (endpoint + transform only;
+    // header values are never printed).
+    for t in &export_cfg.targets {
+        println!("  → forwarding to {} ({})", t.endpoint, t.mode.as_str());
+    }
 
     // Keep the persisted cost snapshot fresh while running (a long-lived daemon
     // never reaches the shutdown flush otherwise).
@@ -120,45 +155,83 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     flush_task.abort();
     let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
     persist_cost(&state);
+    // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
+    // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
+    if let Some(exporter) = &state.exporter {
+        exporter.shutdown();
+    }
+    if let Some(handle) = export_handle {
+        let _ = tokio::time::timeout(EXPORT_DRAIN_TIMEOUT, handle).await;
+    }
     0
 }
 
-/// A decode failure returns 400 so a misconfigured exporter (wrong protocol, non-JSON)
-/// gets a real signal instead of a silent 200 that looks like a valid empty batch. A
-/// successfully-decoded empty batch is a normal 200.
+/// The receiver always answers 200: the status reflects that the body was *received* (and, when
+/// forwarding, queued for egress), not whether this build could decode it. An undecodable body is
+/// noted to stderr and surfaced by `doctor` (which detects a wrong protocol from the settings),
+/// never via a status code — so a raw tee of a protobuf body the local view can't read still
+/// succeeds, and an OTLP client never retries (a retry would inflate downstream delta counts).
 type IngestResponse = (StatusCode, Json<serde_json::Value>);
 
 fn ok() -> IngestResponse {
     (StatusCode::OK, Json(serde_json::json!({})))
 }
 
-fn bad_request(msg: String) -> IngestResponse {
-    eprintln!("hatel: rejected OTLP body — {msg}");
-    (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg })))
-}
-
-async fn ingest_metrics(State(st): State<AppState>, body: Bytes) -> IngestResponse {
+async fn ingest_metrics(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> IngestResponse {
+    // Queue for egress first (cheap refcount clone), independent of local decode — a raw tee must
+    // forward even a body this build can't decode for its own view.
+    if let Some(exporter) = &st.exporter {
+        let (ct, ce) = body_headers(&headers);
+        exporter.enqueue(OtlpSignal::Metrics, body.clone(), ct, ce);
+    }
     match parse_metrics(body.as_ref(), &st.tracked) {
         Ok(points) if !points.is_empty() => {
             lock(&st.acc).update_metrics(points);
             render(&st);
-            ok()
         }
-        Ok(_) => ok(),
-        Err(e) => bad_request(e),
+        Ok(_) => {}
+        Err(e) => eprintln!("hatel: undecodable OTLP metrics body — {e}"),
     }
+    ok()
 }
 
-async fn ingest_logs(State(st): State<AppState>, body: Bytes) -> IngestResponse {
+async fn ingest_logs(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> IngestResponse {
+    if let Some(exporter) = &st.exporter {
+        let (ct, ce) = body_headers(&headers);
+        exporter.enqueue(OtlpSignal::Logs, body.clone(), ct, ce);
+    }
     match parse_events(body.as_ref(), &st.counted) {
         Ok(pairs) if !pairs.is_empty() => {
             lock(&st.acc).update_events(pairs);
             render(&st);
-            ok()
         }
-        Ok(_) => ok(),
-        Err(e) => bad_request(e),
+        Ok(_) => {}
+        Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
     }
+    ok()
+}
+
+/// The inbound `Content-Type` and `Content-Encoding`, preserved so a raw tee forwards a body
+/// byte-faithfully (a protobuf body stays protobuf; a gzip body keeps its encoding).
+fn body_headers(headers: &HeaderMap) -> (Option<String>, Option<String>) {
+    let get = |name| {
+        headers
+            .get(name)
+            .and_then(|v: &axum::http::HeaderValue| v.to_str().ok())
+            .map(str::to_string)
+    };
+    (
+        get(axum::http::header::CONTENT_TYPE),
+        get(axum::http::header::CONTENT_ENCODING),
+    )
 }
 
 /// Recover a poisoned accumulator lock rather than cascading panics through every
@@ -200,7 +273,15 @@ fn render(st: &AppState) {
         let mut out = String::from("\n=== hatel (live) ===\n");
         out.push_str(&format!(
             "{:<8} {:<20} {:>9} {:>9} {:>8} {:>6} {:>7} {:>6} {:>9}\n",
-            "session", "project", "tokens", "cost$", "active_s", "lines", "prompts", "skills", "decisions"
+            "session",
+            "project",
+            "tokens",
+            "cost$",
+            "active_s",
+            "lines",
+            "prompts",
+            "skills",
+            "decisions"
         ));
         for (sid, totals) in acc.sessions() {
             let row_ref = index.get(sid);
@@ -242,15 +323,18 @@ fn agent_rows(t: &SessionTotals) -> String {
     let agents = t.by_agent();
     // Show the breakdown only when a real (named) subagent is present — hide it when
     // everything is top-level (`main` / `(unattributed)`), however many such buckets.
-    let only_top_level = agents
-        .keys()
-        .all(|a| a == "main" || a == "(unattributed)");
+    let only_top_level = agents.keys().all(|a| a == "main" || a == "(unattributed)");
     if only_top_level {
         return String::new();
     }
     let mut out = String::new();
     for (agent, (tokens, cost)) in &agents {
-        out.push_str(&format!("  └ {:<27} {:>9} {:>9.4}\n", truncate(agent, 27), tokens, cost));
+        out.push_str(&format!(
+            "  └ {:<27} {:>9} {:>9.4}\n",
+            truncate(agent, 27),
+            tokens,
+            cost
+        ));
     }
     out
 }
@@ -288,7 +372,11 @@ fn persist_cost(st: &AppState) {
             // temporality session correct.
             let base = st.baseline.get(sid);
             let add = |is_delta: bool, pick: fn(&CostRow) -> f64| -> f64 {
-                if is_delta { base.map_or(0.0, pick) } else { 0.0 }
+                if is_delta {
+                    base.map_or(0.0, pick)
+                } else {
+                    0.0
+                }
             };
             CostRow {
                 session_id: sid.clone(),
@@ -299,7 +387,8 @@ fn persist_cost(st: &AppState) {
                     .unwrap_or_default(),
                 tokens: t.tokens() + add(t.tokens_is_delta(), |b| b.tokens as f64) as i64,
                 cost_usd: t.cost() + add(t.cost_is_delta(), |b| b.cost_usd),
-                active_time_s: t.active_time_s() + add(t.active_time_is_delta(), |b| b.active_time_s),
+                active_time_s: t.active_time_s()
+                    + add(t.active_time_is_delta(), |b| b.active_time_s),
                 lines: t.lines() + add(t.lines_is_delta(), |b| b.lines as f64) as i64,
                 ts: now.clone(),
             }

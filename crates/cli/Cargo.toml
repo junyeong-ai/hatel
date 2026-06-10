@@ -18,3 +18,5 @@ serde_json.workspace = true
 clap.workspace = true
 tokio.workspace = true
 axum.workspace = true
+reqwest.workspace = true
+bytes.workspace = true

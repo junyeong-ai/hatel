@@ -6,19 +6,23 @@
 
 pub mod config;
 pub mod cost;
+pub mod export;
 pub mod hook;
 pub mod model;
 pub mod pii;
 pub mod project;
 pub mod registry;
-pub mod report;
 pub mod render;
+pub mod report;
 pub mod schema;
 pub mod session;
 pub mod sink;
 
 pub use config::Config;
-pub use model::{Envelope, Payload, SCHEMA_VERSION, make_envelope, now_epoch, now_iso_utc, ts_epoch};
+pub use export::{ExportConfig, ExportMode, ExportTarget};
+pub use model::{
+    Envelope, Payload, SCHEMA_VERSION, make_envelope, now_epoch, now_iso_utc, ts_epoch,
+};
 pub use project::{ProjectRef, resolve_project};
 pub use registry::{FieldMap, HookBinding, KindSpec, Registry};
 pub use session::{SessionIndex, SessionRow};
@@ -42,6 +46,14 @@ pub enum Error {
         #[source]
         source: toml::de::Error,
     },
+    #[error("export config parse error in {path}: {source}")]
+    ExportParse {
+        path: String,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid export config: {0}")]
+    InvalidExport(String),
     #[error("io error: {0}")]
     Io(String),
 }

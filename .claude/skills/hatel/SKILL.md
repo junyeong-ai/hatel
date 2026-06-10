@@ -27,6 +27,7 @@ hatel init --scope local   # this repo only (.claude/settings.local.json)
 hatel init --scope project # committed, shared with the team
 hatel init --print         # print the block instead (for managed/org settings)
 hatel init --remove        # remove our wiring (leaves the native telemetry env)
+hatel init --insert        # keep a corporate endpoint AND route through hatel (see Forwarding)
 hatel doctor               # verify and explain any gaps
 ```
 
@@ -36,6 +37,30 @@ hatel doctor               # verify and explain any gaps
 - **OTEL_METRICS_INCLUDE_SESSION_ID=false** → per-session/project attribution is impossible;
   only org/user aggregates remain. There is no fallback — report it as-is.
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
+- **export forwards nothing / endpoint bypasses this receiver** → export only forwards what
+  reaches hatel; the OTel endpoint must point at hatel. Run `hatel init --insert` (or, if the
+  endpoint is managed-locked, only the hook ledger is available — report it as-is).
+
+## Forward to other collectors (export)
+
+The receiver can tee what it ingests to downstream OTLP/HTTP collectors, so you keep a corporate
+collector *and* gain hatel. Destinations live in `config.toml` (`$HATEL_CONFIG`, else
+`<config-dir>/hatel/config.toml`), one `[[export]]` per destination:
+
+```toml
+[[export]]
+endpoint = "http://collector.corp:4318"   # /v1/metrics, /v1/logs appended
+mode = "enriched"                           # raw (byte-verbatim) | enriched (injects `project`)
+headers = { authorization = "…" }           # never logged by value
+```
+
+- `raw` forwards verbatim (protocol-agnostic, tees protobuf too); `enriched` injects the
+  `project` label so the downstream backend gains attribution raw OTel lacks (needs `http/json`).
+- A duplicate endpoint is rejected (it would double-count); forwarding is best-effort and never
+  retried; **egress is NOT redacted** (it forwards the full OTLP body off-host — `doctor` warns).
+- `hatel init --insert [--mode raw|enriched]` captures an existing corporate endpoint as a
+  target and repoints Claude Code at hatel in one step (this is how export becomes usable when the
+  endpoint already points elsewhere). Always finish with `hatel doctor`.
 
 ## Analyse cost & usage
 

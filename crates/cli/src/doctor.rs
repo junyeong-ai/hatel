@@ -6,9 +6,12 @@
 
 use std::path::Path;
 
-use hatel_core::Config;
+use hatel_core::{Config, ExportConfig, ExportMode};
 
 use crate::claude_settings as cs;
+
+/// A resolved entry from the merged settings `env`: `&(value, source-scope)`.
+type EnvEntry<'a> = &'a (String, &'static str);
 
 pub fn run() -> i32 {
     let files = cs::scope_files();
@@ -19,7 +22,12 @@ pub fn run() -> i32 {
 
     println!("settings files:");
     for f in &files {
-        println!("  {:<8} {:<22} {}", f.name, f.load.label(), f.path.display());
+        println!(
+            "  {:<8} {:<22} {}",
+            f.name,
+            f.load.label(),
+            f.path.display()
+        );
     }
     println!();
 
@@ -29,7 +37,7 @@ pub fn run() -> i32 {
     ok &= check_env(&env, "CLAUDE_CODE_ENABLE_TELEMETRY", Some("1"));
     ok &= check_env(&env, "OTEL_METRICS_EXPORTER", Some("otlp"));
     ok &= check_env(&env, "OTEL_LOGS_EXPORTER", Some("otlp"));
-    ok &= check_present(&env, "OTEL_EXPORTER_OTLP_ENDPOINT");
+    ok &= check_endpoint_present(&env);
     ok &= advise_protocol(&env);
     advise_session_id(&env);
     println!();
@@ -43,11 +51,16 @@ pub fn run() -> i32 {
     match writable(&cfg.state_dir) {
         Ok(()) => println!("  ✓ state dir writable: {}", cfg.state_dir.display()),
         Err(e) => {
-            println!("  ✗ state dir not writable ({}): {e}", cfg.state_dir.display());
+            println!(
+                "  ✗ state dir not writable ({}): {e}",
+                cfg.state_dir.display()
+            );
             ok = false;
         }
     }
     println!();
+
+    ok &= report_export(&env);
 
     println!(
         "to wire automatically run `hatel init` — or paste this into managed settings for an org:\n"
@@ -73,10 +86,20 @@ fn report_hooks(files: &[cs::ScopeFile]) -> bool {
         println!("  ✓ all {total} lifecycle events invoke `hatel-hook`");
     } else if !covered.is_empty() {
         // Partial coverage, reported before the "blocked" case so it is never masked.
-        let missing: Vec<&str> = cs::EVENTS.iter().copied().filter(|e| !covered.contains(e)).collect();
-        print!("  ✗ only {}/{total} events wired — missing {}", covered.len(), missing.join(", "));
+        let missing: Vec<&str> = cs::EVENTS
+            .iter()
+            .copied()
+            .filter(|e| !covered.contains(e))
+            .collect();
+        print!(
+            "  ✗ only {}/{total} events wired — missing {}",
+            covered.len(),
+            missing.join(", ")
+        );
         if managed_only {
-            println!("; deploy the rest as MANAGED hooks (allowManagedHooksOnly ignores lower scopes)");
+            println!(
+                "; deploy the rest as MANAGED hooks (allowManagedHooksOnly ignores lower scopes)"
+            );
         } else {
             println!("; re-run `hatel init`");
         }
@@ -103,11 +126,121 @@ fn report_hooks(files: &[cs::ScopeFile]) -> bool {
     for cmd in cs::wired_hook_commands(files) {
         let p = Path::new(&cmd);
         if p.is_absolute() && !p.exists() {
-            println!("  ✗ wired hook `{cmd}` is missing on disk — re-run `hatel init` to repoint it");
+            println!(
+                "  ✗ wired hook `{cmd}` is missing on disk — re-run `hatel init` to repoint it"
+            );
             ok = false;
         }
     }
     ok
+}
+
+/// Report the configured egress destinations and — decisively — whether the OTel stream actually
+/// reaches this receiver. Export forwards *from* the receiver, so a configured export does nothing
+/// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
+/// egress-privacy and enriched-protocol notes are advisory. Prints nothing when no export is
+/// configured. Returns whether the export wiring is functional.
+fn report_export(env: &cs::Env) -> bool {
+    let export = match ExportConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("export:");
+            println!("  ✗ export config is invalid ({e}) — `serve` will refuse to start");
+            println!();
+            return false;
+        }
+    };
+    if export.targets.is_empty() {
+        return true; // nothing configured — no section, no failure
+    }
+
+    println!("export:");
+    for t in &export.targets {
+        let headers = match t.headers.len() {
+            0 => String::new(),
+            // The values may be secrets (auth tokens) — only the count is shown, never the value.
+            n => format!(", {n} header(s)"),
+        };
+        println!("  • {} ({}{})", t.endpoint, t.mode.as_str(), headers);
+    }
+    // Egress is the one place data leaves the host, and hatel does not redact the forwarded body.
+    println!("  ⚠ egress forwards the raw OTLP stream off this host — hatel does not redact it");
+
+    let mut ok = true;
+
+    // Enriched needs a JSON body to transform; flag a protocol that would make it skip.
+    if export
+        .targets
+        .iter()
+        .any(|t| t.mode == ExportMode::Enriched)
+    {
+        let proto = env
+            .get("OTEL_EXPORTER_OTLP_PROTOCOL")
+            .map(|(v, _)| v.as_str());
+        if proto != Some("http/json") {
+            println!(
+                "  ⚠ enriched export needs http/json input — OTEL_EXPORTER_OTLP_PROTOCOL is {} → enriched targets are skipped",
+                proto.unwrap_or("unset")
+            );
+        }
+    }
+
+    // The decisive check: export forwards from this receiver, so the OTel stream must reach it.
+    // A signal-specific endpoint (metrics/logs) overrides the general one, so check each — a
+    // per-signal override could send one signal past hatel while the general endpoint looks clean.
+    let (metrics, logs) = effective_otlp_endpoints(env);
+    let same_destination = match (metrics, logs) {
+        (Some((m, _)), Some((l, _))) => {
+            hatel_core::export::normalize_endpoint(m) == hatel_core::export::normalize_endpoint(l)
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if same_destination {
+        ok &= report_route(None, metrics); // one effective endpoint for both signals (the common case)
+    } else {
+        ok &= report_route(Some("metrics"), metrics);
+        ok &= report_route(Some("logs"), logs);
+    }
+    println!();
+    ok
+}
+
+/// Report whether one OTLP route reaches this receiver. `signal` labels a per-signal route
+/// (metrics/logs) or `None` for the single shared endpoint. A managed-locked endpoint is unfixable
+/// here; a user/project/local one is fixable via `init --insert`. Returns whether the route is
+/// functional for export.
+fn report_route(signal: Option<&str>, endpoint: Option<EnvEntry<'_>>) -> bool {
+    let at = signal.map(|s| format!("{s} ")).unwrap_or_default();
+    match endpoint {
+        Some((endpoint, _)) if cs::is_local_receiver(endpoint) => {
+            println!(
+                "  ✓ {at}OTel is routed through this receiver — export has a stream to forward"
+            );
+            true
+        }
+        Some((endpoint, scope)) if *scope == "managed" => {
+            println!(
+                "  ✗ {at}endpoint is managed-locked to {endpoint} — OTel can't be routed through hatel, so export forwards nothing (only the hook ledger is available)"
+            );
+            false
+        }
+        Some((endpoint, scope)) => {
+            println!(
+                "  ✗ {at}OTel goes directly to {endpoint} (from {scope}), bypassing this receiver — export forwards nothing; run `hatel init --insert` to route it through hatel"
+            );
+            false
+        }
+        // Unset is the native section's call (it requires an explicit endpoint); here it's only
+        // advisory, since an unset endpoint falls back to the OTel default rather than a definite
+        // bypass — don't double-fail it.
+        None => {
+            println!(
+                "  ⚠ {at}OTLP endpoint is unset — run `hatel init` to point it explicitly at this receiver"
+            );
+            true
+        }
+    }
 }
 
 /// Print a ✓/✗ for an env key and return whether it passed (a hard requirement).
@@ -128,26 +261,63 @@ fn check_env(env: &cs::Env, key: &str, want: Option<&str>) -> bool {
     }
 }
 
-fn check_present(env: &cs::Env, key: &str) -> bool {
-    check_env(env, key, None)
+/// At least one OTLP endpoint must be set. The general `OTEL_EXPORTER_OTLP_ENDPOINT` is the
+/// canonical setup (`hatel init` writes it); a per-signal override (`…_METRICS_ENDPOINT` /
+/// `…_LOGS_ENDPOINT`) is honored too rather than mis-reported as unset.
+fn check_endpoint_present(env: &cs::Env) -> bool {
+    for key in [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ] {
+        if let Some((val, scope)) = env.get(key) {
+            println!("  ✓ {key}={val} (from {scope})");
+            return true;
+        }
+    }
+    println!(
+        "  ✗ no OTLP endpoint set (OTEL_EXPORTER_OTLP_ENDPOINT, or a per-signal …_METRICS_ENDPOINT / …_LOGS_ENDPOINT)"
+    );
+    false
 }
 
 /// `http/json` is mandatory only when the exporter points at the local receiver (it decodes
 /// nothing else); when the endpoint is repointed elsewhere the protocol is the remote collector's
 /// business. So this is a hard failure only in the local case — returns whether it passed.
+/// The effective OTLP endpoint per signal: a per-signal override (`…_METRICS_ENDPOINT` /
+/// `…_LOGS_ENDPOINT`) wins over the general `OTEL_EXPORTER_OTLP_ENDPOINT`. Returned as
+/// `(metrics, logs)` so the protocol check and the export bypass check both reason per signal,
+/// not just on the general endpoint.
+fn effective_otlp_endpoints(env: &cs::Env) -> (Option<EnvEntry<'_>>, Option<EnvEntry<'_>>) {
+    let general = env.get("OTEL_EXPORTER_OTLP_ENDPOINT");
+    let metrics = env.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").or(general);
+    let logs = env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").or(general);
+    (metrics, logs)
+}
+
 fn advise_protocol(env: &cs::Env) -> bool {
-    let local = env.get("OTEL_EXPORTER_OTLP_ENDPOINT").is_some_and(|(v, _)| cs::is_local_receiver(v));
+    // `http/json` is mandatory if EITHER effective signal endpoint reaches the local receiver — a
+    // per-signal override could route one signal to hatel even when the general endpoint is remote.
+    let (metrics, logs) = effective_otlp_endpoints(env);
+    let local = [metrics, logs]
+        .into_iter()
+        .flatten()
+        .any(|(v, _)| cs::is_local_receiver(v));
     match env.get("OTEL_EXPORTER_OTLP_PROTOCOL") {
         Some((v, scope)) if v == "http/json" => {
             println!("  ✓ OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from {scope})");
             true
         }
         Some((v, scope)) if local => {
-            println!("  ✗ OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); the local receiver only decodes http/json");
+            println!(
+                "  ✗ OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); the local receiver only decodes http/json"
+            );
             false
         }
         Some((v, scope)) => {
-            println!("  ⚠ OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); http/json is required for the local receiver");
+            println!(
+                "  ⚠ OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); http/json is required for the local receiver"
+            );
             true
         }
         None if local => {
@@ -155,7 +325,9 @@ fn advise_protocol(env: &cs::Env) -> bool {
             false
         }
         None => {
-            println!("  ⚠ OTEL_EXPORTER_OTLP_PROTOCOL unset; set it to http/json for the local receiver");
+            println!(
+                "  ⚠ OTEL_EXPORTER_OTLP_PROTOCOL unset; set it to http/json for the local receiver"
+            );
             true
         }
     }

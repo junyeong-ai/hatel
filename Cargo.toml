@@ -19,8 +19,14 @@ etcetera = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2.0"
 clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time"] }
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "time", "sync"] }
 axum = "0.8"
+# Receiver-only HTTP client for OTLP egress (the `serve` forward path). rustls so an https
+# downstream works without a system OpenSSL; no `json`/default features — we POST raw bytes.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# Reference-counted byte buffer shared between the receiver and the export queue (zero-copy
+# fan-out of one received body to several destinations). The type axum and reqwest already use.
+bytes = "1"
 
 # The hook binary is spawned on every lifecycle event; a fat, single-codegen-unit,
 # abort-on-panic, stripped build minimises both size and cold-start.

@@ -8,7 +8,9 @@
 A local, zero-infrastructure telemetry collector for Claude Code. It joins two
 complementary signal layers that Claude Code already produces — native
 OpenTelemetry and lifecycle hooks — into a per-project, per-session, and
-per-subagent view, with no dashboards to host and no data leaving your machine.
+per-subagent view, with no dashboards to host and, by default, no data leaving your
+machine (opt-in [export](#forwarding-to-other-collectors-export) can tee the enriched
+stream to a downstream collector).
 
 - **Native OTel** (push) carries the machine signals: tokens, cost, active time,
   lines, and per-subagent attribution via `agent.name`. It has no project on the
@@ -108,12 +110,73 @@ hatel serve --all      # every project sharing this collector
 
 The receiver is a single-writer daemon: it binds `127.0.0.1:<port>`, so a second
 instance on the same port exits and the cost snapshot has exactly one writer. It
-rejects a non-JSON / wrong-protocol body with `400` (so a misconfigured exporter gets
-a real signal, not a silent `200`), caps request bodies at 64 MB, and recovers a
-poisoned lock rather than crashing. Durable state is bounded by retention
-(`HATEL_RETENTION_DAYS`); the in-memory per-session accumulator is bounded
+always answers `200` — the status reflects that the body was *received*, not whether
+this build could decode it, so a raw tee of a body the local view can't read still
+succeeds and an OTLP client never retries (a retry would inflate delta counts). An
+undecodable body is noted to stderr and surfaced by `doctor` (which detects a wrong
+protocol from the settings), never via a status code. It caps request bodies at 64 MB
+and recovers a poisoned lock rather than crashing. Durable state is bounded by
+retention (`HATEL_RETENTION_DAYS`); the in-memory per-session accumulator is bounded
 by the sessions seen since the process started, which a normally-restarting daemon
 keeps small.
+
+## Forwarding to other collectors (export)
+
+The receiver can forward what it ingests to one or more downstream OTLP/HTTP
+collectors, so you no longer have to choose between hatel and a corporate collector —
+hatel sits in front and tees to it. This mirrors an OpenTelemetry Collector pipeline:
+the receiver decodes locally and forwards onward; fan-out to Prometheus/Honeycomb/etc.
+is the downstream collector's job, so hatel emits **OTLP only**.
+
+Configure destinations in `config.toml` (`$HATEL_CONFIG`, else
+`<config-dir>/hatel/config.toml`). Each `[[export]]` is one destination and the
+transform applied on the way there:
+
+```toml
+[[export]]
+endpoint = "http://collector.corp:4318"   # /v1/metrics and /v1/logs are appended
+mode = "enriched"                           # raw | enriched
+headers = { authorization = "…" }           # e.g. downstream auth (never logged by value)
+# timeout_ms = 5000
+
+[[export]]
+endpoint = "http://archive:4318"
+mode = "raw"
+```
+
+- **`raw`** forwards the incoming OTLP byte-verbatim — protocol-agnostic, so it tees a
+  `protobuf` body too.
+- **`enriched`** injects the `project` label (joined from `session.id`) into each
+  datapoint/record, so the downstream backend gains the project-level attribution that
+  raw OTel structurally lacks. It needs an `http/json` stream to transform; a datapoint
+  whose session is unknown is forwarded unchanged (the label is never fabricated).
+
+A/B is a per-destination transform, not two toggles: the same endpoint with both would
+double-count delta metrics, so a duplicate endpoint is rejected at load. Forwarding is
+best-effort and fail-open — a slow/unreachable downstream never blocks ingestion (the
+queue drops and counts under pressure) and is never retried.
+
+> **Egress is not redacted.** `raw`/`enriched` forward the full OTLP body off the host;
+> hatel's allow-list/hashing applies to the hook ledger, **not** to this egress. `doctor`
+> prints this as a standing warning whenever export is configured. (Because hatel is
+> content-free by construction it carries no prompt/tool bodies, so this is still safer
+> than pointing Claude Code's raw OTel at a corporate collector — but it is off-host.)
+
+### Insert hatel in front of an existing collector
+
+Export only forwards what reaches the receiver, so Claude Code's endpoint must point at
+hatel. If it currently points at a corporate collector, one command captures it and
+repoints Claude Code at hatel — keeping the collector and gaining hatel:
+
+```sh
+hatel init --insert                 # capture the current endpoint as an enriched target, repoint CC
+hatel init --insert --mode raw      # …forwarding byte-verbatim instead
+```
+
+It writes the captured endpoint (and its auth headers) into `config.toml`, repoints the
+scope that set the endpoint, and verifies with `doctor`. If the endpoint is **managed-
+locked** it can't be repointed — `doctor` says so plainly; only the hook ledger is then
+available.
 
 ## Claude Code skill
 
@@ -131,7 +194,7 @@ otherwise.
 |---|---|
 | `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP receiver + live per-session rollup, with per-subagent token/cost breakdown when subagents run. |
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures` — plus the cost snapshot. `--format json` for dashboards; `--top 0` shows all groups; `--kind K` scopes the rollup to one registered Kind and omits the cost snapshot. |
-| `init [--scope user\|project\|local] [--print] [--remove]` | wire (or unwire) the telemetry env + lifecycle hooks in `settings.json` — idempotent, non-destructive, atomic. `--print` emits the block for managed settings. |
+| `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire (or unwire) the telemetry env + lifecycle hooks in `settings.json` — idempotent, non-destructive, atomic. `--print` emits the block for managed settings. `--insert` captures an existing corporate endpoint as an export target and repoints Claude Code at hatel. |
 | `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service for gap-free collection (runs `serve --all`). `--print` emits the unit. |
 | `doctor` | verify the wiring and report policy gaps honestly (see below). |
 | `kinds [--json]` | list the registered Kinds (core + plugins). |
@@ -168,6 +231,7 @@ field (an `emit` Kind that didn't include one), with no row rather than an error
 |---|---|
 | `HATEL_SINK` | `jsonl` (default) / `sqlite` |
 | `HATEL_STATE_DIR` | override the state directory |
+| `HATEL_CONFIG` | override the `config.toml` path (the `[[export]]` destinations) |
 | `HATEL_PLUGINS` | plugin TOML paths, OS path-list separator (`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
 | `HATEL_RETENTION_DAYS` | cost-snapshot retention horizon (default 90, max 100000) |

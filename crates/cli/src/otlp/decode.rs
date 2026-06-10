@@ -24,8 +24,8 @@ pub struct MetricPoint {
 /// event names are — so a tracked entry matches whether the wire form is prefixed
 /// or bare, and metrics never silently drop while events still match.
 pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<MetricPoint>, String> {
-    let req: MetricsRequest =
-        serde_json::from_slice(bytes).map_err(|e| format!("invalid OTLP/JSON metrics body: {e}"))?;
+    let req: MetricsRequest = serde_json::from_slice(bytes)
+        .map_err(|e| format!("invalid OTLP/JSON metrics body: {e}"))?;
     let want: BTreeSet<&str> = tracked.iter().map(|s| normalize(s)).collect();
     let mut out = Vec::new();
     for rm in &req.resource_metrics {
@@ -41,8 +41,11 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
                     (None, None) => continue,
                 };
                 for dp in points {
-                    let mut attrs: Vec<(String, String)> =
-                        dp.attributes.iter().map(|kv| (kv.key.clone(), kv.value.as_string())).collect();
+                    let mut attrs: Vec<(String, String)> = dp
+                        .attributes
+                        .iter()
+                        .map(|kv| (kv.key.clone(), kv.value.as_string()))
+                        .collect();
                     let session_id = take(&mut attrs, "session.id");
                     if session_id.is_empty() {
                         continue;
@@ -65,7 +68,10 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
 /// Decode logs into `(session_id, normalized_event_name)` pairs for counted events.
 /// Names are normalized by stripping the `claude_code.` prefix so the match holds
 /// whether the wire form is prefixed or bare.
-pub fn parse_events(bytes: &[u8], counted: &BTreeSet<String>) -> Result<Vec<(String, String)>, String> {
+pub fn parse_events(
+    bytes: &[u8],
+    counted: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
     let req: LogsRequest =
         serde_json::from_slice(bytes).map_err(|e| format!("invalid OTLP/JSON logs body: {e}"))?;
     let counted: BTreeSet<&str> = counted.iter().map(|s| normalize(s)).collect();
@@ -252,7 +258,10 @@ mod tests {
     use super::*;
 
     fn tracked() -> BTreeSet<String> {
-        ["claude_code.token.usage"].iter().map(|s| s.to_string()).collect()
+        ["claude_code.token.usage"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     #[test]
@@ -275,7 +284,10 @@ mod tests {
         assert_eq!(points[0].session_id, "S1");
         assert_eq!(points[0].value, 100.0);
         assert!(points[0].delta);
-        assert_eq!(points[0].series, vec![("type".to_string(), "output".to_string())]);
+        assert_eq!(
+            points[0].series,
+            vec![("type".to_string(), "output".to_string())]
+        );
     }
 
     #[test]
@@ -320,13 +332,16 @@ mod tests {
             }]}]}]
         })
         .to_string();
-        assert!(parse_metrics(body.as_bytes(), &tracked()).unwrap().is_empty());
+        assert!(
+            parse_metrics(body.as_bytes(), &tracked())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn events_match_on_normalized_name() {
-        let counted: BTreeSet<String> =
-            ["skill_activated"].iter().map(|s| s.to_string()).collect();
+        let counted: BTreeSet<String> = ["skill_activated"].iter().map(|s| s.to_string()).collect();
         let body = serde_json::json!({
             "resourceLogs": [{ "scopeLogs": [{ "logRecords": [{
                 "attributes": [
@@ -337,13 +352,17 @@ mod tests {
         })
         .to_string();
         let pairs = parse_events(body.as_bytes(), &counted).unwrap();
-        assert_eq!(pairs, vec![("S1".to_string(), "skill_activated".to_string())]);
+        assert_eq!(
+            pairs,
+            vec![("S1".to_string(), "skill_activated".to_string())]
+        );
     }
 
     #[test]
     fn malformed_body_is_an_error_not_an_empty_batch() {
-        // A non-JSON / wrong-protocol body must be distinguishable from a valid empty
-        // batch, so the receiver can answer 400 instead of a silent 200.
+        // A non-JSON / wrong-protocol body must stay distinguishable from a valid empty batch: the
+        // receiver always answers 200 (the status means "received"), so this distinction drives the
+        // stderr note for an undecodable body, not a status code.
         assert!(parse_metrics(b"not json", &tracked()).is_err());
         assert!(parse_events(b"\x00\x01protobuf", &BTreeSet::new()).is_err());
         // a valid-but-empty OTLP body is Ok(empty), not an error.

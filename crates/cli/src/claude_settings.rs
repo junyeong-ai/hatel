@@ -37,10 +37,13 @@ pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:4318";
 /// alias (`localhost`, `::1`), a non-default port, or a trailing slash/path doesn't slip past as
 /// "remote". Anything non-loopback is treated as a remote collector (protocol is its business).
 pub fn is_local_receiver(endpoint: &str) -> bool {
-    let rest = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint);
+    // The receiver is plaintext HTTP, so an `https://` endpoint — even on loopback — is not it
+    // (Claude Code would TLS-handshake a server that speaks none). Only plain `http://` (or a
+    // scheme-less authority) on a loopback host counts.
+    if endpoint.starts_with("https://") {
+        return false;
+    }
+    let rest = endpoint.strip_prefix("http://").unwrap_or(endpoint);
     let authority = rest.split('/').next().unwrap_or(rest);
     let host = if let Some(after) = authority.strip_prefix('[') {
         after.split(']').next().unwrap_or(after) // [::1]:4318 → ::1
@@ -703,6 +706,9 @@ mod tests {
         assert!(is_local_receiver("http://[::1]:4318")); // ipv6 loopback
         assert!(!is_local_receiver("http://corp-collector:4318"));
         assert!(!is_local_receiver("https://otel.example.com"));
+        // https on loopback is NOT our receiver — serve speaks plaintext HTTP only.
+        assert!(!is_local_receiver("https://127.0.0.1:4318"));
+        assert!(!is_local_receiver("https://localhost:4318"));
     }
 
     #[test]
