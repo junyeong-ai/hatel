@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use hatel_core::export::parse_otlp_headers;
-use hatel_core::{ExportConfig, ExportMode, ExportTarget};
+use hatel_core::schema::build_registry_resilient;
+use hatel_core::{Config, ExportConfig, ExportMode, ExportTarget, ProjectFilter};
 use serde_json::{Value, json};
 
 use crate::claude_settings as cs;
@@ -57,9 +58,13 @@ impl InsertMode {
 
 pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     let hook_cmd = cs::hook_command();
+    // Wire only the events some loaded Kind binds (plus SessionStart for the index) — resilient so
+    // a broken plugin can't block wiring core telemetry, exactly as the hook itself loads.
+    let registry = build_registry_resilient(&Config::load());
+    let events = cs::active_events(&registry);
 
     if print {
-        print!("{}", cs::render_snippet(&hook_cmd));
+        print!("{}", cs::render_snippet(&hook_cmd, &events));
         return 0;
     }
 
@@ -100,7 +105,7 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
         }
     };
 
-    let rep = cs::wire(&mut settings, &hook_cmd);
+    let rep = cs::wire(&mut settings, &hook_cmd, &events);
 
     // An advisory key the user set differently (e.g. an endpoint repointed at a corporate
     // collector) — telemetry still flows, so note it but don't fail.
@@ -154,6 +159,10 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
         }
         if !rep.events_added.is_empty() {
             println!("  hooks: +{}", rep.events_added.join(", "));
+        }
+        if !rep.events_cleared.is_empty() {
+            // Stale wirings pruned (an event no Kind binds anymore) so nothing fires for nothing.
+            println!("  hooks: -{}", rep.events_cleared.join(", "));
         }
     } else {
         println!("already wired: {}", path.display());
@@ -247,7 +256,8 @@ pub fn insert(mode: InsertMode) -> i32 {
     // Prepare and validate the settings repoint fully IN MEMORY before persisting anything — wire
     // hooks + the required telemetry env, and reject a structurally malformed env/hooks block here,
     // so neither the config nor the settings file is touched if the settings can't be wired.
-    let rep = cs::wire(&mut settings, &cs::hook_command());
+    let events = cs::active_events(&build_registry_resilient(&Config::load()));
+    let rep = cs::wire(&mut settings, &cs::hook_command(), &events);
     if rep.malformed() {
         eprintln!(
             "init --insert: {} has a malformed env/hooks block — fix it first",
@@ -280,7 +290,9 @@ pub fn insert(mode: InsertMode) -> i32 {
         if dropped > 0 {
             // Count only — a malformed segment may carry a secret value (e.g. an empty-key
             // `=token`), so its contents are never logged.
-            eprintln!("  ⚠ ignored {dropped} malformed OTLP header segment(s) (each needs `key=value`)");
+            eprintln!(
+                "  ⚠ ignored {dropped} malformed OTLP header segment(s) (each needs `key=value`)"
+            );
         }
     }
     let headers = raw_headers
@@ -290,6 +302,9 @@ pub fn insert(mode: InsertMode) -> i32 {
     export.upsert(ExportTarget {
         endpoint: endpoint.clone(),
         mode: mode.as_export(),
+        // Insert forwards every project by default; a `projects`/`exclude_projects` filter is
+        // added by editing config.toml when a destination should not see some projects.
+        filter: ProjectFilter::All,
         headers,
         timeout_ms: None,
     });

@@ -4,4 +4,4 @@ pub mod accumulator;
 pub mod decode;
 
 pub use accumulator::{Accumulator, SessionTotals};
-pub use decode::{parse_events, parse_metrics};
+pub use decode::{ToolResult, parse_events, parse_metrics, parse_tool_results};

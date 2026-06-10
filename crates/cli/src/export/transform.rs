@@ -11,10 +11,51 @@
 //! resource-level `session.id` (a layout Claude Code does not produce) is intentionally not
 //! consulted; that would have to change in lockstep with `decode.rs` to stay consistent.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 /// Resolve a `session.id` to a project label (`None` when unknown).
 pub type Resolve<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
+/// Collect the distinct `session.id`s carried by an OTLP body — at the datapoint level for
+/// metrics, the log-record level for logs (the same layer enrichment reads). Returns `None` when
+/// the body isn't parseable JSON; `Some` (possibly empty) otherwise. The per-destination project
+/// filter uses this to resolve a batch's project before deciding whether to forward it.
+pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
+    let root: Value = serde_json::from_slice(body).ok()?;
+    let mut ids = BTreeSet::new();
+    if is_metrics {
+        for rm in read_children(&root, "resourceMetrics") {
+            for sm in read_children(rm, "scopeMetrics") {
+                for metric in read_children(sm, "metrics") {
+                    for shape in ["sum", "gauge"] {
+                        let points = metric
+                            .get(shape)
+                            .and_then(|s| s.get("dataPoints"))
+                            .and_then(Value::as_array);
+                        for dp in points.into_iter().flatten() {
+                            if let Some(sid) = point_session_id(dp) {
+                                ids.insert(sid.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for rl in read_children(&root, "resourceLogs") {
+            for sl in read_children(rl, "scopeLogs") {
+                for rec in read_children(sl, "logRecords") {
+                    if let Some(sid) = point_session_id(rec) {
+                        ids.insert(sid.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Some(ids)
+}
 
 /// Inject `project` into every metrics datapoint whose `session.id` resolves. Returns the
 /// re-serialized body, or `Err` if the body isn't parseable JSON (the caller skips this
@@ -66,28 +107,39 @@ fn children<'a>(v: &'a mut Value, key: &str) -> impl Iterator<Item = &'a mut Val
         .flatten()
 }
 
+/// Read-only counterpart of [`children`].
+fn read_children<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value> {
+    v.get(key).and_then(Value::as_array).into_iter().flatten()
+}
+
 /// Add a `project` attribute to one datapoint/record, resolved from its own `session.id`.
 /// No-op when: the attribute set is absent, a `project` is already present (don't duplicate),
 /// the datapoint carries no `session.id`, or the session doesn't resolve (don't fabricate).
 fn inject_project(point: &mut Value, resolve: &Resolve) {
+    let session = point_session_id(point).map(str::to_string);
     let Some(attrs) = point.get_mut("attributes").and_then(Value::as_array_mut) else {
         return;
     };
     if attrs.iter().any(|a| attr_key(a) == Some("project")) {
         return;
     }
-    let session = attrs
-        .iter()
-        .find(|a| attr_key(a) == Some("session.id"))
-        .and_then(|a| a.get("value"))
-        .and_then(|v| v.get("stringValue"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
     let Some(session) = session else { return };
     let Some(label) = resolve(&session) else {
         return;
     };
     attrs.push(json!({ "key": "project", "value": { "stringValue": label } }));
+}
+
+/// The `session.id` string attribute on one datapoint/record, if present.
+fn point_session_id(point: &Value) -> Option<&str> {
+    point
+        .get("attributes")?
+        .as_array()?
+        .iter()
+        .find(|a| attr_key(a) == Some("session.id"))?
+        .get("value")?
+        .get("stringValue")?
+        .as_str()
 }
 
 fn attr_key(attr: &Value) -> Option<&str> {
@@ -264,5 +316,30 @@ mod tests {
     fn non_json_body_is_an_error() {
         assert!(enrich_metrics(b"not json", &resolver(&[])).is_err());
         assert!(enrich_logs(b"\x00\x01proto", &resolver(&[])).is_err());
+    }
+
+    #[test]
+    fn session_ids_collects_distinct_across_datapoints() {
+        let body = metrics_body(json!([
+            { "attributes": [{ "key": "session.id", "value": { "stringValue": "S1" } }], "asInt": "1" },
+            { "attributes": [{ "key": "session.id", "value": { "stringValue": "S2" } }], "asInt": "2" },
+            { "attributes": [{ "key": "session.id", "value": { "stringValue": "S1" } }], "asInt": "3" }
+        ]));
+        let ids = session_ids(&body, true).unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("S1") && ids.contains("S2"));
+    }
+
+    #[test]
+    fn session_ids_none_for_non_json_some_empty_for_sessionless() {
+        assert!(
+            session_ids(b"\x00proto", true).is_none(),
+            "non-JSON is None"
+        );
+        let body = metrics_body(json!([{ "attributes": [], "asInt": "1" }]));
+        assert!(
+            session_ids(&body, true).unwrap().is_empty(),
+            "parseable but sessionless is an empty set"
+        );
     }
 }

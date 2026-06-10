@@ -13,11 +13,12 @@ machine (opt-in [export](#forwarding-to-other-collectors-export) can tee the enr
 stream to a downstream collector).
 
 - **Native OTel** (push) carries the machine signals: tokens, cost, active time,
-  lines, and per-subagent attribution via `agent.name`. It has no project on the
-  wire, so it is joined to a project through the session index.
+  lines, per-subagent attribution via `agent.name`, and per-tool duration and outcome
+  (from the `tool_result` event). It has no project on the wire, so it is joined to a
+  project through the session index.
 - **Hooks** (event) carry the project context (`cwd`) and the domain events OTel
-  can't express: tool calls, prompt sizes, memory loads, subagent stops,
-  compactions — and anything a plugin defines.
+  can't express: prompt sizes, memory loads, subagent stops, compactions — and
+  anything a plugin defines.
 
 Two binaries:
 
@@ -84,16 +85,18 @@ layers are separate. For an org, paste the equivalent block (printed by
   },
   "hooks": {
     "SessionStart":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "PostToolUse":       [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
     "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
     "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
     "InstructionsLoaded":[{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "PreCompact":        [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "PostCompact":       [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }]
+    "PreCompact":        [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }]
   }
 }
 ```
+
+`init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the
+session→project index). Tool calls aren't here — their duration and outcome come from the native
+`tool_result` event, not a hook. A plugin that binds another lifecycle event (e.g. `PostToolUse`)
+gets it wired on the next `hatel init`.
 
 The `command` is shown as the bare name for readability; `hatel init` (and `--print`) write the
 **absolute** path to `hatel-hook` beside `hatel`, so Claude Code can spawn it without relying on
@@ -137,6 +140,8 @@ transform applied on the way there:
 endpoint = "http://collector.corp:4318"   # /v1/metrics and /v1/logs are appended
 mode = "enriched"                           # raw | enriched
 headers = { authorization = "…" }           # e.g. downstream auth (never logged by value)
+exclude_projects = ["scratch"]              # forward every project but these…
+# projects = ["work-a", "work-b"]           # …or allow-list only these (not both)
 # timeout_ms = 5000
 
 [[export]]
@@ -150,6 +155,13 @@ mode = "raw"
   datapoint/record, so the downstream backend gains the project-level attribution that
   raw OTel structurally lacks. It needs an `http/json` stream to transform; a datapoint
   whose session is unknown is forwarded unchanged (the label is never fabricated).
+- **`projects`** / **`exclude_projects`** keep a destination from seeing some projects —
+  an allow-list (forward only these) or an exclude-list (forward all but these), one or
+  the other. The batch's project is joined from `session.id`, so this also needs an
+  `http/json` stream; a batch whose project can't yet be resolved **fails closed** (it
+  isn't forwarded to a filtered destination), so a personal project never leaks to a
+  corporate collector on a startup race. A destination with neither key forwards every
+  project.
 
 A/B is a per-destination transform, not two toggles: the same endpoint with both would
 double-count delta metrics, so a duplicate endpoint is rejected at load. Forwarding is

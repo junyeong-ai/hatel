@@ -17,10 +17,16 @@ use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
-use hatel_core::{Config, ExportConfig, SessionIndex, now_iso_utc, resolve_project};
+use hatel_core::sink::build_sink;
+use hatel_core::{
+    Config, ExportConfig, Payload, Registry, SessionIndex, SessionRow, make_envelope, now_iso_utc,
+    resolve_project,
+};
 
 use crate::export::{Exporter, OtlpSignal};
-use crate::otlp::{Accumulator, SessionTotals, parse_events, parse_metrics};
+use crate::otlp::{
+    Accumulator, SessionTotals, ToolResult, parse_events, parse_metrics, parse_tool_results,
+};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
@@ -35,6 +41,12 @@ struct AppState {
     acc: Arc<Mutex<Accumulator>>,
     tracked: Arc<BTreeSet<String>>,
     counted: Arc<BTreeSet<String>>,
+    /// The full registry, for sanitizing receiver-written `tool` records (the `tool` Kind's
+    /// field allow-list is what keeps the rich, PII-bearing `tool_result` event content-free).
+    registry: Arc<Registry>,
+    /// `tool_result` outcomes decoded since the last flush, written to the ledger by `persist`
+    /// (off the request path), exactly as cost is snapshotted — never blocking ingestion on I/O.
+    tool_buffer: Arc<Mutex<Vec<ToolResult>>>,
     cfg: Arc<Config>,
     /// Per-session totals already persisted before this receiver started, so a
     /// session that spans a receiver restart continues from its prior total rather
@@ -68,7 +80,7 @@ pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
 async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let cfg = Arc::new(Config::load());
     let registry = match build_registry(&cfg) {
-        Ok(r) => r,
+        Ok(r) => Arc::new(r),
         Err(e) => {
             eprintln!("serve: {e}");
             return 1;
@@ -100,6 +112,8 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         acc: Arc::new(Mutex::new(Accumulator::default())),
         tracked: Arc::new(registry.tracked_metrics.clone()),
         counted: Arc::new(registry.counted_events.clone()),
+        registry: registry.clone(),
+        tool_buffer: Arc::new(Mutex::new(Vec::new())),
         cfg: cfg.clone(),
         baseline: Arc::new(baseline),
         current_key,
@@ -144,7 +158,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         loop {
             tick.tick().await;
-            persist_cost(&flush_state);
+            persist(&flush_state);
         }
     });
 
@@ -154,7 +168,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     }
     flush_task.abort();
     let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
-    persist_cost(&state);
+    persist(&state);
     // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
     // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
     if let Some(exporter) = &state.exporter {
@@ -208,6 +222,15 @@ async fn ingest_logs(
         let (ct, ce) = body_headers(&headers);
         exporter.enqueue(OtlpSignal::Logs, body.clone(), ct, ce);
     }
+    // Buffer tool outcomes for the ledger (written off the request path by `persist`). Independent
+    // of the counted-event view below: the same body feeds both, decoded once for each.
+    match parse_tool_results(body.as_ref()) {
+        Ok(results) if !results.is_empty() => {
+            lock_buf(&st.tool_buffer).extend(results);
+        }
+        Ok(_) => {}
+        Err(_) => {} // a non-decodable body is reported once by the view path below
+    }
     match parse_events(body.as_ref(), &st.counted) {
         Ok(pairs) if !pairs.is_empty() => {
             lock(&st.acc).update_events(pairs);
@@ -237,6 +260,11 @@ fn body_headers(headers: &HeaderMap) -> (Option<String>, Option<String>) {
 /// Recover a poisoned accumulator lock rather than cascading panics through every
 /// handler — a daemon stays up even if one request panicked mid-update.
 fn lock(m: &Mutex<Accumulator>) -> std::sync::MutexGuard<'_, Accumulator> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Same poison-recovery for the tool-result buffer.
+fn lock_buf(m: &Mutex<Vec<ToolResult>>) -> std::sync::MutexGuard<'_, Vec<ToolResult>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -358,8 +386,49 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-fn persist_cost(st: &AppState) {
+/// Persist both OTel-derived stores off the request path: the per-session cost snapshot and the
+/// buffered per-call tool outcomes. The session index is loaded once and shared, since both join
+/// `session.id` to a project label the same way.
+fn persist(st: &AppState) {
     let index = SessionIndex::new(st.cfg.state_dir.clone()).load();
+    persist_cost(st, &index);
+    persist_tool(st, &index);
+}
+
+/// Drain the tool-result buffer into the ledger as `tool` records, joining each call's project
+/// from the session index. Written via the configured sink (the same write path the hook uses),
+/// so `report` aggregates tool latency and success rate exactly like any other Kind. `tool.jsonl`
+/// has a single writer — this — since the `tool` Kind has no hook binding.
+fn persist_tool(st: &AppState, index: &BTreeMap<String, SessionRow>) {
+    let drained = std::mem::take(&mut *lock_buf(&st.tool_buffer));
+    if drained.is_empty() {
+        return;
+    }
+    let mut sink = build_sink(&st.cfg);
+    for r in drained {
+        let project = index
+            .get(&r.session_id)
+            .map(|row| row.project_label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_default();
+        let mut payload = Payload::new();
+        payload.insert("session_id".into(), r.session_id.into());
+        payload.insert("project".into(), project.into());
+        payload.insert("tool_name".into(), r.tool_name.into());
+        payload.insert("duration_ms".into(), r.duration_ms.into());
+        payload.insert("ok".into(), i64::from(r.ok).into());
+        // Only these five fields are ever inserted, so the rich `tool_result` event — which also
+        // carries the user's email and tool input — stays out of the ledger. The Kind's field
+        // allow-list applied by `make_envelope` is defense-in-depth on top of that.
+        match make_envelope("tool", payload, &st.registry, st.cfg.strict) {
+            Ok(env) => sink.write_record(&env),
+            Err(e) => eprintln!("hatel: tool record dropped — {e}"),
+        }
+    }
+    sink.flush();
+}
+
+fn persist_cost(st: &AppState, index: &BTreeMap<String, SessionRow>) {
     let now = now_iso_utc();
     let acc = lock(&st.acc);
     let rows: Vec<CostRow> = acc

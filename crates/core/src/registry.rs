@@ -24,10 +24,15 @@ pub struct KindSpec {
     /// Numeric fields a report sums per group (durations, counts, costs). Ordered:
     /// the first is the primary metric a report ranks groups by; all are displayed.
     pub measures: Vec<String>,
+    /// Whether this Kind is written by the receiver from a native OTel signal (e.g. `tool` from
+    /// `tool_result`) rather than by the hook. Such a Kind must not have a hook binding — that would
+    /// give it two writers and double-count it — so `bind` rejects one.
+    pub receiver_sourced: bool,
 }
 
 /// The raw, deserialized form of a `[[kind]]` table before validation.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KindSpecRaw {
     pub name: String,
     pub fields: Vec<String>,
@@ -36,6 +41,8 @@ pub struct KindSpecRaw {
     pub redact: Vec<String>,
     #[serde(default)]
     pub measures: Vec<String>,
+    #[serde(default)]
+    pub receiver_sourced: bool,
 }
 
 /// A Kind name is also a JSONL filename component, so it is restricted to a safe
@@ -60,7 +67,10 @@ impl KindSpec {
             ));
         }
         if !fields.contains(&raw.group_key) {
-            return Err(invalid(format!("group_key '{}' not in fields", raw.group_key)));
+            return Err(invalid(format!(
+                "group_key '{}' not in fields",
+                raw.group_key
+            )));
         }
         let redact: BTreeSet<String> = raw.redact.into_iter().collect();
         if let Some(r) = redact.iter().find(|r| !fields.contains(*r)) {
@@ -75,6 +85,7 @@ impl KindSpec {
             group_key: raw.group_key,
             redact,
             measures: raw.measures,
+            receiver_sourced: raw.receiver_sourced,
         })
     }
 }
@@ -127,10 +138,15 @@ impl FieldMap {
     /// order: at most one transform may be set, and a non-`const` map needs a `from`
     /// source (a transform with no source would always omit — a dead mapping).
     fn validate(&self) -> std::result::Result<(), &'static str> {
-        let transforms = [self.capture.is_some(), self.len, self.present, self.basename]
-            .iter()
-            .filter(|x| **x)
-            .count()
+        let transforms = [
+            self.capture.is_some(),
+            self.len,
+            self.present,
+            self.basename,
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count()
             + usize::from(self.constant.is_some());
         if transforms > 1 {
             return Err("at most one of capture/len/present/basename/const may be set");
@@ -226,6 +242,15 @@ impl Registry {
                 binding.event
             )));
         };
+        // A receiver-sourced Kind (e.g. `tool`, written from the native `tool_result` event) must
+        // have exactly one writer; a hook binding would double-count it, so reject it loudly.
+        if spec.receiver_sourced {
+            return Err(invalid(format!(
+                "binding for event '{}' targets receiver-sourced kind '{}' — it is written from \
+                 native OTel and cannot be hook-bound",
+                binding.event, binding.kind
+            )));
+        }
         // Every output field a binding writes must be allow-listed by the target Kind,
         // and every capture regex must compile — both checked here, loudly, at startup,
         // rather than silently dropping a mistyped field or a bad pattern at event time.

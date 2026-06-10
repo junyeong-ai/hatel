@@ -13,9 +13,12 @@ use serde_json::{Value, json};
 /// with.
 const HOOK_BIN: &str = "hatel-hook";
 
-/// The lifecycle events this collector binds. Claude Code deliberately does not pass the
-/// `OTEL_*` telemetry env to hook subprocesses, which is why hooks carry the project context
-/// and domain events the native layer can't — so these are the events worth a hook record.
+/// The lifecycle events this collector *can* wire — its vocabulary. Claude Code deliberately does
+/// not pass the `OTEL_*` telemetry env to hook subprocesses, which is why hooks carry the project
+/// context and domain events the native layer can't. Only the events actually needed are wired
+/// (see [`active_events`]): `SessionStart` (for the session→project index) plus every event a
+/// loaded Kind binds. The rest stay in the vocabulary so a plugin can bind them — e.g. `PostToolUse`
+/// for a tool-driven Kind — without firing the hook on events nothing consumes.
 pub const EVENTS: [&str; 8] = [
     "SessionStart",
     "SessionEnd",
@@ -26,6 +29,18 @@ pub const EVENTS: [&str; 8] = [
     "PreCompact",
     "PostCompact",
 ];
+
+/// The events to actually wire for a given registry: `SessionStart` (needed for the session index
+/// even though no Kind binds it) plus every vocabulary event some loaded Kind binds. This is what
+/// keeps the hook off events nothing consumes — no `PostToolUse` spawn per tool call when the
+/// `tool` Kind is sourced from native OTel, no dead `SessionEnd`/`PostCompact` wiring.
+pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
+    EVENTS
+        .iter()
+        .copied()
+        .filter(|ev| *ev == "SessionStart" || !registry.bindings_for(ev).is_empty())
+        .collect::<Vec<_>>()
+}
 
 /// The receiver's default bind address — the endpoint `init` wires. Used to tell "pointed at the
 /// local receiver" (where `http/json` is mandatory) from "repointed elsewhere" (where it's the
@@ -48,7 +63,10 @@ pub fn is_local_receiver(endpoint: &str) -> bool {
     let host = if let Some(after) = authority.strip_prefix('[') {
         after.split(']').next().unwrap_or(after) // [::1]:4318 → ::1
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
     };
     matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
@@ -124,7 +142,13 @@ pub type Env = std::collections::BTreeMap<String, (String, &'static str)>;
 pub fn scope_files() -> Vec<ScopeFile> {
     SCOPES
         .iter()
-        .filter_map(|&name| scope_path(name).map(|path| ScopeFile { name, load: read_json(&path), path }))
+        .filter_map(|&name| {
+            scope_path(name).map(|path| ScopeFile {
+                name,
+                load: read_json(&path),
+                path,
+            })
+        })
         .collect()
 }
 
@@ -184,7 +208,12 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 pub fn effective_env(files: &[ScopeFile]) -> Env {
     let mut env = Env::new();
     for f in files {
-        let Some(obj) = f.load.value().and_then(|v| v.get("env")).and_then(|v| v.as_object()) else {
+        let Some(obj) = f
+            .load
+            .value()
+            .and_then(|v| v.get("env"))
+            .and_then(|v| v.as_object())
+        else {
             continue;
         };
         for (k, v) in obj {
@@ -221,9 +250,9 @@ fn scope_wires_hook(f: &ScopeFile) -> bool {
 /// Claude Code actually honors (under `allowManagedHooksOnly`, just the managed scope). `doctor`
 /// compares this to `EVENTS` so partial coverage — most lifecycle events silently uncaptured — is
 /// reported rather than passing as fully wired on the strength of a single event.
-pub fn covered_events(files: &[ScopeFile]) -> Vec<&'static str> {
+pub fn covered_events(files: &[ScopeFile], events: &[&'static str]) -> Vec<&'static str> {
     let managed_only = managed_hooks_only(files);
-    EVENTS
+    events
         .iter()
         .copied()
         .filter(|ev| {
@@ -246,7 +275,10 @@ fn scope_event_has_hook(f: &ScopeFile, ev: &str) -> bool {
 
 /// Whether a blocked (non-managed) scope wires the hook while managed-only is in force.
 pub fn hook_wired_but_blocked(files: &[ScopeFile]) -> bool {
-    managed_hooks_only(files) && files.iter().any(|f| f.name != "managed" && scope_wires_hook(f))
+    managed_hooks_only(files)
+        && files
+            .iter()
+            .any(|f| f.name != "managed" && scope_wires_hook(f))
 }
 
 /// The distinct commands our hook is wired with across honored scopes — so `doctor` can check
@@ -259,14 +291,26 @@ pub fn wired_hook_commands(files: &[ScopeFile]) -> Vec<String> {
         if managed_only && f.name != "managed" {
             continue;
         }
-        let Some(events) = f.load.value().and_then(|v| v.get("hooks")).and_then(|h| h.as_object()) else {
+        let Some(events) = f
+            .load
+            .value()
+            .and_then(|v| v.get("hooks"))
+            .and_then(|h| h.as_object())
+        else {
             continue;
         };
         for groups in events.values() {
-            let Some(groups) = groups.as_array() else { continue };
+            let Some(groups) = groups.as_array() else {
+                continue;
+            };
             for g in groups {
-                let Some(entries) = g.get("hooks").and_then(|h| h.as_array()) else { continue };
-                for c in entries.iter().filter_map(|e| e.get("command").and_then(|c| c.as_str())) {
+                let Some(entries) = g.get("hooks").and_then(|h| h.as_array()) else {
+                    continue;
+                };
+                for c in entries
+                    .iter()
+                    .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
+                {
                     if command_is_our_hook(c) && !cmds.iter().any(|x| x == c) {
                         cmds.push(c.to_string());
                     }
@@ -279,7 +323,9 @@ pub fn wired_hook_commands(files: &[ScopeFile]) -> Vec<String> {
 
 /// Whether one event's value (an array of matcher groups) already invokes our hook.
 fn event_has_hook(event: &Value) -> bool {
-    event.as_array().is_some_and(|groups| event_array_has_hook(groups))
+    event
+        .as_array()
+        .is_some_and(|groups| event_array_has_hook(groups))
 }
 
 fn event_array_has_hook(groups: &[Value]) -> bool {
@@ -297,7 +343,10 @@ fn group_invokes_our_hook(group: &Value) -> bool {
 /// Whether a single entry runs *our* hook. Both detection and removal key on this, so they
 /// always agree.
 fn entry_is_our_hook(entry: &Value) -> bool {
-    entry.get("command").and_then(|c| c.as_str()).is_some_and(command_is_our_hook)
+    entry
+        .get("command")
+        .and_then(|c| c.as_str())
+        .is_some_and(command_is_our_hook)
 }
 
 /// Whether a hook `command` runs our hook binary: its path basename is `hatel-hook`
@@ -338,13 +387,13 @@ fn group_hooks_is_empty(group: &Value) -> bool {
 /// The paste-ready settings block — the same `env` + `hooks` that `wire` merges, rendered for
 /// managed/org settings where automated writing isn't appropriate. Values go through `{:?}`,
 /// which JSON-escapes them, so a Windows hook path with backslashes stays valid JSON.
-pub fn render_snippet(hook_cmd: &str) -> String {
+pub fn render_snippet(hook_cmd: &str, events: &[&'static str]) -> String {
     let env = TELEMETRY_ENV
         .iter()
         .map(|(k, v, _)| format!("    {k:?}: {v:?}"))
         .collect::<Vec<_>>()
         .join(",\n");
-    let hooks = EVENTS
+    let hooks = events
         .iter()
         .map(|e| {
             format!("    {e:?}: [{{ \"hooks\": [{{ \"type\": \"command\", \"command\": {hook_cmd:?} }}] }}]")
@@ -369,6 +418,9 @@ pub struct WireReport {
     pub env_not_object: bool,
     pub events_added: Vec<&'static str>,
     pub events_present: Vec<&'static str>,
+    /// Events whose stale wiring was pruned because no loaded Kind binds them anymore (e.g. after
+    /// `tool` moved to native OTel) — so a re-run converges to exactly the active set.
+    pub events_cleared: Vec<&'static str>,
     pub events_conflicts: Vec<&'static str>,
     pub hooks_not_object: bool,
 }
@@ -376,7 +428,9 @@ pub struct WireReport {
 impl WireReport {
     /// Whether the merge changed anything that must be persisted.
     pub fn changed(&self) -> bool {
-        !self.env_added.is_empty() || !self.events_added.is_empty()
+        !self.env_added.is_empty()
+            || !self.events_added.is_empty()
+            || !self.events_cleared.is_empty()
     }
     /// Whether the file is structurally broken where we needed to merge — an `env` or `hooks`
     /// that isn't an object, or an event whose value isn't an array. Unlike a repointed
@@ -392,7 +446,7 @@ impl WireReport {
 /// that differs — e.g. an endpoint repointed at a corporate collector — is reported, never
 /// overwritten), and each event's hook is *appended* only when our hook isn't already present,
 /// so a user's own hooks survive and a second run is a no-op.
-pub fn wire(settings: &mut Value, hook_cmd: &str) -> WireReport {
+pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> WireReport {
     let mut rep = WireReport::default();
     let Some(obj) = settings.as_object_mut() else {
         rep.env_not_object = true;
@@ -429,44 +483,81 @@ pub fn wire(settings: &mut Value, hook_cmd: &str) -> WireReport {
         .and_then(Value::as_str)
         .is_some_and(is_local_receiver);
     if endpoint_is_local
-        && let Some(i) = rep.env_conflicts.iter().position(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        && let Some(i) = rep
+            .env_conflicts
+            .iter()
+            .position(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
     {
         rep.env_blocked.push(rep.env_conflicts.remove(i));
     }
 
     match obj.entry("hooks").or_insert_with(|| json!({})) {
         Value::Object(hooks) => {
+            // Walk the whole vocabulary so a re-run converges to *exactly* the active set: ensure
+            // our hook on active events, and strip it from inactive ones — otherwise an upgrade that
+            // drops an event (e.g. `tool` moving to native OTel) would leave the hook firing on it
+            // for no record, which `covered_events` (scoped to the active set) couldn't even see.
+            let mut pruned_empty: Vec<&'static str> = Vec::new();
             for ev in EVENTS {
+                let active = events.contains(&ev);
+                // Don't materialise an entry for an inactive event that has none — only prune ones
+                // that already exist.
+                if !active && !hooks.contains_key(ev) {
+                    continue;
+                }
                 match hooks.entry(ev).or_insert_with(|| Value::Array(vec![])) {
                     Value::Array(groups) => {
-                        // Strip our *stale* entries (our basename, but not the current path) from
-                        // each group so a moved/reinstalled binary is repointed — at entry
-                        // granularity (like `unwire`), so a user command co-located in the same
-                        // group is never collateral-damaged. Then drop any group we emptied.
-                        let mut removed_stale = false;
+                        // Strip our entries at entry granularity (a user command co-located in the
+                        // same group is never collateral-damaged). For an active event we keep our
+                        // *current-path* entry (repointing only a stale one); for an inactive event
+                        // we remove every entry of ours.
+                        let mut removed = false;
                         for group in groups.iter_mut() {
                             if let Some(Value::Array(entries)) = group.get_mut("hooks") {
                                 let before = entries.len();
-                                entries.retain(|e| !entry_is_our_hook(e) || entry_has_command(e, hook_cmd));
-                                removed_stale |= entries.len() != before;
+                                entries.retain(|e| {
+                                    !entry_is_our_hook(e)
+                                        || (active && entry_has_command(e, hook_cmd))
+                                });
+                                removed |= entries.len() != before;
                             }
                         }
-                        groups.retain(|g| !group_hooks_is_empty(g));
 
-                        if groups.iter().any(|g| group_has_command(g, hook_cmd)) {
-                            // Already wired to the current path; a repoint (stale removed) is a change.
-                            if removed_stale {
-                                rep.events_added.push(ev);
-                            } else {
-                                rep.events_present.push(ev);
+                        if !active {
+                            // Inactive event: touch it only when we actually stripped our hook. If
+                            // there was nothing of ours, the event is left exactly as the user had
+                            // it — no group is dropped, no key is deleted, nothing is reported.
+                            if removed {
+                                groups.retain(|g| !group_hooks_is_empty(g));
+                                rep.events_cleared.push(ev);
+                                if groups.is_empty() {
+                                    pruned_empty.push(ev);
+                                }
                             }
                         } else {
-                            groups.push(hook_group(hook_cmd));
-                            rep.events_added.push(ev);
+                            // Active event: drop any group our strip emptied, then ensure our hook.
+                            groups.retain(|g| !group_hooks_is_empty(g));
+                            if groups.iter().any(|g| group_has_command(g, hook_cmd)) {
+                                // Already wired to the current path; a repoint (stale removed) is a change.
+                                if removed {
+                                    rep.events_added.push(ev);
+                                } else {
+                                    rep.events_present.push(ev);
+                                }
+                            } else {
+                                groups.push(hook_group(hook_cmd));
+                                rep.events_added.push(ev);
+                            }
                         }
                     }
-                    _ => rep.events_conflicts.push(ev),
+                    _ if active => rep.events_conflicts.push(ev),
+                    _ => {}
                 }
+            }
+            // Remove only the keys our pruning emptied, so no `"PostToolUse": []` cruft is left
+            // (mirrors `unwire`) — a key we didn't empty, or a user's own, is untouched.
+            for ev in pruned_empty {
+                hooks.remove(ev);
             }
         }
         _ => rep.hooks_not_object = true,
@@ -547,7 +638,7 @@ mod tests {
     #[test]
     fn wire_empty_adds_env_and_all_events() {
         let mut s = json!({});
-        let rep = wire(&mut s, CMD);
+        let rep = wire(&mut s, CMD, &EVENTS);
         assert_eq!(rep.env_added.len(), TELEMETRY_ENV.len());
         assert_eq!(rep.events_added.len(), EVENTS.len());
         assert!(rep.changed());
@@ -564,9 +655,9 @@ mod tests {
     #[test]
     fn wire_is_idempotent_byte_for_byte() {
         let mut s = json!({});
-        wire(&mut s, CMD);
+        wire(&mut s, CMD, &EVENTS);
         let first = s.clone();
-        let rep = wire(&mut s, CMD);
+        let rep = wire(&mut s, CMD, &EVENTS);
         assert!(!rep.changed(), "second run changes nothing");
         assert_eq!(rep.events_present.len(), EVENTS.len());
         assert_eq!(s, first, "second run leaves the value identical");
@@ -576,37 +667,41 @@ mod tests {
     fn wire_appends_to_an_existing_user_hook() {
         let mut s = json!({
             "hooks": {
-                "PostToolUse": [{ "hooks": [{ "type": "command", "command": "my-own-tool" }] }]
+                "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "my-own-tool" }] }]
             }
         });
-        let rep = wire(&mut s, CMD);
-        let groups = s["hooks"]["PostToolUse"].as_array().unwrap();
+        let rep = wire(&mut s, CMD, &EVENTS);
+        let groups = s["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(groups.len(), 2, "our hook is appended, theirs kept");
         assert_eq!(groups[0]["hooks"][0]["command"], "my-own-tool");
-        assert!(rep.events_added.contains(&"PostToolUse"));
+        assert!(rep.events_added.contains(&"UserPromptSubmit"));
     }
 
     #[test]
     fn wire_repoints_a_stale_hook_path() {
         // a hook of ours wired at an old path (binary moved) is repointed, not duplicated
         let mut s = json!({ "hooks": {
-            "PostToolUse": [{ "hooks": [{ "type": "command", "command": "/old/bin/hatel-hook" }] }]
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/old/bin/hatel-hook" }] }]
         }});
-        let rep = wire(&mut s, CMD);
-        let groups = s["hooks"]["PostToolUse"].as_array().unwrap();
-        assert_eq!(groups.len(), 1, "stale group is repointed in place, not added alongside");
+        let rep = wire(&mut s, CMD, &EVENTS);
+        let groups = s["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "stale group is repointed in place, not added alongside"
+        );
         assert_eq!(groups[0]["hooks"][0]["command"], CMD);
-        assert!(rep.events_added.contains(&"PostToolUse"));
+        assert!(rep.events_added.contains(&"UserPromptSubmit"));
     }
 
     #[test]
     fn wire_repoints_stale_but_keeps_the_users_hook() {
-        let mut s = json!({ "hooks": { "PostToolUse": [
+        let mut s = json!({ "hooks": { "UserPromptSubmit": [
             { "hooks": [{ "type": "command", "command": "my-own-tool" }] },
             { "hooks": [{ "type": "command", "command": "/old/hatel-hook" }] }
         ] }});
-        wire(&mut s, CMD);
-        let cmds: Vec<String> = s["hooks"]["PostToolUse"]
+        wire(&mut s, CMD, &EVENTS);
+        let cmds: Vec<String> = s["hooks"]["UserPromptSubmit"]
             .as_array()
             .unwrap()
             .iter()
@@ -614,8 +709,14 @@ mod tests {
             .collect();
         assert_eq!(cmds.len(), 2);
         assert!(cmds.iter().any(|c| c == "my-own-tool"), "user hook kept");
-        assert!(cmds.iter().any(|c| c == CMD), "our hook repointed to current");
-        assert!(!cmds.iter().any(|c| c == "/old/hatel-hook"), "stale path gone");
+        assert!(
+            cmds.iter().any(|c| c == CMD),
+            "our hook repointed to current"
+        );
+        assert!(
+            !cmds.iter().any(|c| c == "/old/hatel-hook"),
+            "stale path gone"
+        );
     }
 
     // Helper: every command string across all groups of an event.
@@ -633,48 +734,71 @@ mod tests {
     fn wire_strips_a_stale_entry_colocated_with_a_user_entry() {
         // contrived: the user's command and our STALE hook share one group's hooks array — entry-
         // level stripping must drop only the stale one, never the user's.
-        let mut s = json!({ "hooks": { "PostToolUse": [{ "hooks": [
+        let mut s = json!({ "hooks": { "UserPromptSubmit": [{ "hooks": [
             { "type": "command", "command": "my-own-tool" },
             { "type": "command", "command": "/old/hatel-hook" }
         ] }] }});
-        wire(&mut s, CMD);
-        let cmds = event_commands(&s, "PostToolUse");
-        assert!(cmds.iter().any(|c| c == "my-own-tool"), "user entry survives");
+        wire(&mut s, CMD, &EVENTS);
+        let cmds = event_commands(&s, "UserPromptSubmit");
+        assert!(
+            cmds.iter().any(|c| c == "my-own-tool"),
+            "user entry survives"
+        );
         assert!(cmds.iter().any(|c| c == CMD), "current added");
-        assert!(!cmds.iter().any(|c| c == "/old/hatel-hook"), "stale entry removed");
+        assert!(
+            !cmds.iter().any(|c| c == "/old/hatel-hook"),
+            "stale entry removed"
+        );
     }
 
     #[test]
     fn wire_strips_a_stale_entry_colocated_with_the_current_one() {
-        let mut s = json!({ "hooks": { "PostToolUse": [{ "hooks": [
+        let mut s = json!({ "hooks": { "UserPromptSubmit": [{ "hooks": [
             { "type": "command", "command": CMD },
             { "type": "command", "command": "/old/hatel-hook" }
         ] }] }});
-        wire(&mut s, CMD);
-        let cmds = event_commands(&s, "PostToolUse");
-        assert_eq!(cmds, vec![CMD.to_string()], "stale entry stripped, current kept once");
+        wire(&mut s, CMD, &EVENTS);
+        let cmds = event_commands(&s, "UserPromptSubmit");
+        assert_eq!(
+            cmds,
+            vec![CMD.to_string()],
+            "stale entry stripped, current kept once"
+        );
     }
 
     #[test]
     fn wired_hook_commands_collects_distinct_ours_only() {
         let v = json!({ "hooks": {
             "SessionStart": [{ "hooks": [{ "type": "command", "command": "/x/hatel-hook" }] }],
-            "PostToolUse": [{ "hooks": [
+            "UserPromptSubmit": [{ "hooks": [
                 { "type": "command", "command": "/x/hatel-hook" },
                 { "type": "command", "command": "my-tool" }
             ] }]
         }});
-        assert_eq!(wired_hook_commands(&one_scope(v)), vec!["/x/hatel-hook".to_string()]);
+        assert_eq!(
+            wired_hook_commands(&one_scope(v)),
+            vec!["/x/hatel-hook".to_string()]
+        );
     }
 
     #[test]
     fn wire_does_not_overwrite_a_repointed_endpoint() {
         let mut s = json!({ "env": { "OTEL_EXPORTER_OTLP_ENDPOINT": "http://corp:4318" } });
-        let rep = wire(&mut s, CMD);
+        let rep = wire(&mut s, CMD, &EVENTS);
         assert_eq!(s["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"], "http://corp:4318");
-        assert!(rep.env_conflicts.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_ENDPOINT"));
-        assert!(!rep.malformed(), "a repointed endpoint is advisory, not malformed");
-        assert!(rep.env_blocked.is_empty(), "a repointed endpoint is advisory, not blocking");
+        assert!(
+            rep.env_conflicts
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_ENDPOINT")
+        );
+        assert!(
+            !rep.malformed(),
+            "a repointed endpoint is advisory, not malformed"
+        );
+        assert!(
+            rep.env_blocked.is_empty(),
+            "a repointed endpoint is advisory, not blocking"
+        );
         // the non-conflicting keys are still added
         assert_eq!(s["env"]["OTEL_METRICS_EXPORTER"], "otlp");
     }
@@ -686,12 +810,24 @@ mod tests {
             "OTEL_METRICS_EXPORTER": "none",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://corp:4318"
         }});
-        let rep = wire(&mut s, CMD);
+        let rep = wire(&mut s, CMD, &EVENTS);
         // required keys set to non-collector values block native telemetry...
-        assert!(rep.env_blocked.iter().any(|(k, _)| *k == "CLAUDE_CODE_ENABLE_TELEMETRY"));
-        assert!(rep.env_blocked.iter().any(|(k, _)| *k == "OTEL_METRICS_EXPORTER"));
+        assert!(
+            rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "CLAUDE_CODE_ENABLE_TELEMETRY")
+        );
+        assert!(
+            rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "OTEL_METRICS_EXPORTER")
+        );
         // ...while a repointed endpoint stays advisory, not blocking
-        assert!(rep.env_conflicts.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_ENDPOINT"));
+        assert!(
+            rep.env_conflicts
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_ENDPOINT")
+        );
         assert!(!rep.malformed());
         // nothing the user set is overwritten
         assert_eq!(s["env"]["CLAUDE_CODE_ENABLE_TELEMETRY"], "0");
@@ -716,9 +852,17 @@ mod tests {
         // grpc with the (default-added) local endpoint can't reach the http/json receiver — block,
         // so `init` agrees with `doctor` instead of exiting 0.
         let mut s = json!({ "env": { "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc" } });
-        let rep = wire(&mut s, CMD);
-        assert!(rep.env_blocked.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"));
-        assert!(!rep.env_conflicts.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"));
+        let rep = wire(&mut s, CMD, &EVENTS);
+        assert!(
+            rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        );
+        assert!(
+            !rep.env_conflicts
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        );
     }
 
     #[test]
@@ -727,18 +871,29 @@ mod tests {
             "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
             "OTEL_EXPORTER_OTLP_ENDPOINT": "http://corp:4318"
         }});
-        let rep = wire(&mut s, CMD);
-        assert!(rep.env_conflicts.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"));
-        assert!(!rep.env_blocked.iter().any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"));
+        let rep = wire(&mut s, CMD, &EVENTS);
+        assert!(
+            rep.env_conflicts
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        );
+        assert!(
+            !rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        );
     }
 
     #[test]
     fn wire_leaves_a_non_array_event_untouched() {
-        let mut s = json!({ "hooks": { "PostToolUse": "oops" } });
-        let rep = wire(&mut s, CMD);
-        assert_eq!(s["hooks"]["PostToolUse"], "oops");
-        assert!(rep.events_conflicts.contains(&"PostToolUse"));
-        assert!(rep.malformed(), "a non-array event is structural malformation");
+        let mut s = json!({ "hooks": { "UserPromptSubmit": "oops" } });
+        let rep = wire(&mut s, CMD, &EVENTS);
+        assert_eq!(s["hooks"]["UserPromptSubmit"], "oops");
+        assert!(rep.events_conflicts.contains(&"UserPromptSubmit"));
+        assert!(
+            rep.malformed(),
+            "a non-array event is structural malformation"
+        );
         // other events still wire
         assert!(rep.events_added.contains(&"SessionStart"));
     }
@@ -746,32 +901,38 @@ mod tests {
     #[test]
     fn unwire_removes_only_our_hooks_and_prunes() {
         let mut s = json!({});
-        wire(&mut s, CMD);
+        wire(&mut s, CMD, &EVENTS);
         let rep = unwire(&mut s);
         assert!(rep.changed());
         assert_eq!(rep.events_cleared.len(), EVENTS.len());
-        assert!(s.get("hooks").is_none(), "an emptied hooks object is pruned");
-        assert!(s["env"].is_object(), "env is Claude Code's config — left intact");
+        assert!(
+            s.get("hooks").is_none(),
+            "an emptied hooks object is pruned"
+        );
+        assert!(
+            s["env"].is_object(),
+            "env is Claude Code's config — left intact"
+        );
     }
 
     #[test]
     fn unwire_keeps_a_users_own_hook() {
         let mut s = json!({
-            "hooks": { "PostToolUse": [{ "hooks": [{ "type": "command", "command": "my-own-tool" }] }] }
+            "hooks": { "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "my-own-tool" }] }] }
         });
-        wire(&mut s, CMD);
+        wire(&mut s, CMD, &EVENTS);
         let rep = unwire(&mut s);
-        let groups = s["hooks"]["PostToolUse"].as_array().unwrap();
+        let groups = s["hooks"]["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(groups.len(), 1, "only our hook is removed");
         assert_eq!(groups[0]["hooks"][0]["command"], "my-own-tool");
-        assert!(rep.events_cleared.contains(&"PostToolUse"));
+        assert!(rep.events_cleared.contains(&"UserPromptSubmit"));
     }
 
     #[test]
     fn unwire_removes_only_our_entry_from_a_shared_group() {
         // A (contrived) group holding both the user's command and ours in one hooks array.
         let mut s = json!({
-            "hooks": { "PostToolUse": [
+            "hooks": { "UserPromptSubmit": [
                 { "hooks": [
                     { "type": "command", "command": "my-own-tool" },
                     { "type": "command", "command": CMD }
@@ -779,9 +940,15 @@ mod tests {
             ] }
         });
         let rep = unwire(&mut s);
-        assert!(rep.events_cleared.contains(&"PostToolUse"));
-        let entries = s["hooks"]["PostToolUse"][0]["hooks"].as_array().unwrap();
-        assert_eq!(entries.len(), 1, "only our entry is removed, the user's survives");
+        assert!(rep.events_cleared.contains(&"UserPromptSubmit"));
+        let entries = s["hooks"]["UserPromptSubmit"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only our entry is removed, the user's survives"
+        );
         assert_eq!(entries[0]["command"], "my-own-tool");
     }
 
@@ -796,7 +963,7 @@ mod tests {
     #[test]
     fn wire_then_unwire_round_trips() {
         let mut s = json!({ "permissions": { "allow": ["Bash"] } });
-        wire(&mut s, CMD);
+        wire(&mut s, CMD, &EVENTS);
         unwire(&mut s);
         // back to just the user's unrelated settings plus the env block wire added
         assert!(s.get("hooks").is_none());
@@ -805,7 +972,7 @@ mod tests {
 
     #[test]
     fn snippet_is_valid_json_with_a_windows_path() {
-        let snippet = render_snippet(r"C:\Program Files\ht\hatel-hook.exe");
+        let snippet = render_snippet(r"C:\Program Files\ht\hatel-hook.exe", &EVENTS);
         let parsed: Value = serde_json::from_str(&snippet).expect("snippet parses as JSON");
         assert!(event_has_hook(&parsed["hooks"]["SessionStart"]));
     }
@@ -822,7 +989,11 @@ mod tests {
     }
 
     fn one_scope(v: Value) -> Vec<ScopeFile> {
-        vec![ScopeFile { name: "user", path: std::path::PathBuf::from("x"), load: Load::Found(v) }]
+        vec![ScopeFile {
+            name: "user",
+            path: std::path::PathBuf::from("x"),
+            load: Load::Found(v),
+        }]
     }
 
     #[test]
@@ -830,43 +1001,151 @@ mod tests {
         let files = one_scope(json!({
             "hooks": {
                 "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }],
-                "PostToolUse":  [{ "hooks": [{ "type": "command", "command": CMD }] }]
+                "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": CMD }] }]
             }
         }));
-        let covered = covered_events(&files);
+        let covered = covered_events(&files, &EVENTS);
         assert_eq!(covered.len(), 2);
-        assert!(covered.contains(&"SessionStart") && covered.contains(&"PostToolUse"));
+        assert!(covered.contains(&"SessionStart") && covered.contains(&"UserPromptSubmit"));
         assert!(!covered.contains(&"SessionEnd"));
     }
 
     #[test]
     fn covered_events_is_complete_after_wire() {
         let mut s = json!({});
-        wire(&mut s, CMD);
-        assert_eq!(covered_events(&one_scope(s)).len(), EVENTS.len());
+        wire(&mut s, CMD, &EVENTS);
+        assert_eq!(covered_events(&one_scope(s), &EVENTS).len(), EVENTS.len());
     }
 
     fn scope(name: &'static str, v: Value) -> ScopeFile {
-        ScopeFile { name, path: "x".into(), load: Load::Found(v) }
+        ScopeFile {
+            name,
+            path: "x".into(),
+            load: Load::Found(v),
+        }
     }
 
     #[test]
     fn managed_only_does_not_count_blocked_user_hooks() {
         let files = vec![
-            scope("user", json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }] } })),
+            scope(
+                "user",
+                json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }] } }),
+            ),
             scope("managed", json!({ "allowManagedHooksOnly": true })),
         ];
         // the user hook is configured but blocked, so it covers nothing and is flagged distinctly
-        assert!(covered_events(&files).is_empty());
+        assert!(covered_events(&files, &EVENTS).is_empty());
         assert!(hook_wired_but_blocked(&files));
     }
 
     #[test]
     fn managed_only_counts_managed_wiring() {
         let mut managed = json!({ "allowManagedHooksOnly": true });
-        wire(&mut managed, CMD);
+        wire(&mut managed, CMD, &EVENTS);
         let files = vec![scope("managed", managed)];
-        assert_eq!(covered_events(&files).len(), EVENTS.len());
+        assert_eq!(covered_events(&files, &EVENTS).len(), EVENTS.len());
         assert!(!hook_wired_but_blocked(&files));
+    }
+
+    #[test]
+    fn rewiring_a_shrunken_active_set_prunes_stale_events() {
+        // An upgrade that drops an event from the active set (e.g. `tool` → native OTel) must, on
+        // the next wire, strip the now-stale wiring rather than leave the hook firing for nothing.
+        let mut s = json!({});
+        wire(&mut s, CMD, &EVENTS); // previously: all 8 events wired
+        assert!(s["hooks"].get("PostToolUse").is_some());
+
+        // Now wire a shrunken active set (no PostToolUse).
+        let active: Vec<&str> = EVENTS
+            .iter()
+            .copied()
+            .filter(|e| *e != "PostToolUse")
+            .collect();
+        let rep = wire(&mut s, CMD, &active);
+        assert!(
+            rep.events_cleared.contains(&"PostToolUse"),
+            "stale event reported as cleared"
+        );
+        assert!(
+            s["hooks"].get("PostToolUse").is_none(),
+            "stale event key pruned, no empty cruft"
+        );
+        // The active events remain wired, and a user hook elsewhere would have survived.
+        assert!(group_has_command(&s["hooks"]["SessionStart"][0], CMD));
+    }
+
+    #[test]
+    fn pruning_leaves_an_inactive_event_we_dont_own_untouched() {
+        // An inactive event carrying only the user's structure (here an empty group, and a real
+        // user hook) must be left byte-for-byte as-is — wire never drops a group or deletes a key
+        // it didn't put a hook in.
+        let mut s = json!({
+            "hooks": {
+                "PostToolUse": [
+                    { "hooks": [] },
+                    { "hooks": [{ "type": "command", "command": "user-tool" }] }
+                ]
+            }
+        });
+        let before = s.clone();
+        let active: Vec<&str> = EVENTS
+            .iter()
+            .copied()
+            .filter(|e| *e != "PostToolUse")
+            .collect();
+        let rep = wire(&mut s, CMD, &active);
+        assert!(
+            !rep.events_cleared.contains(&"PostToolUse"),
+            "nothing of ours to clear"
+        );
+        assert_eq!(
+            s["hooks"]["PostToolUse"], before["hooks"]["PostToolUse"],
+            "an event we don't own is untouched (no group dropped, no key deleted)"
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_a_users_own_hook_on_a_deactivated_event() {
+        // If a deactivated event also carries the user's own hook, only ours is stripped.
+        let mut s = json!({
+            "hooks": { "PostToolUse": [{ "hooks": [
+                { "type": "command", "command": CMD },
+                { "type": "command", "command": "user-tool" }
+            ] }] }
+        });
+        let active: Vec<&str> = EVENTS
+            .iter()
+            .copied()
+            .filter(|e| *e != "PostToolUse")
+            .collect();
+        wire(&mut s, CMD, &active);
+        let cmds = event_commands(&s, "PostToolUse");
+        assert!(!cmds.iter().any(|c| c == CMD), "our hook stripped");
+        assert!(cmds.iter().any(|c| c == "user-tool"), "user's hook kept");
+    }
+
+    #[test]
+    fn active_events_are_session_start_plus_bound_events_only() {
+        let reg = hatel_core::schema::load_core().unwrap();
+        let active = active_events(&reg);
+        // SessionStart (for the index) plus exactly the events a core Kind binds.
+        for ev in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "SubagentStop",
+            "InstructionsLoaded",
+            "PreCompact",
+        ] {
+            assert!(active.contains(&ev), "{ev} should be wired");
+        }
+        // Vocabulary events nothing binds are NOT wired: tool is OTel-sourced, and SessionEnd /
+        // PostCompact have no binding — so the hook never fires on a tool call for no record.
+        for ev in ["PostToolUse", "SessionEnd", "PostCompact"] {
+            assert!(
+                !active.contains(&ev),
+                "{ev} should not be wired (nothing binds it)"
+            );
+        }
     }
 }

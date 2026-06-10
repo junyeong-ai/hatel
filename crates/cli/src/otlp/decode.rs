@@ -98,6 +98,59 @@ pub fn parse_events(
     Ok(out)
 }
 
+/// One decoded `tool_result` event: a single tool call's outcome. This is the only OTel signal
+/// carrying a tool's wall-clock `duration_ms` and `success`, so the `tool` Kind is sourced here
+/// rather than from the (duration/outcome-less) `PostToolUse` hook.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolResult {
+    pub session_id: String,
+    pub tool_name: String,
+    pub duration_ms: i64,
+    pub ok: bool,
+}
+
+/// Decode `tool_result` log events into per-call outcomes. A record is yielded only when it is a
+/// `tool_result` carrying both identifying fields (`session.id`, `tool_name`); `duration_ms` and
+/// `success` are read leniently (proto3-JSON may encode them as number, string, or bool). A
+/// `success` attribute that is absent is treated as a success — a `tool_result` is emitted on
+/// completion, so its absence is a missing annotation, never evidence of failure (don't fabricate
+/// a failure).
+pub fn parse_tool_results(bytes: &[u8]) -> Result<Vec<ToolResult>, String> {
+    let req: LogsRequest =
+        serde_json::from_slice(bytes).map_err(|e| format!("invalid OTLP/JSON logs body: {e}"))?;
+    let mut out = Vec::new();
+    for rl in &req.resource_logs {
+        for sl in &rl.scope_logs {
+            for record in &sl.log_records {
+                let mut event = String::new();
+                let mut session = String::new();
+                let mut tool = String::new();
+                let mut duration = 0i64;
+                let mut ok = true;
+                for kv in &record.attributes {
+                    match kv.key.as_str() {
+                        "event.name" => event = kv.value.as_string(),
+                        "session.id" => session = kv.value.as_string(),
+                        "tool_name" => tool = kv.value.as_string(),
+                        "duration_ms" => duration = kv.value.as_f64() as i64,
+                        "success" => ok = kv.value.as_bool(),
+                        _ => {}
+                    }
+                }
+                if normalize(&event) == "tool_result" && !session.is_empty() && !tool.is_empty() {
+                    out.push(ToolResult {
+                        session_id: session,
+                        tool_name: tool,
+                        duration_ms: duration,
+                        ok,
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn normalize(event: &str) -> &str {
     event.strip_prefix("claude_code.").unwrap_or(event)
 }
@@ -251,6 +304,30 @@ impl AnyValue {
         }
         String::new()
     }
+
+    /// Numeric value of an attribute, accepting proto3-JSON's number-or-string encodings
+    /// (`duration_ms` may arrive as `intValue:"23"` or `doubleValue:23`).
+    fn as_f64(&self) -> f64 {
+        if let Some(i) = &self.int_value {
+            return json_to_f64(i);
+        }
+        if let Some(d) = self.double_value {
+            return d;
+        }
+        self.string_value
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    /// Boolean value of an attribute, accepting a JSON bool or the string `"true"` (proto3-JSON
+    /// may encode `success` either way).
+    fn as_bool(&self) -> bool {
+        if let Some(b) = self.bool_value {
+            return b;
+        }
+        self.string_value.as_deref() == Some("true")
+    }
 }
 
 #[cfg(test)]
@@ -288,6 +365,72 @@ mod tests {
             points[0].series,
             vec![("type".to_string(), "output".to_string())]
         );
+    }
+
+    #[test]
+    fn tool_result_decodes_duration_and_outcome() {
+        let body = serde_json::json!({
+            "resourceLogs": [{ "scopeLogs": [{ "logRecords": [
+                { "attributes": [
+                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
+                    {"key": "session.id", "value": {"stringValue": "S1"}},
+                    {"key": "tool_name", "value": {"stringValue": "Bash"}},
+                    {"key": "duration_ms", "value": {"intValue": "23"}},
+                    {"key": "success", "value": {"boolValue": true}}
+                ]},
+                { "attributes": [
+                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
+                    {"key": "session.id", "value": {"stringValue": "S1"}},
+                    {"key": "tool_name", "value": {"stringValue": "Edit"}},
+                    {"key": "duration_ms", "value": {"doubleValue": 5.0}},
+                    {"key": "success", "value": {"stringValue": "false"}}
+                ]},
+                // A non-tool_result event is ignored.
+                { "attributes": [
+                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_decision"}},
+                    {"key": "session.id", "value": {"stringValue": "S1"}}
+                ]}
+            ]}]}]
+        })
+        .to_string();
+        let r = parse_tool_results(body.as_bytes()).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r[0],
+            ToolResult {
+                session_id: "S1".into(),
+                tool_name: "Bash".into(),
+                duration_ms: 23,
+                ok: true
+            }
+        );
+        assert_eq!(
+            r[1],
+            ToolResult {
+                session_id: "S1".into(),
+                tool_name: "Edit".into(),
+                duration_ms: 5,
+                ok: false
+            }
+        );
+    }
+
+    #[test]
+    fn tool_result_without_success_attribute_is_a_success() {
+        // `tool_result` fires on completion; a missing `success` is a missing annotation, not a
+        // failure — never fabricate a failure.
+        let body = serde_json::json!({
+            "resourceLogs": [{ "scopeLogs": [{ "logRecords": [{ "attributes": [
+                {"key": "event.name", "value": {"stringValue": "tool_result"}},
+                {"key": "session.id", "value": {"stringValue": "S1"}},
+                {"key": "tool_name", "value": {"stringValue": "Read"}},
+                {"key": "duration_ms", "value": {"intValue": "9"}}
+            ]}]}]}]
+        })
+        .to_string();
+        let r = parse_tool_results(body.as_bytes()).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].ok, "absent success defaults to ok");
     }
 
     #[test]

@@ -6,7 +6,8 @@
 
 use std::path::Path;
 
-use hatel_core::{Config, ExportConfig, ExportMode};
+use hatel_core::schema::build_registry_resilient;
+use hatel_core::{Config, ExportConfig, ExportMode, ProjectFilter};
 
 use crate::claude_settings as cs;
 
@@ -16,6 +17,9 @@ type EnvEntry<'a> = &'a (String, &'static str);
 pub fn run() -> i32 {
     let files = cs::scope_files();
     let env = cs::effective_env(&files);
+    // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
+    // them from the registry rather than the full vocabulary — coverage is judged against these.
+    let events = cs::active_events(&build_registry_resilient(&Config::load()));
     let mut ok = true;
 
     println!("hatel doctor\n");
@@ -43,7 +47,7 @@ pub fn run() -> i32 {
     println!();
 
     println!("hooks:");
-    ok &= report_hooks(&files);
+    ok &= report_hooks(&files, &events);
     println!();
 
     println!("storage:");
@@ -65,7 +69,7 @@ pub fn run() -> i32 {
     println!(
         "to wire automatically run `hatel init` — or paste this into managed settings for an org:\n"
     );
-    print!("{}", cs::render_snippet(&cs::hook_command()));
+    print!("{}", cs::render_snippet(&cs::hook_command(), &events));
 
     if !ok {
         eprintln!("\ndoctor: the wiring is incomplete (see ✗ above)");
@@ -76,9 +80,9 @@ pub fn run() -> i32 {
 /// Report hook coverage across the canonical lifecycle events. Full coverage in an honored scope
 /// is the requirement; partial coverage is a failure because the uncovered events are silently
 /// not captured. Returns whether the requirement is met.
-fn report_hooks(files: &[cs::ScopeFile]) -> bool {
-    let covered = cs::covered_events(files);
-    let total = cs::EVENTS.len();
+fn report_hooks(files: &[cs::ScopeFile], events: &[&'static str]) -> bool {
+    let covered = cs::covered_events(files, events);
+    let total = events.len();
     let managed_only = cs::managed_hooks_only(files);
     let mut ok = true;
 
@@ -86,7 +90,7 @@ fn report_hooks(files: &[cs::ScopeFile]) -> bool {
         println!("  ✓ all {total} lifecycle events invoke `hatel-hook`");
     } else if !covered.is_empty() {
         // Partial coverage, reported before the "blocked" case so it is never masked.
-        let missing: Vec<&str> = cs::EVENTS
+        let missing: Vec<&str> = events
             .iter()
             .copied()
             .filter(|e| !covered.contains(e))
@@ -161,25 +165,48 @@ fn report_export(env: &cs::Env) -> bool {
             // The values may be secrets (auth tokens) — only the count is shown, never the value.
             n => format!(", {n} header(s)"),
         };
-        println!("  • {} ({}{})", t.endpoint, t.mode.as_str(), headers);
+        let filter = match &t.filter {
+            ProjectFilter::All => String::new(),
+            ProjectFilter::Only(s) => {
+                format!(
+                    ", only: {}",
+                    s.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            }
+            ProjectFilter::Except(s) => {
+                format!(
+                    ", except: {}",
+                    s.iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            }
+        };
+        println!(
+            "  • {} ({}{}{})",
+            t.endpoint,
+            t.mode.as_str(),
+            filter,
+            headers
+        );
     }
     // Egress is the one place data leaves the host, and hatel does not redact the forwarded body.
     println!("  ⚠ egress forwards the raw OTLP stream off this host — hatel does not redact it");
 
     let mut ok = true;
 
-    // Enriched needs a JSON body to transform; flag a protocol that would make it skip.
-    if export
+    // Both enriching and filtering read the JSON body (to inject, or to resolve a batch's project
+    // from its session.id); a non-JSON protocol makes an enriched target skip and a filtered target
+    // fail closed (forward nothing). Flag the protocol that would do so.
+    let needs_json = export
         .targets
         .iter()
-        .any(|t| t.mode == ExportMode::Enriched)
-    {
+        .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
+    if needs_json {
         let proto = env
             .get("OTEL_EXPORTER_OTLP_PROTOCOL")
             .map(|(v, _)| v.as_str());
         if proto != Some("http/json") {
             println!(
-                "  ⚠ enriched export needs http/json input — OTEL_EXPORTER_OTLP_PROTOCOL is {} → enriched targets are skipped",
+                "  ⚠ enriched/filtered export needs http/json input — OTEL_EXPORTER_OTLP_PROTOCOL is {} → those targets forward nothing",
                 proto.unwrap_or("unset")
             );
         }

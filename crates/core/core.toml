@@ -18,12 +18,20 @@ counted_events = [
     "claude_code.skill_activated",
 ]
 
-# ── Kinds (all hook-written) ──
+# ── Kinds ──
+# The `tool` Kind is written by the receiver from the native `tool_result` OTel event
+# (the only signal carrying a tool's wall-clock duration and success); every other Kind
+# is hook-written. Its `project` is joined from `session.id` through the session index,
+# exactly as cost/token attribution is. `duration_ms` and `ok` (1 success / 0 failure)
+# are measures, so a report sums them per tool — call count, total time, and successes,
+# from which average latency and success rate follow.
 
 [[kind]]
 name = "tool"
-fields = ["session_id", "project", "tool_name"]
+fields = ["session_id", "project", "tool_name", "duration_ms", "ok"]
 group_key = "tool_name"
+measures = ["duration_ms", "ok"]
+receiver_sourced = true
 
 [[kind]]
 name = "prompt"
@@ -50,12 +58,7 @@ group_key = "session_id"
 
 # ── Hook bindings (event → kind, with declarative field maps) ──
 # `project` is injected by the hook from the cwd; it is never mapped here.
-
-[[binding]]
-event = "PostToolUse"
-kind = "tool"
-map.session_id = { from = "session_id" }
-map.tool_name = { from = "tool_name" }
+# (`tool` has no binding — it is receiver-written from the OTel `tool_result` event.)
 
 [[binding]]
 event = "UserPromptSubmit"

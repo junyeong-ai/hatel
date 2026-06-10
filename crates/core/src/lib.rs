@@ -19,7 +19,7 @@ pub mod session;
 pub mod sink;
 
 pub use config::Config;
-pub use export::{ExportConfig, ExportMode, ExportTarget};
+pub use export::{ExportConfig, ExportMode, ExportTarget, ProjectFilter};
 pub use model::{
     Envelope, Payload, SCHEMA_VERSION, make_envelope, now_epoch, now_iso_utc, ts_epoch,
 };

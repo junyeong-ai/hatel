@@ -5,7 +5,7 @@
 //! `bytes::Bytes` + `OtlpSignal`, never an axum type, so a future ledger→OTLP-logs exporter can
 //! reuse the same `enqueue`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 
 use hatel_core::{ExportMode, ExportTarget, SessionIndex};
 
-use super::transform::{enrich_logs, enrich_metrics};
+use super::transform::{enrich_logs, enrich_metrics, session_ids};
 
 /// Queue depth (slot backstop) before new batches are dropped. The memory bound is `MAX_QUEUED_BYTES`
 /// below; this caps slot count so the channel itself stays small.
@@ -148,9 +148,9 @@ struct Worker {
     client: reqwest::Client,
     index: IndexCache,
     queued_bytes: Arc<AtomicUsize>,
-    /// Whether any target enriches — gates the per-batch index refresh, so an all-raw config
-    /// does no session-index I/O at all.
-    enriched_present: bool,
+    /// Whether any target enriches or filters by project — both need the session→project map, so
+    /// either gates the per-batch index refresh; a config with neither does no session-index I/O.
+    index_needed: bool,
     /// Endpoints whose enrich-skip has already been logged, so a steady non-JSON stream warns once
     /// per destination rather than once per batch.
     enrich_skip_warned: HashSet<String>,
@@ -164,13 +164,15 @@ impl Worker {
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
             .expect("reqwest client (rustls) initialises");
-        let enriched_present = targets.iter().any(|t| t.mode == ExportMode::Enriched);
+        let index_needed = targets
+            .iter()
+            .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
         Worker {
             targets,
             client,
             index: IndexCache::new(state_dir),
             queued_bytes,
-            enriched_present,
+            index_needed,
             enrich_skip_warned: HashSet::new(),
         }
     }
@@ -199,18 +201,36 @@ impl Worker {
     }
 
     async fn forward(&mut self, out: Outbound) {
-        // Refresh the session→project map only when something actually enriches, and only when the
-        // index file changed since last load (mtime-gated) — no per-batch file read, no read storm
-        // on a session that never appears in the index.
-        if self.enriched_present {
+        // Refresh the session→project map only when something actually enriches or filters, and
+        // only when the index file changed since last load (mtime-gated) — no per-batch file read,
+        // no read storm on a session that never appears in the index.
+        if self.index_needed {
             self.index.refresh();
         }
+        // Resolve the batch's project(s) once, for the destinations that filter by project. `Some`
+        // only when every session.id in the body is known; `None` when the project can't be fully
+        // determined (a session is unknown, the body carries none, or it isn't JSON) — a filtered
+        // destination then fails closed, never leaking an unattributable batch.
+        let batch_projects = self
+            .targets
+            .iter()
+            .any(|t| t.filter.is_filtered())
+            .then(|| self.resolve_batch_projects(&out.body, out.signal))
+            .flatten();
         // Disjoint field borrows: the loop reads targets/client/index and mutates the warned set.
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
         let warned = &mut self.enrich_skip_warned;
         for target in targets {
+            if target.filter.is_filtered() {
+                let allowed = batch_projects
+                    .as_ref()
+                    .is_some_and(|ps| ps.iter().all(|p| target.filter.allows(p)));
+                if !allowed {
+                    continue; // project not allowed here, or undeterminable → fail closed
+                }
+            }
             let url = format!("{}{}", target.endpoint, out.signal.path());
             // (payload, content-type, content-encoding-to-forward)
             let prepared: Option<(reqwest::Body, &str, Option<&str>)> = match target.mode {
@@ -271,6 +291,25 @@ impl Worker {
                 Err(e) => eprintln!("hatel: export to {} failed: {e}", target.endpoint),
             }
         }
+    }
+
+    /// The set of project labels a batch belongs to, for project-filtered destinations. `None`
+    /// when the batch can't be attributed — it isn't JSON, carries no `session.id` at all, or one
+    /// of its `session.id`s isn't yet in the index — so a filtered destination fails closed rather
+    /// than forward an unattributable (possibly out-of-scope) batch. Self-heals: the next batch
+    /// after the index catches up resolves and forwards. Resolution is over the `session.id`s
+    /// actually present; in practice every Claude Code datapoint carries one and a single export
+    /// body is a single session, so the set is one project the filter then accepts or rejects.
+    fn resolve_batch_projects(&self, body: &[u8], signal: OtlpSignal) -> Option<BTreeSet<String>> {
+        let ids = session_ids(body, matches!(signal, OtlpSignal::Metrics))?;
+        if ids.is_empty() {
+            return None;
+        }
+        let mut projects = BTreeSet::new();
+        for sid in &ids {
+            projects.insert(self.index.get(sid)?); // any unknown session → None (fail closed)
+        }
+        Some(projects)
     }
 }
 
@@ -455,6 +494,44 @@ mod tests {
         f.set_modified(future).unwrap();
     }
 
+    #[test]
+    fn batch_projects_resolves_known_and_fails_closed_on_unknown() {
+        let dir = std::env::temp_dir().join(format!("ht-filter-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session_index.jsonl"),
+            "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
+        )
+        .unwrap();
+        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        worker.index.refresh();
+        let body = |sid: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
+                    "sum": { "dataPoints": [{
+                        "attributes": [{ "key": "session.id", "value": { "stringValue": sid } }]
+                    }]}
+                }]}]}]
+            }))
+            .unwrap()
+        };
+        // Known session → its project; the allow/exclude decision is then plain set logic.
+        let known = worker.resolve_batch_projects(&body("S1"), OtlpSignal::Metrics);
+        assert_eq!(known, Some(BTreeSet::from(["alpha".to_string()])));
+        // Unknown session, no session.id, and non-JSON all fail closed (None).
+        assert_eq!(
+            worker.resolve_batch_projects(&body("GHOST"), OtlpSignal::Metrics),
+            None,
+            "unknown session fails closed"
+        );
+        assert_eq!(
+            worker.resolve_batch_projects(b"\x00proto", OtlpSignal::Metrics),
+            None,
+            "non-JSON fails closed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // End-to-end: a real receiver→exporter→downstream hop. Spins a stub OTLP collector on a
     // loopback port, forwards an enriched metrics batch, and asserts the downstream received the
     // body with `project` injected (transform + queue + HTTP client all exercised together).
@@ -496,6 +573,7 @@ mod tests {
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Enriched,
+            filter: hatel_core::ProjectFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };

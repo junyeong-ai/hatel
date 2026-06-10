@@ -54,12 +54,24 @@ fn config_in(dir: PathBuf, plugins: Vec<PathBuf>) -> Config {
 fn core_registry_is_self_consistent() {
     let reg = load_core().expect("core schema loads");
     for spec in reg.kinds() {
-        assert!(spec.fields.contains(&spec.group_key), "group_key in fields for {}", spec.name);
+        assert!(
+            spec.fields.contains(&spec.group_key),
+            "group_key in fields for {}",
+            spec.name
+        );
         for r in &spec.redact {
-            assert!(spec.fields.contains(r), "redact field in fields for {}", spec.name);
+            assert!(
+                spec.fields.contains(r),
+                "redact field in fields for {}",
+                spec.name
+            );
         }
         for m in &spec.measures {
-            assert!(spec.fields.contains(m), "measure in fields for {}", spec.name);
+            assert!(
+                spec.fields.contains(m),
+                "measure in fields for {}",
+                spec.name
+            );
         }
     }
     assert!(reg.kind("tool").is_some());
@@ -73,7 +85,10 @@ fn example_plugin_merges_cleanly() {
     assert!(reg.kind("branch_work").is_some());
     let ci = reg.kind("ci_check").unwrap();
     assert_eq!(ci.group_key, "check");
-    assert_eq!(ci.measures, vec!["runs".to_string(), "failures".to_string()]);
+    assert_eq!(
+        ci.measures,
+        vec!["runs".to_string(), "failures".to_string()]
+    );
     assert!(ci.redact.contains("actor"));
 }
 
@@ -85,7 +100,10 @@ fn emit_redacts_declared_field() {
     payload.insert("actor".to_string(), "alice@example.com".into());
     let env = make_envelope("ci_check", payload, &reg, false).unwrap();
     let stored = env.payload.get("actor").and_then(|v| v.as_str()).unwrap();
-    assert_ne!(stored, "alice@example.com", "raw identity must never be stored");
+    assert_ne!(
+        stored, "alice@example.com",
+        "raw identity must never be stored"
+    );
     assert_eq!(stored.len(), 16, "redacted to a 16-hex blake3 hash");
 }
 
@@ -99,8 +117,14 @@ fn emit_payload_is_allow_list_filtered() {
     payload.insert("failures".to_string(), serde_json::json!(3));
     payload.insert("secret".to_string(), "leak".into()); // outside the allow-list
     let env = make_envelope("ci_check", payload, &reg, false).unwrap();
-    assert_eq!(env.payload.get("runs").and_then(|v| v.as_i64()), Some(14000));
-    assert!(!env.payload.contains_key("secret"), "non-allowed key dropped on emit");
+    assert_eq!(
+        env.payload.get("runs").and_then(|v| v.as_i64()),
+        Some(14000)
+    );
+    assert!(
+        !env.payload.contains_key("secret"),
+        "non-allowed key dropped on emit"
+    );
 }
 
 #[test]
@@ -110,26 +134,51 @@ fn duplicate_kind_is_a_hard_error() {
 }
 
 #[test]
-fn post_tool_use_writes_one_tool_record_without_content() {
-    let cfg = test_config(vec![]);
-    let reg = load_core().unwrap();
-    let mut event = serde_json::json!({
-        "hook_event_name": "PostToolUse",
-        "session_id": "S1",
-        "cwd": "/tmp/not-a-repo",
-        "tool_name": "Bash",
-        "tool_input": {"command": "rm -rf /"}
-    });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+fn hook_binding_to_a_receiver_sourced_kind_is_rejected() {
+    // `tool` is written by the receiver from the native `tool_result` event. A plugin that also
+    // hook-binds it would double-write the Kind — the registry must reject the binding loudly,
+    // rather than silently produce two records per tool call.
+    let dir = temp_dir();
+    let plugin = dir.join("dbl.toml");
+    std::fs::write(
+        &plugin,
+        "[[binding]]\nevent = \"PostToolUse\"\nkind = \"tool\"\nmap.session_id = { from = \"session_id\" }\n",
+    )
+    .unwrap();
+    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    assert!(format!("{err}").contains("receiver-sourced"), "got: {err}");
+}
 
-    let recs = hatel_core::sink::read_records(&cfg, "tool", None);
-    assert_eq!(recs.len(), 1);
-    let p = &recs[0].payload;
-    assert_eq!(p.get("tool_name").and_then(|v| v.as_str()), Some("Bash"));
-    assert_eq!(p.get("session_id").and_then(|v| v.as_str()), Some("S1"));
-    assert_eq!(p.get("project").and_then(|v| v.as_str()), Some("not-a-repo"));
-    // tool input/content is never stored.
-    assert!(!p.contains_key("tool_input"));
+#[test]
+fn tool_kind_allow_list_keeps_it_content_free() {
+    // The `tool` Kind is written by the receiver from the native `tool_result` event, which also
+    // carries the user's email and full tool input. Its field allow-list is the guard that keeps
+    // the ledger content-free: anything outside duration/outcome identity is dropped at envelope
+    // time, so PII and tool content can never reach the sink.
+    let reg = load_core().unwrap();
+    let mut payload = Payload::new();
+    payload.insert("session_id".to_string(), "S1".into());
+    payload.insert("project".to_string(), "myproj".into());
+    payload.insert("tool_name".to_string(), "Bash".into());
+    payload.insert("duration_ms".to_string(), 23.into());
+    payload.insert("ok".to_string(), 1.into());
+    payload.insert("user.email".to_string(), "a@b.com".into()); // PII — outside the allow-list
+    payload.insert("tool_input".to_string(), "rm -rf /".into()); // content — outside the allow-list
+    let env = make_envelope("tool", payload, &reg, false).unwrap();
+    assert_eq!(
+        env.payload.get("tool_name").and_then(|v| v.as_str()),
+        Some("Bash")
+    );
+    assert_eq!(
+        env.payload.get("duration_ms").and_then(|v| v.as_i64()),
+        Some(23)
+    );
+    assert_eq!(env.payload.get("ok").and_then(|v| v.as_i64()), Some(1));
+    assert!(!env.payload.contains_key("user.email"), "PII dropped");
+    assert!(
+        !env.payload.contains_key("tool_input"),
+        "tool content dropped"
+    );
 }
 
 #[test]
@@ -144,7 +193,10 @@ fn prompt_stores_length_not_text() {
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].payload.get("prompt_len").and_then(|v| v.as_i64()), Some(11));
+    assert_eq!(
+        recs[0].payload.get("prompt_len").and_then(|v| v.as_i64()),
+        Some(11)
+    );
     assert!(!recs[0].payload.contains_key("prompt"));
 }
 
@@ -167,7 +219,10 @@ fn session_start_is_recorded_in_the_index() {
 fn field_map_capture_derives_value_or_omits() {
     let fm: FieldMap = toml::from_str("from = \"git_branch\"\ncapture = \"^spec/(.+)$\"").unwrap();
     let matched = serde_json::json!({"git_branch": "spec/my-feature"});
-    assert_eq!(fm.apply(&matched), Some(serde_json::Value::from("my-feature")));
+    assert_eq!(
+        fm.apply(&matched),
+        Some(serde_json::Value::from("my-feature"))
+    );
     // No match → field omitted, never fabricated.
     let unmatched = serde_json::json!({"git_branch": "main"});
     assert_eq!(fm.apply(&unmatched), None);
@@ -179,9 +234,15 @@ fn field_map_capture_derives_value_or_omits() {
 fn field_map_tries_multiple_source_keys() {
     let fm: FieldMap = toml::from_str("from = [\"trigger\", \"compact_trigger\"]").unwrap();
     // first key present wins
-    assert_eq!(fm.apply(&serde_json::json!({"trigger": "auto"})), Some("auto".into()));
+    assert_eq!(
+        fm.apply(&serde_json::json!({"trigger": "auto"})),
+        Some("auto".into())
+    );
     // falls back to the second key
-    assert_eq!(fm.apply(&serde_json::json!({"compact_trigger": "manual"})), Some("manual".into()));
+    assert_eq!(
+        fm.apply(&serde_json::json!({"compact_trigger": "manual"})),
+        Some("manual".into())
+    );
     // neither present → omitted, never fabricated
     assert_eq!(fm.apply(&serde_json::json!({"other": "x"})), None);
 }
@@ -197,7 +258,10 @@ fn compaction_records_trigger_with_either_field_name() {
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "compaction", None);
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].payload.get("trigger").and_then(|v| v.as_str()), Some("auto"));
+    assert_eq!(
+        recs[0].payload.get("trigger").and_then(|v| v.as_str()),
+        Some("auto")
+    );
 }
 
 #[test]
@@ -221,7 +285,11 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
     .unwrap();
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
-    std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/spec/checkout\n").unwrap();
+    std::fs::write(
+        repo.join(".git").join("HEAD"),
+        "ref: refs/heads/spec/checkout\n",
+    )
+    .unwrap();
     let cfg = Config {
         sink: SinkKind::Jsonl,
         ledger_dir: dir.join("ledger"),
@@ -239,17 +307,26 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
         "hook_event_name": "SessionEnd", "session_id": "S", "cwd": repo.to_str().unwrap()
     });
     hatel_core::hook::process_event(&mut end, &cfg, &reg);
-    assert_eq!(end.get("git_branch").and_then(|v| v.as_str()), Some("spec/checkout"));
+    assert_eq!(
+        end.get("git_branch").and_then(|v| v.as_str()),
+        Some("spec/checkout")
+    );
     let recs = hatel_core::sink::read_records(&cfg, "work", None);
     assert_eq!(recs.len(), 1);
-    assert_eq!(recs[0].payload.get("spec_slug").and_then(|v| v.as_str()), Some("checkout"));
+    assert_eq!(
+        recs[0].payload.get("spec_slug").and_then(|v| v.as_str()),
+        Some("checkout")
+    );
 
     // PostToolUse has no git_branch-referencing binding → the branch is never read.
     let mut tool = serde_json::json!({
         "hook_event_name": "PostToolUse", "session_id": "S", "cwd": repo.to_str().unwrap(), "tool_name": "Bash"
     });
     hatel_core::hook::process_event(&mut tool, &cfg, &reg);
-    assert!(tool.get("git_branch").is_none(), "git_branch not read when no binding uses it");
+    assert!(
+        tool.get("git_branch").is_none(),
+        "git_branch not read when no binding uses it"
+    );
 }
 
 #[test]
@@ -267,7 +344,11 @@ fn strict_mode_rejects_unknown_keys() {
 fn reports_read_active_and_rotated_archives() {
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
-    std::fs::write(cfg.ledger_dir.join("tool.jsonl"), format!("{}\n", line("A"))).unwrap();
+    std::fs::write(
+        cfg.ledger_dir.join("tool.jsonl"),
+        format!("{}\n", line("A")),
+    )
+    .unwrap();
     std::fs::write(
         cfg.ledger_dir.join("tool.jsonl.20240101"),
         format!("{}\n", line("B")),
@@ -321,7 +402,10 @@ fn merge_with_no_rows_still_prunes_stale_entries() {
         .unwrap()
         .as_second();
     cost::merge_snapshot(&cfg.state_dir, vec![], cutoff); // idle flush, but prunes
-    assert!(cost::read_snapshot(&cfg.state_dir).is_empty(), "stale row pruned on empty merge");
+    assert!(
+        cost::read_snapshot(&cfg.state_dir).is_empty(),
+        "stale row pruned on empty merge"
+    );
 }
 
 #[test]
@@ -343,7 +427,11 @@ fn cost_snapshot_prunes_rows_past_retention() {
         vec![row("old", "2000-01-01T00:00:00Z"), row("recent", &now)],
         0,
     );
-    assert_eq!(cost::read_snapshot(&cfg.state_dir).len(), 2, "both retained at retain_since=0");
+    assert_eq!(
+        cost::read_snapshot(&cfg.state_dir).len(),
+        2,
+        "both retained at retain_since=0"
+    );
     // A retain_since of "one day ago" drops the year-2000 row, keeps the recent one.
     let cutoff = now.parse::<jiff::Timestamp>().unwrap().as_second() - 86_400;
     cost::merge_snapshot(&cfg.state_dir, vec![], cutoff);
@@ -364,7 +452,10 @@ fn compaction_writes_one_record_per_compaction() {
         });
         hatel_core::hook::process_event(&mut ev, &cfg, &reg);
     }
-    assert_eq!(hatel_core::sink::read_records(&cfg, "compaction", None).len(), 1);
+    assert_eq!(
+        hatel_core::sink::read_records(&cfg, "compaction", None).len(),
+        1
+    );
 }
 
 #[test]
@@ -378,7 +469,10 @@ fn binding_writing_a_non_allowlisted_field_is_rejected_at_build() {
     )
     .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("not in the kind's fields"), "got: {err}");
+    assert!(
+        format!("{err}").contains("not in the kind's fields"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -393,14 +487,21 @@ fn invalid_capture_regex_is_rejected_at_build() {
     )
     .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("invalid capture regex"), "got: {err}");
+    assert!(
+        format!("{err}").contains("invalid capture regex"),
+        "got: {err}"
+    );
 }
 
 #[test]
 fn unsafe_kind_name_is_rejected() {
     let dir = temp_dir();
     let plugin = dir.join("bad.toml");
-    std::fs::write(&plugin, "[[kind]]\nname=\"../escape\"\nfields=[\"a\"]\ngroup_key=\"a\"\n").unwrap();
+    std::fs::write(
+        &plugin,
+        "[[kind]]\nname=\"../escape\"\nfields=[\"a\"]\ngroup_key=\"a\"\n",
+    )
+    .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
     assert!(format!("{err}").contains("[A-Za-z0-9._-]"), "got: {err}");
 }
@@ -427,7 +528,11 @@ fn report_sums_measures_and_coerces_numeric_strings() {
     };
     std::fs::write(
         cfg.ledger_dir.join("ci_check.jsonl"),
-        format!("{}\n{}\n", rec(serde_json::json!(14000), 3), rec(serde_json::json!("1000"), 2)),
+        format!(
+            "{}\n{}\n",
+            rec(serde_json::json!(14000), 3),
+            rec(serde_json::json!("1000"), 2)
+        ),
     )
     .unwrap();
     let groups = report::aggregate(&reg, &cfg, "ci_check", 0, 5, None);
@@ -455,7 +560,12 @@ fn report_filters_by_project() {
     };
     std::fs::write(
         cfg.ledger_dir.join("tool.jsonl"),
-        format!("{}\n{}\n{}\n", rec("alpha", "Bash"), rec("alpha", "Edit"), rec("beta", "Bash")),
+        format!(
+            "{}\n{}\n{}\n",
+            rec("alpha", "Bash"),
+            rec("alpha", "Edit"),
+            rec("beta", "Bash")
+        ),
     )
     .unwrap();
     let total = |p: Option<&str>| -> i64 {
@@ -480,7 +590,10 @@ fn binding_mapping_project_is_rejected() {
     )
     .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("may not map 'project'"), "got: {err}");
+    assert!(
+        format!("{err}").contains("may not map 'project'"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -543,7 +656,11 @@ fn measures_reject_non_finite_values() {
     // an `inf` string must contribute 0 — never poison the sum.
     std::fs::write(
         cfg.ledger_dir.join("ci_check.jsonl"),
-        format!("{}\n{}\n", rec(serde_json::json!("inf")), rec(serde_json::json!(50))),
+        format!(
+            "{}\n{}\n",
+            rec(serde_json::json!("inf")),
+            rec(serde_json::json!(50))
+        ),
     )
     .unwrap();
     let groups = report::aggregate(&reg, &cfg, "ci_check", 0, 5, None);
@@ -563,7 +680,10 @@ fn duplicate_event_kind_binding_is_rejected() {
     )
     .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("already has a binding for kind"), "got: {err}");
+    assert!(
+        format!("{err}").contains("already has a binding for kind"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -578,26 +698,26 @@ fn sqlite_window_filter_excludes_old_records() {
     let reg = load_core().unwrap();
     // recent record via the real write path
     let mut event = serde_json::json!({
-        "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/p", "tool_name": "Bash"
+        "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     // an ancient record inserted directly
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1,'tool',1,'{}')",
+            "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1,'prompt',1,'{}')",
             ["2000-01-01T00:00:00Z"],
         )
         .unwrap();
     }
-    let all = hatel_core::sink::read_records(&cfg, "tool", None);
+    let all = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(all.len(), 2, "both rows present");
     let recent_epoch = hatel_core::now_iso_utc()
         .parse::<jiff::Timestamp>()
         .unwrap()
         .as_second()
         - 86_400;
-    let windowed = hatel_core::sink::read_records(&cfg, "tool", Some(recent_epoch));
+    let windowed = hatel_core::sink::read_records(&cfg, "prompt", Some(recent_epoch));
     assert_eq!(windowed.len(), 1, "ancient row excluded by SQL window");
 }
 
@@ -613,14 +733,18 @@ fn sqlite_window_keeps_records_in_the_cutoff_second() {
     };
     let reg = load_core().unwrap();
     let mut event = serde_json::json!({
-        "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/p", "tool_name": "Bash"
+        "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     // cutoff = the exact second of the record we just wrote.
-    let recs = hatel_core::sink::read_records(&cfg, "tool", None);
+    let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     let secs = recs[0].ts.parse::<jiff::Timestamp>().unwrap().as_second();
-    let kept = hatel_core::sink::read_records(&cfg, "tool", Some(secs));
-    assert_eq!(kept.len(), 1, "same-second record kept by the SQL superset filter");
+    let kept = hatel_core::sink::read_records(&cfg, "prompt", Some(secs));
+    assert_eq!(
+        kept.len(),
+        1,
+        "same-second record kept by the SQL superset filter"
+    );
     let _ = db;
 }
 
@@ -635,15 +759,22 @@ fn sqlite_sink_round_trips_through_report() {
     };
     let reg = load_core().unwrap();
     let mut event = serde_json::json!({
-        "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/p", "tool_name": "Bash"
+        "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
 
-    let recs = hatel_core::sink::read_records(&cfg, "tool", None);
+    let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(recs.len(), 1, "record read back from sqlite");
-    assert_eq!(recs[0].payload.get("tool_name").and_then(|v| v.as_str()), Some("Bash"));
-    let groups = report::aggregate(&reg, &cfg, "tool", 0, 5, None);
-    assert_eq!(groups.iter().map(|g| g.count).sum::<i64>(), 1, "report aggregates sqlite records");
+    assert_eq!(
+        recs[0].payload.get("prompt_len").and_then(|v| v.as_i64()),
+        Some(2)
+    );
+    let groups = report::aggregate(&reg, &cfg, "prompt", 0, 5, None);
+    assert_eq!(
+        groups.iter().map(|g| g.count).sum::<i64>(),
+        1,
+        "report aggregates sqlite records"
+    );
 }
 
 #[test]
@@ -663,8 +794,16 @@ fn top_zero_means_all_groups() {
         .map(|t| format!("{}\n", rec(t)))
         .collect();
     std::fs::write(cfg.ledger_dir.join("tool.jsonl"), body).unwrap();
-    assert_eq!(report::aggregate(&reg, &cfg, "tool", 0, 3, None).len(), 3, "capped at 3");
-    assert_eq!(report::aggregate(&reg, &cfg, "tool", 0, 0, None).len(), 6, "0 = all 6");
+    assert_eq!(
+        report::aggregate(&reg, &cfg, "tool", 0, 3, None).len(),
+        3,
+        "capped at 3"
+    );
+    assert_eq!(
+        report::aggregate(&reg, &cfg, "tool", 0, 0, None).len(),
+        6,
+        "0 = all 6"
+    );
 }
 
 #[test]
@@ -683,7 +822,10 @@ fn records_newer_than_this_schema_version_are_skipped() {
     std::fs::write(cfg.ledger_dir.join("tool.jsonl"), format!("{v1}\n{v999}\n")).unwrap();
     let recs = hatel_core::sink::read_records(&cfg, "tool", None);
     assert_eq!(recs.len(), 1, "only the v1 record is read");
-    assert_eq!(recs[0].payload.get("tool_name").and_then(|v| v.as_str()), Some("Bash"));
+    assert_eq!(
+        recs[0].payload.get("tool_name").and_then(|v| v.as_str()),
+        Some("Bash")
+    );
 }
 
 fn line(tool: &str) -> String {

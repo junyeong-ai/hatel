@@ -43,12 +43,47 @@ impl ExportMode {
     }
 }
 
+/// Which projects a destination accepts. A destination forwards a batch only when its project
+/// (joined from `session.id`) passes this filter — so a project's telemetry can be kept off a
+/// downstream (e.g. a personal project off the corporate collector). The type encodes the
+/// "at most one of allow/exclude" invariant: a config setting both is rejected at load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectFilter {
+    /// No filter — forward every project (the default).
+    All,
+    /// Forward only these projects (allow-list; secure-by-default — a new project is excluded
+    /// until listed).
+    Only(BTreeSet<String>),
+    /// Forward every project except these (exclude-list).
+    Except(BTreeSet<String>),
+}
+
+impl ProjectFilter {
+    /// Whether a *known* project is forwarded to this destination. The unknown-project case
+    /// (session not yet joined) is decided by the caller, which fails closed for a filtered target.
+    pub fn allows(&self, project: &str) -> bool {
+        match self {
+            ProjectFilter::All => true,
+            ProjectFilter::Only(set) => set.contains(project),
+            ProjectFilter::Except(set) => !set.contains(project),
+        }
+    }
+
+    /// Whether this destination restricts by project at all (used to decide if a batch's project
+    /// must be resolved before forwarding).
+    pub fn is_filtered(&self) -> bool {
+        !matches!(self, ProjectFilter::All)
+    }
+}
+
 /// One validated downstream destination.
 #[derive(Debug, Clone)]
 pub struct ExportTarget {
     /// OTLP/HTTP base endpoint; `/v1/metrics` and `/v1/logs` are appended per signal.
     pub endpoint: String,
     pub mode: ExportMode,
+    /// Which projects reach this destination (default `All`).
+    pub filter: ProjectFilter,
     /// Extra request headers (e.g. a downstream's `authorization`). Never logged by value.
     pub headers: BTreeMap<String, String>,
     /// Per-request timeout in milliseconds; `None` uses the receiver default.
@@ -70,6 +105,7 @@ struct ConfigFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TargetRaw {
     endpoint: String,
     mode: String,
@@ -77,6 +113,12 @@ struct TargetRaw {
     headers: BTreeMap<String, String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Allow-list: forward only these projects. Mutually exclusive with `exclude_projects`.
+    #[serde(default)]
+    projects: BTreeSet<String>,
+    /// Exclude-list: forward every project but these. Mutually exclusive with `projects`.
+    #[serde(default)]
+    exclude_projects: BTreeSet<String>,
 }
 
 impl ExportConfig {
@@ -132,9 +174,21 @@ impl ExportConfig {
                      two to the same endpoint would double-count delta metrics"
                 )));
             }
+            let filter = match (raw.projects.is_empty(), raw.exclude_projects.is_empty()) {
+                (true, true) => ProjectFilter::All,
+                (false, true) => ProjectFilter::Only(raw.projects),
+                (true, false) => ProjectFilter::Except(raw.exclude_projects),
+                (false, false) => {
+                    return Err(Error::InvalidExport(format!(
+                        "export endpoint {endpoint:?}: set either `projects` (allow-list) or \
+                         `exclude_projects`, not both"
+                    )));
+                }
+            };
             targets.push(ExportTarget {
                 endpoint,
                 mode,
+                filter,
                 headers: raw.headers,
                 timeout_ms: raw.timeout_ms,
             });
@@ -179,20 +233,34 @@ impl ExportConfig {
         struct TargetOut<'a> {
             endpoint: &'a str,
             mode: &'a str,
+            #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+            projects: &'a BTreeSet<String>,
+            #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+            exclude_projects: &'a BTreeSet<String>,
             #[serde(skip_serializing_if = "BTreeMap::is_empty")]
             headers: &'a BTreeMap<String, String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             timeout_ms: &'a Option<u64>,
         }
+        const EMPTY: &BTreeSet<String> = &BTreeSet::new();
         let out = Out {
             export: self
                 .targets
                 .iter()
-                .map(|t| TargetOut {
-                    endpoint: &t.endpoint,
-                    mode: t.mode.as_str(),
-                    headers: &t.headers,
-                    timeout_ms: &t.timeout_ms,
+                .map(|t| {
+                    let (projects, exclude_projects) = match &t.filter {
+                        ProjectFilter::All => (EMPTY, EMPTY),
+                        ProjectFilter::Only(s) => (s, EMPTY),
+                        ProjectFilter::Except(s) => (EMPTY, s),
+                    };
+                    TargetOut {
+                        endpoint: &t.endpoint,
+                        mode: t.mode.as_str(),
+                        projects,
+                        exclude_projects,
+                        headers: &t.headers,
+                        timeout_ms: &t.timeout_ms,
+                    }
                 })
                 .collect(),
         };
@@ -359,12 +427,14 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://x:4318".into(),
             mode: ExportMode::Raw,
+            filter: ProjectFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
         });
         cfg.upsert(ExportTarget {
             endpoint: "http://x:4318".into(),
             mode: ExportMode::Enriched,
+            filter: ProjectFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
         });
@@ -378,6 +448,7 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://corp:4318".into(),
             mode: ExportMode::Enriched,
+            filter: ProjectFilter::All,
             headers: parse_otlp_headers("authorization=tok, x-team=core"),
             timeout_ms: Some(3000),
         });
@@ -388,6 +459,72 @@ mod tests {
         assert_eq!(back.targets[0].headers.get("authorization").unwrap(), "tok");
         assert_eq!(back.targets[0].headers.get("x-team").unwrap(), "core");
         assert_eq!(back.targets[0].timeout_ms, Some(3000));
+    }
+
+    #[test]
+    fn allow_list_round_trips_and_filters() {
+        let cfg = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"enriched\"\n\
+             projects = [\"work-a\", \"work-b\"]\n",
+            "<test>",
+        )
+        .unwrap();
+        let f = &cfg.targets[0].filter;
+        assert!(f.is_filtered());
+        assert!(f.allows("work-a") && f.allows("work-b"));
+        assert!(!f.allows("personal"));
+        // survives a serialize/parse round-trip
+        let back = ExportConfig::parse(&cfg.to_toml().unwrap(), "<rt>").unwrap();
+        assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
+    }
+
+    #[test]
+    fn exclude_list_forwards_all_but_named() {
+        let cfg = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n\
+             exclude_projects = [\"personal\"]\n",
+            "<test>",
+        )
+        .unwrap();
+        let f = &cfg.targets[0].filter;
+        assert!(f.allows("work-a"));
+        assert!(!f.allows("personal"));
+        let back = ExportConfig::parse(&cfg.to_toml().unwrap(), "<rt>").unwrap();
+        assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
+    }
+
+    #[test]
+    fn a_misspelled_filter_key_is_rejected_not_silently_ignored() {
+        // `project` (singular) would otherwise deserialize to an empty allow-list → forward
+        // everything, silently defeating the filter. An unknown key must fail loud.
+        let err = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\nproject = [\"work\"]\n",
+            "<test>",
+        );
+        assert!(matches!(err, Err(Error::ExportParse { .. })));
+    }
+
+    #[test]
+    fn allow_and_exclude_together_is_rejected() {
+        let err = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n\
+             projects = [\"a\"]\nexclude_projects = [\"b\"]\n",
+            "<test>",
+        );
+        assert!(matches!(err, Err(Error::InvalidExport(_))));
+    }
+
+    #[test]
+    fn no_filter_is_all_and_allows_everything() {
+        let cfg = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n",
+            "<test>",
+        )
+        .unwrap();
+        let f = &cfg.targets[0].filter;
+        assert_eq!(*f, ProjectFilter::All);
+        assert!(!f.is_filtered());
+        assert!(f.allows("anything"));
     }
 
     #[test]
