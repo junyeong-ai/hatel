@@ -6,8 +6,7 @@
 
 use std::path::Path;
 
-use hatel_core::schema::build_registry_resilient;
-use hatel_core::{Config, ExportConfig, ExportMode, ProjectFilter};
+use hatel_core::{Config, ExportConfig, ExportMode};
 
 use crate::claude_settings as cs;
 
@@ -19,7 +18,7 @@ pub fn run() -> i32 {
     let env = cs::effective_env(&files);
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
     // them from the registry rather than the full vocabulary — coverage is judged against these.
-    let events = cs::active_events(&build_registry_resilient(&Config::load()));
+    let events = cs::active_events_default();
     let mut ok = true;
 
     println!("hatel doctor\n");
@@ -165,21 +164,11 @@ fn report_export(env: &cs::Env) -> bool {
             // The values may be secrets (auth tokens) — only the count is shown, never the value.
             n => format!(", {n} header(s)"),
         };
-        let filter = match &t.filter {
-            ProjectFilter::All => String::new(),
-            ProjectFilter::Only(s) => {
-                format!(
-                    ", only: {}",
-                    s.iter().cloned().collect::<Vec<_>>().join(", ")
-                )
-            }
-            ProjectFilter::Except(s) => {
-                format!(
-                    ", except: {}",
-                    s.iter().cloned().collect::<Vec<_>>().join(", ")
-                )
-            }
-        };
+        let filter = t
+            .filter
+            .describe()
+            .map(|d| format!(", {d}"))
+            .unwrap_or_default();
         println!(
             "  • {} ({}{}{})",
             t.endpoint,

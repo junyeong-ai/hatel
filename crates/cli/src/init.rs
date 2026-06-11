@@ -9,8 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use hatel_core::export::parse_otlp_headers;
-use hatel_core::schema::build_registry_resilient;
-use hatel_core::{Config, ExportConfig, ExportMode, ExportTarget, ProjectFilter};
+use hatel_core::{ExportConfig, ExportMode, ExportTarget, ProjectFilter};
 use serde_json::{Value, json};
 
 use crate::claude_settings as cs;
@@ -58,10 +57,8 @@ impl InsertMode {
 
 pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     let hook_cmd = cs::hook_command();
-    // Wire only the events some loaded Kind binds (plus SessionStart for the index) — resilient so
-    // a broken plugin can't block wiring core telemetry, exactly as the hook itself loads.
-    let registry = build_registry_resilient(&Config::load());
-    let events = cs::active_events(&registry);
+    // Wire only the events some loaded Kind binds (plus SessionStart for the index).
+    let events = cs::active_events_default();
 
     if print {
         print!("{}", cs::render_snippet(&hook_cmd, &events));
@@ -256,7 +253,7 @@ pub fn insert(mode: InsertMode) -> i32 {
     // Prepare and validate the settings repoint fully IN MEMORY before persisting anything — wire
     // hooks + the required telemetry env, and reject a structurally malformed env/hooks block here,
     // so neither the config nor the settings file is touched if the settings can't be wired.
-    let events = cs::active_events(&build_registry_resilient(&Config::load()));
+    let events = cs::active_events_default();
     let rep = cs::wire(&mut settings, &cs::hook_command(), &events);
     if rep.malformed() {
         eprintln!(

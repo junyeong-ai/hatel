@@ -157,11 +157,13 @@ mode = "raw"
   whose session is unknown is forwarded unchanged (the label is never fabricated).
 - **`projects`** / **`exclude_projects`** keep a destination from seeing some projects —
   an allow-list (forward only these) or an exclude-list (forward all but these), one or
-  the other. The batch's project is joined from `session.id`, so this also needs an
-  `http/json` stream; a batch whose project can't yet be resolved **fails closed** (it
-  isn't forwarded to a filtered destination), so a personal project never leaks to a
-  corporate collector on a startup race. A destination with neither key forwards every
-  project.
+  the other. An entry matches a project by its **label** (the git-root basename, e.g.
+  `aix-platform`) or its unique **key** (the absolute git-root path) — so two repos that
+  share a basename are told apart by writing the path. The batch's project is joined from
+  `session.id`, so this also needs an `http/json` stream; a batch whose project can't yet
+  be resolved **fails closed** (it isn't forwarded to a filtered destination), so a
+  personal project never leaks to a corporate collector on a startup race. A destination
+  with neither key forwards every project.
 
 A/B is a per-destination transform, not two toggles: the same endpoint with both would
 double-count delta metrics, so a duplicate endpoint is rejected at load. Forwarding is

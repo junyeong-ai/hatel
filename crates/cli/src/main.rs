@@ -180,6 +180,16 @@ fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
         );
         return 2;
     }
+    // A receiver-sourced Kind (e.g. `tool`, written from native OTel) has a single writer by
+    // design — emitting one by hand would interleave fabricated records with the real stream, so
+    // refuse it here the same way `bind` refuses a hook binding to it.
+    if reg.kind(kind).is_some_and(|s| s.receiver_sourced) {
+        eprintln!(
+            "emit: {kind:?} is receiver-sourced (written from native OTel) — it has a single writer \
+             and cannot be emitted by hand"
+        );
+        return 2;
+    }
     let payload = match build_payload(fields, json) {
         Ok(p) => p,
         Err(e) => {

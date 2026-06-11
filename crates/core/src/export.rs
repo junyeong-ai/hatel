@@ -47,6 +47,12 @@ impl ExportMode {
 /// (joined from `session.id`) passes this filter — so a project's telemetry can be kept off a
 /// downstream (e.g. a personal project off the corporate collector). The type encodes the
 /// "at most one of allow/exclude" invariant: a config setting both is rejected at load.
+///
+/// An entry matches a project by its display **label** (the git-root basename, e.g. `aix-platform`)
+/// or its unique **key** (the absolute git-root path) — so two repositories that share a basename
+/// can be told apart by writing the path. Matching on the key never weakens privacy: the key is
+/// only read here, for the local forward/skip decision, and is never part of an egressed body
+/// (enrichment injects the label alone).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectFilter {
     /// No filter — forward every project (the default).
@@ -59,13 +65,15 @@ pub enum ProjectFilter {
 }
 
 impl ProjectFilter {
-    /// Whether a *known* project is forwarded to this destination. The unknown-project case
+    /// Whether a *known* project (identified by both its `label` and unique `key`) is forwarded to
+    /// this destination — an entry matching either identifier counts. The unknown-project case
     /// (session not yet joined) is decided by the caller, which fails closed for a filtered target.
-    pub fn allows(&self, project: &str) -> bool {
+    pub fn allows(&self, label: &str, key: &str) -> bool {
+        let listed = |set: &BTreeSet<String>| set.contains(label) || set.contains(key);
         match self {
             ProjectFilter::All => true,
-            ProjectFilter::Only(set) => set.contains(project),
-            ProjectFilter::Except(set) => !set.contains(project),
+            ProjectFilter::Only(set) => listed(set),
+            ProjectFilter::Except(set) => !listed(set),
         }
     }
 
@@ -73,6 +81,18 @@ impl ProjectFilter {
     /// must be resolved before forwarding).
     pub fn is_filtered(&self) -> bool {
         !matches!(self, ProjectFilter::All)
+    }
+
+    /// A human-readable summary for `serve`'s forwarding line and `doctor` — `only: a, b` /
+    /// `except: c`, or `None` for an unfiltered destination — so both surfaces describe a
+    /// destination's project policy the same way.
+    pub fn describe(&self) -> Option<String> {
+        let list = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
+        match self {
+            ProjectFilter::All => None,
+            ProjectFilter::Only(set) => Some(format!("only: {}", list(set))),
+            ProjectFilter::Except(set) => Some(format!("except: {}", list(set))),
+        }
     }
 }
 
@@ -471,8 +491,8 @@ mod tests {
         .unwrap();
         let f = &cfg.targets[0].filter;
         assert!(f.is_filtered());
-        assert!(f.allows("work-a") && f.allows("work-b"));
-        assert!(!f.allows("personal"));
+        assert!(f.allows("work-a", "/repos/work-a") && f.allows("work-b", "/x/work-b"));
+        assert!(!f.allows("personal", "/repos/personal"));
         // survives a serialize/parse round-trip
         let back = ExportConfig::parse(&cfg.to_toml().unwrap(), "<rt>").unwrap();
         assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
@@ -487,10 +507,26 @@ mod tests {
         )
         .unwrap();
         let f = &cfg.targets[0].filter;
-        assert!(f.allows("work-a"));
-        assert!(!f.allows("personal"));
+        assert!(f.allows("work-a", "/repos/work-a"));
+        assert!(!f.allows("personal", "/repos/personal"));
         let back = ExportConfig::parse(&cfg.to_toml().unwrap(), "<rt>").unwrap();
         assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
+    }
+
+    #[test]
+    fn a_filter_entry_matches_label_or_unique_key() {
+        // Two repos can share a basename; a path entry disambiguates by the unique key while a
+        // bare label still matches every project with that basename.
+        let cfg = ExportConfig::parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"enriched\"\n\
+             projects = [\"/Users/me/work/api\"]\n",
+            "<test>",
+        )
+        .unwrap();
+        let f = &cfg.targets[0].filter;
+        // same label "api", different keys — only the listed key is allowed.
+        assert!(f.allows("api", "/Users/me/work/api"));
+        assert!(!f.allows("api", "/Users/me/personal/api"));
     }
 
     #[test]
@@ -524,7 +560,7 @@ mod tests {
         let f = &cfg.targets[0].filter;
         assert_eq!(*f, ProjectFilter::All);
         assert!(!f.is_filtered());
-        assert!(f.allows("anything"));
+        assert!(f.allows("anything", "/any/where"));
     }
 
     #[test]

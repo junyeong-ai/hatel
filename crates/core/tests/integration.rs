@@ -150,6 +150,22 @@ fn hook_binding_to_a_receiver_sourced_kind_is_rejected() {
 }
 
 #[test]
+fn a_plugin_kind_cannot_declare_receiver_sourced() {
+    // `receiver_sourced` is core-only: the receiver writes only Kinds it has a native handler for,
+    // so a plugin declaring it would create a Kind nothing ever writes (and that can't be
+    // hook-bound either) — a dead extension point. Reject it loudly at load.
+    let dir = temp_dir();
+    let plugin = dir.join("rs.toml");
+    std::fs::write(
+        &plugin,
+        "[[kind]]\nname = \"team.native\"\nfields = [\"session_id\"]\ngroup_key = \"session_id\"\nreceiver_sourced = true\n",
+    )
+    .unwrap();
+    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    assert!(format!("{err}").contains("core-only"), "got: {err}");
+}
+
+#[test]
 fn tool_kind_allow_list_keeps_it_content_free() {
     // The `tool` Kind is written by the receiver from the native `tool_result` event, which also
     // carries the user's email and full tool input. Its field allow-list is the guard that keeps

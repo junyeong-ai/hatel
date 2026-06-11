@@ -224,9 +224,10 @@ impl Worker {
         let warned = &mut self.enrich_skip_warned;
         for target in targets {
             if target.filter.is_filtered() {
-                let allowed = batch_projects
-                    .as_ref()
-                    .is_some_and(|ps| ps.iter().all(|p| target.filter.allows(p)));
+                let allowed = batch_projects.as_ref().is_some_and(|ps| {
+                    ps.iter()
+                        .all(|(label, key)| target.filter.allows(label, key))
+                });
                 if !allowed {
                     continue; // project not allowed here, or undeterminable → fail closed
                 }
@@ -240,7 +241,7 @@ impl Worker {
                     out.content_encoding.as_deref(),
                 )),
                 ExportMode::Enriched => {
-                    let resolve = |sid: &str| index.get(sid);
+                    let resolve = |sid: &str| index.label(sid);
                     let transformed = match out.signal {
                         OtlpSignal::Metrics => enrich_metrics(&out.body, &resolve),
                         OtlpSignal::Logs => enrich_logs(&out.body, &resolve),
@@ -293,33 +294,40 @@ impl Worker {
         }
     }
 
-    /// The set of project labels a batch belongs to, for project-filtered destinations. `None`
-    /// when the batch can't be attributed — it isn't JSON, carries no `session.id` at all, or one
-    /// of its `session.id`s isn't yet in the index — so a filtered destination fails closed rather
-    /// than forward an unattributable (possibly out-of-scope) batch. Self-heals: the next batch
-    /// after the index catches up resolves and forwards. Resolution is over the `session.id`s
+    /// The `(label, key)` of every project a batch belongs to, for project-filtered destinations.
+    /// `None` when the batch can't be attributed — it isn't JSON, carries no `session.id` at all, or
+    /// one of its `session.id`s isn't yet in the index — so a filtered destination fails closed
+    /// rather than forward an unattributable (possibly out-of-scope) batch. Self-heals: the next
+    /// batch after the index catches up resolves and forwards. Resolution is over the `session.id`s
     /// actually present; in practice every Claude Code datapoint carries one and a single export
     /// body is a single session, so the set is one project the filter then accepts or rejects.
-    fn resolve_batch_projects(&self, body: &[u8], signal: OtlpSignal) -> Option<BTreeSet<String>> {
+    fn resolve_batch_projects(
+        &self,
+        body: &[u8],
+        signal: OtlpSignal,
+    ) -> Option<BTreeSet<(String, String)>> {
         let ids = session_ids(body, matches!(signal, OtlpSignal::Metrics))?;
         if ids.is_empty() {
             return None;
         }
         let mut projects = BTreeSet::new();
         for sid in &ids {
-            projects.insert(self.index.get(sid)?); // any unknown session → None (fail closed)
+            let (label, key) = self.index.project(sid)?; // any unknown session → None (fail closed)
+            projects.insert((label.to_string(), key.to_string()));
         }
         Some(projects)
     }
 }
 
-/// A session→project-label map cached from `session_index.jsonl`, reloaded only when the file's
-/// mtime advances. The index is append-only so its mtime increases on each new session; gating on
-/// it means a steady stream costs no I/O while a brand-new session is picked up on the next batch.
+/// A session→project map cached from `session_index.jsonl`, reloaded only when the file's mtime
+/// advances. The index is append-only so its mtime increases on each new session; gating on it
+/// means a steady stream costs no I/O while a brand-new session is picked up on the next batch.
+/// Each entry keeps both the display `label` (what enrichment injects) and the unique `key` (the
+/// absolute git-root path, used only for the local filter decision and never egressed).
 struct IndexCache {
     state_dir: PathBuf,
     mtime: Option<SystemTime>,
-    map: HashMap<String, String>,
+    map: HashMap<String, (String, String)>,
 }
 
 impl IndexCache {
@@ -354,11 +362,11 @@ impl IndexCache {
             // A transient error (permissions, I/O) — keep what we have rather than wrongly clearing.
             Err(_) => return,
         };
-        let loaded: HashMap<String, String> = SessionIndex::new(self.state_dir.clone())
+        let loaded: HashMap<String, (String, String)> = SessionIndex::new(self.state_dir.clone())
             .load()
             .into_iter()
             .filter(|(_, row)| !row.project_label.is_empty())
-            .map(|(sid, row)| (sid, row.project_label))
+            .map(|(sid, row)| (sid, (row.project_label, row.project_key)))
             .collect();
         // Replace the map when the load produced rows, or when the file is genuinely empty. A
         // non-empty file that yields nothing is a transient read race — keep the prior labels
@@ -368,9 +376,18 @@ impl IndexCache {
         }
     }
 
-    /// The project label for a session, or `None` when unknown (never fabricated).
-    fn get(&self, session_id: &str) -> Option<String> {
-        self.map.get(session_id).cloned()
+    /// The project label for a session — what enrichment injects — or `None` when unknown (never
+    /// fabricated).
+    fn label(&self, session_id: &str) -> Option<String> {
+        self.map.get(session_id).map(|(label, _)| label.clone())
+    }
+
+    /// The `(label, key)` for a session, for the local filter decision. The key (absolute path) is
+    /// used only to decide forward/skip and is never egressed.
+    fn project(&self, session_id: &str) -> Option<(&str, &str)> {
+        self.map
+            .get(session_id)
+            .map(|(label, key)| (label.as_str(), key.as_str()))
     }
 }
 
@@ -413,7 +430,7 @@ mod tests {
         .unwrap();
         let mut cache = IndexCache::new(dir.clone());
         cache.refresh();
-        assert_eq!(cache.get("S1").as_deref(), Some("a"));
+        assert_eq!(cache.label("S1").as_deref(), Some("a"));
         // Rewrite to a non-empty file whose only row has an empty label (yields nothing after the
         // filter), and advance mtime — the guard keeps the prior labels.
         std::fs::write(
@@ -424,7 +441,7 @@ mod tests {
         filetime_bump(&path);
         cache.refresh();
         assert_eq!(
-            cache.get("S1").as_deref(),
+            cache.label("S1").as_deref(),
             Some("a"),
             "prior labels kept on an empty read"
         );
@@ -443,12 +460,12 @@ mod tests {
         .unwrap();
         let mut cache = IndexCache::new(dir.clone());
         cache.refresh();
-        assert_eq!(cache.get("S1").as_deref(), Some("a"));
+        assert_eq!(cache.label("S1").as_deref(), Some("a"));
         // A state reset removes the index — the cache must not keep injecting the old label.
         std::fs::remove_file(&path).unwrap();
         cache.refresh();
         assert_eq!(
-            cache.get("S1"),
+            cache.label("S1"),
             None,
             "stale label dropped after index removal"
         );
@@ -469,8 +486,8 @@ mod tests {
 
         let mut cache = IndexCache::new(dir.clone());
         cache.refresh();
-        assert_eq!(cache.get("S1").as_deref(), Some("alpha"));
-        assert_eq!(cache.get("S2"), None, "unknown session is not fabricated");
+        assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
+        assert_eq!(cache.label("S2"), None, "unknown session is not fabricated");
 
         // Append a new session and bump mtime; a refresh must pick it up.
         std::fs::write(
@@ -480,7 +497,7 @@ mod tests {
         .unwrap();
         filetime_bump(&path);
         cache.refresh();
-        assert_eq!(cache.get("S2").as_deref(), Some("beta"));
+        assert_eq!(cache.label("S2").as_deref(), Some("beta"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -515,9 +532,15 @@ mod tests {
             }))
             .unwrap()
         };
-        // Known session → its project; the allow/exclude decision is then plain set logic.
+        // Known session → its (label, key); the allow/exclude decision is then plain set logic.
         let known = worker.resolve_batch_projects(&body("S1"), OtlpSignal::Metrics);
-        assert_eq!(known, Some(BTreeSet::from(["alpha".to_string()])));
+        assert_eq!(
+            known,
+            Some(BTreeSet::from([(
+                "alpha".to_string(),
+                "/k/alpha".to_string()
+            )]))
+        );
         // Unknown session, no session.id, and non-JSON all fail closed (None).
         assert_eq!(
             worker.resolve_batch_projects(&body("GHOST"), OtlpSignal::Metrics),
@@ -528,6 +551,44 @@ mod tests {
             worker.resolve_batch_projects(b"\x00proto", OtlpSignal::Metrics),
             None,
             "non-JSON fails closed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mixed_project_batch_is_forwarded_only_when_every_project_passes() {
+        // A batch spanning two sessions resolves to both projects; an allow-list missing one of
+        // them rejects the whole batch (fail closed), so a disallowed session can never ride along
+        // with an allowed one.
+        let dir = std::env::temp_dir().join(format!("ht-mixed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session_index.jsonl"),
+            "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n\
+             {\"session_id\":\"S2\",\"project_key\":\"/k/beta\",\"project_label\":\"beta\"}\n",
+        )
+        .unwrap();
+        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        worker.index.refresh();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{ "sum": { "dataPoints": [
+                { "attributes": [{ "key": "session.id", "value": { "stringValue": "S1" } }] },
+                { "attributes": [{ "key": "session.id", "value": { "stringValue": "S2" } }] }
+            ]}}]}]}]
+        }))
+        .unwrap();
+        let projects = worker
+            .resolve_batch_projects(&body, OtlpSignal::Metrics)
+            .unwrap();
+        assert_eq!(projects.len(), 2, "both sessions resolved");
+        let only_alpha =
+            hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect());
+        let passes = projects
+            .iter()
+            .all(|(label, key)| only_alpha.allows(label, key));
+        assert!(
+            !passes,
+            "a batch with a disallowed project (beta) is rejected as a whole"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

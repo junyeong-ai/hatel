@@ -21,7 +21,7 @@ struct SchemaFile {
     binding: Vec<HookBinding>,
 }
 
-fn merge(reg: &mut Registry, src: &str, path: &str) -> Result<()> {
+fn merge(reg: &mut Registry, src: &str, path: &str, is_core: bool) -> Result<()> {
     let file: SchemaFile = toml::from_str(src).map_err(|e| Error::SchemaParse {
         path: path.to_string(),
         source: e,
@@ -29,6 +29,17 @@ fn merge(reg: &mut Registry, src: &str, path: &str) -> Result<()> {
     reg.tracked_metrics.extend(file.tracked_metrics);
     reg.counted_events.extend(file.counted_events);
     for raw in file.kind {
+        // `receiver_sourced` is core-only: the receiver writes only the Kinds it has a native
+        // handler for. A plugin setting it would declare a Kind that nothing writes (no handler)
+        // and that can't be hook-bound either — a dead extension point — so reject it loudly.
+        if raw.receiver_sourced && !is_core {
+            return Err(Error::InvalidSpec {
+                name: raw.name.clone(),
+                reason:
+                    "receiver_sourced is core-only — a plugin Kind has no native receiver source"
+                        .to_string(),
+            });
+        }
         reg.add_kind(KindSpec::from_raw(raw)?)?;
     }
     for binding in file.binding {
@@ -39,14 +50,14 @@ fn merge(reg: &mut Registry, src: &str, path: &str) -> Result<()> {
 
 pub fn load_core() -> Result<Registry> {
     let mut reg = Registry::new();
-    merge(&mut reg, CORE_TOML, "<core>")?;
+    merge(&mut reg, CORE_TOML, "<core>", true)?;
     Ok(reg)
 }
 
 fn load_plugin(reg: &mut Registry, path: &std::path::Path) -> Result<()> {
     let src = std::fs::read_to_string(path)
         .map_err(|e| Error::Io(format!("read plugin {}: {e}", path.display())))?;
-    merge(reg, &src, &path.display().to_string())
+    merge(reg, &src, &path.display().to_string(), false)
 }
 
 /// Core schema plus every plugin, merged in order. Strict: any error fails the whole

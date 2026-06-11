@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -35,6 +36,11 @@ const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// OTLP/HTTP body cap. Far above any real batch (axum's 2 MB default would silently
 /// 413 a large export and lose it), but bounded so a runaway body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on tool outcomes buffered between flushes — a memory backstop (like the export queue's byte
+/// cap) so a stalled `persist` can't grow the buffer without bound. Far above a realistic 30s burst.
+const MAX_TOOL_BUFFER: usize = 100_000;
+/// Re-log the cumulative tool-buffer drop count once per this many drops (throttled, not per-drop).
+const TOOL_DROP_LOG_EVERY: u64 = 1_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -46,7 +52,11 @@ struct AppState {
     registry: Arc<Registry>,
     /// `tool_result` outcomes decoded since the last flush, written to the ledger by `persist`
     /// (off the request path), exactly as cost is snapshotted — never blocking ingestion on I/O.
+    /// Bounded by `MAX_TOOL_BUFFER`; overflow is dropped and counted in `tool_dropped`.
     tool_buffer: Arc<Mutex<Vec<ToolResult>>>,
+    /// Cumulative tool outcomes dropped because the buffer was full (an honest undercount surfaced
+    /// to stderr), mirroring the export queue's drop accounting.
+    tool_dropped: Arc<AtomicU64>,
     cfg: Arc<Config>,
     /// Per-session totals already persisted before this receiver started, so a
     /// session that spans a receiver restart continues from its prior total rather
@@ -114,6 +124,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         counted: Arc::new(registry.counted_events.clone()),
         registry: registry.clone(),
         tool_buffer: Arc::new(Mutex::new(Vec::new())),
+        tool_dropped: Arc::new(AtomicU64::new(0)),
         cfg: cfg.clone(),
         baseline: Arc::new(baseline),
         current_key,
@@ -148,7 +159,16 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     // Announce egress so a forwarding deployment is visible in the log (endpoint + transform only;
     // header values are never printed).
     for t in &export_cfg.targets {
-        println!("  → forwarding to {} ({})", t.endpoint, t.mode.as_str());
+        let filter = t
+            .filter
+            .describe()
+            .map(|d| format!(", {d}"))
+            .unwrap_or_default();
+        println!(
+            "  → forwarding to {} ({}{filter})",
+            t.endpoint,
+            t.mode.as_str()
+        );
     }
 
     // Keep the persisted cost snapshot fresh while running (a long-lived daemon
@@ -226,7 +246,19 @@ async fn ingest_logs(
     // of the counted-event view below: the same body feeds both, decoded once for each.
     match parse_tool_results(body.as_ref()) {
         Ok(results) if !results.is_empty() => {
-            lock_buf(&st.tool_buffer).extend(results);
+            let mut buf = lock_buf(&st.tool_buffer);
+            let room = MAX_TOOL_BUFFER.saturating_sub(buf.len());
+            if results.len() <= room {
+                buf.extend(results);
+            } else {
+                // Persist is falling behind — fill the remaining room and drop the rest, counting
+                // it, so the buffer is a hard bound (not a soft cap that overshoots by a whole
+                // batch). Honest undercount, never a blocked request.
+                let total = results.len();
+                buf.extend(results.into_iter().take(room));
+                drop(buf);
+                record_tool_drop(&st.tool_dropped, (total - room) as u64);
+            }
         }
         Ok(_) => {}
         Err(_) => {} // a non-decodable body is reported once by the view path below
@@ -266,6 +298,18 @@ fn lock(m: &Mutex<Accumulator>) -> std::sync::MutexGuard<'_, Accumulator> {
 /// Same poison-recovery for the tool-result buffer.
 fn lock_buf(m: &Mutex<Vec<ToolResult>>) -> std::sync::MutexGuard<'_, Vec<ToolResult>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Count dropped tool outcomes and log the cumulative total once per `TOOL_DROP_LOG_EVERY` drops
+/// (throttled to avoid per-batch spam), mirroring the export queue's drop accounting.
+fn record_tool_drop(counter: &AtomicU64, n: u64) {
+    let before = counter.fetch_add(n, Ordering::Relaxed);
+    if before / TOOL_DROP_LOG_EVERY != (before + n) / TOOL_DROP_LOG_EVERY {
+        eprintln!(
+            "hatel: tool buffer full — dropped {} tool record(s) so far (persist falling behind)",
+            before + n
+        );
+    }
 }
 
 async fn shutdown_signal() {
@@ -398,7 +442,10 @@ fn persist(st: &AppState) {
 /// Drain the tool-result buffer into the ledger as `tool` records, joining each call's project
 /// from the session index. Written via the configured sink (the same write path the hook uses),
 /// so `report` aggregates tool latency and success rate exactly like any other Kind. `tool.jsonl`
-/// has a single writer — this — since the `tool` Kind has no hook binding.
+/// has a single writer — this — since the `tool` Kind has no hook binding. Buffered outcomes since
+/// the last flush survive a graceful stop (the shutdown path flushes), but — unlike cost, which
+/// re-derives from the cumulative OTel metric on restart — these are discrete events with no
+/// resend, so an ungraceful kill loses that ≤30s window.
 fn persist_tool(st: &AppState, index: &BTreeMap<String, SessionRow>) {
     let drained = std::mem::take(&mut *lock_buf(&st.tool_buffer));
     if drained.is_empty() {

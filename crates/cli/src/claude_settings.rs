@@ -42,6 +42,15 @@ pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
         .collect::<Vec<_>>()
 }
 
+/// The active events for the env-derived config — the single derivation `init` and `doctor` share.
+/// Resilient (a broken plugin is skipped, never blocking wiring of core telemetry), matching the
+/// hook's own load.
+pub fn active_events_default() -> Vec<&'static str> {
+    active_events(&hatel_core::schema::build_registry_resilient(
+        &hatel_core::Config::load(),
+    ))
+}
+
 /// The receiver's default bind address — the endpoint `init` wires. Used to tell "pointed at the
 /// local receiver" (where `http/json` is mandatory) from "repointed elsewhere" (where it's the
 /// remote collector's business).
@@ -382,6 +391,25 @@ fn group_hooks_is_empty(group: &Value) -> bool {
     matches!(group.get("hooks"), Some(Value::Array(a)) if a.is_empty())
 }
 
+/// Remove our hook *entries* from every group of one event — at entry granularity, so a user's
+/// command co-located in the same group always survives. `keep_current` keeps our entry at the
+/// given path (repointing only a *stale* one), which is what `wire` wants for an event it still
+/// owns; `None` removes every entry of ours (`unwire`, and an event `wire` no longer owns). Returns
+/// whether anything was removed; the caller prunes emptied groups if it chooses to mutate.
+fn strip_our_entries(groups: &mut [Value], keep_current: Option<&str>) -> bool {
+    let mut removed = false;
+    for group in groups.iter_mut() {
+        if let Some(Value::Array(entries)) = group.get_mut("hooks") {
+            let before = entries.len();
+            entries.retain(|e| {
+                !entry_is_our_hook(e) || keep_current.is_some_and(|cmd| entry_has_command(e, cmd))
+            });
+            removed |= entries.len() != before;
+        }
+    }
+    removed
+}
+
 // ── snippet ──
 
 /// The paste-ready settings block — the same `env` + `hooks` that `wire` merges, rendered for
@@ -507,21 +535,9 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
                 }
                 match hooks.entry(ev).or_insert_with(|| Value::Array(vec![])) {
                     Value::Array(groups) => {
-                        // Strip our entries at entry granularity (a user command co-located in the
-                        // same group is never collateral-damaged). For an active event we keep our
-                        // *current-path* entry (repointing only a stale one); for an inactive event
-                        // we remove every entry of ours.
-                        let mut removed = false;
-                        for group in groups.iter_mut() {
-                            if let Some(Value::Array(entries)) = group.get_mut("hooks") {
-                                let before = entries.len();
-                                entries.retain(|e| {
-                                    !entry_is_our_hook(e)
-                                        || (active && entry_has_command(e, hook_cmd))
-                                });
-                                removed |= entries.len() != before;
-                            }
-                        }
+                        // For an active event keep our current-path entry (repointing only a stale
+                        // one); for an inactive event remove every entry of ours.
+                        let removed = strip_our_entries(groups, active.then_some(hook_cmd));
 
                         if !active {
                             // Inactive event: touch it only when we actually stripped our hook. If
@@ -600,16 +616,9 @@ pub fn unwire(settings: &mut Value) -> UnwireReport {
     for ev in EVENTS {
         let (removed, empty) = match hooks.get_mut(ev) {
             Some(Value::Array(groups)) => {
-                // Remove our hook *entries*, so a user's command co-located in the same group
-                // survives; then drop any group whose hooks array we emptied.
-                let mut removed = false;
-                for group in groups.iter_mut() {
-                    if let Some(Value::Array(entries)) = group.get_mut("hooks") {
-                        let before = entries.len();
-                        entries.retain(|e| !entry_is_our_hook(e));
-                        removed |= entries.len() != before;
-                    }
-                }
+                // Remove every entry of ours (a user's co-located command survives), then drop any
+                // group we emptied.
+                let removed = strip_our_entries(groups, None);
                 groups.retain(|g| !group_hooks_is_empty(g));
                 (removed, groups.is_empty())
             }
