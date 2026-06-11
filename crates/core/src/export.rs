@@ -134,11 +134,13 @@ struct TargetRaw {
     #[serde(default)]
     timeout_ms: Option<u64>,
     /// Allow-list: forward only these projects. Mutually exclusive with `exclude_projects`.
+    /// `Option` distinguishes absent (no filter) from an explicit empty list (rejected at load —
+    /// an empty allow-list forwards nothing, which is a config mistake, not a fail-open `All`).
     #[serde(default)]
-    projects: BTreeSet<String>,
+    projects: Option<BTreeSet<String>>,
     /// Exclude-list: forward every project but these. Mutually exclusive with `projects`.
     #[serde(default)]
-    exclude_projects: BTreeSet<String>,
+    exclude_projects: Option<BTreeSet<String>>,
 }
 
 impl ExportConfig {
@@ -194,11 +196,23 @@ impl ExportConfig {
                      two to the same endpoint would double-count delta metrics"
                 )));
             }
-            let filter = match (raw.projects.is_empty(), raw.exclude_projects.is_empty()) {
-                (true, true) => ProjectFilter::All,
-                (false, true) => ProjectFilter::Only(raw.projects),
-                (true, false) => ProjectFilter::Except(raw.exclude_projects),
-                (false, false) => {
+            // A present-but-empty list is a config mistake, not a fail-open `All`: reject it so an
+            // empty allow-list never silently forwards everything. Absent (`None`) is no filter.
+            let nonempty = |set: BTreeSet<String>, what: &str| -> Result<BTreeSet<String>> {
+                if set.is_empty() {
+                    Err(Error::InvalidExport(format!(
+                        "export endpoint {endpoint:?}: `{what}` is present but empty — list the \
+                         projects, or remove the key (an empty list has no useful meaning)"
+                    )))
+                } else {
+                    Ok(set)
+                }
+            };
+            let filter = match (raw.projects, raw.exclude_projects) {
+                (None, None) => ProjectFilter::All,
+                (Some(allow), None) => ProjectFilter::Only(nonempty(allow, "projects")?),
+                (None, Some(deny)) => ProjectFilter::Except(nonempty(deny, "exclude_projects")?),
+                (Some(_), Some(_)) => {
                     return Err(Error::InvalidExport(format!(
                         "export endpoint {endpoint:?}: set either `projects` (allow-list) or \
                          `exclude_projects`, not both"
@@ -538,6 +552,22 @@ mod tests {
             "<test>",
         );
         assert!(matches!(err, Err(Error::ExportParse { .. })));
+    }
+
+    #[test]
+    fn an_explicit_empty_filter_list_is_rejected_not_fail_open() {
+        // `projects = []` must NOT silently become `All` (forward everything) — an empty allow-list
+        // is a config mistake. Both an empty allow-list and an empty exclude-list are rejected.
+        for key in ["projects", "exclude_projects"] {
+            let err = ExportConfig::parse(
+                &format!("[[export]]\nendpoint = \"http://x:4318\"\nmode = \"raw\"\n{key} = []\n"),
+                "<test>",
+            );
+            assert!(
+                matches!(err, Err(Error::InvalidExport(_))),
+                "{key} = [] should be rejected, got {err:?}"
+            );
+        }
     }
 
     #[test]

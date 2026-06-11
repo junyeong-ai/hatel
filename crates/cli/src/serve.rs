@@ -304,7 +304,9 @@ fn lock_buf(m: &Mutex<Vec<ToolResult>>) -> std::sync::MutexGuard<'_, Vec<ToolRes
 /// (throttled to avoid per-batch spam), mirroring the export queue's drop accounting.
 fn record_tool_drop(counter: &AtomicU64, n: u64) {
     let before = counter.fetch_add(n, Ordering::Relaxed);
-    if before / TOOL_DROP_LOG_EVERY != (before + n) / TOOL_DROP_LOG_EVERY {
+    // Surface the first drop immediately (like the export queue), then throttle to once per
+    // `TOOL_DROP_LOG_EVERY` — so an operator sees the problem before hundreds are already lost.
+    if before == 0 || before / TOOL_DROP_LOG_EVERY != (before + n) / TOOL_DROP_LOG_EVERY {
         eprintln!(
             "hatel: tool buffer full — dropped {} tool record(s) so far (persist falling behind)",
             before + n

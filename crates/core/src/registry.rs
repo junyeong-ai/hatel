@@ -318,4 +318,11 @@ impl Registry {
     pub fn bindings_for(&self, event: &str) -> &[HookBinding] {
         self.bindings.get(event).map(Vec::as_slice).unwrap_or(&[])
     }
+
+    /// Every distinct event some binding targets. The CLI compares these against the events it can
+    /// actually wire, so a binding to an event outside that vocabulary is flagged loudly rather than
+    /// silently never firing. (Core stays free of the wiring vocabulary itself.)
+    pub fn bound_events(&self) -> impl Iterator<Item = &str> {
+        self.bindings.keys().map(String::as_str)
+    }
 }

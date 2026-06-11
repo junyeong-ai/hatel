@@ -150,6 +150,27 @@ fn hook_binding_to_a_receiver_sourced_kind_is_rejected() {
 }
 
 #[test]
+fn bound_events_surfaces_an_out_of_vocabulary_binding() {
+    // Core accepts a binding to any event string (it doesn't own the wiring vocabulary); the
+    // registry surfaces every bound event so the CLI can flag one it can't wire, rather than let
+    // a binding to e.g. `PreToolUse` load cleanly and then silently never fire.
+    let dir = temp_dir();
+    let plugin = dir.join("oov.toml");
+    std::fs::write(
+        &plugin,
+        "[[kind]]\nname = \"team.pre\"\nfields = [\"session_id\"]\ngroup_key = \"session_id\"\n\
+         [[binding]]\nevent = \"PreToolUse\"\nkind = \"team.pre\"\nmap.session_id = { from = \"session_id\" }\n",
+    )
+    .unwrap();
+    let reg = build_registry(&config_in(dir, vec![plugin])).unwrap();
+    let bound: Vec<&str> = reg.bound_events().collect();
+    assert!(
+        bound.contains(&"PreToolUse"),
+        "bound events include the out-of-vocab one: {bound:?}"
+    );
+}
+
+#[test]
 fn a_plugin_kind_cannot_declare_receiver_sourced() {
     // `receiver_sourced` is core-only: the receiver writes only Kinds it has a native handler for,
     // so a plugin declaring it would create a Kind nothing ever writes (and that can't be

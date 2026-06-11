@@ -164,6 +164,14 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     } else {
         println!("already wired: {}", path.display());
     }
+    // A plugin binding an event hatel can't wire would silently never fire — surface it rather than
+    // leave it a dead extension point.
+    for ev in cs::unwireable_bindings() {
+        eprintln!(
+            "  ⚠ a plugin binds `{ev}`, which hatel does not wire — that binding never fires \
+             (not a supported event)"
+        );
+    }
     println!("verify with `hatel doctor`");
 
     // The hooks are in place, but a blocked required key means native telemetry won't be

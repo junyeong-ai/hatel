@@ -46,9 +46,30 @@ pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
 /// Resilient (a broken plugin is skipped, never blocking wiring of core telemetry), matching the
 /// hook's own load.
 pub fn active_events_default() -> Vec<&'static str> {
-    active_events(&hatel_core::schema::build_registry_resilient(
-        &hatel_core::Config::load(),
-    ))
+    active_events(&registry_for_wiring())
+}
+
+/// Events some loaded Kind binds that are *not* in the wireable vocabulary — `init` can't wire
+/// them (the hook never fires for them), so the binding would silently collect nothing. `init`/
+/// `doctor` surface them loudly instead. Mirrors the `active_events`/`active_events_default` split:
+/// a pure form over a registry, plus the env-derived wrapper.
+pub fn unwireable_bindings() -> Vec<String> {
+    unwireable(&registry_for_wiring())
+}
+
+fn unwireable(registry: &hatel_core::Registry) -> Vec<String> {
+    let mut events: Vec<String> = registry
+        .bound_events()
+        .filter(|e| !EVENTS.contains(e))
+        .map(str::to_string)
+        .collect();
+    events.sort_unstable();
+    events.dedup();
+    events
+}
+
+fn registry_for_wiring() -> hatel_core::Registry {
+    hatel_core::schema::build_registry_resilient(&hatel_core::Config::load())
 }
 
 /// The receiver's default bind address — the endpoint `init` wires. Used to tell "pointed at the
@@ -1156,5 +1177,34 @@ mod tests {
                 "{ev} should not be wired (nothing binds it)"
             );
         }
+    }
+
+    #[test]
+    fn unwireable_flags_only_out_of_vocabulary_bound_events() {
+        use hatel_core::registry::{HookBinding, KindSpec, KindSpecRaw};
+        let mut reg = hatel_core::Registry::new();
+        reg.add_kind(
+            KindSpec::from_raw(KindSpecRaw {
+                name: "x".into(),
+                fields: vec!["session_id".into()],
+                group_key: "session_id".into(),
+                redact: vec![],
+                measures: vec![],
+                receiver_sourced: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // One in-vocabulary event and one outside it, both bound by the same plugin Kind.
+        for ev in ["PostToolUse", "PreToolUse"] {
+            reg.bind(HookBinding {
+                event: ev.into(),
+                kind: "x".into(),
+                map: Default::default(),
+            })
+            .unwrap();
+        }
+        // `PostToolUse` is wireable (in EVENTS); `PreToolUse` is not, so only it is flagged.
+        assert_eq!(unwireable(&reg), vec!["PreToolUse".to_string()]);
     }
 }

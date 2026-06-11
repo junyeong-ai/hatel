@@ -135,6 +135,15 @@ fn report_hooks(files: &[cs::ScopeFile], events: &[&'static str]) -> bool {
             ok = false;
         }
     }
+    // A plugin can bind any event string, but `init` only wires the events hatel knows how to wire;
+    // a binding outside that set never fires, so the plugin's Kind would silently collect nothing.
+    for ev in cs::unwireable_bindings() {
+        println!(
+            "  ✗ a plugin binds `{ev}`, which hatel does not wire — that binding never fires \
+             (the event isn't in the supported set; remove it or use a supported event)"
+        );
+        ok = false;
+    }
     ok
 }
 
