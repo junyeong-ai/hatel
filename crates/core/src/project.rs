@@ -14,15 +14,16 @@ pub struct ProjectRef {
 pub fn resolve_project(cwd: &str) -> ProjectRef {
     let start = Path::new(cwd);
     let root = git_root(start).unwrap_or_else(|| start.to_path_buf());
+    let key = root.to_string_lossy().into_owned();
+    // A root without a basename (e.g. `/`) falls back to the full path as its label —
+    // still visible and still matchable by a filter entry — rather than an empty string,
+    // which would render as a ghost project and could never be listed in a filter.
     let label = root
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_string();
-    ProjectRef {
-        key: root.to_string_lossy().into_owned(),
-        label,
-    }
+        .map(str::to_string)
+        .unwrap_or_else(|| key.clone());
+    ProjectRef { key, label }
 }
 
 /// Walk up from `start` to the nearest directory containing `.git` (the worktree root).
@@ -68,8 +69,11 @@ mod tests {
     static N: AtomicU32 = AtomicU32::new(0);
 
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("ht-proj-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+        let dir = std::env::temp_dir().join(format!(
+            "ht-proj-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -79,7 +83,10 @@ mod tests {
         let repo = scratch();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/x\r\n").unwrap();
-        assert_eq!(git_branch(repo.to_str().unwrap()).as_deref(), Some("feature/x"));
+        assert_eq!(
+            git_branch(repo.to_str().unwrap()).as_deref(),
+            Some("feature/x")
+        );
         std::fs::remove_dir_all(&repo).ok();
     }
 
@@ -93,6 +100,16 @@ mod tests {
         std::fs::write(repo.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
         assert_eq!(git_branch(repo.to_str().unwrap()).as_deref(), Some("wt"));
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_root_path_labels_as_the_path_not_an_empty_string() {
+        // `/` has no basename; the label falls back to the path so the project stays
+        // visible in reports and addressable by a filter entry.
+        let p = resolve_project("/");
+        assert_eq!(p.key, "/");
+        assert_eq!(p.label, "/", "no-basename root labels as its path");
+        assert!(!p.label.is_empty());
     }
 
     #[test]

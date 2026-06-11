@@ -48,7 +48,7 @@ impl ExportMode {
 /// downstream (e.g. a personal project off the corporate collector). The type encodes the
 /// "at most one of allow/exclude" invariant: a config setting both is rejected at load.
 ///
-/// An entry matches a project by its display **label** (the git-root basename, e.g. `aix-platform`)
+/// An entry matches a project by its display **label** (the git-root basename, e.g. `my-app`)
 /// or its unique **key** (the absolute git-root path) — so two repositories that share a basename
 /// can be told apart by writing the path. Matching on the key never weakens privacy: the key is
 /// only read here, for the local forward/skip decision, and is never part of an egressed body
@@ -198,11 +198,18 @@ impl ExportConfig {
             }
             // A present-but-empty list is a config mistake, not a fail-open `All`: reject it so an
             // empty allow-list never silently forwards everything. Absent (`None`) is no filter.
+            // An empty/whitespace entry is rejected for the same reason — no real project has an
+            // empty label or key, so the entry could only ever match by accident.
             let nonempty = |set: BTreeSet<String>, what: &str| -> Result<BTreeSet<String>> {
                 if set.is_empty() {
                     Err(Error::InvalidExport(format!(
                         "export endpoint {endpoint:?}: `{what}` is present but empty — list the \
                          projects, or remove the key (an empty list has no useful meaning)"
+                    )))
+                } else if set.iter().any(|e| e.trim().is_empty()) {
+                    Err(Error::InvalidExport(format!(
+                        "export endpoint {endpoint:?}: `{what}` contains an empty entry — every \
+                         entry must be a project label or git-root path"
                     )))
                 } else {
                     Ok(set)
@@ -566,6 +573,24 @@ mod tests {
             assert!(
                 matches!(err, Err(Error::InvalidExport(_))),
                 "{key} = [] should be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_filter_entry_is_rejected() {
+        // `projects = [""]` (or whitespace) can never name a real project — reject it loudly
+        // instead of carrying an entry that could only match a broken, label-less record.
+        for entry in ["\"\"", "\"  \""] {
+            let err = ExportConfig::parse(
+                &format!(
+                    "[[export]]\nendpoint = \"http://x:4318\"\nmode = \"raw\"\nprojects = [{entry}]\n"
+                ),
+                "<test>",
+            );
+            assert!(
+                matches!(err, Err(Error::InvalidExport(_))),
+                "projects = [{entry}] should be rejected, got {err:?}"
             );
         }
     }

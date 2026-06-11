@@ -9,7 +9,8 @@ allowed-tools: Bash, Read, Edit
 
 Two binaries: `hatel` (the receiver — `serve`, `report`, `init`, `service`, `doctor`, `kinds`,
 `emit`) and `hatel-hook` (wired into Claude Code lifecycle events; runs automatically — never
-invoke it by hand). The receiver runs locally; nothing leaves the machine.
+invoke it by hand). The receiver runs locally; by default nothing leaves the machine (opt-in
+export tees downstream — see Forwarding).
 
 Always check wiring with `hatel doctor` first when something looks off — it reports
 each gap honestly (it never fabricates a missing signal) and exits non-zero when the wiring is
@@ -72,6 +73,7 @@ hatel serve --all                          # live view; leave running to collect
 hatel report --window 30d --format json    # machine-readable rollup + cost snapshot
 hatel report --project <label> --format json
 hatel report --kind <name> --format json    # scope to one Kind (omits the cost snapshot)
+hatel report --kind <name> --filter field=value   # only records matching every --filter
 hatel report --top 0                        # all groups, not just the top N
 hatel kinds --json                          # every registered Kind and its fields
 ```
@@ -81,6 +83,13 @@ Reading a report: each Kind lists groups with a record count and the summed `mea
 `project`). For "which subagent costs most", the live `serve` view breaks tokens/cost down per
 subagent via `agent.name`. `report --project <label>` matches by the project's basename label
 and drops Kinds that carry no `project` field — don't present that as zero usage.
+
+`--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
+column shows; a redacted field is matched by its *original* value (the query is hashed exactly
+as the ledger stored it). A field outside the Kind's allow-list is a loud error, never an empty
+report. Retention is governed by `HATEL_RETENTION_DAYS` (default 90 days): the receiver prunes
+older ledger archives and cost rows, so a `--window` beyond the horizon shows only what is
+retained — say so rather than presenting it as low usage.
 
 ## Add a custom per-project metric
 
@@ -124,5 +133,6 @@ echo '{"check":"lint","runs":14000}' | hatel emit ci_check
 
 `emit` does **not** infer the project from its working directory (the emitter may run anywhere),
 so include attribution (`project`, a slug) as fields. A field the Kind doesn't accept is dropped
-*and warned to stderr* with the accepted list — surface that to the user rather than ignoring it.
+*and warned to stderr* with the accepted list (under `HATEL_STRICT=1` it is an error and nothing
+is written) — surface that to the user rather than ignoring it.
 See `plugins/example.toml` for a worked example.

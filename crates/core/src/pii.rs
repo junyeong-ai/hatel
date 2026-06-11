@@ -34,6 +34,13 @@ pub fn sanitize(spec: &KindSpec, payload: Payload, strict: bool) -> Result<Paylo
     Ok(out)
 }
 
+/// The stored form of a redacted field's value — exactly what `sanitize` writes for it.
+/// Query paths apply the same mapping, so a redacted field can be matched by its original
+/// value without that value ever touching the ledger.
+pub fn redacted(raw: &str) -> String {
+    hash_id(raw)
+}
+
 /// A short, stable, non-cryptographic correlation hash for an identifier.
 fn hash_id(raw: &str) -> String {
     let hex = blake3::hash(raw.as_bytes()).to_hex();

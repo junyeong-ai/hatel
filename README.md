@@ -158,12 +158,16 @@ mode = "raw"
 - **`projects`** / **`exclude_projects`** keep a destination from seeing some projects —
   an allow-list (forward only these) or an exclude-list (forward all but these), one or
   the other. An entry matches a project by its **label** (the git-root basename, e.g.
-  `aix-platform`) or its unique **key** (the absolute git-root path) — so two repos that
+  `my-app`) or its unique **key** (the absolute git-root path) — so two repos that
   share a basename are told apart by writing the path. The batch's project is joined from
   `session.id`, so this also needs an `http/json` stream; a batch whose project can't yet
   be resolved **fails closed** (it isn't forwarded to a filtered destination), so a
-  personal project never leaks to a corporate collector on a startup race. A destination
-  with neither key forwards every project.
+  personal project never leaks to a corporate collector on a startup race. A batch that
+  merely raced the session index (the session exists but isn't indexed *yet*) is parked
+  until **its own** session reaches the index — an unrelated session's arrival never costs
+  it anything — then forwarded; one whose session never appears (bounded to a few minutes)
+  is dropped for the filtered destination and counted to stderr. A destination with
+  neither key forwards every project.
 
 A/B is a per-destination transform, not two toggles: the same endpoint with both would
 double-count delta metrics, so a duplicate endpoint is rejected at load. Forwarding is
@@ -207,7 +211,7 @@ otherwise.
 | Command | Purpose |
 |---|---|
 | `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP receiver + live per-session rollup, with per-subagent token/cost breakdown when subagents run. |
-| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures` — plus the cost snapshot. `--format json` for dashboards; `--top 0` shows all groups; `--kind K` scopes the rollup to one registered Kind and omits the cost snapshot. |
+| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--filter f=v]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures` — plus the cost snapshot. `--format json` for dashboards; `--top 0` shows all groups; `--kind K` scopes the rollup to one registered Kind and omits the cost snapshot; `--filter field=value` (repeatable, needs `--kind`) keeps only records whose field equals the value — e.g. one spec's gate outcomes from a `spec` field; a redacted field is matched by its original value (hashed exactly as stored). |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire (or unwire) the telemetry env + lifecycle hooks in `settings.json` — idempotent, non-destructive, atomic. `--print` emits the block for managed settings. `--insert` captures an existing corporate endpoint as an export target and repoints Claude Code at hatel. |
 | `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service for gap-free collection (runs `serve --all`). `--print` emits the unit. |
 | `doctor` | verify the wiring and report policy gaps honestly (see below). |
@@ -248,7 +252,7 @@ field (an `emit` Kind that didn't include one), with no row rather than an error
 | `HATEL_CONFIG` | override the `config.toml` path (the `[[export]]` destinations) |
 | `HATEL_PLUGINS` | plugin TOML paths, OS path-list separator (`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
-| `HATEL_RETENTION_DAYS` | cost-snapshot retention horizon (default 90, max 100000) |
+| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, rotated ledger archives, SQLite rows (default 90, max 100000); the receiver sweeps daily, never the active ledger file |
 | `HATEL_DISABLED=1` | turn the hook into a no-op |
 | `HATEL_STRICT=1` | error (don't silently drop) on a payload key outside the allow-list |
 | `HATEL_TESTING=1` | redirect writes under a `_test/` subdirectory |

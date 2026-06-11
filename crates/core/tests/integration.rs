@@ -36,6 +36,17 @@ fn example_plugin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/example.toml")
 }
 
+/// An unrestricted query over everything since `since`, showing `top_n` groups per Kind.
+fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
+    report::Query {
+        since,
+        top_n,
+        project,
+        kind: None,
+        filters: &[],
+    }
+}
+
 /// A config rooted at an explicit dir, so a test can write a plugin file into it.
 fn config_in(dir: PathBuf, plugins: Vec<PathBuf>) -> Config {
     Config {
@@ -396,6 +407,189 @@ fn reports_read_active_and_rotated_archives() {
 }
 
 #[test]
+fn report_filter_restricts_to_matching_records() {
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    let rec = |tool: &str, ok: i64| {
+        serde_json::json!({
+            "ts": hatel_core::now_iso_utc(), "kind": "tool", "_schema_version": 1,
+            "payload": {"session_id": "S", "project": "p", "tool_name": tool,
+                        "duration_ms": 5, "ok": ok}
+        })
+        .to_string()
+    };
+    std::fs::write(
+        cfg.ledger_dir.join("tool.jsonl"),
+        format!(
+            "{}\n{}\n{}\n",
+            rec("Bash", 1),
+            rec("Bash", 0),
+            rec("Edit", 1)
+        ),
+    )
+    .unwrap();
+    // A string field filters to exactly its rows.
+    let filters = vec![("tool_name".to_string(), "Bash".to_string())];
+    let q = report::Query {
+        filters: &filters,
+        ..query(0, 0, None)
+    };
+    let groups = report::aggregate(&reg, &cfg, "tool", &q);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].key, "Bash");
+    assert_eq!(groups[0].count, 2);
+    // A numeric field matches its rendered form, and multiple filters AND-combine.
+    let filters = vec![
+        ("tool_name".to_string(), "Bash".to_string()),
+        ("ok".to_string(), "1".to_string()),
+    ];
+    let q = report::Query {
+        filters: &filters,
+        ..query(0, 0, None)
+    };
+    let groups = report::aggregate(&reg, &cfg, "tool", &q);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].count, 1, "both filters must match");
+    // A value matching nothing yields an empty report — not an error, not all rows.
+    let filters = vec![("tool_name".to_string(), "Nope".to_string())];
+    let q = report::Query {
+        filters: &filters,
+        ..query(0, 0, None)
+    };
+    assert!(report::aggregate(&reg, &cfg, "tool", &q).is_empty());
+}
+
+#[test]
+fn a_redacted_field_is_filterable_by_its_stored_form() {
+    // The write path hashes a redacted field; a query carrying the same hash (what the CLI's
+    // `--filter` computes from the original value) must match the stored record, while the raw
+    // value — which never reached the ledger — must match nothing.
+    let cfg = test_config(vec![example_plugin()]);
+    let reg = build_registry(&cfg).unwrap();
+    let mut payload = Payload::new();
+    payload.insert("check".into(), "lint".into());
+    payload.insert("actor".into(), "alice@example.com".into());
+    let env = make_envelope("ci_check", payload, &reg, false).unwrap();
+    let mut sink = hatel_core::build_sink(&cfg);
+    sink.write_record(&env);
+    sink.flush();
+    let stored = vec![(
+        "actor".to_string(),
+        hatel_core::pii::redacted("alice@example.com"),
+    )];
+    let q = report::Query {
+        filters: &stored,
+        ..query(0, 0, None)
+    };
+    let groups = report::aggregate(&reg, &cfg, "ci_check", &q);
+    assert_eq!(
+        groups.iter().map(|g| g.count).sum::<i64>(),
+        1,
+        "stored form matches the redacted record"
+    );
+    let raw = vec![("actor".to_string(), "alice@example.com".to_string())];
+    let q = report::Query {
+        filters: &raw,
+        ..query(0, 0, None)
+    };
+    assert!(
+        report::aggregate(&reg, &cfg, "ci_check", &q).is_empty(),
+        "the raw value never exists on disk, so it matches nothing"
+    );
+}
+
+#[test]
+fn retention_prunes_old_archives_but_never_the_active_ledger() {
+    let cfg = test_config(vec![]);
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    let active = cfg.ledger_dir.join("tool.jsonl");
+    let old_archive = cfg.ledger_dir.join("tool.jsonl.20240101");
+    let fresh_archive = cfg.ledger_dir.join("tool.jsonl.20990101");
+    std::fs::write(&active, format!("{}\n", line("A"))).unwrap();
+    std::fs::write(&old_archive, format!("{}\n", line("B"))).unwrap();
+    std::fs::write(&fresh_archive, format!("{}\n", line("C"))).unwrap();
+    // Age the active ledger AND one archive past the horizon: only the archive may go —
+    // the active file is never pruned, whatever its age.
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);
+    for p in [&active, &old_archive] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let cutoff = hatel_core::now_epoch() - 90 * 86_400;
+    let removed = hatel_core::sink::prune_before(&cfg, cutoff);
+    assert_eq!(removed, 1, "exactly the aged archive is removed");
+    assert!(active.exists(), "the active ledger is never pruned");
+    assert!(!old_archive.exists(), "the aged archive is gone");
+    assert!(fresh_archive.exists(), "a fresh archive is kept");
+}
+
+#[test]
+fn retention_never_prunes_an_active_ledger_for_a_dotted_kind_name() {
+    // Kind names may contain dots (the charset allows them), so a Kind named `foo.jsonl` has
+    // the active file `foo.jsonl.jsonl` — which contains `.jsonl.` but, like every active
+    // ledger, ENDS with `.jsonl`. The sweep must spare it however old it is, while that same
+    // Kind's archives are still prunable.
+    let cfg = test_config(vec![]);
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    let dotted_active = cfg.ledger_dir.join("foo.jsonl.jsonl");
+    let dotted_archive = cfg.ledger_dir.join("foo.jsonl.jsonl.20240101");
+    std::fs::write(&dotted_active, format!("{}\n", line("A"))).unwrap();
+    std::fs::write(&dotted_archive, format!("{}\n", line("B"))).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);
+    for p in [&dotted_active, &dotted_archive] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+    let cutoff = hatel_core::now_epoch() - 90 * 86_400;
+    assert_eq!(hatel_core::sink::prune_before(&cfg, cutoff), 1);
+    assert!(dotted_active.exists(), "dotted-Kind active ledger spared");
+    assert!(!dotted_archive.exists(), "its aged archive is pruned");
+}
+
+#[test]
+fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
+    let dir = temp_dir();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.clone(), vec![])
+    };
+    // A current row through the real write path…
+    let reg = load_core().unwrap();
+    let mut payload = Payload::new();
+    payload.insert("tool_name".into(), "Bash".into());
+    let env = make_envelope("tool", payload, &reg, false).unwrap();
+    let mut sink = hatel_core::build_sink(&cfg);
+    sink.write_record(&env);
+    sink.flush();
+    // …and an ancient row inserted directly.
+    {
+        let conn = rusqlite::Connection::open(dir.join("telemetry.db")).unwrap();
+        conn.execute(
+            "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1,'tool',1,'{}')",
+            ["2000-01-01T00:00:00Z"],
+        )
+        .unwrap();
+    }
+    let cutoff = hatel_core::now_epoch() - 86_400;
+    assert_eq!(
+        hatel_core::sink::prune_before(&cfg, cutoff),
+        1,
+        "exactly the ancient row is deleted"
+    );
+    let rows = hatel_core::sink::read_records(&cfg, "tool", None);
+    assert_eq!(rows.len(), 1, "the in-window row remains");
+}
+
+#[test]
 fn cost_snapshot_merges_by_session() {
     use hatel_core::cost::{self, CostRow};
     let cfg = test_config(vec![]);
@@ -572,7 +766,7 @@ fn report_sums_measures_and_coerces_numeric_strings() {
         ),
     )
     .unwrap();
-    let groups = report::aggregate(&reg, &cfg, "ci_check", 0, 5, None);
+    let groups = report::aggregate(&reg, &cfg, "ci_check", &query(0, 5, None));
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key, "lint");
     assert_eq!(groups[0].count, 2);
@@ -606,7 +800,7 @@ fn report_filters_by_project() {
     )
     .unwrap();
     let total = |p: Option<&str>| -> i64 {
-        report::aggregate(&reg, &cfg, "tool", 0, 5, p)
+        report::aggregate(&reg, &cfg, "tool", &query(0, 5, p))
             .iter()
             .map(|g| g.count)
             .sum()
@@ -700,7 +894,7 @@ fn measures_reject_non_finite_values() {
         ),
     )
     .unwrap();
-    let groups = report::aggregate(&reg, &cfg, "ci_check", 0, 5, None);
+    let groups = report::aggregate(&reg, &cfg, "ci_check", &query(0, 5, None));
     assert_eq!(groups[0].sums[0].sum, 50.0, "inf rejected, only 50 summed");
 }
 
@@ -806,7 +1000,7 @@ fn sqlite_sink_round_trips_through_report() {
         recs[0].payload.get("prompt_len").and_then(|v| v.as_i64()),
         Some(2)
     );
-    let groups = report::aggregate(&reg, &cfg, "prompt", 0, 5, None);
+    let groups = report::aggregate(&reg, &cfg, "prompt", &query(0, 5, None));
     assert_eq!(
         groups.iter().map(|g| g.count).sum::<i64>(),
         1,
@@ -832,12 +1026,12 @@ fn top_zero_means_all_groups() {
         .collect();
     std::fs::write(cfg.ledger_dir.join("tool.jsonl"), body).unwrap();
     assert_eq!(
-        report::aggregate(&reg, &cfg, "tool", 0, 3, None).len(),
+        report::aggregate(&reg, &cfg, "tool", &query(0, 3, None)).len(),
         3,
         "capped at 3"
     );
     assert_eq!(
-        report::aggregate(&reg, &cfg, "tool", 0, 0, None).len(),
+        report::aggregate(&reg, &cfg, "tool", &query(0, 0, None)).len(),
         6,
         "0 = all 6"
     );

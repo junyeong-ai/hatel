@@ -20,3 +20,8 @@ tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+# `start_paused` (a virtual clock) for deterministic tests of time-driven paths — the
+# export worker's park-timeout wakeup — without real sleeps.
+tokio = { workspace = true, features = ["test-util"] }

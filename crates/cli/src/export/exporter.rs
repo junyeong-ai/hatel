@@ -27,6 +27,18 @@ const EXPORT_QUEUE_CAP: usize = 1024;
 const MAX_QUEUED_BYTES: usize = 256 * 1024 * 1024;
 /// Per-request timeout when a target doesn't set one.
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+/// Cap on bodies parked awaiting a session-index catch-up (see `Deferred`). Their bytes stay
+/// reserved in `queued_bytes`, so memory is doubly bounded; `DEFER_TIMEOUT` bounds how long a
+/// slot can stay held, so a never-indexed session can't monopolize the park list.
+const MAX_DEFERRED: usize = 64;
+/// How long a deferred body waits for *its own* sessions to reach the index before it is dropped
+/// for the filtered destinations. The race it absorbs (an OTLP batch beating the SessionStart
+/// hook's index append) resolves in seconds; minutes is generous, and past that the session is
+/// evidently never going to be indexed (it predates the wiring). The receiver's ledger absorbs
+/// the same race with `serve::MAX_TOOL_DEFERRALS` — cycle-counted because its flush loop has a
+/// fixed cadence, and fail-open because local data outranks attribution; here egress privacy
+/// outranks delivery, so an unresolved body fails closed.
+const DEFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Cap on establishing the TCP/TLS connection, so a downstream that accepts the socket but never
 /// responds can't pin the drain task past this.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -143,6 +155,45 @@ impl Exporter {
     }
 }
 
+/// Resolution of a batch's project set, for project-filtered destinations.
+#[derive(Debug)]
+enum BatchProjects {
+    /// Every `session.id` in the body resolved to a project.
+    Resolved(BTreeSet<(String, String)>),
+    /// The body carries session ids but the listed ones aren't in the index yet — the
+    /// SessionStart hook's index append may simply not have landed, so the batch is worth
+    /// parking until *those* sessions appear rather than dropping it forever.
+    Unindexed(BTreeSet<String>),
+    /// Structurally unattributable — not JSON, or no `session.id` anywhere. No index catch-up
+    /// can resolve it, so a filtered destination fails closed immediately.
+    Unattributable,
+}
+
+/// One body parked because a `session.id` it carries wasn't in the index yet. Its bytes stay
+/// reserved in `queued_bytes` until it is finally forwarded or dropped.
+struct Deferred {
+    out: Outbound,
+    /// The session ids that failed to resolve at deferral time. The body is forwarded once ALL
+    /// of them have reached the index — an unrelated session's append releases nothing — and is
+    /// dropped (fail closed, counted) once `DEFER_TIMEOUT` passes without them, or on the
+    /// shutdown pass.
+    missing: BTreeSet<String>,
+    /// On tokio's clock, so the run loop can sleep precisely until the earliest deadline and
+    /// tests can drive the timeout deterministically with a paused clock.
+    deferred_at: tokio::time::Instant,
+}
+
+/// Which destinations a forwarding pass addresses. A fresh, fully-resolved body goes to every
+/// target (`All`); a body parked while its session was unindexed reaches the unfiltered targets
+/// immediately (`UnfilteredOnly`) and its retry then addresses only the filtered ones
+/// (`FilteredOnly`) — so no target ever receives the same body twice.
+#[derive(Clone, Copy)]
+enum TargetSet {
+    All,
+    UnfilteredOnly,
+    FilteredOnly,
+}
+
 struct Worker {
     targets: Vec<ExportTarget>,
     client: reqwest::Client,
@@ -154,6 +205,12 @@ struct Worker {
     /// Endpoints whose enrich-skip has already been logged, so a steady non-JSON stream warns once
     /// per destination rather than once per batch.
     enrich_skip_warned: HashSet<String>,
+    /// Bodies awaiting their sessions' index arrival before the filtered targets can have them —
+    /// each forwarded once its `missing` set resolves, or dropped at its deadline (see `Deferred`).
+    deferred: Vec<Deferred>,
+    /// Batches dropped for the filtered destination(s) because their session never appeared in
+    /// the index — surfaced to stderr like the queue's drop accounting.
+    unresolved_dropped: u64,
 }
 
 impl Worker {
@@ -174,57 +231,173 @@ impl Worker {
             queued_bytes,
             index_needed,
             enrich_skip_warned: HashSet::new(),
+            deferred: Vec::new(),
+            unresolved_dropped: 0,
         }
     }
 
     async fn run(mut self, mut rx: mpsc::Receiver<Outbound>, shutdown: Arc<Notify>) {
         loop {
+            // Wake at the earliest park deadline even with no inbound traffic — a timed-out
+            // parked body's reserved bytes must not hold the queue budget hostage on an idle
+            // stream. No deadline (nothing parked) sleeps forever; no polling either way.
+            let deadline = self
+                .deferred
+                .iter()
+                .map(|d| d.deferred_at + DEFER_TIMEOUT)
+                .min();
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Some(out) => self.handle(out).await,
                     None => break, // all senders dropped
                 },
                 _ = shutdown.notified() => break,
+                _ = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if self.index_needed {
+                        self.index.refresh();
+                    }
+                    self.retry_deferred(false).await;
+                }
             }
         }
         // Drain whatever is already queued before exiting (the caller bounds total time).
         while let Ok(out) = rx.try_recv() {
             self.handle(out).await;
         }
+        // Final disposition for parked bodies: one last look at the index, then forward or fail
+        // closed — nothing stays parked past shutdown.
+        if self.index_needed {
+            self.index.refresh();
+        }
+        self.retry_deferred(true).await;
     }
 
-    /// Forward one queued body, then release its bytes from the memory accounting.
+    /// Process one queued body: refresh the index, retry anything parked against an older index,
+    /// then forward this body — parking it instead when a filtered destination needs a project the
+    /// index doesn't know *yet*. Bytes are released only on final disposition (forwarded/dropped),
+    /// never while parked, so the queue's memory ceiling stays a hard bound.
     async fn handle(&mut self, out: Outbound) {
-        let len = out.body.len();
-        self.forward(out).await;
-        self.queued_bytes.fetch_sub(len, Ordering::Relaxed);
-    }
-
-    async fn forward(&mut self, out: Outbound) {
         // Refresh the session→project map only when something actually enriches or filters, and
         // only when the index file changed since last load (mtime-gated) — no per-batch file read,
         // no read storm on a session that never appears in the index.
         if self.index_needed {
             self.index.refresh();
         }
-        // Resolve the batch's project(s) once, for the destinations that filter by project. `Some`
-        // only when every session.id in the body is known; `None` when the project can't be fully
-        // determined (a session is unknown, the body carries none, or it isn't JSON) — a filtered
-        // destination then fails closed, never leaking an unattributable batch.
-        let batch_projects = self
-            .targets
-            .iter()
-            .any(|t| t.filter.is_filtered())
-            .then(|| self.resolve_batch_projects(&out.body, out.signal))
-            .flatten();
+        self.retry_deferred(false).await;
+        if !self.targets.iter().any(|t| t.filter.is_filtered()) {
+            self.forward(&out, TargetSet::All, None).await;
+            self.release(&out);
+            return;
+        }
+        match self.resolve_batch_projects(&out.body, out.signal) {
+            BatchProjects::Resolved(projects) => {
+                self.forward(&out, TargetSet::All, Some(&projects)).await;
+                self.release(&out);
+            }
+            BatchProjects::Unindexed(missing) if self.deferred.len() < MAX_DEFERRED => {
+                // The OTLP batch raced the SessionStart hook's index append. The unfiltered
+                // targets get the body now; the filtered pass is parked until the missing
+                // sessions reach the index, instead of being dropped forever.
+                self.forward(&out, TargetSet::UnfilteredOnly, None).await;
+                self.deferred.push(Deferred {
+                    out,
+                    missing,
+                    deferred_at: tokio::time::Instant::now(),
+                });
+            }
+            BatchProjects::Unindexed(_) => {
+                // Park list full — fail closed for the filtered targets, visibly.
+                self.forward(&out, TargetSet::UnfilteredOnly, None).await;
+                self.record_unresolved_drop();
+                self.release(&out);
+            }
+            BatchProjects::Unattributable => {
+                // Not JSON, or no session.id anywhere — no index catch-up can change that, so the
+                // filtered targets fail closed now (`doctor` explains a wrong-protocol setup).
+                self.forward(&out, TargetSet::UnfilteredOnly, None).await;
+                self.release(&out);
+            }
+        }
+    }
+
+    /// Dispose of parked bodies whose wait is over. A body is resolved and forwarded once ALL of
+    /// its missing sessions have reached the index — an unrelated session's append never burns
+    /// its chance — and is dropped for the filtered targets (fail closed, counted) once
+    /// `DEFER_TIMEOUT` passes without them, or unconditionally on the shutdown `final_pass`.
+    /// Everything else stays parked, bytes still reserved.
+    async fn retry_deferred(&mut self, final_pass: bool) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        for d in std::mem::take(&mut self.deferred) {
+            let ready = d.missing.iter().all(|sid| self.index.contains(sid));
+            if !final_pass && !ready && d.deferred_at.elapsed() < DEFER_TIMEOUT {
+                self.deferred.push(d);
+                continue;
+            }
+            match self.resolve_batch_projects(&d.out.body, d.out.signal) {
+                BatchProjects::Resolved(projects) => {
+                    self.forward(&d.out, TargetSet::FilteredOnly, Some(&projects))
+                        .await;
+                }
+                _ => self.record_unresolved_drop(),
+            }
+            self.release(&d.out);
+        }
+    }
+
+    /// Release a body's bytes from the queue's memory accounting — called exactly once per body,
+    /// at its final disposition.
+    fn release(&self, out: &Outbound) {
+        self.queued_bytes
+            .fetch_sub(out.body.len(), Ordering::Relaxed);
+    }
+
+    /// Count a batch the filtered destination(s) never received because its session never made it
+    /// into the index; log the first and then once per `DROP_LOG_EVERY` (mirrors `record_drop`).
+    fn record_unresolved_drop(&mut self) {
+        let before = self.unresolved_dropped;
+        self.unresolved_dropped += 1;
+        if before == 0 || before / DROP_LOG_EVERY != self.unresolved_dropped / DROP_LOG_EVERY {
+            eprintln!(
+                "hatel: {} batch(es) so far had no indexed session — dropped for the \
+                 project-filtered destination(s) (fail closed)",
+                self.unresolved_dropped
+            );
+        }
+    }
+
+    /// Forward one body to the destinations selected by `set`. `projects` is the batch's resolved
+    /// project set; a filtered destination forwards only when every project passes its filter and
+    /// fails closed when the set is absent.
+    async fn forward(
+        &mut self,
+        out: &Outbound,
+        set: TargetSet,
+        projects: Option<&BTreeSet<(String, String)>>,
+    ) {
         // Disjoint field borrows: the loop reads targets/client/index and mutates the warned set.
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
         let warned = &mut self.enrich_skip_warned;
         for target in targets {
-            if target.filter.is_filtered() {
-                let allowed = batch_projects.as_ref().is_some_and(|ps| {
+            let filtered = target.filter.is_filtered();
+            let addressed = match set {
+                TargetSet::All => true,
+                TargetSet::UnfilteredOnly => !filtered,
+                TargetSet::FilteredOnly => filtered,
+            };
+            if !addressed {
+                continue;
+            }
+            if filtered {
+                let allowed = projects.is_some_and(|ps| {
                     ps.iter()
                         .all(|(label, key)| target.filter.allows(label, key))
                 });
@@ -295,27 +468,37 @@ impl Worker {
     }
 
     /// The `(label, key)` of every project a batch belongs to, for project-filtered destinations.
-    /// `None` when the batch can't be attributed — it isn't JSON, carries no `session.id` at all, or
-    /// one of its `session.id`s isn't yet in the index — so a filtered destination fails closed
-    /// rather than forward an unattributable (possibly out-of-scope) batch. Self-heals: the next
-    /// batch after the index catches up resolves and forwards. Resolution is over the `session.id`s
-    /// actually present; in practice every Claude Code datapoint carries one and a single export
-    /// body is a single session, so the set is one project the filter then accepts or rejects.
-    fn resolve_batch_projects(
-        &self,
-        body: &[u8],
-        signal: OtlpSignal,
-    ) -> Option<BTreeSet<(String, String)>> {
-        let ids = session_ids(body, matches!(signal, OtlpSignal::Metrics))?;
+    /// `Resolved` only when every `session.id` in the body is known; the two failure shapes are
+    /// kept distinct because they behave differently — `Unindexed` (sessions not in the index
+    /// *yet*, all of them listed) earns a park until those sessions appear, while
+    /// `Unattributable` (not JSON, or no `session.id` at all) fails closed immediately.
+    /// Resolution is over the `session.id`s actually present; in practice every Claude Code
+    /// datapoint carries one and a single export body is a single session, so the set is one
+    /// project the filter then accepts or rejects.
+    fn resolve_batch_projects(&self, body: &[u8], signal: OtlpSignal) -> BatchProjects {
+        let Some(ids) = session_ids(body, matches!(signal, OtlpSignal::Metrics)) else {
+            return BatchProjects::Unattributable;
+        };
         if ids.is_empty() {
-            return None;
+            return BatchProjects::Unattributable;
         }
         let mut projects = BTreeSet::new();
-        for sid in &ids {
-            let (label, key) = self.index.project(sid)?; // any unknown session → None (fail closed)
-            projects.insert((label.to_string(), key.to_string()));
+        let mut missing = BTreeSet::new();
+        for sid in ids {
+            match self.index.project(&sid) {
+                Some((label, key)) => {
+                    projects.insert((label.to_string(), key.to_string()));
+                }
+                None => {
+                    missing.insert(sid);
+                }
+            }
         }
-        Some(projects)
+        if missing.is_empty() {
+            BatchProjects::Resolved(projects)
+        } else {
+            BatchProjects::Unindexed(missing)
+        }
     }
 }
 
@@ -337,6 +520,12 @@ impl IndexCache {
             mtime: None,
             map: HashMap::new(),
         }
+    }
+
+    /// Whether a session is in the index — the cheap readiness probe parked bodies use before
+    /// spending a full re-resolution.
+    fn contains(&self, session_id: &str) -> bool {
+        self.map.contains_key(session_id)
     }
 
     fn index_path(&self) -> PathBuf {
@@ -395,6 +584,43 @@ impl IndexCache {
 mod tests {
     use super::*;
 
+    /// A scratch state dir unique to this test (pid-scoped, tag-disambiguated).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ht-export-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A stub downstream OTLP collector on a loopback port, recording every body it receives.
+    async fn stub_collector() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::routing::post;
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/v1/metrics",
+            post({
+                let received = received.clone();
+                move |body: Bytes| {
+                    let received = received.clone();
+                    async move {
+                        received.lock().unwrap().push(body.to_vec());
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, received, server)
+    }
+
     #[test]
     fn enqueue_never_blocks_and_counts_drops_past_capacity() {
         // A receiver whose worker never drains: try_send fills the channel, then every further
@@ -420,8 +646,7 @@ mod tests {
         // A non-empty index that yields no labelled rows is treated as a transient read race — the
         // prior good labels are kept rather than clobbered with an empty snapshot. (Distinct from a
         // removed file, which clears; see the test above.)
-        let dir = std::env::temp_dir().join(format!("ht-idxkeep-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("idxkeep");
         let path = dir.join("session_index.jsonl");
         std::fs::write(
             &path,
@@ -450,8 +675,7 @@ mod tests {
 
     #[test]
     fn index_cache_drops_stale_map_when_index_is_removed() {
-        let dir = std::env::temp_dir().join(format!("ht-idxdel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("idxdel");
         let path = dir.join("session_index.jsonl");
         std::fs::write(
             &path,
@@ -474,8 +698,7 @@ mod tests {
 
     #[test]
     fn index_cache_reloads_only_when_mtime_advances() {
-        let dir = std::env::temp_dir().join(format!("ht-idxcache-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("idxcache");
         let path = dir.join("session_index.jsonl");
         let line = |sid: &str, label: &str| {
             format!(
@@ -513,8 +736,7 @@ mod tests {
 
     #[test]
     fn batch_projects_resolves_known_and_fails_closed_on_unknown() {
-        let dir = std::env::temp_dir().join(format!("ht-filter-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("filter");
         std::fs::write(
             dir.join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
@@ -533,24 +755,28 @@ mod tests {
             .unwrap()
         };
         // Known session → its (label, key); the allow/exclude decision is then plain set logic.
-        let known = worker.resolve_batch_projects(&body("S1"), OtlpSignal::Metrics);
-        assert_eq!(
-            known,
-            Some(BTreeSet::from([(
-                "alpha".to_string(),
-                "/k/alpha".to_string()
-            )]))
-        );
-        // Unknown session, no session.id, and non-JSON all fail closed (None).
-        assert_eq!(
-            worker.resolve_batch_projects(&body("GHOST"), OtlpSignal::Metrics),
-            None,
-            "unknown session fails closed"
-        );
-        assert_eq!(
-            worker.resolve_batch_projects(b"\x00proto", OtlpSignal::Metrics),
-            None,
-            "non-JSON fails closed"
+        match worker.resolve_batch_projects(&body("S1"), OtlpSignal::Metrics) {
+            BatchProjects::Resolved(p) => assert_eq!(
+                p,
+                BTreeSet::from([("alpha".to_string(), "/k/alpha".to_string())])
+            ),
+            other => panic!("known session should resolve, got {other:?}"),
+        }
+        // An unknown-but-plausible session is `Unindexed` carrying exactly the missing ids; a
+        // body with no session.id at all, or a non-JSON body, is `Unattributable` (fails closed
+        // immediately).
+        match worker.resolve_batch_projects(&body("GHOST"), OtlpSignal::Metrics) {
+            BatchProjects::Unindexed(missing) => {
+                assert_eq!(missing, BTreeSet::from(["GHOST".to_string()]))
+            }
+            other => panic!("unknown session is unindexed (parkable), got {other:?}"),
+        }
+        assert!(
+            matches!(
+                worker.resolve_batch_projects(b"\x00proto", OtlpSignal::Metrics),
+                BatchProjects::Unattributable
+            ),
+            "non-JSON is unattributable (never retried)"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -560,8 +786,7 @@ mod tests {
         // A batch spanning two sessions resolves to both projects; an allow-list missing one of
         // them rejects the whole batch (fail closed), so a disallowed session can never ride along
         // with an allowed one.
-        let dir = std::env::temp_dir().join(format!("ht-mixed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("mixed");
         std::fs::write(
             dir.join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n\
@@ -577,9 +802,10 @@ mod tests {
             ]}}]}]}]
         }))
         .unwrap();
-        let projects = worker
-            .resolve_batch_projects(&body, OtlpSignal::Metrics)
-            .unwrap();
+        let projects = match worker.resolve_batch_projects(&body, OtlpSignal::Metrics) {
+            BatchProjects::Resolved(p) => p,
+            other => panic!("both sessions are indexed, got {other:?}"),
+        };
         assert_eq!(projects.len(), 2, "both sessions resolved");
         let only_alpha =
             hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect());
@@ -593,6 +819,210 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A metrics body carrying one datapoint for `sid`.
+    fn metrics_body(sid: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
+                "name": "claude_code.token.usage",
+                "sum": { "aggregationTemporality": 1, "dataPoints": [{
+                    "attributes": [{ "key": "session.id", "value": { "stringValue": sid } }],
+                    "asInt": "10"
+                }]}
+            }]}]}]
+        }))
+        .unwrap()
+    }
+
+    fn outbound(body: Vec<u8>) -> Outbound {
+        Outbound {
+            signal: OtlpSignal::Metrics,
+            body: Bytes::from(body),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unindexed_batch_is_parked_then_forwarded_after_the_index_catches_up() {
+        let (addr, received, server) = stub_collector().await;
+        let dir = scratch("park");
+        let target = ExportTarget {
+            endpoint: format!("http://{addr}"),
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(2_000),
+        };
+        let qb = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+
+        // The batch arrives before the SessionStart hook indexed S1 — it must be parked for the
+        // filtered destination, not dropped.
+        let first = metrics_body("S1");
+        qb.fetch_add(first.len(), Ordering::Relaxed);
+        worker.handle(outbound(first)).await;
+        assert_eq!(worker.deferred.len(), 1, "unindexed batch parked");
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "nothing forwarded while unresolved"
+        );
+
+        // The SessionStart hook lands; the next batch triggers the parked retry.
+        let path = dir.join("session_index.jsonl");
+        std::fs::write(
+            &path,
+            "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
+        )
+        .unwrap();
+        filetime_bump(&path);
+        let second = metrics_body("S1");
+        qb.fetch_add(second.len(), Ordering::Relaxed);
+        worker.handle(outbound(second)).await;
+
+        assert!(worker.deferred.is_empty(), "parked batch disposed");
+        assert_eq!(
+            received.lock().unwrap().len(),
+            2,
+            "the parked batch AND the fresh batch both reached the filtered destination"
+        );
+        assert_eq!(
+            qb.load(Ordering::Relaxed),
+            0,
+            "all bytes released at disposition"
+        );
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_session_append_does_not_burn_a_parked_body() {
+        let (addr, received, server) = stub_collector().await;
+        let dir = scratch("unrelated");
+        let allow: std::collections::BTreeSet<String> =
+            ["alpha".to_string(), "beta".to_string()].into();
+        let target = ExportTarget {
+            endpoint: format!("http://{addr}"),
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::Only(allow),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(2_000),
+        };
+        let qb = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let reserve = |body: Vec<u8>| {
+            qb.fetch_add(body.len(), Ordering::Relaxed);
+            outbound(body)
+        };
+
+        // RACER's batch beats its SessionStart append — parked.
+        worker.handle(reserve(metrics_body("RACER"))).await;
+        assert_eq!(worker.deferred.len(), 1);
+
+        // An UNRELATED session (OTHER) reaches the index first. Its batch forwards, but the
+        // parked RACER body must STAY parked — an unrelated append must not burn its chance.
+        let path = dir.join("session_index.jsonl");
+        let other =
+            "{\"session_id\":\"OTHER\",\"project_key\":\"/k/beta\",\"project_label\":\"beta\"}\n";
+        std::fs::write(&path, other).unwrap();
+        filetime_bump(&path);
+        worker.handle(reserve(metrics_body("OTHER"))).await;
+        assert_eq!(received.lock().unwrap().len(), 1, "OTHER forwarded");
+        assert_eq!(
+            worker.deferred.len(),
+            1,
+            "RACER still parked after an unrelated index advance"
+        );
+        assert_eq!(worker.unresolved_dropped, 0, "nothing dropped");
+
+        // RACER's own append lands — the next batch flushes the parked body.
+        std::fs::write(
+            &path,
+            format!(
+                "{other}{}",
+                "{\"session_id\":\"RACER\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n"
+            ),
+        )
+        .unwrap();
+        filetime_bump(&path);
+        worker.handle(reserve(metrics_body("OTHER"))).await;
+        assert!(worker.deferred.is_empty(), "RACER disposed");
+        assert_eq!(
+            received.lock().unwrap().len(),
+            3,
+            "parked RACER and both OTHER batches all delivered"
+        );
+        assert_eq!(qb.load(Ordering::Relaxed), 0, "all bytes released");
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_worker_purges_timed_out_parked_bodies_by_itself() {
+        // No traffic after the park and no shutdown: the run loop's deadline arm alone must
+        // wake, fail the body closed, and release its reserved bytes — parked bodies can never
+        // hold the queue budget hostage on an idle stream. (Paused clock: sleeps auto-advance.)
+        let dir = scratch("idle");
+        let target = ExportTarget {
+            endpoint: "http://127.0.0.1:9".to_string(), // never contacted
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(500),
+        };
+        let (exporter, handle) = Exporter::spawn(vec![target], dir.clone());
+        exporter.enqueue(
+            OtlpSignal::Metrics,
+            Bytes::from(metrics_body("GHOST")),
+            None,
+            None,
+        );
+        assert!(
+            exporter.queued_bytes.load(Ordering::Relaxed) > 0,
+            "bytes reserved on enqueue"
+        );
+        // Cross the deadline; then poll briefly for the worker's own wakeup to release.
+        tokio::time::sleep(DEFER_TIMEOUT + Duration::from_secs(2)).await;
+        let mut released = false;
+        for _ in 0..50 {
+            if exporter.queued_bytes.load(Ordering::Relaxed) == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(released, "idle worker released the timed-out parked bytes");
+        exporter.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parked_batches_fail_closed_at_shutdown_when_never_indexed() {
+        let dir = scratch("parkdrop");
+        // The endpoint is never contacted: an unresolved batch is dropped, not forwarded.
+        let target = ExportTarget {
+            endpoint: "http://127.0.0.1:9".to_string(),
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(500),
+        };
+        let qb = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let body = metrics_body("GHOST");
+        qb.fetch_add(body.len(), Ordering::Relaxed);
+        worker.handle(outbound(body)).await;
+        assert_eq!(worker.deferred.len(), 1, "parked while plausibly racing");
+
+        // Shutdown pass: the session never appeared — fail closed, count it, release the bytes.
+        worker.index.refresh();
+        worker.retry_deferred(true).await;
+        assert!(worker.deferred.is_empty(), "nothing stays parked");
+        assert_eq!(worker.unresolved_dropped, 1, "the drop is counted");
+        assert_eq!(qb.load(Ordering::Relaxed), 0, "bytes released");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // End-to-end: a real receiver→exporter→downstream hop. Spins a stub OTLP collector on a
     // loopback port, forwards an enriched metrics batch, and asserts the downstream received the
     // body with `project` injected (transform + queue + HTTP client all exercised together).
@@ -602,8 +1032,7 @@ mod tests {
         use axum::routing::post;
         use tokio::sync::oneshot;
 
-        let dir = std::env::temp_dir().join(format!("ht-export-e2e-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch("e2e");
         std::fs::write(
             dir.join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",

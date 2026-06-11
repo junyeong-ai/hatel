@@ -41,35 +41,58 @@ pub struct GroupAgg {
     pub sums: Vec<Measure>,
 }
 
-/// Aggregate one Kind from `since` (an epoch-second cutoff) to now: group by `group_key`,
-/// count records, and sum each measure. Optionally restricted to one `project`. Records
-/// are read from the configured storage backend (JSONL / SQLite). The caller computes a
-/// single `since` so every Kind AND the cost section share one window boundary. Groups are
-/// ranked by the first measure's sum (the primary metric) when the Kind declares measures,
-/// otherwise by record count, then by key; capped at `top_n`.
-pub fn aggregate(
-    reg: &Registry,
-    cfg: &Config,
-    kind: &str,
-    since: i64,
-    top_n: usize,
-    project: Option<&str>,
-) -> Vec<GroupAgg> {
+/// One report query: the window boundary plus every user restriction, carried as a unit
+/// through all output formats so they cannot disagree on what is in scope.
+#[derive(Debug, Clone, Copy)]
+pub struct Query<'a> {
+    /// Epoch-second lower bound (the rolling window's start). The caller computes it once
+    /// so every Kind AND the cost section share one boundary.
+    pub since: i64,
+    /// Groups shown per Kind (0 = all).
+    pub top_n: usize,
+    /// Restrict to one project (its label).
+    pub project: Option<&'a str>,
+    /// Restrict to one registered Kind.
+    pub kind: Option<&'a str>,
+    /// `(field, value)` exact-match restrictions — a record counts only when every pair
+    /// matches. Values compare against the same rendering the group-key column shows, so
+    /// what a report displays is exactly what can be filtered on.
+    pub filters: &'a [(String, String)],
+}
+
+/// Aggregate one Kind under `q`: group in-window records by `group_key`, count them, and
+/// sum each declared measure. Records are read from the configured storage backend
+/// (JSONL / SQLite). Groups are ranked by the first measure's sum (the primary metric)
+/// when the Kind declares measures, otherwise by record count, then by key; capped at
+/// `q.top_n`.
+///
+/// `kind` is the Kind being aggregated right now (the caller's loop variable); `q.kind` is
+/// the report-level restriction the caller applies when choosing which Kinds to loop over,
+/// and is not consulted here.
+pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<GroupAgg> {
     let Some(spec) = reg.kind(kind) else {
         return Vec::new();
     };
     let mut groups: BTreeMap<String, (i64, Vec<f64>)> = BTreeMap::new();
     // `since` lets the backend skip out-of-window history (SQLite); the exact filter
     // below is the correctness gate (and does the windowing for JSONL).
-    for env in sink::read_records(cfg, kind, Some(since)) {
+    for env in sink::read_records(cfg, kind, Some(q.since)) {
         // A record with an unparseable timestamp is dropped (not silently bucketed at
         // epoch 0, which would flip between always-in and always-out by window size).
         match ts_epoch(&env.ts) {
-            Some(ts) if ts >= since => {}
+            Some(ts) if ts >= q.since => {}
             _ => continue,
         }
-        if let Some(p) = project
+        if let Some(p) = q.project
             && env.payload.get("project").and_then(|v| v.as_str()) != Some(p)
+        {
+            continue;
+        }
+        // `--filter field=value`: a record lacking the field never matches.
+        if !q
+            .filters
+            .iter()
+            .all(|(field, want)| env.payload.get(field).map(value_label).as_deref() == Some(want))
         {
             continue;
         }
@@ -107,8 +130,8 @@ pub fn aggregate(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.key.cmp(&b.key))
     });
-    if top_n > 0 {
-        rows.truncate(top_n);
+    if q.top_n > 0 {
+        rows.truncate(q.top_n);
     }
     rows
 }
@@ -131,4 +154,3 @@ fn numeric(v: &serde_json::Value) -> f64 {
         .filter(|n| n.is_finite())
         .unwrap_or(0.0)
 }
-

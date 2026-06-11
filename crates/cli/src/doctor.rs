@@ -13,12 +13,18 @@ use crate::claude_settings as cs;
 /// A resolved entry from the merged settings `env`: `&(value, source-scope)`.
 type EnvEntry<'a> = &'a (String, &'static str);
 
+/// Window for the dormant-binding note: a wired binding with no records while sessions HAVE
+/// been starting is worth pointing out (the upstream event may have been renamed, or its payload
+/// reshaped — both fail silently otherwise).
+const DORMANT_WINDOW_DAYS: i64 = 7;
+
 pub fn run() -> i32 {
     let files = cs::scope_files();
     let env = cs::effective_env(&files);
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
     // them from the registry rather than the full vocabulary — coverage is judged against these.
     let events = cs::active_events_default();
+    let cfg = Config::load();
     let mut ok = true;
 
     println!("hatel doctor\n");
@@ -47,10 +53,10 @@ pub fn run() -> i32 {
 
     println!("hooks:");
     ok &= report_hooks(&files, &events);
+    advise_dormant_bindings(&files, &events, &cfg);
     println!();
 
     println!("storage:");
-    let cfg = Config::load();
     match writable(&cfg.state_dir) {
         Ok(()) => println!("  ✓ state dir writable: {}", cfg.state_dir.display()),
         Err(e) => {
@@ -147,6 +153,50 @@ fn report_hooks(files: &[cs::ScopeFile], events: &[&'static str]) -> bool {
     ok
 }
 
+/// Informational only, never a failure: a wired, hook-bound Kind that produced no records in the
+/// recent window, while sessions HAVE been starting (the index advanced). Both readings are
+/// stated because both are real — a rare event (PreCompact can stay quiet for weeks) and a
+/// silently dead binding (Claude Code renamed the event or reshaped its payload) look identical
+/// from here; the point is that the silence is *visible* where an operator already looks.
+/// Grouped per Kind (records carry no event provenance, so Kind-level is the honest granularity
+/// when one Kind is bound to several events) and gated on session recency — "no records" carries
+/// no signal when nothing has been running.
+fn advise_dormant_bindings(files: &[cs::ScopeFile], events: &[&'static str], cfg: &Config) {
+    let since = hatel_core::now_epoch() - DORMANT_WINDOW_DAYS * 86_400;
+    let index_recent = std::fs::metadata(cfg.state_dir.join("session_index.jsonl"))
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|d| d.as_secs() as i64 >= since);
+    if !index_recent {
+        return;
+    }
+    // Resilient build, like the wiring derivation: a broken plugin must not silence doctor.
+    let registry = hatel_core::schema::build_registry_resilient(cfg);
+    let mut bound_kinds: std::collections::BTreeMap<&str, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for ev in cs::covered_events(files, events) {
+        for binding in registry.bindings_for(ev) {
+            bound_kinds
+                .entry(binding.kind.as_str())
+                .or_default()
+                .push(ev);
+        }
+    }
+    for (kind, evs) in bound_kinds {
+        let active = hatel_core::sink::read_records(cfg, kind, Some(since))
+            .iter()
+            .any(|r| hatel_core::ts_epoch(&r.ts).is_some_and(|t| t >= since));
+        if !active {
+            println!(
+                "  • {} → {kind}: wired, but no records in the last {DORMANT_WINDOW_DAYS}d — \
+                 either the event hasn't fired, or its payload no longer matches the binding",
+                evs.join(", ")
+            );
+        }
+    }
+}
+
 /// Report the configured egress destinations and — decisively — whether the OTel stream actually
 /// reaches this receiver. Export forwards *from* the receiver, so a configured export does nothing
 /// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
@@ -188,6 +238,14 @@ fn report_export(env: &cs::Env) -> bool {
     }
     // Egress is the one place data leaves the host, and hatel does not redact the forwarded body.
     println!("  ⚠ egress forwards the raw OTLP stream off this host — hatel does not redact it");
+    // The config writer sets owner-only permissions (0o600) on Unix; Windows has no mode-bit
+    // equivalent here, so a config holding auth headers deserves an honest heads-up.
+    if cfg!(windows) && export.targets.iter().any(|t| !t.headers.is_empty()) {
+        println!(
+            "  ⚠ this export config carries auth headers, and on Windows hatel cannot restrict \
+             the config file's permissions — protect it with file ACLs"
+        );
+    }
 
     let mut ok = true;
 
@@ -306,9 +364,6 @@ fn check_endpoint_present(env: &cs::Env) -> bool {
     false
 }
 
-/// `http/json` is mandatory only when the exporter points at the local receiver (it decodes
-/// nothing else); when the endpoint is repointed elsewhere the protocol is the remote collector's
-/// business. So this is a hard failure only in the local case — returns whether it passed.
 /// The effective OTLP endpoint per signal: a per-signal override (`…_METRICS_ENDPOINT` /
 /// `…_LOGS_ENDPOINT`) wins over the general `OTEL_EXPORTER_OTLP_ENDPOINT`. Returned as
 /// `(metrics, logs)` so the protocol check and the export bypass check both reason per signal,
@@ -320,6 +375,10 @@ fn effective_otlp_endpoints(env: &cs::Env) -> (Option<EnvEntry<'_>>, Option<EnvE
     (metrics, logs)
 }
 
+/// `http/json` is mandatory only when the exporter points at the local receiver (it decodes
+/// nothing else); when the endpoint is repointed elsewhere the protocol is the remote
+/// collector's business. So this is a hard failure only in the local case — returns whether
+/// it passed.
 fn advise_protocol(env: &cs::Env) -> bool {
     // `http/json` is mandatory if EITHER effective signal endpoint reaches the local receiver — a
     // per-signal override could route one signal to hatel even when the general endpoint is remote.

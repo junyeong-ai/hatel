@@ -163,6 +163,11 @@ fn take(attrs: &mut Vec<(String, String)>, key: &str) -> String {
     }
 }
 
+/// Whether a sum's `aggregationTemporality` marks it delta. Anything else — cumulative,
+/// unspecified, or absent (proto3-JSON may omit an unspecified enum) — reads as non-delta.
+/// That is the conservative direction: treating a running total as a per-interval increment
+/// would inflate counts, while the reverse merely replaces; it also matches OTLP, whose
+/// default temporality for sums is cumulative.
 fn is_delta(v: &serde_json::Value) -> bool {
     match v {
         serde_json::Value::Number(n) => n.as_i64() == Some(1),
@@ -446,6 +451,26 @@ mod tests {
         })
         .to_string();
         assert!(parse_metrics(body.as_bytes(), &tracked()).unwrap()[0].delta);
+    }
+
+    #[test]
+    fn missing_temporality_reads_as_cumulative() {
+        // A sum with no `aggregationTemporality` must read as cumulative (replace, never
+        // accumulate) — the OTLP default, and the direction that can inflate nothing. This is
+        // load-bearing for the accumulator, which adds delta points and replaces cumulative ones.
+        let body = serde_json::json!({
+            "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
+                "name": "claude_code.token.usage",
+                "sum": { "dataPoints": [{
+                    "attributes": [{"key": "session.id", "value": {"stringValue": "S"}}],
+                    "asInt": "7"
+                }]}
+            }]}]}]
+        })
+        .to_string();
+        let points = parse_metrics(body.as_bytes(), &tracked()).unwrap();
+        assert_eq!(points.len(), 1);
+        assert!(!points[0].delta, "absent temporality is cumulative");
     }
 
     #[test]

@@ -56,3 +56,15 @@ pub fn read_records(cfg: &Config, kind: &str, since: Option<i64>) -> Vec<Envelop
         SinkKind::Sqlite => sqlite::read_records(&sqlite_db_path(cfg), kind, since),
     }
 }
+
+/// Remove stored records older than `cutoff_epoch` from the configured backend — the retention
+/// sweep, applying the same horizon the cost snapshot already honors. JSONL deletes whole
+/// rotated archives (never the active file); SQLite deletes rows. Destructive, so it belongs to
+/// exactly one caller: the receiver (whose port bind is the single-writer lock) — never the
+/// hook, and never a read path. Returns the units removed (files / rows).
+pub fn prune_before(cfg: &Config, cutoff_epoch: i64) -> usize {
+    match cfg.sink {
+        SinkKind::Jsonl => jsonl::prune_archives(&cfg.ledger_dir, cutoff_epoch),
+        SinkKind::Sqlite => sqlite::prune_records(&sqlite_db_path(cfg), cutoff_epoch),
+    }
+}

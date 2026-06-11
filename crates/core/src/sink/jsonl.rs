@@ -1,5 +1,9 @@
-//! Default sink: one append-only JSONL file per Kind, rotated at 10 MB. Writes use
-//! `O_APPEND` so concurrent hook subprocesses interleave cleanly at the line level.
+//! Default sink: one append-only JSONL file per Kind, rotated at 10 MB. Each record is
+//! a single `write` of one full line through an `O_APPEND` descriptor — that is what lets
+//! concurrent hook subprocesses interleave cleanly at the line level (the kernel
+//! serializes same-file appends per write call). Building the whole line first and
+//! writing it once is therefore a correctness invariant, not a style choice; records are
+//! allow-list-bounded and far below any size at which a single append could split.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -16,14 +20,33 @@ use crate::Envelope;
 /// a new active file is created. A single pass could then miss the just-rotated archive. So
 /// a pass that observes the matching-file set change (re-listed after reading) is retried
 /// against a fresh listing. Since each line lives in exactly one file at any instant, a pass
-/// over an unchanged set is a consistent snapshot. Bounded retries; rotation is finite.
+/// over an unchanged set is a consistent snapshot. Retries are bounded; sustained churn (a
+/// retention sweep unlinking many archives, back-to-back rotations) degrades to a best-effort
+/// snapshot with a stderr note — never a silently empty result.
 pub fn read_records(dir: &Path, kind: &str) -> Vec<Envelope> {
     for _ in 0..4 {
         if let Some(records) = read_pass(dir, kind) {
             return records;
         }
     }
-    read_pass(dir, kind).unwrap_or_default()
+    eprintln!(
+        "hatel: ledger read for {kind:?} kept racing concurrent rotation/pruning — \
+         returning a best-effort snapshot"
+    );
+    read_best_effort(dir, kind)
+}
+
+/// The degraded read: whatever exists right now, skipping anything that vanishes mid-read.
+/// Records can be missed under churn (the caller has already said so on stderr), but present
+/// data is never discarded — the failure mode is an undercount, not an empty report.
+fn read_best_effort(dir: &Path, kind: &str) -> Vec<Envelope> {
+    let mut out = Vec::new();
+    for path in matching_files(dir, kind).unwrap_or_default() {
+        if let Ok(text) = fs::read_to_string(&path) {
+            out.extend(text.lines().filter_map(Envelope::from_json_line));
+        }
+    }
+    out
 }
 
 /// Returns the set of files matching `kind` (active + archives), sorted, or `None` if the
@@ -68,6 +91,40 @@ fn read_pass(dir: &Path, kind: &str) -> Option<Vec<Envelope>> {
     }
 }
 
+/// Delete rotated archives whose last write predates `cutoff_epoch` — the JSONL half of the
+/// retention sweep. The active `<kind>.jsonl` is never touched, so only whole archives go, and
+/// an archive's mtime is its newest record's write time (rename preserves it) — deleting one
+/// removes only records older than the cutoff. Returns files removed. Fail-open: an unreadable
+/// entry or a failed remove is skipped, and a concurrent report read that observes the set
+/// change retries against a fresh listing (same protocol as rotation).
+pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0; // no ledger dir yet — nothing stored, nothing to prune
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Archives carry a numeric suffix after `.jsonl.` (date stamp, pid, sequence), so they
+        // never END with `.jsonl` — while every active ledger does, even for a Kind whose own
+        // name contains `.jsonl` (the Kind charset allows dots). Both conditions together make
+        // the active file unmatchable.
+        if !name.contains(".jsonl.") || name.ends_with(".jsonl") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| (d.as_secs() as i64) < cutoff_epoch);
+        if old && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub struct JsonlSink {
     dir: PathBuf,
     rotate_bytes: u64,
@@ -85,6 +142,8 @@ impl JsonlSink {
         // never abort — and thus never drop — the record being written.
         let _ = rotate_if_needed(&path, self.rotate_bytes);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // One write call for the whole line (newline included) — the line-level atomicity
+        // the module relies on under concurrent hook appends.
         let mut line = env.to_json_line();
         line.push('\n');
         file.write_all(line.as_bytes())

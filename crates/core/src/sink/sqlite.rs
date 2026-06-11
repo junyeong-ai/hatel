@@ -75,6 +75,52 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
     out
 }
 
+/// Rows deleted per DELETE statement during the retention sweep. Batching keeps each writer-lock
+/// window short, so a first sweep over a months-old backlog can't hold the WAL write lock long
+/// enough to starve concurrent hook inserts.
+const PRUNE_BATCH: i64 = 5_000;
+
+/// Delete rows older than `cutoff_epoch` — the SQLite half of the retention sweep. The SQL
+/// cutoff is rendered one second *below* the epoch cutoff: the lexical fraction quirk (see
+/// `read_records`) can then only retain a boundary row for one extra second, never delete a
+/// row inside the window. Returns rows deleted; a missing DB is zero, and any error is logged
+/// (fail-open) rather than propagated.
+pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+    let conn = match Connection::open(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hatel: sqlite prune open failed ({e})");
+            return 0;
+        }
+    };
+    // The sweep is the patient side: it waits out other writers rather than failing busy.
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+    let Ok(cutoff) = jiff::Timestamp::from_second(cutoff_epoch.saturating_sub(1)) else {
+        return 0; // a cutoff outside representable time prunes nothing
+    };
+    // `rowid IN (… LIMIT n)` rather than `DELETE … LIMIT`, which needs a non-default
+    // SQLite compile flag.
+    let mut total = 0;
+    loop {
+        match conn.execute(
+            "DELETE FROM records WHERE rowid IN \
+             (SELECT rowid FROM records WHERE ts < ?1 LIMIT ?2)",
+            rusqlite::params![cutoff.to_string(), PRUNE_BATCH],
+        ) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(e) => {
+                eprintln!("hatel: sqlite prune failed ({e})");
+                break;
+            }
+        }
+    }
+    total
+}
+
 pub struct SqliteSink {
     conn: Option<Connection>,
 }
@@ -96,6 +142,10 @@ impl SqliteSink {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
+        // Brief writer contention (another hook, the receiver's flush, a prune batch) should be
+        // absorbed, not turned into a dropped record — but only briefly: the hook sits on the
+        // interaction path, so it must never stall behind a slow writer for long.
+        let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS records (

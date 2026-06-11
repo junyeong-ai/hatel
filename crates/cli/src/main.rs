@@ -58,6 +58,14 @@ enum Command {
         /// How many groups to show per Kind (0 = all).
         #[arg(long, default_value_t = report::TOP_N)]
         top: usize,
+        /// Restrict to records whose field equals a value (`--filter spec=auth`; repeatable —
+        /// every filter must match). Values compare against the same rendering the group-key
+        /// column shows; a redacted field is matched by its original value (the query is
+        /// hashed exactly as the ledger stored it). Requires `--kind`, and the field must be
+        /// in that Kind's allow-list (a field outside it never reaches the ledger, so it
+        /// could only match nothing).
+        #[arg(long, value_name = "field=value", requires = "kind")]
+        filter: Vec<String>,
     },
     /// Wire this collector into Claude Code's settings.json — idempotent and
     /// non-destructive (adds the telemetry env and lifecycle hooks without touching
@@ -139,7 +147,15 @@ fn run() -> i32 {
             project,
             kind,
             top,
-        } => report_cmd(&window, format, top, project.as_deref(), kind.as_deref()),
+            filter,
+        } => report_cmd(
+            &window,
+            format,
+            top,
+            project.as_deref(),
+            kind.as_deref(),
+            &filter,
+        ),
         Command::Init {
             scope,
             print,
@@ -284,6 +300,7 @@ fn report_cmd(
     top: usize,
     project: Option<&str>,
     kind: Option<&str>,
+    filter: &[String],
 ) -> i32 {
     let cfg = Config::load();
     let reg = match build_registry(&cfg) {
@@ -303,67 +320,119 @@ fn report_cmd(
         );
         return 2;
     }
+    let filters = match parse_filters(filter, kind, &reg) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("report: {e}");
+            return 2;
+        }
+    };
     let Some(window_secs) = report::parse_window(window) else {
         eprintln!("report: invalid window {window:?} (expected e.g. 30d — days only)");
         return 2;
     };
-    // One window boundary for the whole report — both the Kind aggregation and the cost
-    // section use this single `since`, so they can't disagree on a record in the last second.
-    let since = hatel_core::now_epoch().saturating_sub(window_secs);
+    // One query for the whole report — every format and the cost section share its single
+    // `since`, so they can't disagree on a record in the last second.
+    let q = report::Query {
+        since: hatel_core::now_epoch().saturating_sub(window_secs),
+        top_n: top,
+        project,
+        kind,
+        filters: &filters,
+    };
     // `--kind` scopes the rollup to one Kind; the native cost snapshot is not a Kind, so it
     // is shown only for the full report.
     match format {
-        Format::Json => print!(
-            "{}",
-            report_json(&reg, &cfg, since, window, top, project, kind)
-        ),
+        Format::Json => print!("{}", report_json(&reg, &cfg, window, &q)),
         Format::Md => {
-            print!(
-                "{}",
-                render::format_markdown(&reg, &cfg, since, window, top, project, kind)
-            );
-            if kind.is_none() {
-                print!("{}", cost_section(&cfg.state_dir, true, since, project));
+            print!("{}", render::format_markdown(&reg, &cfg, window, &q));
+            if q.kind.is_none() {
+                print!("{}", cost_section(&cfg.state_dir, true, q.since, q.project));
             }
         }
         Format::Text => {
-            print!(
-                "{}",
-                render::format_table(&reg, &cfg, since, window, top, project, kind)
-            );
-            if kind.is_none() {
-                print!("{}", cost_section(&cfg.state_dir, false, since, project));
+            print!("{}", render::format_table(&reg, &cfg, window, &q));
+            if q.kind.is_none() {
+                print!(
+                    "{}",
+                    cost_section(&cfg.state_dir, false, q.since, q.project)
+                );
             }
         }
     }
     0
 }
 
-/// Machine-readable report: per-Kind group aggregates plus the cost snapshot.
-fn report_json(
-    reg: &Registry,
-    cfg: &Config,
-    since: i64,
-    window: &str,
-    top: usize,
-    project: Option<&str>,
+/// Parse `--filter field=value` pairs and validate each field against the Kind's allow-list —
+/// loud, because a field outside the allow-list never reaches the ledger, so the filter could
+/// only ever produce an empty (and silently misleading) report. Clap enforces
+/// `requires = "kind"`; the check here is the load-bearing backstop.
+///
+/// A redacted field's value is mapped to its stored hash here, exactly as the write path maps
+/// it — so the field is queried by its original value (which still never touches the ledger),
+/// rather than silently matching nothing against the stored hash.
+fn parse_filters(
+    raw: &[String],
     kind: Option<&str>,
-) -> String {
+    reg: &Registry,
+) -> Result<Vec<(String, String)>, String> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kind = kind.ok_or("--filter requires --kind")?;
+    let spec = reg
+        .kind(kind)
+        .ok_or_else(|| format!("unknown kind {kind:?}"))?;
+    let mut filters = Vec::with_capacity(raw.len());
+    for f in raw {
+        let Some((field, value)) = f.split_once('=') else {
+            return Err(format!("filter {f:?} must be field=value"));
+        };
+        if field.is_empty() {
+            return Err(format!("filter {f:?} has an empty field"));
+        }
+        if !spec.fields.contains(field) {
+            let accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
+            return Err(format!(
+                "{kind} has no field {field:?} to filter on — accepted fields: {}",
+                accepted.join(", ")
+            ));
+        }
+        let value = if spec.redact.contains(field) {
+            hatel_core::pii::redacted(value)
+        } else {
+            value.to_string()
+        };
+        filters.push((field.to_string(), value));
+    }
+    Ok(filters)
+}
+
+/// Machine-readable report: per-Kind group aggregates plus the cost snapshot.
+fn report_json(reg: &Registry, cfg: &Config, window: &str, q: &report::Query) -> String {
     let kinds: Vec<serde_json::Value> = reg
         .kinds()
-        .filter(|s| kind.is_none_or(|k| s.name == k))
+        .filter(|s| q.kind.is_none_or(|k| s.name == k))
         .map(|s| {
             serde_json::json!({
                 "kind": s.name,
-                "groups": report::aggregate(reg, cfg, &s.name, since, top, project),
+                "groups": report::aggregate(reg, cfg, &s.name, q),
             })
         })
         .collect();
+    // `{field, value}` objects, not `"field=value"` strings — a value may itself contain
+    // `=`, and a machine consumer should never have to re-split what the CLI already parsed.
+    let filters: Vec<serde_json::Value> = q
+        .filters
+        .iter()
+        .map(|(field, value)| serde_json::json!({ "field": field, "value": value }))
+        .collect();
     serde_json::to_string_pretty(&serde_json::json!({
         "window": window,
-        "project": project,
+        "project": q.project,
+        "filters": filters,
         "kinds": kinds,
-        "cost": if kind.is_some() { Vec::new() } else { cost_rows(&cfg.state_dir, since, project) },
+        "cost": if q.kind.is_some() { Vec::new() } else { cost_rows(&cfg.state_dir, q.since, q.project) },
     }))
     .map(|s| s + "\n")
     .unwrap_or_default()
@@ -471,8 +540,7 @@ mod tests {
 
     #[test]
     fn cost_rows_honor_window_and_project() {
-        let dir = std::env::temp_dir().join(format!("ht-costwin-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_cfg("costwin", vec![]).state_dir;
         let row = |sid: &str, proj: &str, ts: &str| {
             format!(
                 "{{\"session_id\":\"{sid}\",\"project\":\"{proj}\",\"tokens\":1,\"cost_usd\":0.0,\
@@ -528,25 +596,82 @@ mod tests {
         assert!(parse_pairs(&["n:=not-json".into()]).is_err());
     }
 
-    #[test]
-    fn report_json_kind_filter_scopes_to_one_kind() {
-        let dir = std::env::temp_dir().join(format!("ht-kindfilter-{}", std::process::id()));
+    /// A config over a scratch state dir unique to this test (pid-scoped, tag-disambiguated).
+    fn test_cfg(tag: &str, plugins: Vec<std::path::PathBuf>) -> Config {
+        let dir = std::env::temp_dir().join(format!("ht-cli-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = Config {
+        Config {
             sink: hatel_core::SinkKind::Jsonl,
             ledger_dir: dir.join("ledger"),
-            state_dir: dir.clone(),
-            plugins: vec![],
+            state_dir: dir,
+            plugins,
             rotate_bytes: 10 * 1024 * 1024,
             retention_days: 90,
             disabled: false,
             strict: false,
-        };
+        }
+    }
+
+    #[test]
+    fn filter_flag_requires_kind() {
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["hatel", "report", "--filter", "a=b"]).is_err(),
+            "--filter without --kind must be rejected"
+        );
+        assert!(
+            Cli::try_parse_from(["hatel", "report", "--kind", "tool", "--filter", "a=b"]).is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_filters_validates_fields_against_the_allow_list() {
+        let reg = build_registry(&test_cfg("filters", vec![])).unwrap();
+        assert_eq!(
+            parse_filters(&["tool_name=Bash".into()], Some("tool"), &reg).unwrap(),
+            vec![("tool_name".to_string(), "Bash".to_string())]
+        );
+        // A field outside the Kind's allow-list can never match a record — loud error.
+        let err = parse_filters(&["nope=1".into()], Some("tool"), &reg).unwrap_err();
+        assert!(err.contains("accepted fields"), "got: {err}");
+        assert!(parse_filters(&["broken".into()], Some("tool"), &reg).is_err());
+        assert!(parse_filters(&["=v".into()], Some("tool"), &reg).is_err());
+    }
+
+    #[test]
+    fn parse_filters_maps_a_redacted_field_to_its_stored_form() {
+        // `ci_check.actor` is redacted: the ledger stores its hash, never the raw identity. A
+        // filter must therefore hash the query value the same way — matching by the original
+        // value while the original still never touches disk. The raw value compared literally
+        // would silently match nothing.
+        let plugin =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/example.toml");
+        let reg = build_registry(&test_cfg("redacted", vec![plugin])).unwrap();
+        let parsed =
+            parse_filters(&["actor=alice@example.com".into()], Some("ci_check"), &reg).unwrap();
+        assert_eq!(parsed[0].0, "actor");
+        assert_ne!(
+            parsed[0].1, "alice@example.com",
+            "the raw identity is never used for matching"
+        );
+        assert_eq!(parsed[0].1, hatel_core::pii::redacted("alice@example.com"));
+    }
+
+    #[test]
+    fn report_json_kind_filter_scopes_to_one_kind() {
+        let cfg = test_cfg("kindfilter", vec![]);
         let reg = build_registry(&cfg).unwrap();
+        let q = |kind: Option<&'static str>| report::Query {
+            since: 0,
+            top_n: 0,
+            project: None,
+            kind,
+            filters: &[],
+        };
         // An empty ledger still lists one entry per Kind (with empty groups), so the
         // filter is observable without seeding records.
         let full: serde_json::Value =
-            serde_json::from_str(&report_json(&reg, &cfg, 0, "7d", 0, None, None)).unwrap();
+            serde_json::from_str(&report_json(&reg, &cfg, "7d", &q(None))).unwrap();
         let full_kinds: Vec<&str> = full["kinds"]
             .as_array()
             .unwrap()
@@ -560,7 +685,7 @@ mod tests {
         assert!(full_kinds.len() > 1);
 
         let scoped: serde_json::Value =
-            serde_json::from_str(&report_json(&reg, &cfg, 0, "7d", 0, None, Some("tool"))).unwrap();
+            serde_json::from_str(&report_json(&reg, &cfg, "7d", &q(Some("tool")))).unwrap();
         let scoped_kinds: Vec<&str> = scoped["kinds"]
             .as_array()
             .unwrap()
@@ -574,6 +699,6 @@ mod tests {
         );
         // the native cost section is not a Kind, so a scoped report drops it
         assert_eq!(scoped["cost"].as_array().unwrap().len(), 0);
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&cfg.state_dir).ok();
     }
 }
