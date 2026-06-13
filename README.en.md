@@ -101,15 +101,15 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 Leave the receiver running for a per-session, **per-subagent** live rollup:
 
 ```text
-$ hatel serve
-hatel receiver on http://127.0.0.1:4318 (this project only) — point OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop
+$ hatel serve --all
+hatel receiver on http://127.0.0.1:4318 (all projects) — point OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop
 
 === hatel (live) ===
-session  project              tokens     cost$ active_s  lines prompts skills decisions
-a1b2c3d4 acme-api             248913    1.8423   1284.6    342       2      0         5
-  └ Explore                    142035    1.0512
-  └ main                       106878    0.7911
-e5f6a7b8 acme-api              97540    0.7218    612.3    118       1      0         3
+session  project                 tokens     cost$ active_s  lines prompts skills decisions
+a1b2c3d4 acme-api                248913    1.8423   1284.6    342       2      0         5
+  └ Explore                        142035    1.0512
+  └ main                           106878    0.7911
+e5f6a7b8 acme-api                 97540    0.7218    612.3    118       1      0         3
 ```
 
 > The indented `└` rows are the **per-subagent token/cost** breakdown — "which subagent spent the budget" isn't flattened away into the session total.
@@ -124,21 +124,29 @@ hatel report --window 30d --kind tool --format json
 
 ```json
 {
-  "window": "30d",
-  "project": null,
+  "cost": [],
   "filters": [],
   "kinds": [
     {
-      "kind": "tool",
       "groups": [
-        { "key": "Bash", "count": 4, "sums": [ {"name": "duration_ms", "sum": 5730.0}, {"name": "ok", "sum": 3.0} ] },
-        { "key": "Edit", "count": 4, "sums": [ {"name": "duration_ms", "sum": 1360.0}, {"name": "ok", "sum": 4.0} ] }
-      ]
+        {
+          "count": 4,
+          "key": "Bash",
+          "sums": [
+            { "name": "duration_ms", "sum": 5730.0 },
+            { "name": "ok", "sum": 3.0 }
+          ]
+        }
+      ],
+      "kind": "tool"
     }
   ],
-  "cost": []
+  "project": null,
+  "window": "30d"
 }
 ```
+
+> Keys serialize in alphabetical order (`cost·filters·kinds·project·window`). Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape.
 
 ---
 
@@ -236,6 +244,8 @@ hatel doctor
 
 settings files:
   user     found    ~/.claude/settings.json
+  project  absent   ./.claude/settings.json
+  local    absent   ./.claude/settings.local.json
   managed  absent   /Library/Application Support/ClaudeCode/managed-settings.json
 
 native telemetry (settings.json env):

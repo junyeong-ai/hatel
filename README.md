@@ -101,15 +101,15 @@ hatel report --window 30d
 수신기를 켜두면 세션별·**서브에이전트별** 실시간 롤업이 갱신됩니다:
 
 ```text
-$ hatel serve
-hatel receiver on http://127.0.0.1:4318 (this project only) — point OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop
+$ hatel serve --all
+hatel receiver on http://127.0.0.1:4318 (all projects) — point OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop
 
 === hatel (live) ===
-session  project              tokens     cost$ active_s  lines prompts skills decisions
-a1b2c3d4 acme-api             248913    1.8423   1284.6    342       2      0         5
-  └ Explore                    142035    1.0512
-  └ main                       106878    0.7911
-e5f6a7b8 acme-api              97540    0.7218    612.3    118       1      0         3
+session  project                 tokens     cost$ active_s  lines prompts skills decisions
+a1b2c3d4 acme-api                248913    1.8423   1284.6    342       2      0         5
+  └ Explore                        142035    1.0512
+  └ main                           106878    0.7911
+e5f6a7b8 acme-api                 97540    0.7218    612.3    118       1      0         3
 ```
 
 > 들여쓴 `└` 행은 **서브에이전트별 토큰·비용** 분해입니다 — "어느 서브에이전트가 예산을 썼나"가 세션 합계에 묻히지 않습니다.
@@ -124,21 +124,29 @@ hatel report --window 30d --kind tool --format json
 
 ```json
 {
-  "window": "30d",
-  "project": null,
+  "cost": [],
   "filters": [],
   "kinds": [
     {
-      "kind": "tool",
       "groups": [
-        { "key": "Bash", "count": 4, "sums": [ {"name": "duration_ms", "sum": 5730.0}, {"name": "ok", "sum": 3.0} ] },
-        { "key": "Edit", "count": 4, "sums": [ {"name": "duration_ms", "sum": 1360.0}, {"name": "ok", "sum": 4.0} ] }
-      ]
+        {
+          "count": 4,
+          "key": "Bash",
+          "sums": [
+            { "name": "duration_ms", "sum": 5730.0 },
+            { "name": "ok", "sum": 3.0 }
+          ]
+        }
+      ],
+      "kind": "tool"
     }
   ],
-  "cost": []
+  "project": null,
+  "window": "30d"
 }
 ```
+
+> 키는 알파벳 순으로 직렬화됩니다(`cost·filters·kinds·project·window`). 위는 `Bash` 그룹만 보였고, 실제 리포트엔 `Edit·Grep·Read`가 같은 형태로 이어집니다.
 
 ---
 
@@ -236,6 +244,8 @@ hatel doctor
 
 settings files:
   user     found    ~/.claude/settings.json
+  project  absent   ./.claude/settings.json
+  local    absent   ./.claude/settings.local.json
   managed  absent   /Library/Application Support/ClaudeCode/managed-settings.json
 
 native telemetry (settings.json env):
