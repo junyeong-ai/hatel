@@ -98,7 +98,13 @@ fn read_pass<R>(dir: &Path, base: &str, parse: &impl Fn(&str) -> Option<R>) -> O
         match fs::read_to_string(path) {
             Ok(text) => out.extend(parse_lines(&text, parse)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None, // rotated mid-read
-            Err(_) => {} // other read error → skip this file, fail-open
+            Err(e) => {
+                // Not the rotation race (that is NotFound, handled above) — a genuine read error
+                // on a file we just listed. Skip it so one bad file can't empty a whole report,
+                // but surface it: silently dropping a ledger's worth of records would undercount
+                // a report or attribution pass with no trace.
+                eprintln!("hatel: skipping unreadable {}: {e}", path.display());
+            }
         }
     }
     match matching_files(dir, base) {

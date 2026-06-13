@@ -113,6 +113,7 @@ impl FromSpec {
 /// Exactly one outcome applies; an absent source or a non-matching transform
 /// yields `None`, and the field is simply omitted — never fabricated.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldMap {
     #[serde(default)]
     pub from: Option<FromSpec>,
@@ -201,6 +202,7 @@ impl FieldMap {
 
 /// A hook event → Kind mapping with its field transforms.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HookBinding {
     pub event: String,
     pub kind: String,
@@ -324,5 +326,28 @@ impl Registry {
     /// silently never firing. (Core stays free of the wiring vocabulary itself.)
     pub fn bound_events(&self) -> impl Iterator<Item = &str> {
         self.bindings.keys().map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fieldmap_rejects_unknown_key() {
+        // A misspelled transform key must fail loudly: silently dropping it would leave the map
+        // with no transform and surface only as a confusing "needs a transform" error later.
+        let r: std::result::Result<FieldMap, _> =
+            toml::from_str("from = \"x\"\ncapturee = \"^(.+)$\"");
+        assert!(r.is_err(), "unknown FieldMap key must be rejected");
+    }
+
+    #[test]
+    fn hookbinding_rejects_unknown_key() {
+        // A typo'd binding key (e.g. `kindd`) must fail rather than silently dropping, so a
+        // binding is never half-specified.
+        let r: std::result::Result<HookBinding, _> =
+            toml::from_str("event = \"E\"\nkind = \"k\"\nkindd = \"typo\"");
+        assert!(r.is_err(), "unknown HookBinding key must be rejected");
     }
 }

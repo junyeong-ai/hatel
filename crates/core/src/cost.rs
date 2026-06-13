@@ -59,9 +59,14 @@ pub fn merge_snapshot(state_dir: &Path, rows: Vec<CostRow>, retain_since: i64) {
         .values()
         .filter(|r| crate::ts_epoch(&r.ts).is_some_and(|t| t >= retain_since))
         .collect();
-    // Nothing to persist and no file to prune → don't create a spurious empty snapshot
-    // (a quiet receiver leaves no trace).
-    if kept.is_empty() && !snapshot_path(state_dir).exists() {
+    // A fully-aged-out snapshot leaves no trace: when nothing survives the retain cutoff,
+    // remove any existing file rather than rewriting it as a lone newline — and skip the write
+    // entirely when there was never a file. Symmetric with the never-create case.
+    if kept.is_empty() {
+        let path = snapshot_path(state_dir);
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
         return;
     }
     let body = kept

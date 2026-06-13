@@ -119,6 +119,7 @@ pub struct ExportConfig {
 // ── the raw TOML shapes ──
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(default)]
     export: Vec<TargetRaw>,
@@ -556,6 +557,17 @@ mod tests {
         // everything, silently defeating the filter. An unknown key must fail loud.
         let err = ExportConfig::parse(
             "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\nproject = [\"work\"]\n",
+            "<test>",
+        );
+        assert!(matches!(err, Err(Error::ExportParse { .. })));
+    }
+
+    #[test]
+    fn a_misspelled_top_level_export_key_is_rejected_not_silently_off() {
+        // `[[exports]]` (plural) or any stray top-level key would otherwise leave `export` empty —
+        // silently disabling forwarding the operator asked for. The whole file must fail loud.
+        let err = ExportConfig::parse(
+            "[[exports]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n",
             "<test>",
         );
         assert!(matches!(err, Err(Error::ExportParse { .. })));

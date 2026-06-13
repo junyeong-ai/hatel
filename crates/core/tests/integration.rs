@@ -656,6 +656,10 @@ fn merge_with_no_rows_still_prunes_stale_entries() {
         cost::read_snapshot(&cfg.state_dir).is_empty(),
         "stale row pruned on empty merge"
     );
+    assert!(
+        !cfg.state_dir.join("cost_snapshot.jsonl").exists(),
+        "a fully-aged-out snapshot leaves no file behind"
+    );
 }
 
 #[test]

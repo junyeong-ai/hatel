@@ -10,6 +10,7 @@ use crate::{Config, Error, Result};
 const CORE_TOML: &str = include_str!("../core.toml");
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SchemaFile {
     #[serde(default)]
     tracked_metrics: Vec<String>,
@@ -89,4 +90,24 @@ pub fn build_registry_resilient(cfg: &Config) -> Registry {
         }
     }
     reg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unknown_top_level_key() {
+        // `tracked_metric` (singular) or a `[[kindz]]` typo must fail here — the single loader is
+        // the one place such a mistake can be caught, and silently dropping it would no-op a whole
+        // Kind or metric list with no diagnostic.
+        let r: std::result::Result<SchemaFile, _> = toml::from_str("tracked_metric = []");
+        assert!(r.is_err(), "unknown top-level schema key must be rejected");
+    }
+
+    #[test]
+    fn core_schema_loads_under_deny_unknown_fields() {
+        // Guard: the strict schema must still accept the embedded core TOML in full.
+        assert!(load_core().is_ok());
+    }
 }
