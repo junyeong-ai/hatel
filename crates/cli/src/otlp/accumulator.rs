@@ -91,7 +91,12 @@ impl SessionTotals {
             if metric != TOKENS && metric != COST {
                 continue;
             }
-            let attr = |key: &str| series.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+            let attr = |key: &str| {
+                series
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+            };
             let label = attr("agent.name")
                 .or_else(|| attr("query_source"))
                 .unwrap_or_else(|| "(unattributed)".to_string());
@@ -154,7 +159,10 @@ mod tests {
             name: name.to_string(),
             value,
             session_id: "S".to_string(),
-            series: series.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            series: series
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             delta,
         }
     }
@@ -193,13 +201,26 @@ mod tests {
     #[test]
     fn by_agent_labels_honestly() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![point(TOKENS, 10.0, true, vec![("agent.name", "Explore")])]);
-        acc.update_metrics(vec![point(TOKENS, 20.0, true, vec![("query_source", "main")])]);
+        acc.update_metrics(vec![point(
+            TOKENS,
+            10.0,
+            true,
+            vec![("agent.name", "Explore")],
+        )]);
+        acc.update_metrics(vec![point(
+            TOKENS,
+            20.0,
+            true,
+            vec![("query_source", "main")],
+        )]);
         acc.update_metrics(vec![point(COST, 1.0, false, vec![])]); // no attribution
         let agents = acc.sessions()["S"].by_agent();
         assert_eq!(agents.get("Explore").map(|(t, _)| *t), Some(10));
         assert_eq!(agents.get("main").map(|(t, _)| *t), Some(20));
-        assert!(agents.contains_key("(unattributed)"), "agentless cost is not guessed as main");
+        assert!(
+            agents.contains_key("(unattributed)"),
+            "agentless cost is not guessed as main"
+        );
     }
 
     #[test]
