@@ -40,7 +40,7 @@ flowchart LR
 
 | Binary | Role |
 |---|---|
-| `hatel-hook` | wired into `settings.json` hooks; reads one event on stdin, maps it, records matches, exits. No async runtime — **~3 ms cold start**. |
+| `hatel-hook` | wired into `settings.json` hooks; reads one event on stdin, maps it, records matches, exits. No async runtime — **single-digit-millisecond cold start** (~1 ms over a bare process spawn). |
 | `hatel` | the receiver (`serve`), reports, `init`, `service`, `doctor`, `kinds`, `emit`. |
 
 ---
@@ -279,11 +279,11 @@ hatel emit ci_check check=lint runs:=14000 failures:=3   # record a domain signa
 
 ```text
 $ hatel kinds
-compaction     group_key=session_id    fields=[project, session_id, trigger]
-memory         group_key=memory_id     fields=[load_reason, memory_id, memory_type, project, session_id]
-prompt         group_key=session_id    fields=[project, prompt_len, session_id]
+compaction     group_key=session_id   fields=[project, session_id, trigger]
+memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
+prompt         group_key=session_id   fields=[project, prompt_len, session_id]
 subagent       group_key=subagent_type fields=[project, session_id, subagent_type]
-tool           group_key=tool_name     fields=[duration_ms, ok, project, session_id, tool_name]
+tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
 
 ---
