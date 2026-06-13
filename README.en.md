@@ -62,7 +62,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> Wire while installing with `... | bash -s -- --wire`. Pin a release with `HATEL_VERSION=0.4.0`. Remove everything later with `scripts/uninstall.sh`.
+> Wire while installing with `... | bash -s -- --wire`. Pin a release with `HATEL_VERSION=0.4.1`. Remove everything later with `scripts/uninstall.sh`.
 
 ---
 

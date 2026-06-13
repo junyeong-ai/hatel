@@ -62,7 +62,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> 설치하면서 바로 연결하려면 `... | bash -s -- --wire`. 특정 버전 고정은 `HATEL_VERSION=0.4.0`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
+> 설치하면서 바로 연결하려면 `... | bash -s -- --wire`. 특정 버전 고정은 `HATEL_VERSION=0.4.1`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
 
 ---
 
