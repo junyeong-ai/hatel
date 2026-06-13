@@ -53,7 +53,7 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
   <key>ProgramArguments</key>
   <array><string>{exe_xml}</string><string>serve</string><string>--all</string></array>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict></plist>
 "#
     );
@@ -78,18 +78,29 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
     }
     // Reload so a re-run picks up a new path: unload first (ignore "not loaded"), then load.
     quiet(Command::new("launchctl").arg("unload").arg(&path));
-    match Command::new("launchctl").arg("load").arg("-w").arg(&path).status() {
+    match Command::new("launchctl")
+        .arg("load")
+        .arg("-w")
+        .arg(&path)
+        .status()
+    {
         Ok(s) if s.success() => {
             println!("installed and loaded the launchd agent: {}", path.display());
             println!("the receiver now starts at login and is kept alive");
             0
         }
         Ok(s) => {
-            eprintln!("service: `launchctl load` exited {s}; the plist is at {}", path.display());
+            eprintln!(
+                "service: `launchctl load` exited {s}; the plist is at {}",
+                path.display()
+            );
             1
         }
         Err(e) => {
-            eprintln!("service: launchctl not found ({e}); the plist is at {}", path.display());
+            eprintln!(
+                "service: launchctl not found ({e}); the plist is at {}",
+                path.display()
+            );
             1
         }
     }
@@ -99,7 +110,7 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
 fn linux(exe: &Path, remove: bool, print: bool) -> i32 {
     let exec = systemd_exec_arg(&exe.display().to_string());
     let unit = format!(
-        "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=always\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
     );
     if print {
         print!("{unit}");
@@ -128,19 +139,31 @@ fn linux(exe: &Path, remove: bool, print: bool) -> i32 {
     // already running to the freshly-written ExecStart. Both must succeed for genuinely gap-free
     // collection (survives reboot AND runs now), so neither failure is swallowed.
     for action in ["enable", "restart"] {
-        match Command::new("systemctl").args(["--user", action, svc.as_str()]).status() {
+        match Command::new("systemctl")
+            .args(["--user", action, svc.as_str()])
+            .status()
+        {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                eprintln!("service: `systemctl --user {action}` exited {s}; the unit is at {}", path.display());
+                eprintln!(
+                    "service: `systemctl --user {action}` exited {s}; the unit is at {}",
+                    path.display()
+                );
                 return 1;
             }
             Err(e) => {
-                eprintln!("service: systemctl not found ({e}); the unit is at {}", path.display());
+                eprintln!(
+                    "service: systemctl not found ({e}); the unit is at {}",
+                    path.display()
+                );
                 return 1;
             }
         }
     }
-    println!("installed and started the systemd user unit: {}", path.display());
+    println!(
+        "installed and started the systemd user unit: {}",
+        path.display()
+    );
     println!("the receiver now starts on login and is restarted on failure");
     0
 }
@@ -149,7 +172,9 @@ fn linux(exe: &Path, remove: bool, print: bool) -> i32 {
 /// path containing `&`, `<`, or `>` must be escaped to stay valid (and uninjectable).
 #[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Render a path as a single systemd `ExecStart` token: quote it (systemd splits on whitespace)
@@ -157,7 +182,10 @@ fn xml_escape(s: &str) -> String {
 /// so a path with spaces or `%` runs correctly.
 #[cfg(target_os = "linux")]
 fn systemd_exec_arg(path: &str) -> String {
-    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%");
+    let escaped = path
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
     format!("\"{escaped}\"")
 }
 

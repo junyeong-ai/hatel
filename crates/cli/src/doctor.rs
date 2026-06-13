@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use hatel_core::{Config, ExportConfig, ExportMode};
+use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex};
 
 use crate::claude_settings as cs;
 
@@ -163,9 +163,8 @@ fn report_hooks(files: &[cs::ScopeFile], events: &[&'static str]) -> bool {
 /// no signal when nothing has been running.
 fn advise_dormant_bindings(files: &[cs::ScopeFile], events: &[&'static str], cfg: &Config) {
     let since = hatel_core::now_epoch() - DORMANT_WINDOW_DAYS * 86_400;
-    let index_recent = std::fs::metadata(cfg.state_dir.join("session_index.jsonl"))
-        .ok()
-        .and_then(|m| m.modified().ok())
+    let index_recent = SessionIndex::new(cfg.state_dir.clone())
+        .newest_mtime()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .is_some_and(|d| d.as_secs() as i64 >= since);
     if !index_recent {

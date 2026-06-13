@@ -14,6 +14,7 @@ pub mod project;
 pub mod registry;
 pub mod render;
 pub mod report;
+pub mod rolling;
 pub mod schema;
 pub mod session;
 pub mod sink;
@@ -25,7 +26,7 @@ pub use model::{
 };
 pub use project::{ProjectRef, resolve_project};
 pub use registry::{FieldMap, HookBinding, KindSpec, Registry};
-pub use session::{SessionIndex, SessionRow};
+pub use session::{SessionIndex, SessionIndexCache, SessionRow};
 pub use sink::{Sink, SinkKind, build_sink};
 
 /// One error type for the whole core crate. The hook path is fail-open and never

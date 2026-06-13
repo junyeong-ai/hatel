@@ -46,7 +46,11 @@ impl Config {
         // The OS path-list separator (`:` on Unix, `;` on Windows) — so a native
         // Windows path like `C:\plugins\x.toml` isn't split on its drive colon.
         let plugins = std::env::var_os("HATEL_PLUGINS")
-            .map(|s| std::env::split_paths(&s).filter(|p| !p.as_os_str().is_empty()).collect())
+            .map(|s| {
+                std::env::split_paths(&s)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            })
             .unwrap_or_default();
         let rotate_bytes = std::env::var("HATEL_ROTATE_BYTES")
             .ok()
@@ -88,10 +92,7 @@ fn resolve_state_dir(testing: bool) -> PathBuf {
 fn xdg_state_dir() -> PathBuf {
     use etcetera::BaseStrategy as _;
     match etcetera::choose_base_strategy() {
-        Ok(s) => s
-            .state_dir()
-            .unwrap_or_else(|| s.data_dir())
-            .join("hatel"),
+        Ok(s) => s.state_dir().unwrap_or_else(|| s.data_dir()).join("hatel"),
         Err(_) => PathBuf::from(".hatel"),
     }
 }

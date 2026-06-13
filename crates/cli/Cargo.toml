@@ -21,6 +21,9 @@ axum.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # `start_paused` (a virtual clock) for deterministic tests of time-driven paths — the
 # export worker's park-timeout wakeup — without real sleeps.

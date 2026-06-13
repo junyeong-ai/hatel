@@ -15,6 +15,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
+use crate::otlp::{PROJECT, SESSION_ID};
+
 /// Resolve a `session.id` to a project label (`None` when unknown).
 pub type Resolve<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
@@ -120,14 +122,14 @@ fn inject_project(point: &mut Value, resolve: &Resolve) {
     let Some(attrs) = point.get_mut("attributes").and_then(Value::as_array_mut) else {
         return;
     };
-    if attrs.iter().any(|a| attr_key(a) == Some("project")) {
+    if attrs.iter().any(|a| attr_key(a) == Some(PROJECT)) {
         return;
     }
     let Some(session) = session else { return };
     let Some(label) = resolve(&session) else {
         return;
     };
-    attrs.push(json!({ "key": "project", "value": { "stringValue": label } }));
+    attrs.push(json!({ "key": PROJECT, "value": { "stringValue": label } }));
 }
 
 /// The `session.id` string attribute on one datapoint/record, if present.
@@ -136,7 +138,7 @@ fn point_session_id(point: &Value) -> Option<&str> {
         .get("attributes")?
         .as_array()?
         .iter()
-        .find(|a| attr_key(a) == Some("session.id"))?
+        .find(|a| attr_key(a) == Some(SESSION_ID))?
         .get("value")?
         .get("stringValue")?
         .as_str()

@@ -27,6 +27,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 # Reference-counted byte buffer shared between the receiver and the export queue (zero-copy
 # fan-out of one received body to several destinations). The type axum and reqwest already use.
 bytes = "1"
+# `flock` for the receiver's single-writer lock on the state dir — the OS releases it on exit
+# (even a crash), so a second receiver over the same state dir is refused, not silently racing.
+libc = "0.2"
 
 # The hook binary is spawned on every lifecycle event; a fat, single-codegen-unit,
 # abort-on-panic, stripped build minimises both size and cold-start.
