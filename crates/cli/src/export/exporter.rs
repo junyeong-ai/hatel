@@ -5,17 +5,17 @@
 //! `bytes::Bytes` + `OtlpSignal`, never an axum type, so a future ledger→OTLP-logs exporter can
 //! reuse the same `enqueue`.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use hatel_core::{ExportMode, ExportTarget, SessionIndex};
+use hatel_core::{ExportMode, ExportTarget, SessionIndexCache};
 
 use super::transform::{enrich_logs, enrich_metrics, session_ids};
 
@@ -140,10 +140,11 @@ impl Exporter {
     }
 
     fn record_drop(&self) {
-        let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % DROP_LOG_EVERY == 1 {
+        let before = self.dropped.fetch_add(1, Ordering::Relaxed);
+        if crate::throttle::should_log(before, 1, DROP_LOG_EVERY) {
             eprintln!(
-                "hatel: export queue full — dropped {n} batch(es) so far (downstream slow/unreachable)"
+                "hatel: export queue full — dropped {} batch(es) so far (downstream slow/unreachable)",
+                before + 1
             );
         }
     }
@@ -197,7 +198,7 @@ enum TargetSet {
 struct Worker {
     targets: Vec<ExportTarget>,
     client: reqwest::Client,
-    index: IndexCache,
+    index: SessionIndexCache,
     queued_bytes: Arc<AtomicUsize>,
     /// Whether any target enriches or filters by project — both need the session→project map, so
     /// either gates the per-batch index refresh; a config with neither does no session-index I/O.
@@ -227,7 +228,7 @@ impl Worker {
         Worker {
             targets,
             client,
-            index: IndexCache::new(state_dir),
+            index: SessionIndexCache::new(state_dir),
             queued_bytes,
             index_needed,
             enrich_skip_warned: HashSet::new(),
@@ -363,7 +364,7 @@ impl Worker {
     fn record_unresolved_drop(&mut self) {
         let before = self.unresolved_dropped;
         self.unresolved_dropped += 1;
-        if before == 0 || before / DROP_LOG_EVERY != self.unresolved_dropped / DROP_LOG_EVERY {
+        if crate::throttle::should_log(before, 1, DROP_LOG_EVERY) {
             eprintln!(
                 "hatel: {} batch(es) so far had no indexed session — dropped for the \
                  project-filtered destination(s) (fail closed)",
@@ -386,6 +387,9 @@ impl Worker {
         let client = &self.client;
         let targets = &self.targets;
         let warned = &mut self.enrich_skip_warned;
+        // The enriched body is identical for every enriched target — the project label is resolved
+        // from the index, not the target — so it is built at most once per forward and reused.
+        let mut enriched: Option<Result<Bytes, String>> = None;
         for target in targets {
             let filtered = target.filter.is_filtered();
             let addressed = match set {
@@ -414,14 +418,17 @@ impl Worker {
                     out.content_encoding.as_deref(),
                 )),
                 ExportMode::Enriched => {
-                    let resolve = |sid: &str| index.label(sid);
-                    let transformed = match out.signal {
-                        OtlpSignal::Metrics => enrich_metrics(&out.body, &resolve),
-                        OtlpSignal::Logs => enrich_logs(&out.body, &resolve),
-                    };
-                    match transformed {
+                    let body = enriched.get_or_insert_with(|| {
+                        let resolve = |sid: &str| index.label(sid);
+                        match out.signal {
+                            OtlpSignal::Metrics => enrich_metrics(&out.body, &resolve),
+                            OtlpSignal::Logs => enrich_logs(&out.body, &resolve),
+                        }
+                        .map(Bytes::from)
+                    });
+                    match body {
                         // Enriched output is freshly serialized JSON — no inbound encoding carries over.
-                        Ok(bytes) => Some((bytes.into(), "application/json", None)),
+                        Ok(bytes) => Some((bytes.clone().into(), "application/json", None)),
                         Err(e) => {
                             // Can't enrich (e.g. the inbound body isn't JSON). Skip this
                             // destination — never forward a non-enriched stream in its place. Warn
@@ -502,84 +509,6 @@ impl Worker {
     }
 }
 
-/// A session→project map cached from `session_index.jsonl`, reloaded only when the file's mtime
-/// advances. The index is append-only so its mtime increases on each new session; gating on it
-/// means a steady stream costs no I/O while a brand-new session is picked up on the next batch.
-/// Each entry keeps both the display `label` (what enrichment injects) and the unique `key` (the
-/// absolute git-root path, used only for the local filter decision and never egressed).
-struct IndexCache {
-    state_dir: PathBuf,
-    mtime: Option<SystemTime>,
-    map: HashMap<String, (String, String)>,
-}
-
-impl IndexCache {
-    fn new(state_dir: PathBuf) -> Self {
-        IndexCache {
-            state_dir,
-            mtime: None,
-            map: HashMap::new(),
-        }
-    }
-
-    /// Whether a session is in the index — the cheap readiness probe parked bodies use before
-    /// spending a full re-resolution.
-    fn contains(&self, session_id: &str) -> bool {
-        self.map.contains_key(session_id)
-    }
-
-    fn index_path(&self) -> PathBuf {
-        self.state_dir.join("session_index.jsonl")
-    }
-
-    fn refresh(&mut self) {
-        let file_len = match std::fs::metadata(self.index_path()) {
-            Ok(meta) => {
-                let modified = meta.modified().ok();
-                if modified == self.mtime {
-                    return; // unchanged since last load (or both unreadable) — keep the map
-                }
-                self.mtime = modified; // advance regardless, so we never re-read the same revision
-                meta.len()
-            }
-            // The index was reset/removed — drop the stale map rather than inject obsolete labels.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.mtime = None;
-                self.map.clear();
-                return;
-            }
-            // A transient error (permissions, I/O) — keep what we have rather than wrongly clearing.
-            Err(_) => return,
-        };
-        let loaded: HashMap<String, (String, String)> = SessionIndex::new(self.state_dir.clone())
-            .load()
-            .into_iter()
-            .filter(|(_, row)| !row.project_label.is_empty())
-            .map(|(sid, row)| (sid, (row.project_label, row.project_key)))
-            .collect();
-        // Replace the map when the load produced rows, or when the file is genuinely empty. A
-        // non-empty file that yields nothing is a transient read race — keep the prior labels
-        // rather than clobbering good attribution with an empty snapshot.
-        if !loaded.is_empty() || file_len == 0 {
-            self.map = loaded;
-        }
-    }
-
-    /// The project label for a session — what enrichment injects — or `None` when unknown (never
-    /// fabricated).
-    fn label(&self, session_id: &str) -> Option<String> {
-        self.map.get(session_id).map(|(label, _)| label.clone())
-    }
-
-    /// The `(label, key)` for a session, for the local filter decision. The key (absolute path) is
-    /// used only to decide forward/skip and is never egressed.
-    fn project(&self, session_id: &str) -> Option<(&str, &str)> {
-        self.map
-            .get(session_id)
-            .map(|(label, key)| (label.as_str(), key.as_str()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,93 +570,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn index_cache_keeps_labels_when_a_nonempty_file_reads_empty() {
-        // A non-empty index that yields no labelled rows is treated as a transient read race — the
-        // prior good labels are kept rather than clobbered with an empty snapshot. (Distinct from a
-        // removed file, which clears; see the test above.)
-        let dir = scratch("idxkeep");
-        let path = dir.join("session_index.jsonl");
-        std::fs::write(
-            &path,
-            "{\"session_id\":\"S1\",\"project_key\":\"/k/a\",\"project_label\":\"a\"}\n",
-        )
-        .unwrap();
-        let mut cache = IndexCache::new(dir.clone());
-        cache.refresh();
-        assert_eq!(cache.label("S1").as_deref(), Some("a"));
-        // Rewrite to a non-empty file whose only row has an empty label (yields nothing after the
-        // filter), and advance mtime — the guard keeps the prior labels.
-        std::fs::write(
-            &path,
-            "{\"session_id\":\"S9\",\"project_key\":\"/k/\",\"project_label\":\"\"}\n",
-        )
-        .unwrap();
-        filetime_bump(&path);
-        cache.refresh();
-        assert_eq!(
-            cache.label("S1").as_deref(),
-            Some("a"),
-            "prior labels kept on an empty read"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn index_cache_drops_stale_map_when_index_is_removed() {
-        let dir = scratch("idxdel");
-        let path = dir.join("session_index.jsonl");
-        std::fs::write(
-            &path,
-            "{\"session_id\":\"S1\",\"project_key\":\"/k/a\",\"project_label\":\"a\"}\n",
-        )
-        .unwrap();
-        let mut cache = IndexCache::new(dir.clone());
-        cache.refresh();
-        assert_eq!(cache.label("S1").as_deref(), Some("a"));
-        // A state reset removes the index — the cache must not keep injecting the old label.
-        std::fs::remove_file(&path).unwrap();
-        cache.refresh();
-        assert_eq!(
-            cache.label("S1"),
-            None,
-            "stale label dropped after index removal"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn index_cache_reloads_only_when_mtime_advances() {
-        let dir = scratch("idxcache");
-        let path = dir.join("session_index.jsonl");
-        let line = |sid: &str, label: &str| {
-            format!(
-                "{{\"session_id\":\"{sid}\",\"project_key\":\"/k/{label}\",\"project_label\":\"{label}\"}}\n"
-            )
-        };
-        std::fs::write(&path, line("S1", "alpha")).unwrap();
-
-        let mut cache = IndexCache::new(dir.clone());
-        cache.refresh();
-        assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
-        assert_eq!(cache.label("S2"), None, "unknown session is not fabricated");
-
-        // Append a new session and bump mtime; a refresh must pick it up.
-        std::fs::write(
-            &path,
-            format!("{}{}", line("S1", "alpha"), line("S2", "beta")),
-        )
-        .unwrap();
-        filetime_bump(&path);
-        cache.refresh();
-        assert_eq!(cache.label("S2").as_deref(), Some("beta"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     // Force the mtime forward so the test doesn't depend on filesystem timestamp granularity.
     fn filetime_bump(path: &std::path::Path) {
-        use std::time::Duration;
+        use std::time::{Duration, SystemTime};
         let future = SystemTime::now() + Duration::from_secs(10);
         // set_modified is stable via File::set_modified.
         let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();

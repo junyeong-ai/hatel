@@ -264,6 +264,25 @@ fn session_start_is_recorded_in_the_index() {
 }
 
 #[test]
+fn an_unattributable_session_start_is_not_recorded() {
+    // A SessionStart with no cwd resolves to an empty project label; it can attribute nothing, so
+    // no index row is written (the receiver treats such a session as unattributed regardless).
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let mut event = serde_json::json!({
+        "hook_event_name": "SessionStart",
+        "session_id": "S4", "cwd": ""
+    });
+    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    assert!(
+        !SessionIndex::new(cfg.state_dir.clone())
+            .load()
+            .contains_key("S4"),
+        "an unattributable session is not indexed"
+    );
+}
+
+#[test]
 fn field_map_capture_derives_value_or_omits() {
     let fm: FieldMap = toml::from_str("from = \"git_branch\"\ncapture = \"^spec/(.+)$\"").unwrap();
     let matched = serde_json::json!({"git_branch": "spec/my-feature"});
@@ -398,7 +417,7 @@ fn reports_read_active_and_rotated_archives() {
     )
     .unwrap();
     std::fs::write(
-        cfg.ledger_dir.join("tool.jsonl.20240101"),
+        cfg.ledger_dir.join("tool.jsonl.20240101.1"),
         format!("{}\n", line("B")),
     )
     .unwrap();
@@ -504,8 +523,8 @@ fn retention_prunes_old_archives_but_never_the_active_ledger() {
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
     let active = cfg.ledger_dir.join("tool.jsonl");
-    let old_archive = cfg.ledger_dir.join("tool.jsonl.20240101");
-    let fresh_archive = cfg.ledger_dir.join("tool.jsonl.20990101");
+    let old_archive = cfg.ledger_dir.join("tool.jsonl.20240101.1");
+    let fresh_archive = cfg.ledger_dir.join("tool.jsonl.20990101.1");
     std::fs::write(&active, format!("{}\n", line("A"))).unwrap();
     std::fs::write(&old_archive, format!("{}\n", line("B"))).unwrap();
     std::fs::write(&fresh_archive, format!("{}\n", line("C"))).unwrap();
@@ -537,7 +556,7 @@ fn retention_never_prunes_an_active_ledger_for_a_dotted_kind_name() {
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
     let dotted_active = cfg.ledger_dir.join("foo.jsonl.jsonl");
-    let dotted_archive = cfg.ledger_dir.join("foo.jsonl.jsonl.20240101");
+    let dotted_archive = cfg.ledger_dir.join("foo.jsonl.jsonl.20240101.1");
     std::fs::write(&dotted_active, format!("{}\n", line("A"))).unwrap();
     std::fs::write(&dotted_archive, format!("{}\n", line("B"))).unwrap();
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);

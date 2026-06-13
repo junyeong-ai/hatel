@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,14 +21,12 @@ use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
 use hatel_core::sink::build_sink;
 use hatel_core::{
-    Config, ExportConfig, Payload, Registry, SessionIndex, SessionRow, make_envelope, now_iso_utc,
-    resolve_project,
+    Config, ExportConfig, Payload, Registry, SessionIndex, SessionIndexCache, make_envelope,
+    now_iso_utc, resolve_project,
 };
 
 use crate::export::{Exporter, OtlpSignal};
-use crate::otlp::{
-    Accumulator, SessionTotals, ToolResult, parse_events, parse_metrics, parse_tool_results,
-};
+use crate::otlp::{Accumulator, SessionTotals, ToolResult, parse_logs, parse_metrics};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the retention sweep repeats while serving (it also runs once at startup). Daily is
@@ -76,6 +75,10 @@ struct AppState {
     /// to stderr), mirroring the export queue's drop accounting.
     tool_dropped: Arc<AtomicU64>,
     cfg: Arc<Config>,
+    /// The change-gated session→project map, shared by the live render, each flush, and (via the
+    /// exporter) egress — re-folded only when the index files change, so a growing index is not
+    /// re-parsed on every batch. Taken before `acc` wherever both are held.
+    index_cache: Arc<Mutex<SessionIndexCache>>,
     /// Per-session totals already persisted before this receiver started, so a
     /// session that spans a receiver restart continues from its prior total rather
     /// than being overwritten by only the post-restart deltas.
@@ -107,6 +110,30 @@ pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
 
 async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let cfg = Arc::new(Config::load());
+    // The single-writer lock, taken before any work: the cost snapshot and the tool ledger assume
+    // one receiver per state dir, so a second one is refused here rather than left to race. Held in
+    // `_state_lock` for the whole run; the OS releases it on exit.
+    let _state_lock = match acquire_state_lock(&cfg.state_dir) {
+        LockOutcome::Acquired(f) => f,
+        LockOutcome::Held => {
+            // Another receiver currently holds the lock — this instance can't run. Exit NON-ZERO so
+            // the service manager (launchd `SuccessfulExit=false` / systemd `Restart=on-failure`,
+            // both throttled to ≥5s) RETRIES rather than giving up: that retry is what lets a
+            // service-managed receiver take over gap-free once the holder exits — e.g. when it lost
+            // a startup race to a manual `serve --all`. The ≥5s throttle keeps the retry from
+            // becoming a tight loop. An interactive run simply reports the message and exits non-zero.
+            eprintln!(
+                "serve: another hatel receiver already holds the lock on {} — exiting; a service \
+                 manager will retry (only one runs per state dir)",
+                cfg.state_dir.display()
+            );
+            return 1;
+        }
+        LockOutcome::Failed(e) => {
+            eprintln!("serve: {e}");
+            return 1;
+        }
+    };
     let registry = match build_registry(&cfg) {
         Ok(r) => Arc::new(r),
         Err(e) => {
@@ -144,6 +171,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         tool_buffer: Arc::new(Mutex::new(Vec::new())),
         tool_dropped: Arc::new(AtomicU64::new(0)),
         cfg: cfg.clone(),
+        index_cache: Arc::new(Mutex::new(SessionIndexCache::new(cfg.state_dir.clone()))),
         baseline: Arc::new(baseline),
         current_key,
         project_filter: project,
@@ -279,37 +307,17 @@ async fn ingest_logs(
         let (ct, ce) = body_headers(&headers);
         exporter.enqueue(OtlpSignal::Logs, body.clone(), ct, ce);
     }
-    // Buffer tool outcomes for the ledger (written off the request path by `persist`). Independent
-    // of the counted-event view below: the same body feeds both, decoded once for each.
-    match parse_tool_results(body.as_ref()) {
-        Ok(results) if !results.is_empty() => {
-            let mut buf = lock_buf(&st.tool_buffer);
-            let room = MAX_TOOL_BUFFER.saturating_sub(buf.len());
-            let fresh = |result| BufferedTool {
-                result,
-                deferrals: 0,
-            };
-            if results.len() <= room {
-                buf.extend(results.into_iter().map(fresh));
-            } else {
-                // Persist is falling behind — fill the remaining room and drop the rest, counting
-                // it, so the buffer is a hard bound (not a soft cap that overshoots by a whole
-                // batch). Honest undercount, never a blocked request.
-                let total = results.len();
-                buf.extend(results.into_iter().take(room).map(fresh));
-                drop(buf);
-                record_tool_drop(&st.tool_dropped, (total - room) as u64);
+    // Decode the body once: the per-call tool outcomes (buffered for the ledger, written off the
+    // request path by `persist`) and the counted-event tallies (folded into the live view) both
+    // come from the single walk.
+    match parse_logs(body.as_ref(), &st.counted) {
+        Ok(decoded) => {
+            buffer_tool_results(&st, decoded.tool_results);
+            if !decoded.events.is_empty() {
+                lock(&st.acc).update_events(decoded.events);
+                render(&st);
             }
         }
-        Ok(_) => {}
-        Err(_) => {} // a non-decodable body is reported once by the view path below
-    }
-    match parse_events(body.as_ref(), &st.counted) {
-        Ok(pairs) if !pairs.is_empty() => {
-            lock(&st.acc).update_events(pairs);
-            render(&st);
-        }
-        Ok(_) => {}
         Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
     }
     ok()
@@ -341,17 +349,133 @@ fn lock_buf(m: &Mutex<Vec<BufferedTool>>) -> std::sync::MutexGuard<'_, Vec<Buffe
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Same poison-recovery for the session-index cache.
+fn lock_index(m: &Mutex<SessionIndexCache>) -> std::sync::MutexGuard<'_, SessionIndexCache> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The outcome of trying to take the receiver's single-writer lock: `Acquired` (the held file —
+/// keep it alive for the process lifetime), `Held` (another receiver currently holds it — this
+/// instance can't run and exits non-zero so a throttled service manager retries until the lock
+/// frees), or `Failed` (a genuine I/O problem).
+enum LockOutcome {
+    Acquired(std::fs::File),
+    Held,
+    Failed(String),
+}
+
+/// Take the receiver's single-writer lock on the state dir — an advisory lock held for the process
+/// lifetime, which the OS releases on exit (even a crash). A second receiver over the same state dir
+/// is told to stand down instead of racing the cost snapshot and the tool ledger, which assume one
+/// writer.
+#[cfg(unix)]
+fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
+    use std::os::unix::io::AsRawFd as _;
+    if let Err(e) = std::fs::create_dir_all(state_dir) {
+        return LockOutcome::Failed(format!(
+            "cannot create state dir {}: {e}",
+            state_dir.display()
+        ));
+    }
+    let path = state_dir.join("serve.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return LockOutcome::Failed(format!(
+                "cannot open receiver lock {}: {e}",
+                path.display()
+            ));
+        }
+    };
+    // SAFETY: `flock` on a valid borrowed fd; the kernel owns the lock and frees it when the fd
+    // closes at process exit. `LOCK_NB` makes a held lock fail fast rather than block.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        LockOutcome::Acquired(file)
+    } else {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            LockOutcome::Held // another receiver holds it
+        } else {
+            LockOutcome::Failed(format!(
+                "cannot lock state dir {}: {e}",
+                state_dir.display()
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    if let Err(e) = std::fs::create_dir_all(state_dir) {
+        return LockOutcome::Failed(format!(
+            "cannot create state dir {}: {e}",
+            state_dir.display()
+        ));
+    }
+    let path = state_dir.join("serve.lock");
+    // `share_mode(0)` denies all sharing, so a second receiver's open fails with a sharing violation
+    // — the Windows analogue of the unix `flock`, released when the handle closes at process exit.
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&path)
+    {
+        Ok(f) => LockOutcome::Acquired(f),
+        // ERROR_SHARING_VIOLATION (32) means another receiver already holds it.
+        Err(e) if e.raw_os_error() == Some(32) => LockOutcome::Held,
+        Err(e) => LockOutcome::Failed(format!("cannot open receiver lock {}: {e}", path.display())),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn acquire_state_lock(_state_dir: &Path) -> LockOutcome {
+    // No advisory-lock primitive on this platform: the cost snapshot and tool ledger require one
+    // writer, so refuse rather than run without that guarantee (never a silent no-op). Unreachable
+    // on real targets — unix and windows cover every platform that can run the receiver.
+    LockOutcome::Failed("the receiver's single-writer lock is unsupported on this platform".into())
+}
+
 /// Count dropped tool outcomes and log the cumulative total once per `TOOL_DROP_LOG_EVERY` drops
 /// (throttled to avoid per-batch spam), mirroring the export queue's drop accounting.
 fn record_tool_drop(counter: &AtomicU64, n: u64) {
     let before = counter.fetch_add(n, Ordering::Relaxed);
-    // Surface the first drop immediately (like the export queue), then throttle to once per
-    // `TOOL_DROP_LOG_EVERY` — so an operator sees the problem before hundreds are already lost.
-    if before == 0 || before / TOOL_DROP_LOG_EVERY != (before + n) / TOOL_DROP_LOG_EVERY {
+    if crate::throttle::should_log(before, n, TOOL_DROP_LOG_EVERY) {
         eprintln!(
             "hatel: tool buffer full — dropped {} tool record(s) so far (persist falling behind)",
             before + n
         );
+    }
+}
+
+/// Buffer decoded `tool_result` outcomes for the ledger (written off the request path by
+/// `persist`). Bounded by `MAX_TOOL_BUFFER`: when `persist` falls behind, the remaining room is
+/// filled and the rest dropped and counted, so the buffer is a hard bound — an honest undercount,
+/// never a blocked request.
+fn buffer_tool_results(st: &AppState, results: Vec<ToolResult>) {
+    if results.is_empty() {
+        return;
+    }
+    let mut buf = lock_buf(&st.tool_buffer);
+    let room = MAX_TOOL_BUFFER.saturating_sub(buf.len());
+    let fresh = |result| BufferedTool {
+        result,
+        deferrals: 0,
+    };
+    if results.len() <= room {
+        buf.extend(results.into_iter().map(fresh));
+    } else {
+        let total = results.len();
+        buf.extend(results.into_iter().take(room).map(fresh));
+        drop(buf);
+        record_tool_drop(&st.tool_dropped, (total - room) as u64);
     }
 }
 
@@ -380,10 +504,12 @@ async fn shutdown_signal() {
 }
 
 fn render(st: &AppState) {
-    let index = SessionIndex::new(st.cfg.state_dir.clone()).load();
-    // Build the whole frame under the lock, then release it before any stdout I/O —
-    // so a slow/blocked terminal can never stall OTLP ingestion behind the lock.
+    // Refresh the change-gated index cache, then build the whole frame under the locks and release
+    // them before any stdout I/O, so a slow/blocked terminal can never stall OTLP ingestion. The
+    // index cache is taken before the accumulator — the one lock order this and `persist` share.
     let out = {
+        let mut index = lock_index(&st.index_cache);
+        index.refresh();
         let acc = lock(&st.acc);
         let mut out = String::from("\n=== hatel (live) ===\n");
         out.push_str(&format!(
@@ -473,11 +599,16 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Apply the retention horizon (`HATEL_RETENTION_DAYS`, default 90) to the ledger, exactly as
-/// `persist_cost` applies it to the cost snapshot — one horizon for every record store. (The
-/// session index is deliberately outside it: it is the join table for whatever records remain,
-/// and costs ~100 bytes per session.) `retention_days` is capped at parse time, so the product
-/// cannot overflow.
+/// Apply the retention horizon (`HATEL_RETENTION_DAYS`, default 90) on ONE horizon to every record
+/// store: the ledger (here), the cost snapshot (`persist_cost`), and the session index's archives
+/// (below). `retention_days` is capped at parse time, so the product cannot overflow.
+///
+/// Pruning the session index is safe even though it is the project-attribution join table. Only
+/// whole ARCHIVES past the horizon go — the active file is never touched — and an index archive is
+/// past the horizon only once its NEWEST session start is, i.e. every session it holds ended long
+/// ago and produces no more data to attribute. Live attribution reads only recent rows (in the
+/// active file), and historical cost/tool records bake in their project label at write time, so they
+/// never re-consult the index. Nothing still needing attribution can be pruned.
 fn prune_ledger(cfg: &Config) {
     let cutoff = hatel_core::now_epoch() - cfg.retention_days * 86_400;
     let removed = hatel_core::sink::prune_before(cfg, cutoff);
@@ -491,16 +622,24 @@ fn prune_ledger(cfg: &Config) {
             cfg.retention_days
         );
     }
+    // The session index is sink-independent, so its archives are pruned on the same horizon
+    // regardless of which sink holds the records.
+    let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(cutoff);
+    if index_removed > 0 {
+        eprintln!(
+            "hatel: retention — removed {index_removed} archived session-index file(s) older than {} days",
+            cfg.retention_days
+        );
+    }
 }
 
 /// Persist both OTel-derived stores off the request path: the per-session cost snapshot and the
-/// buffered per-call tool outcomes. The session index is loaded once and shared, since both join
-/// `session.id` to a project label the same way. `final_flush` is the shutdown pass: nothing may
-/// stay buffered after it.
+/// buffered per-call tool outcomes. Each resolves project attribution under the index-cache lock and
+/// releases it before writing, so a flush never holds a lock across I/O. `final_flush` is the
+/// shutdown pass: nothing may stay buffered after it.
 fn persist(st: &AppState, final_flush: bool) {
-    let index = SessionIndex::new(st.cfg.state_dir.clone()).load();
-    persist_cost(st, &index);
-    persist_tool(st, &index, final_flush);
+    persist_cost(st);
+    persist_tool(st, final_flush);
 }
 
 /// Drain the tool-result buffer into the ledger as `tool` records, joining each call's project
@@ -518,39 +657,50 @@ fn persist(st: &AppState, final_flush: bool) {
 /// reality (outcome known, attribution unknown) rather than dropping data. A deferred record's
 /// envelope timestamp is its (later) write time, exactly like every buffered outcome — at most
 /// ~2 min of skew against day-scale report windows.
-fn persist_tool(st: &AppState, index: &BTreeMap<String, SessionRow>, final_flush: bool) {
+fn persist_tool(st: &AppState, final_flush: bool) {
     let drained = std::mem::take(&mut *lock_buf(&st.tool_buffer));
     if drained.is_empty() {
         return;
     }
-    let mut sink = build_sink(&st.cfg);
+    // Resolve each outcome's project under the cache lock, partitioning into write-now (with its
+    // resolved label) and defer-again, then release the lock before the sink writes below.
+    let mut to_write: Vec<(ToolResult, String)> = Vec::new();
     let mut deferred: Vec<BufferedTool> = Vec::new();
-    for mut item in drained {
-        let project = index
-            .get(&item.result.session_id)
-            .map(|row| row.project_label.clone())
-            .filter(|l| !l.is_empty());
-        if project.is_none() && !final_flush && item.deferrals < MAX_TOOL_DEFERRALS {
-            item.deferrals += 1;
-            deferred.push(item);
-            continue;
-        }
-        let r = item.result;
-        let mut payload = Payload::new();
-        payload.insert("session_id".into(), r.session_id.into());
-        payload.insert("project".into(), project.unwrap_or_default().into());
-        payload.insert("tool_name".into(), r.tool_name.into());
-        payload.insert("duration_ms".into(), r.duration_ms.into());
-        payload.insert("ok".into(), i64::from(r.ok).into());
-        // Only these five fields are ever inserted, so the rich `tool_result` event — which also
-        // carries the user's email and tool input — stays out of the ledger. The Kind's field
-        // allow-list applied by `make_envelope` is defense-in-depth on top of that.
-        match make_envelope("tool", payload, &st.registry, st.cfg.strict) {
-            Ok(env) => sink.write_record(&env),
-            Err(e) => eprintln!("hatel: tool record dropped — {e}"),
+    {
+        let mut index = lock_index(&st.index_cache);
+        index.refresh();
+        for mut item in drained {
+            let project = index
+                .get(&item.result.session_id)
+                .map(|row| row.project_label.clone())
+                .filter(|l| !l.is_empty());
+            if project.is_none() && !final_flush && item.deferrals < MAX_TOOL_DEFERRALS {
+                item.deferrals += 1;
+                deferred.push(item);
+            } else {
+                to_write.push((item.result, project.unwrap_or_default()));
+            }
         }
     }
-    sink.flush();
+    if !to_write.is_empty() {
+        let mut sink = build_sink(&st.cfg);
+        for (r, project) in to_write {
+            let mut payload = Payload::new();
+            payload.insert("session_id".into(), r.session_id.into());
+            payload.insert("project".into(), project.into());
+            payload.insert("tool_name".into(), r.tool_name.into());
+            payload.insert("duration_ms".into(), r.duration_ms.into());
+            payload.insert("ok".into(), i64::from(r.ok).into());
+            // Only these five fields are ever inserted, so the rich `tool_result` event — which also
+            // carries the user's email and tool input — stays out of the ledger. The Kind's field
+            // allow-list applied by `make_envelope` is defense-in-depth on top of that.
+            match make_envelope("tool", payload, &st.registry, st.cfg.strict) {
+                Ok(env) => sink.write_record(&env),
+                Err(e) => eprintln!("hatel: tool record dropped — {e}"),
+            }
+        }
+        sink.flush();
+    }
     if !deferred.is_empty() {
         // Re-buffer the deferred outcomes under the same hard bound as ingestion — arrivals since
         // the drain have first claim on the room, so the cap can never overshoot.
@@ -565,8 +715,12 @@ fn persist_tool(st: &AppState, index: &BTreeMap<String, SessionRow>, final_flush
     }
 }
 
-fn persist_cost(st: &AppState, index: &BTreeMap<String, SessionRow>) {
+fn persist_cost(st: &AppState) {
     let now = now_iso_utc();
+    // Resolve totals and attribution under the index + accumulator locks, dropping both before the
+    // snapshot write — a flush never holds a lock across I/O.
+    let mut index = lock_index(&st.index_cache);
+    index.refresh();
     let acc = lock(&st.acc);
     let rows: Vec<CostRow> = acc
         .sessions()
@@ -601,6 +755,7 @@ fn persist_cost(st: &AppState, index: &BTreeMap<String, SessionRow>) {
         })
         .collect();
     drop(acc);
+    drop(index); // release the cache before the snapshot I/O
     // Always merge — even with no active sessions this flush — so the retention prune
     // runs on an idle receiver too, and stale prior-run rows can't linger unbounded.
     // `retention_days` is capped at parse time, so this product cannot overflow.
@@ -635,6 +790,7 @@ mod tests {
             registry,
             tool_buffer: Arc::new(Mutex::new(Vec::new())),
             tool_dropped: Arc::new(AtomicU64::new(0)),
+            index_cache: Arc::new(Mutex::new(SessionIndexCache::new(dir.to_path_buf()))),
             cfg: Arc::new(cfg),
             baseline: Arc::new(BTreeMap::new()),
             current_key: None,
@@ -686,6 +842,7 @@ mod tests {
                 key: "/k/alpha".into(),
                 label: "alpha".into(),
             },
+            st.cfg.rotate_bytes,
         );
         persist(&st, false);
         let recs = tool_records(&st);

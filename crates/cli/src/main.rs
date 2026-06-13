@@ -8,6 +8,7 @@ mod init;
 mod otlp;
 mod serve;
 mod service;
+mod throttle;
 
 use std::path::Path;
 
@@ -516,6 +517,7 @@ fn kinds_cmd(json: bool) -> i32 {
                     "group_key": s.group_key,
                     "redact": s.redact,
                     "measures": s.measures,
+                    "receiver_sourced": s.receiver_sourced,
                 })
             })
             .collect();

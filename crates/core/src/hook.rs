@@ -67,7 +67,10 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
         }
         // The hook owns project attribution (from cwd); inject it only into Kinds that
         // declare `project`, so a Kind that opts out isn't rejected under strict mode.
-        if registry.kind(&binding.kind).is_some_and(|s| s.fields.contains("project")) {
+        if registry
+            .kind(&binding.kind)
+            .is_some_and(|s| s.fields.contains("project"))
+        {
             payload.insert(
                 "project".to_string(),
                 serde_json::Value::from(project.label.clone()),
@@ -85,8 +88,11 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
 /// the receiver can attribute project-less OTel data regardless of the sink. Only the
 /// session start establishes it; that is all the receiver needs.
 fn record_session(cfg: &Config, event_name: &str, session_id: &str, project: &ProjectRef) {
-    if event_name == "SessionStart" && !session_id.is_empty() {
-        SessionIndex::new(cfg.state_dir.clone()).record(session_id, project);
+    // Record only an attributable session: a non-empty id AND a non-empty project label. A session
+    // with no resolvable project (an empty cwd) attributes nothing, so an unlabelled row would only
+    // add noise the receiver already treats as unattributed.
+    if event_name == "SessionStart" && !session_id.is_empty() && !project.label.is_empty() {
+        SessionIndex::new(cfg.state_dir.clone()).record(session_id, project, cfg.rotate_bytes);
     }
 }
 
