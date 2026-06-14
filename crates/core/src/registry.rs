@@ -137,7 +137,8 @@ pub struct FieldMap {
 impl FieldMap {
     /// Reject an ambiguous map at startup rather than silently applying a priority
     /// order: at most one transform may be set, and a non-`const` map needs a `from`
-    /// source (a transform with no source would always omit — a dead mapping).
+    /// with at least one non-empty source key (a transform with no usable source
+    /// would always omit — a dead mapping).
     fn validate(&self) -> std::result::Result<(), &'static str> {
         let transforms = [
             self.capture.is_some(),
