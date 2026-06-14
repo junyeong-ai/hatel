@@ -270,6 +270,15 @@ pub fn insert(mode: InsertMode) -> i32 {
         );
         return 1;
     }
+    // A required telemetry key the user set so native telemetry can't flow (disabled / non-OTLP
+    // exporter) — the repoint below still proceeds, but nothing reaches hatel until it's fixed, so
+    // surface it and drive a non-zero exit, exactly as `run` does. The advisory endpoint/protocol
+    // are never here (they go to env_conflicts) — insert overwrites those itself below.
+    for (k, existing) in &rep.env_blocked {
+        eprintln!(
+            "  ✗ {k}={existing} keeps native telemetry off — left as-is; set it to the collector value to capture cost/tokens"
+        );
+    }
 
     // Capture the corporate endpoint (and its auth headers) as a forward target. Refuse to clobber
     // an existing-but-broken config rather than overwrite it.
@@ -354,7 +363,9 @@ pub fn insert(mode: InsertMode) -> i32 {
     );
     warn_if_hook_missing(&cs::hook_command());
     println!("run `hatel serve` (or `hatel service`) to start forwarding, then `hatel doctor`");
-    0
+    // Non-zero if a required key keeps native telemetry off, so an installer/script sees that the
+    // repoint succeeded but the stream won't flow yet — the same contract as `run`.
+    i32::from(!rep.env_blocked.is_empty())
 }
 
 /// Warn if the hook command we just wired points at a binary that isn't there — a CLI-only
