@@ -198,6 +198,8 @@ hatel report --window 30d --format json            # for dashboards / scripts
 ```text
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
+compaction       —
+memory           —
 prompt           a1b2c3d4(2), e5f6a7b8(1)
 subagent         Explore(2), code-reviewer(1)
 tool             Bash [count=3, duration_ms=4230, ok=2], Edit [count=3, duration_ms=1010, ok=3], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2]
@@ -286,6 +288,8 @@ export:
   ⚠ egress forwards the raw OTLP stream off this host — hatel does not redact it
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
+
+> The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
 
 ### `emit` / `kinds`
 

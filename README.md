@@ -198,6 +198,8 @@ hatel report --window 30d --format json            # 대시보드/스크립트�
 ```text
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
+compaction       —
+memory           —
 prompt           a1b2c3d4(2), e5f6a7b8(1)
 subagent         Explore(2), code-reviewer(1)
 tool             Bash [count=3, duration_ms=4230, ok=2], Edit [count=3, duration_ms=1010, ok=3], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2]
@@ -286,6 +288,8 @@ export:
   ⚠ egress forwards the raw OTLP stream off this host — hatel does not redact it
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
+
+> `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
 
 ### `emit` / `kinds`
 
