@@ -209,7 +209,11 @@ fn prune_matching(dir: &Path, cutoff_epoch: i64, matches: impl Fn(&str) -> bool)
 /// Rotate an oversized active file to `<base>.YYYYMMDD.<pid>[.N]`. Including the pid makes
 /// concurrent rotations by different processes pick distinct targets, so a rename can never clobber
 /// another's archive; a `NotFound` means a peer already rotated, which is fine — the active file is
-/// recreated on the next open.
+/// recreated on the next open. Within a single process, appends to a given base are serialized —
+/// hooks are one-shot and single-threaded, and the receiver writes each ledger from its one flush
+/// writer — so the `exists()`-bump for the `.N` suffix only ever disambiguates *sequential*
+/// same-pid same-day rotations (or a dead process's leftovers after pid reuse), never two
+/// concurrent ones; there is no caller that rotates the same base from two threads at once.
 fn rotate_if_needed(path: &Path, base: &str, threshold: u64) -> std::io::Result<()> {
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
