@@ -5,27 +5,36 @@
 
 > **English** | **[한국어](README.md)**
 
-**Claude Code telemetry, kept local.** Collect tokens, cost, active time, and tool usage **per project, per session, and per subagent** — with no dashboards to host and, by default, no data leaving your machine.
+**See the tokens, cost, and time Claude Code spends — on your own laptop.** Collect tokens, cost, active time, and tool usage **per project, per session, and per subagent** — with no dashboard to host and no SaaS to sign up for. By default, data never leaves your machine.
+
+```text
+| tool | Bash [count=4, duration_ms=5730, ok=3], Edit [count=4, duration_ms=1360, ok=4], … |
+
+| session  | project  | tokens | cost$  | active_s | lines |
+| a1b2c3d4 | acme-api | 248913 | 1.8423 |   1284.6 |   342 |
+```
 
 ---
 
 ## Why hatel?
 
-- **Two signals, joined** — Claude Code already emits **native OpenTelemetry** (tokens, cost, tools) and **lifecycle hooks** (project, prompts, subagents). hatel joins them on `session.id`. Native OTel has no "which project" on the wire — hatel fills that in to give you **per-project attribution**.
-- **Zero infrastructure** — a single binary, a local OTLP receiver. No Docker, no dashboard to host, no external dependency.
-- **Privacy first** — an allow-list is the primary defense. Prompts store *length only*, tools store *name only* (never the text or arguments). By default everything stays on your machine.
-- **Extensible** — add a custom metric with one TOML file (no code, no recompile). Record CI / deploy / gate outcomes with `emit`.
-- **Sit in front of a corporate collector** — keep your existing OTLP collector; hatel sits in front and tees to it, injecting the project label.
+- **🧩 Two signals, joined** — Claude Code emits **native OpenTelemetry** (tokens, cost) and **lifecycle hooks** (project, prompts, subagents). hatel joins them on `session.id`. Native OTel has no "which project" on the wire — hatel fills that in.
+- **📦 Zero infrastructure** — a single binary, a local OTLP receiver. No Docker, no dashboard to host, no external dependency.
+- **🔒 Privacy first** — prompts store *length only*, tools store *name only* (never the text or arguments). By default everything stays on your machine.
+- **🧱 Extensible** — add a custom metric with one TOML file (no code, no recompile). Record CI / deploy / gate outcomes with one `emit`.
+- **🔌 Sit in front of a corporate collector** — keep your existing OTLP collector; hatel sits in front and tees to it, injecting the project label.
 
 ---
 
-## At a glance
+## How it works (60 seconds)
+
+Claude Code **already** emits two streams. hatel just joins them in one place:
 
 ```mermaid
 flowchart LR
   subgraph CC["Claude Code"]
-    M["native OpenTelemetry<br/>tokens · cost · active time · tool duration/outcome"]
-    H["lifecycle hooks<br/>project (cwd) · prompts · subagents · memory"]
+    M["① native OpenTelemetry<br/>tokens · cost · active time · tool duration/outcome"]
+    H["② lifecycle hooks<br/>project (cwd) · prompts · subagents · memory"]
   end
   M -->|"OTLP/HTTP (push)"| R["hatel<br/>receiver"]
   H -->|"per event"| K["hatel-hook"]
@@ -35,8 +44,14 @@ flowchart LR
   R -.->|"optional enriched tee"| CORP["corporate collector"]
 ```
 
-- **Native OTel** (push) — tokens, cost, active time, lines, per-subagent attribution (`agent.name`), and per-tool duration/outcome (the `tool_result` event). It has no project on the wire, so it is **joined through the session index**.
-- **Hooks** (event) — the project context (`cwd`) and the domain events OTel can't express: prompt sizes, memory loads, subagent stops, compactions — and anything a plugin defines.
+| | What it gives | Why it's needed |
+|---|---|---|
+| **① Native OTel** (push) | tokens, cost, active time, lines, per-subagent attribution (`agent.name`), per-tool duration/outcome | exact numbers — but **no project on the wire** |
+| **② Hooks** (event) | project (`cwd`), prompt sizes, memory loads, subagent stops, compactions | the "which project, what happened" context |
+
+> **The key idea**: ①'s numbers have no project label. hatel joins ②'s session→project mapping on `session.id` to produce **per-project attribution**. That's how "how much did `acme-api` spend" becomes one line.
+
+Two small binaries do the work:
 
 | Binary | Role |
 |---|---|
@@ -53,16 +68,18 @@ curl -fsSL https://raw.githubusercontent.com/junyeong-ai/hatel/main/scripts/inst
 
 # 2) Wire into Claude Code — idempotently merge the telemetry env + hooks into settings.json
 hatel init
-hatel doctor            # verify the wiring
+hatel doctor            # verify the wiring (look for green ✓)
 
 # 3) Run the receiver — for always-on, use `hatel service` (below)
 hatel serve --all
 
-# 4) See a report
+# 4) Use Claude Code as usual, then see a report
 hatel report --window 30d
 ```
 
-> Wire while installing with `... | bash -s -- --wire`. Pin a release with `HATEL_VERSION=0.4.1`. Remove everything later with `scripts/uninstall.sh`.
+> 💡 Wire while installing with `... | bash -s -- --wire`. Pin a release with `HATEL_VERSION=0.4.3`. Remove everything later with `scripts/uninstall.sh`.
+
+> ⚠️ **Cost and tokens are captured only while the receiver is running** (native OTel is push-only). So you don't have to remember to start it, run it as a background service with `hatel service` ([Always-on collection](#always-on-collection-no-gaps)).
 
 ---
 
@@ -95,6 +112,8 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 - The **`tool`** row is per tool: `[call count, total duration ms, successes]`. `Bash [count=4, duration_ms=5730, ok=3]` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one line**.
 - The **`cost`** table is per-session tokens, cost, active time, lines — all from **native OTel**.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, which subagent ran how often.
+
+> Before there's any data, every row reads `—`. That's normal — start the receiver and run Claude Code once and it fills in (see [Troubleshooting](#troubleshooting)).
 
 ### Live view — `hatel serve`
 
@@ -366,7 +385,14 @@ hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3
 echo '{"check":"lint","runs":14000}' | hatel emit ci_check
 ```
 
-`emit` validates the Kind, applies the same allow-list and redaction, and writes via the active sink. A field the Kind doesn't accept is dropped but **warned to stderr with the list of accepted fields** — a typo surfaces immediately. It is language-agnostic (any project, any language, calls the binary). Unlike a hook, `emit` does **not** infer the project from its working directory (a scheduler or CI job may run anywhere — guessing would mis-attribute), so include the attribution you want as payload fields. `plugins/example.toml` is a worked example.
+`emit` validates the Kind, applies the same allow-list and redaction, and writes via the active sink. A field the Kind doesn't accept is dropped but **warned to stderr with the list of accepted fields** — a typo surfaces immediately:
+
+```text
+$ hatel emit ci_check check=lint runs:=14000 failurez:=3
+emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor, check, date, failures, project, runs
+```
+
+It is language-agnostic (any project, any language, calls the binary). Unlike a hook, `emit` does **not** infer the project from its working directory (a scheduler or CI job may run anywhere — guessing would mis-attribute), so include the attribution you want as payload fields. `plugins/example.toml` is a worked example.
 
 ---
 
@@ -404,6 +430,8 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 - Event records carry the project **label** only; the absolute git-root path lives solely in the local session index.
 - Everything stays on your machine. Failures are fail-open: a write error degrades to a stderr note and never blocks a tool call.
 
+---
+
 ## Always-on collection (no gaps)
 
 Native OTel is push-only — tokens and cost are captured only while the receiver runs. For gap-free collection, install it as a background service; `hatel` writes and loads the unit for you (launchd on macOS, systemd `--user` on Linux):
@@ -416,6 +444,8 @@ hatel service --print   # print the unit instead of installing — to inspect or
 
 > The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. (`scripts/install.sh --service` does this in the same step as install.)
 
+---
+
 ## Enterprise / managed settings
 
 The collector never fights managed policy; it adapts:
@@ -423,6 +453,21 @@ The collector never fights managed policy; it adapts:
 - **OTel repointed at a corporate collector** — the local hook ledger keeps working; the `session.id` join holds wherever the native data lands, so metrics query from the corporate backend and join to the local domain ledger by session.
 - **`allowManagedHooksOnly`** — user/project hooks are blocked, so IT deploys `hatel-hook` as a *managed* hook (the single static binary ships via MDM). `doctor` detects this from the file-based managed settings.
 - **`OTEL_METRICS_INCLUDE_SESSION_ID=false`** — per-session attribution becomes impossible. `doctor` reports it plainly; org/user aggregates still work. There is no guessed fallback — an unavailable signal is reported as unavailable, never fabricated.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| **Report is all `—`** | No data yet. ① `hatel doctor` to confirm wiring → ② run the receiver (`hatel serve --all` or `hatel service`) → ③ do some work in Claude Code → `hatel report` again. |
+| **`prompt`/`subagent` show up but `cost`/`tokens`/`tool` are empty** | All three come **through the receiver** — cost/tokens are native OTel metrics, and `tool` is the native `tool_result` event. The hook ledger (`prompt`, `subagent`, `memory`, `compaction`) accrues without the receiver, but these three need it running *at that moment*. Run `hatel service` for always-on. |
+| **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
+| **`emit` drops a field** | The field isn't in the Kind's allow-list. stderr prints the accepted fields (`accepted fields: …`) — fix the typo. |
+| **Receiver won't start / exits immediately** | Another receiver already holds the lock on the same state dir (single-writer). Use that one, or manage it with `hatel service`. |
+| **Corporate policy locks the endpoint/hooks** | See [Enterprise / managed settings](#enterprise--managed-settings) — `doctor` reports honestly what's possible. |
+
+> The fastest diagnosis is always **`hatel doctor`** — it reports the missing signal as-is, no guessing.
 
 ---
 
@@ -435,6 +480,24 @@ crates/cli    the receiver, reports, doctor (core + tokio/axum)
 plugins/      example declarative plugins
 ```
 
+---
+
+## Support
+
+- 🐛 [GitHub Issues](https://github.com/junyeong-ai/hatel/issues) — bug reports and feature requests
+- 📖 `hatel <command> --help` — inline help on every command
+- 🩺 `hatel doctor` — self-diagnose wiring and policy
+
 ## License
 
 MIT OR Apache-2.0.
+
+---
+
+<div align="center">
+
+**English** | **[한국어](README.md)**
+
+Made with 🦀 Rust · your data stays on your machine
+
+</div>

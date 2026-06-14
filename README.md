@@ -5,27 +5,36 @@
 
 > **[English](README.en.md)** | **한국어**
 
-**Claude Code 텔레메트리를 로컬에서.** 토큰·비용·활성 시간·도구 사용을 **프로젝트·세션·서브에이전트별로** 모읍니다 — 호스팅할 대시보드 없이, 기본적으로 데이터는 당신의 머신을 떠나지 않습니다.
+**Claude Code가 쓴 토큰·비용·시간을 내 노트북에서 본다.** 토큰·비용·활성 시간·도구 사용을 **프로젝트·세션·서브에이전트별로** 모읍니다 — 띄워둘 대시보드도, 가입할 SaaS도 없이. 기본적으로 데이터는 당신의 머신을 떠나지 않습니다.
+
+```text
+| tool | Bash [count=4, duration_ms=5730, ok=3], Edit [count=4, duration_ms=1360, ok=4], … |
+
+| session  | project  | tokens | cost$  | active_s | lines |
+| a1b2c3d4 | acme-api | 248913 | 1.8423 |   1284.6 |   342 |
+```
 
 ---
 
 ## 왜 hatel인가?
 
-- **두 신호를 하나로** — Claude Code가 이미 내보내는 **네이티브 OpenTelemetry**(토큰·비용·도구)와 **라이프사이클 훅**(프로젝트·프롬프트·서브에이전트)을 `session.id`로 조인합니다. 네이티브 OTel에는 "어느 프로젝트인지"가 없는데, hatel이 그걸 채워 **프로젝트별 귀속**을 만듭니다.
-- **제로 인프라** — 단일 바이너리, 로컬 OTLP 수신기. 도커도, 대시보드도, 외부 의존도 없습니다.
-- **프라이버시 우선** — allow-list가 1차 방어. 프롬프트는 *길이만*, 도구는 *이름만* 저장합니다(본문·인자 저장 안 함). 기본적으로 모든 데이터는 로컬에만 머뭅니다.
-- **확장 가능** — TOML 한 장으로 커스텀 지표 추가(코드·재컴파일 없음). CI·배포·게이트 결과도 `emit`으로 기록할 수 있습니다.
-- **사내 컬렉터 앞에 끼우기** — 기존 OTLP 컬렉터를 그대로 두고, hatel이 그 앞에 앉아 프로젝트 라벨을 주입해 전달합니다.
+- **🧩 두 신호를 하나로** — Claude Code가 내보내는 **네이티브 OpenTelemetry**(토큰·비용)와 **라이프사이클 훅**(프로젝트·프롬프트·서브에이전트)을 `session.id`로 조인. OTel 숫자엔 "어느 프로젝트"가 없는데, hatel이 그걸 채웁니다.
+- **📦 제로 인프라** — 단일 바이너리, 로컬 OTLP 수신기. 도커도, 대시보드도, 외부 의존도 없음.
+- **🔒 프라이버시 우선** — 프롬프트는 *길이만*, 도구는 *이름만* 저장(본문·인자는 저장 안 함). 기본적으로 전부 로컬에만.
+- **🧱 확장 가능** — TOML 한 장으로 커스텀 지표 추가(코드·재컴파일 없음). CI·배포·게이트 결과도 `emit` 한 줄로 기록.
+- **🔌 사내 컬렉터 앞에 끼우기** — 기존 OTLP 컬렉터를 그대로 두고, hatel이 앞에 앉아 프로젝트 라벨을 주입해 전달.
 
 ---
 
-## 한눈에 보기
+## 작동 원리 (60초)
+
+Claude Code는 **이미** 두 가지를 흘려보냅니다. hatel은 그 둘을 한 곳에서 합칠 뿐입니다:
 
 ```mermaid
 flowchart LR
   subgraph CC["Claude Code"]
-    M["네이티브 OpenTelemetry<br/>토큰 · 비용 · 활성시간 · 도구 소요/성공"]
-    H["라이프사이클 훅<br/>프로젝트(cwd) · 프롬프트 · 서브에이전트 · 메모리"]
+    M["① 네이티브 OpenTelemetry<br/>토큰 · 비용 · 활성시간 · 도구 소요/성공"]
+    H["② 라이프사이클 훅<br/>프로젝트(cwd) · 프롬프트 · 서브에이전트 · 메모리"]
   end
   M -->|"OTLP/HTTP (push)"| R["hatel<br/>수신기"]
   H -->|"이벤트마다"| K["hatel-hook"]
@@ -35,8 +44,14 @@ flowchart LR
   R -.->|"선택: enriched 전달"| CORP["사내 컬렉터"]
 ```
 
-- **네이티브 OTel**(push) — 토큰·비용·활성시간·라인, 서브에이전트 귀속(`agent.name`), 도구별 소요/성공(`tool_result` 이벤트). 와이어에 프로젝트가 없어 **세션 인덱스로 조인**합니다.
-- **훅**(event) — 프로젝트 컨텍스트(`cwd`)와 OTel이 표현 못 하는 도메인 이벤트: 프롬프트 크기, 메모리 로드, 서브에이전트 종료, 압축 — 그리고 플러그인이 정의한 무엇이든.
+| | 무엇을 주나 | 왜 필요한가 |
+|---|---|---|
+| **① 네이티브 OTel** (push) | 토큰·비용·활성시간·라인, 서브에이전트 귀속(`agent.name`), 도구별 소요/성공 | 정확한 숫자. 단, 와이어에 **프로젝트가 없음** |
+| **② 훅** (event) | 프로젝트(`cwd`), 프롬프트 크기, 메모리 로드, 서브에이전트 종료, 압축 | "어느 프로젝트·무슨 일"의 맥락 |
+
+> **핵심**: ①의 숫자엔 프로젝트 라벨이 없습니다. hatel이 ②의 세션→프로젝트 매핑을 `session.id`로 조인해 **프로젝트별 귀속**을 만듭니다. 그래서 `acme-api`가 토큰을 얼마 썼는지가 한 줄로 나옵니다.
+
+두 개의 작은 바이너리가 이 일을 합니다:
 
 | 바이너리 | 역할 |
 |---|---|
@@ -53,16 +68,18 @@ curl -fsSL https://raw.githubusercontent.com/junyeong-ai/hatel/main/scripts/inst
 
 # 2) Claude Code에 연결 — settings.json에 텔레메트리 env + 훅을 멱등 병합
 hatel init
-hatel doctor            # 연결이 제대로 됐는지 검증
+hatel doctor            # 연결이 제대로 됐는지 검증 (초록 ✓ 확인)
 
 # 3) 수신기 실행 — 항상 켜두려면 `hatel service` (아래 참고)
 hatel serve --all
 
-# 4) 리포트 보기
+# 4) Claude Code를 평소처럼 쓴 뒤, 리포트 보기
 hatel report --window 30d
 ```
 
-> 설치하면서 바로 연결하려면 `... | bash -s -- --wire`. 특정 버전 고정은 `HATEL_VERSION=0.4.1`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
+> 💡 설치하면서 바로 연결하려면 `... | bash -s -- --wire`. 특정 버전 고정은 `HATEL_VERSION=0.4.3`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
+
+> ⚠️ **비용·토큰은 수신기가 켜져 있을 때만** 잡힙니다(네이티브 OTel은 push 전용). 끄고 켜는 걸 잊지 않으려면 `hatel service`로 백그라운드 상시 실행하세요([항상 켜두기](#항상-켜두기-무중단-수집)).
 
 ---
 
@@ -95,6 +112,8 @@ hatel report --window 30d
 - **`tool`** 행은 도구별로 `[호출 수, 총 소요 ms, 성공 수]`. `Bash [count=4, duration_ms=5730, ok=3]` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공. → **평균 지연과 성공률**이 한 줄에서 나옵니다.
 - **`cost`** 표는 세션별 토큰·비용·활성시간·라인 — 전부 **네이티브 OTel**에서.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번.
+
+> 아직 아무 데이터도 없다면 모든 행이 `—`로 나옵니다. 그건 정상입니다 — 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
 ### 라이브 뷰 — `hatel serve`
 
@@ -366,7 +385,14 @@ hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3
 echo '{"check":"lint","runs":14000}' | hatel emit ci_check
 ```
 
-`emit`은 Kind를 검증하고 같은 allow-list·redaction을 적용해 활성 sink에 씁니다. Kind가 받지 않는 필드는 드롭하되 **허용 필드 목록과 함께 stderr로 경고** — 오타가 바로 드러납니다. 언어 무관(어떤 프로젝트·언어든 바이너리를 호출). 훅과 달리 `emit`은 cwd로 프로젝트를 추측하지 **않습니다**(스케줄러·CI가 어디서든 돌 수 있어 추측은 오귀속). 크로스-프로젝트 분석에는 원하는 귀속(`project`, 슬러그, 조직)을 페이로드 필드로 넣으세요. `plugins/example.toml`이 동작 예제입니다.
+`emit`은 Kind를 검증하고 같은 allow-list·redaction을 적용해 활성 sink에 씁니다. Kind가 받지 않는 필드는 드롭하되 **허용 필드 목록과 함께 stderr로 경고** — 오타가 바로 드러납니다:
+
+```text
+$ hatel emit ci_check check=lint runs:=14000 failurez:=3
+emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor, check, date, failures, project, runs
+```
+
+언어 무관(어떤 프로젝트·언어든 바이너리를 호출). 훅과 달리 `emit`은 cwd로 프로젝트를 추측하지 **않습니다**(스케줄러·CI가 어디서든 돌 수 있어 추측은 오귀속). 크로스-프로젝트 분석에는 원하는 귀속(`project`, 슬러그, 조직)을 페이로드 필드로 넣으세요. `plugins/example.toml`이 동작 예제입니다.
 
 ---
 
@@ -404,6 +430,8 @@ echo '{"check":"lint","runs":14000}' | hatel emit ci_check
 - 이벤트 레코드는 프로젝트 **라벨**만 — 절대 git-root 경로는 로컬 세션 인덱스에만.
 - 전부 로컬에. 실패는 fail-open: 쓰기 오류는 stderr 메모로 degrade되지 도구 호출을 막지 않습니다.
 
+---
+
 ## 항상 켜두기 (무중단 수집)
 
 네이티브 OTel은 push 전용이라 수신기가 켜져 있을 때만 토큰·비용이 잡힙니다. 무중단 사용자-레벨 수집은 백그라운드 서비스로 설치하세요 — `hatel`이 유닛을 직접 쓰고 로드합니다(macOS launchd, Linux systemd `--user`):
@@ -416,6 +444,8 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 
 > 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. (`scripts/install.sh --service`가 설치와 같은 단계에서 이걸 합니다.)
 
+---
+
 ## 엔터프라이즈 / managed 설정
 
 수집기는 managed 정책과 싸우지 않고 적응합니다:
@@ -423,6 +453,21 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 - **OTel이 사내 컬렉터로 재지정됨** — 로컬 훅 원장은 계속 작동. `session.id` 조인이 네이티브 데이터가 어디 떨어지든 유지되어, 사내 백엔드의 메트릭과 로컬 도메인 원장이 세션으로 조인됩니다.
 - **`allowManagedHooksOnly`** — user/project 훅이 차단되면 IT가 `hatel-hook`을 *managed* 훅으로 배포(단일 정적 바이너리를 MDM으로). `doctor`가 파일 기반 managed 설정에서 감지.
 - **`OTEL_METRICS_INCLUDE_SESSION_ID=false`** — 세션별 귀속이 불가능. `doctor`가 명확히 보고; org/user 집계는 여전히 작동. 추측 fallback은 없습니다 — 못 쓰는 신호는 못 쓴다고 보고하지 지어내지 않습니다.
+
+---
+
+## 문제 해결
+
+| 증상 | 원인 / 해결 |
+|---|---|
+| **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
+| **`prompt`·`subagent`는 잡히는데 `cost`·`tokens`·`tool`이 비어있음** | 이 셋은 전부 **수신기**를 거쳐 옵니다 — 비용·토큰은 네이티브 OTel 메트릭, `tool`은 네이티브 `tool_result` 이벤트입니다. 훅 원장(`prompt`·`subagent`·`memory`·`compaction`)은 수신기 없이도 쌓이지만, 이 셋은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
+| **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
+| **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |
+| **수신기가 안 뜸 / 곧바로 종료** | 같은 state 디렉터리에 다른 수신기가 이미 락을 잡고 있습니다(단일-writer). 기존 것을 쓰거나 `hatel service`로 관리하세요. |
+| **사내 정책으로 endpoint·훅이 잠김** | [엔터프라이즈 / managed 설정](#엔터프라이즈--managed-설정) 참고 — `doctor`가 무엇이 가능한지 정직하게 보고합니다. |
+
+> 무엇이 잘못됐는지 가장 빠른 진단은 항상 **`hatel doctor`** 입니다 — 추측 없이 빠진 신호를 그대로 보고합니다.
 
 ---
 
@@ -435,6 +480,24 @@ crates/cli    수신기, 리포트, doctor (core + tokio/axum)
 plugins/      선언적 플러그인 예제
 ```
 
+---
+
+## 지원
+
+- 🐛 [GitHub Issues](https://github.com/junyeong-ai/hatel/issues) — 버그 제보·기능 제안
+- 📖 `hatel <명령> --help` — 모든 명령에 인라인 도움말
+- 🩺 `hatel doctor` — 연결·정책 자가 진단
+
 ## 라이선스
 
 MIT OR Apache-2.0.
+
+---
+
+<div align="center">
+
+**[English](README.en.md)** | **한국어**
+
+Made with 🦀 Rust · 데이터는 당신의 머신에 머뭅니다
+
+</div>
