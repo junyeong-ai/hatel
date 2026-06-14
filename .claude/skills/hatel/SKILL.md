@@ -81,8 +81,9 @@ hatel kinds --json                          # every registered Kind and its fiel
 Reading a report: each Kind lists groups with a record count and the summed `measures`; the
 `cost` array is the latest snapshot per session (`tokens`, `cost_usd`, `active_time_s`, `lines`,
 `project`). For "which subagent costs most", the live `serve` view breaks tokens/cost down per
-subagent via `agent.name`. `report --project <label>` matches by the project's basename label
-and drops Kinds that carry no `project` field — don't present that as zero usage.
+subagent via `agent.name`. `report --project <label>` matches by the project's basename label;
+a Kind that carries no `project` field can never match it, so it renders as `—` (empty) — read
+that as "not applicable", not as zero usage.
 
 `--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly
