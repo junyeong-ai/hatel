@@ -877,7 +877,7 @@ fn field_map_transform_without_source_is_rejected() {
     )
     .unwrap();
     let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("needs a `from`"), "got: {err}");
+    assert!(format!("{err}").contains("non-empty `from`"), "got: {err}");
 }
 
 #[test]

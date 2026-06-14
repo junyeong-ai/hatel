@@ -152,8 +152,17 @@ impl FieldMap {
         if transforms > 1 {
             return Err("at most one of capture/len/present/basename/const may be set");
         }
-        if self.constant.is_none() && self.from.is_none() {
-            return Err("a non-const map needs a `from` source");
+        // A non-const map needs a `from` with at least one usable source key. Absent, an empty list
+        // (`from = []`), or only blank keys (`from = ""`) are all the same dead mapping — they would
+        // always omit — so reject them loudly at load rather than silently emit nothing.
+        if self.constant.is_none() {
+            let has_source = self
+                .from
+                .as_ref()
+                .is_some_and(|f| f.keys().iter().any(|k| !k.is_empty()));
+            if !has_source {
+                return Err("a non-const map needs a non-empty `from` source");
+            }
         }
         Ok(())
     }
@@ -349,5 +358,52 @@ mod tests {
         let r: std::result::Result<HookBinding, _> =
             toml::from_str("event = \"E\"\nkind = \"k\"\nkindd = \"typo\"");
         assert!(r.is_err(), "unknown HookBinding key must be rejected");
+    }
+
+    fn reg_with_kind() -> Registry {
+        let mut reg = Registry::new();
+        reg.add_kind(
+            KindSpec::from_raw(
+                toml::from_str("name = \"k\"\nfields = [\"thing\"]\ngroup_key = \"thing\"")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        reg
+    }
+
+    #[test]
+    fn binding_rejects_empty_from_source() {
+        // `from = []`, `from = ""`, and `from = ["", ""]` are all dead mappings — a non-const map
+        // with no usable source key always omits — so they must fail at load, not silently emit
+        // nothing. (`from` absent is already rejected; this covers the present-but-empty forms.)
+        for from in ["from = []", "from = \"\"", "from = [\"\", \"\"]"] {
+            let binding: HookBinding = toml::from_str(&format!(
+                "event = \"SessionStart\"\nkind = \"k\"\nmap.thing = {{ {from} }}"
+            ))
+            .unwrap();
+            let err = reg_with_kind().bind(binding);
+            assert!(
+                matches!(&err, Err(Error::InvalidSpec { reason, .. }) if reason.contains("non-empty `from`")),
+                "`{from}` must be rejected as a dead mapping, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_accepts_a_real_from_source() {
+        // Guard against over-rejection: a normal source key, and a list with at least one non-empty
+        // key, must still load.
+        for from in ["from = \"thing\"", "from = [\"\", \"thing\"]"] {
+            let binding: HookBinding = toml::from_str(&format!(
+                "event = \"SessionStart\"\nkind = \"k\"\nmap.thing = {{ {from} }}"
+            ))
+            .unwrap();
+            assert!(
+                reg_with_kind().bind(binding).is_ok(),
+                "`{from}` has a usable source and must load"
+            );
+        }
     }
 }
