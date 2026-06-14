@@ -420,7 +420,7 @@ fn advise_session_id(env: &cs::Env) {
     match env.get("OTEL_METRICS_INCLUDE_SESSION_ID") {
         Some((v, scope)) if v == "false" => println!(
             "  ⚠ OTEL_METRICS_INCLUDE_SESSION_ID=false (from {scope}): per-session/project \
-             attribution is impossible. Only org/user aggregates remain."
+             attribution is impossible — hatel drops these session-less metrics rather than guess."
         ),
         _ => println!("  ✓ session.id included in metrics (default on)"),
     }

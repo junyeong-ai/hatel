@@ -36,7 +36,8 @@ hatel doctor               # verify and explain any gaps
 - **no hook invokes …** → run `init`.
 - **BLOCKED by allowManagedHooksOnly** → IT must deploy the hook as a *managed* hook (MDM).
 - **OTEL_METRICS_INCLUDE_SESSION_ID=false** → per-session/project attribution is impossible;
-  only org/user aggregates remain. There is no fallback — report it as-is.
+  hatel drops session-less metrics rather than guess (org/user aggregation only survives at a
+  downstream collector you forward the raw stream to). There is no fallback — report it as-is.
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
 - **export forwards nothing / endpoint bypasses this receiver** → export only forwards what
   reaches hatel; the OTel endpoint must point at hatel. Run `hatel init --insert` (or, if the

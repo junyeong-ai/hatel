@@ -523,14 +523,23 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
         _ => rep.env_not_object = true,
     }
 
-    // The protocol key is advisory in general, but mandatory when the (effective) endpoint is the
+    // The protocol key is advisory in general, but mandatory when the effective endpoint is the
     // local receiver — promote a mismatch there from advisory to blocking, so `init` and `doctor`
-    // agree that telemetry won't actually reach the receiver.
-    let endpoint_is_local = obj
-        .get("env")
-        .and_then(|e| e.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
-        .and_then(Value::as_str)
-        .is_some_and(is_local_receiver);
+    // agree that telemetry won't actually reach the receiver. "Effective" means the same resolution
+    // `doctor` uses: a per-signal `…_METRICS_ENDPOINT` / `…_LOGS_ENDPOINT` counts as well as the
+    // general `OTEL_EXPORTER_OTLP_ENDPOINT`, so a per-signal route to the receiver isn't missed.
+    let endpoint_is_local = [
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+    ]
+    .iter()
+    .filter_map(|k| {
+        obj.get("env")
+            .and_then(|e| e.get(*k))
+            .and_then(Value::as_str)
+    })
+    .any(is_local_receiver);
     if endpoint_is_local
         && let Some(i) = rep
             .env_conflicts
@@ -911,6 +920,25 @@ mod tests {
             !rep.env_blocked
                 .iter()
                 .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
+        );
+    }
+
+    #[test]
+    fn wire_blocks_wrong_protocol_against_a_per_signal_local_endpoint() {
+        // The general endpoint is remote, but a per-signal metrics endpoint routes to the local
+        // receiver. `doctor` resolves endpoints per signal, so `wire` must too — the grpc protocol
+        // can't reach the http/json receiver, so it is blocking, not advisory.
+        let mut s = json!({ "env": {
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://corp:4318",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://127.0.0.1:4318"
+        }});
+        let rep = wire(&mut s, CMD, &EVENTS);
+        assert!(
+            rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            "a per-signal local endpoint must promote the protocol mismatch to blocking"
         );
     }
 
