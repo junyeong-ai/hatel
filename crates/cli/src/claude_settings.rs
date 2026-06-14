@@ -523,23 +523,25 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
         _ => rep.env_not_object = true,
     }
 
-    // The protocol key is advisory in general, but mandatory when the effective endpoint is the
+    // The protocol key is advisory in general, but mandatory when an effective endpoint is the
     // local receiver — promote a mismatch there from advisory to blocking, so `init` and `doctor`
-    // agree that telemetry won't actually reach the receiver. "Effective" means the same resolution
-    // `doctor` uses: a per-signal `…_METRICS_ENDPOINT` / `…_LOGS_ENDPOINT` counts as well as the
-    // general `OTEL_EXPORTER_OTLP_ENDPOINT`, so a per-signal route to the receiver isn't missed.
-    let endpoint_is_local = [
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    ]
-    .iter()
-    .filter_map(|k| {
+    // agree that telemetry won't actually reach the receiver. "Effective" is resolved exactly as
+    // `doctor`'s `effective_otlp_endpoints` does: a per-signal `…_METRICS_ENDPOINT` /
+    // `…_LOGS_ENDPOINT` *overrides* (shadows) the general `OTEL_EXPORTER_OTLP_ENDPOINT` for that
+    // signal — so a per-signal route to the receiver is caught, and a per-signal override away from
+    // a local general endpoint is honored (not falsely seen as local).
+    let env_str = |k: &str| {
         obj.get("env")
-            .and_then(|e| e.get(*k))
+            .and_then(|e| e.get(k))
             .and_then(Value::as_str)
-    })
-    .any(is_local_receiver);
+    };
+    let general = env_str("OTEL_EXPORTER_OTLP_ENDPOINT");
+    let effective_metrics = env_str("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").or(general);
+    let effective_logs = env_str("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").or(general);
+    let endpoint_is_local = [effective_metrics, effective_logs]
+        .into_iter()
+        .flatten()
+        .any(is_local_receiver);
     if endpoint_is_local
         && let Some(i) = rep
             .env_conflicts
@@ -939,6 +941,32 @@ mod tests {
                 .iter()
                 .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"),
             "a per-signal local endpoint must promote the protocol mismatch to blocking"
+        );
+    }
+
+    #[test]
+    fn wire_keeps_protocol_advisory_when_per_signal_overrides_shadow_a_local_general() {
+        // A per-signal endpoint *overrides* the general one for its signal (doctor's resolution): a
+        // local general endpoint fully shadowed by remote metrics+logs overrides reaches the
+        // receiver for neither signal, so the protocol stays advisory — `wire` must agree with
+        // `doctor`, not over-block on the raw (shadowed) general key.
+        let mut s = json!({ "env": {
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+            "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "http://corp:4318",
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://corp:4318"
+        }});
+        let rep = wire(&mut s, CMD, &EVENTS);
+        assert!(
+            !rep.env_blocked
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL"),
+            "both signals overridden to remote → protocol is advisory, not blocking"
+        );
+        assert!(
+            rep.env_conflicts
+                .iter()
+                .any(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
         );
     }
 
