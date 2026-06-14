@@ -473,8 +473,8 @@ fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&s
         for r in &rows {
             out.push_str(&format!(
                 "| {} | {} | {} | {:.4} | {:.1} | {} |\n",
-                short(&r.session_id),
-                project(&r.project),
+                hatel_core::render::escape_md_cell(&short(&r.session_id)),
+                hatel_core::render::escape_md_cell(&project(&r.project)),
                 r.tokens,
                 r.cost_usd,
                 r.active_time_s,
