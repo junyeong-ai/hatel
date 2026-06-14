@@ -23,12 +23,15 @@ pub fn format_markdown(reg: &Registry, cfg: &Config, window_label: &str, q: &Que
 /// Neutralize a string for a GitHub-flavored-Markdown table cell. A literal `|` would open a new
 /// column and any newline a new row, so a field value carrying either — a `tool_name`, a project
 /// label from a directory name, a git branch used as a group key — would otherwise break or inject
-/// into the table. `|` is backslash-escaped; every control character (newlines included) collapses
-/// to a space. Stored data is untouched — this is render-only.
+/// into the table. The backslash is escaped first (it is GFM's own escape leader, so a pre-existing
+/// `\` before a `|` would otherwise form an even run that leaves the pipe live); then `|` is
+/// backslash-escaped and every control character (newlines included) collapses to a space. Stored
+/// data is untouched — this is render-only.
 pub fn escape_md_cell(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '\\' => out.push_str("\\\\"),
             '|' => out.push_str("\\|"),
             c if c.is_control() => out.push(' '),
             c => out.push(c),
@@ -103,6 +106,10 @@ mod tests {
         assert_eq!(escape_md_cell("feat/a|b"), "feat/a\\|b");
         assert_eq!(escape_md_cell("line1\nline2"), "line1 line2");
         assert_eq!(escape_md_cell("a\r\nb\tc"), "a  b c");
+        // The backslash is escaped first, so a `\` before a `|` can't leave the pipe live: `a\|b`
+        // becomes `a\\\|b` (literal backslash, then escaped pipe), and a Windows path stays intact.
+        assert_eq!(escape_md_cell(r"a\|b"), r"a\\\|b");
+        assert_eq!(escape_md_cell(r"c:\path"), r"c:\\path");
         // Ordinary text (including the empty-group em-dash) is untouched.
         assert_eq!(escape_md_cell("Bash"), "Bash");
         assert_eq!(escape_md_cell("—"), "—");
