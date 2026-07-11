@@ -8,6 +8,11 @@ updates:
       time: "06:00"
       timezone: Asia/Seoul
     open-pull-requests-limit: 10
+    # A week's cooldown keeps routine bumps on the weekly cadence while skipping the
+    # first days after a release — the window where yanked or compromised versions
+    # are most likely to be caught upstream.
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - rust
@@ -31,6 +36,8 @@ updates:
       time: "06:00"
       timezone: Asia/Seoul
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     labels:
       - dependencies
       - github-actions
