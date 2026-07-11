@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.4.5
+version: 0.5.0
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
 when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
@@ -111,7 +111,8 @@ retained — say so rather than presenting it as low usage.
 A plugin is a TOML schema file (no code, no recompile). Point at it with
 `HATEL_PLUGINS=path/to/plugin.toml` (OS path-list separator for several), then
 confirm with `hatel kinds`. **Choose the path by where the signal originates, and
-keep one writer per Kind** (a Kind written by both paths double-counts):
+keep one writer per Kind** (a Kind written by both paths double-counts; a
+receiver-sourced Kind like `tool` is refused by `emit` outright, exit 2):
 
 - A signal the Claude Code lifecycle can observe → a **hook binding** (zero code,
   auto-attributed to the session's project).
@@ -142,8 +143,8 @@ collide with core's flat names. Field-map transforms: `from` (a list tries each 
 `emit` records a domain signal directly (`key=value` is a string, `key:=value` is JSON):
 
 ```bash
-hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3
-echo '{"check":"lint","runs":14000}' | hatel emit ci_check
+hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3 project=acme-api
+echo '{"check":"lint","runs":14000,"project":"acme-api"}' | hatel emit ci_check
 ```
 
 `emit` does **not** infer the project from its working directory (the emitter may run anywhere),

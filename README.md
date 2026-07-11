@@ -308,7 +308,7 @@ export:
 
 ```sh
 hatel kinds                                         # 등록된 Kind와 필드
-hatel emit ci_check check=lint runs:=14000 failures:=3   # 도메인 신호 기록
+hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # 도메인 신호 기록
 ```
 
 `hatel kinds` 출력(코어):
@@ -397,9 +397,9 @@ map.ok         = { from = "tool_response", present = true }
 
 ```sh
 # key=value 는 문자열, key:=value 는 JSON(숫자·bool·배열)
-hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3
+hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3 project=acme-api
 # 또는 --json 으로 객체 통째로, 혹은 stdin 파이프
-echo '{"check":"lint","runs":14000}' | hatel emit ci_check
+echo '{"check":"lint","runs":14000,"project":"acme-api"}' | hatel emit ci_check
 ```
 
 `emit`은 Kind를 검증하고 같은 allow-list·redaction을 적용해 활성 sink에 씁니다. Kind가 받지 않는 필드는 드롭하되 **허용 필드 목록과 함께 stderr로 경고** — 오타가 바로 드러납니다:

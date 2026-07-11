@@ -308,7 +308,7 @@ export:
 
 ```sh
 hatel kinds                                              # registered Kinds and their fields
-hatel emit ci_check check=lint runs:=14000 failures:=3   # record a domain signal
+hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # record a domain signal
 ```
 
 `hatel kinds` (core):
@@ -397,9 +397,9 @@ map.ok         = { from = "tool_response", present = true }
 
 ```sh
 # key=value is a string, key:=value is JSON (numbers, bools, arrays)
-hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3
+hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3 project=acme-api
 # or a whole JSON object via --json, or piped on stdin
-echo '{"check":"lint","runs":14000}' | hatel emit ci_check
+echo '{"check":"lint","runs":14000,"project":"acme-api"}' | hatel emit ci_check
 ```
 
 `emit` validates the Kind, applies the same allow-list and redaction, and writes via the active sink. A field the Kind doesn't accept is dropped but **warned to stderr with the list of accepted fields** — a typo surfaces immediately:
