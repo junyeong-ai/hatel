@@ -26,7 +26,9 @@ use hatel_core::{
 };
 
 use crate::export::{Exporter, OtlpSignal};
-use crate::otlp::{Accumulator, SessionTotals, ToolResult, parse_logs, parse_metrics};
+use crate::otlp::{
+    Accumulator, SessionTotals, ToolResult, UNATTRIBUTED, parse_logs, parse_metrics,
+};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the retention sweep repeats while serving (it also runs once at startup). Daily is
@@ -564,17 +566,17 @@ fn agent_rows(t: &SessionTotals) -> String {
     let agents = t.by_agent();
     // Show the breakdown only when a real (named) subagent is present — hide it when
     // everything is top-level (`main` / `(unattributed)`), however many such buckets.
-    let only_top_level = agents.keys().all(|a| a == "main" || a == "(unattributed)");
+    let only_top_level = agents.keys().all(|a| a == "main" || a == UNATTRIBUTED);
     if only_top_level {
         return String::new();
     }
     let mut out = String::new();
-    for (agent, (tokens, cost)) in &agents {
+    for (agent, spend) in &agents {
         out.push_str(&format!(
             "  └ {:<27} {:>9} {:>9.4}\n",
             truncate(agent, 27),
-            tokens,
-            cost
+            spend.tokens,
+            spend.cost_usd
         ));
     }
     out
@@ -722,6 +724,8 @@ fn persist_cost(st: &AppState) {
     let mut index = lock_index(&st.index_cache);
     index.refresh();
     let acc = lock(&st.acc);
+    let no_counts = BTreeMap::new();
+    let no_spend = BTreeMap::new();
     let rows: Vec<CostRow> = acc
         .sessions()
         .iter()
@@ -729,7 +733,9 @@ fn persist_cost(st: &AppState) {
             // The pre-restart baseline is added per metric, and only where that metric
             // is delta — a cumulative metric already reports its full total, so adding
             // it would double-count. Per-metric (not per-session) keeps a mixed-
-            // temporality session correct.
+            // temporality session correct. The dimensional breakdowns apply the same
+            // rule per bucket key (`cost::merge_counts` / `merge_spend`), so a model
+            // or subagent used only before the restart keeps its spend.
             let base = st.baseline.get(sid);
             let add = |is_delta: bool, pick: fn(&CostRow) -> f64| -> f64 {
                 if is_delta {
@@ -750,6 +756,23 @@ fn persist_cost(st: &AppState) {
                 active_time_s: t.active_time_s()
                     + add(t.active_time_is_delta(), |b| b.active_time_s),
                 lines: t.lines() + add(t.lines_is_delta(), |b| b.lines as f64) as i64,
+                tokens_by_type: cost::merge_counts(
+                    base.map_or(&no_counts, |b| &b.tokens_by_type),
+                    t.tokens_by_type(),
+                    t.tokens_is_delta(),
+                ),
+                by_model: cost::merge_spend(
+                    base.map_or(&no_spend, |b| &b.by_model),
+                    t.by_model(),
+                    t.tokens_is_delta(),
+                    t.cost_is_delta(),
+                ),
+                by_agent: cost::merge_spend(
+                    base.map_or(&no_spend, |b| &b.by_agent),
+                    t.by_agent(),
+                    t.tokens_is_delta(),
+                    t.cost_is_delta(),
+                ),
                 ts: now.clone(),
             }
         })
@@ -879,6 +902,97 @@ mod tests {
             "exhausted deferral records reality: unattributed"
         );
         assert!(lock_buf(&st.tool_buffer).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_cost_merges_dimensional_baselines_across_restart() {
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("dims");
+        let mut st = test_state(&dir);
+        // A session persisted by the previous receiver run: 100 tokens (90 cacheRead /
+        // 10 input), all on opus.
+        let base_row = CostRow {
+            session_id: "S1".into(),
+            tokens: 100,
+            cost_usd: 1.0,
+            tokens_by_type: [("cacheRead".to_string(), 90), ("input".to_string(), 10)]
+                .into_iter()
+                .collect(),
+            by_model: [(
+                "opus".to_string(),
+                cost::Spend {
+                    tokens: 100,
+                    cost_usd: 1.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ts: now_iso_utc(),
+            ..CostRow::default()
+        };
+        st.baseline = Arc::new([("S1".to_string(), base_row)].into_iter().collect());
+        // Post-restart delta points: more opus cacheRead tokens, and cost on a model
+        // the baseline never saw.
+        lock(&st.acc).update_metrics(vec![
+            MetricPoint {
+                name: "token.usage".into(),
+                value: 50.0,
+                session_id: "S1".into(),
+                series: vec![
+                    ("model".into(), "opus".into()),
+                    ("type".into(), "cacheRead".into()),
+                ],
+                delta: true,
+            },
+            MetricPoint {
+                name: "cost.usage".into(),
+                value: 0.5,
+                session_id: "S1".into(),
+                series: vec![("model".into(), "haiku".into())],
+                delta: true,
+            },
+        ]);
+        persist(&st, false);
+        let rows = cost::read_snapshot(&st.cfg.state_dir);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.tokens, 150, "scalar baseline added to the delta total");
+        assert!((row.cost_usd - 1.5).abs() < 1e-9);
+        assert_eq!(
+            row.tokens_by_type.get("cacheRead"),
+            Some(&140),
+            "per-key delta merge: baseline 90 + current 50"
+        );
+        assert_eq!(
+            row.tokens_by_type.get("input"),
+            Some(&10),
+            "a bucket only in the baseline keeps its pre-restart spend"
+        );
+        assert_eq!(
+            row.by_model.get("opus"),
+            Some(&cost::Spend {
+                tokens: 150,
+                cost_usd: 1.0
+            })
+        );
+        assert_eq!(
+            row.by_model.get("haiku"),
+            Some(&cost::Spend {
+                tokens: 0,
+                cost_usd: 0.5
+            }),
+            "a model first seen after the restart needs no baseline"
+        );
+        assert_eq!(
+            row.by_agent.get(UNATTRIBUTED),
+            Some(&cost::Spend {
+                tokens: 50,
+                cost_usd: 0.5
+            }),
+            "agentless series are recorded as such, never guessed"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

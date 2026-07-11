@@ -16,7 +16,16 @@ use serde::{Deserialize, Serialize};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One dimension bucket's spend: the two budget measures every breakdown carries.
+/// A named pair rather than a tuple so the serialized form is self-describing
+/// (`{"cost_usd": …, "tokens": …}`), which is what a machine consumer keys on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Spend {
+    pub tokens: i64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostRow {
     pub session_id: String,
     pub project: String,
@@ -24,7 +33,66 @@ pub struct CostRow {
     pub cost_usd: f64,
     pub active_time_s: f64,
     pub lines: i64,
+    /// Dimensional breakdowns of the totals above, bucketed by the OTel series
+    /// attributes: token counts by token type (`input` / `output` / `cacheRead` /
+    /// `cacheCreation` — the cache-hit accounting), and spend by model and by
+    /// subagent attribution. A series missing the dimension buckets under
+    /// `(unattributed)` — recorded, never guessed. A breakdown sums to its total
+    /// only when every contributing record carried the dimension: rows persisted
+    /// before a dimension existed deserialize to an empty map (`serde(default)`),
+    /// which is the honest reading — the breakdown genuinely was not recorded.
+    #[serde(default)]
+    pub tokens_by_type: BTreeMap<String, i64>,
+    #[serde(default)]
+    pub by_model: BTreeMap<String, Spend>,
+    #[serde(default)]
+    pub by_agent: BTreeMap<String, Spend>,
     pub ts: String,
+}
+
+/// Merge one breakdown across a receiver restart, per bucket key: a key in both maps
+/// accumulates (delta temporality) or is replaced by the current value (cumulative — the
+/// current point already carries its full total); a key only in the pre-restart baseline
+/// keeps its last known value under either temporality (its spend really happened and the
+/// current run simply has no series for it); a key only in the current run needs no
+/// baseline. This is the per-key form of the same per-metric rule the scalar totals use.
+pub fn merge_counts(
+    base: &BTreeMap<String, i64>,
+    current: BTreeMap<String, i64>,
+    delta: bool,
+) -> BTreeMap<String, i64> {
+    let mut out = base.clone();
+    for (key, value) in current {
+        let slot = out.entry(key).or_insert(0);
+        *slot = if delta { *slot + value } else { value };
+    }
+    out
+}
+
+/// `merge_counts` for a `Spend` breakdown. The two measures merge under their own
+/// metric's temporality — tokens and cost are distinct OTel metrics, so a session mixing
+/// temporalities across them stays correct per component.
+pub fn merge_spend(
+    base: &BTreeMap<String, Spend>,
+    current: BTreeMap<String, Spend>,
+    tokens_delta: bool,
+    cost_delta: bool,
+) -> BTreeMap<String, Spend> {
+    let mut out = base.clone();
+    for (key, value) in current {
+        let slot = out.entry(key).or_default();
+        slot.tokens = if tokens_delta {
+            slot.tokens + value.tokens
+        } else {
+            value.tokens
+        };
+        slot.cost_usd = if cost_delta {
+            slot.cost_usd + value.cost_usd
+        } else {
+            value.cost_usd
+        };
+    }
+    out
 }
 
 fn snapshot_path(state_dir: &Path) -> PathBuf {
@@ -89,4 +157,67 @@ fn write_atomic(state_dir: &Path, body: &str) -> std::io::Result<()> {
     let tmp = final_path.with_extension(format!("jsonl.{}.{seq}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{body}\n"))?;
     std::fs::rename(&tmp, &final_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    fn spends(pairs: &[(&str, i64, f64)]) -> BTreeMap<String, Spend> {
+        pairs
+            .iter()
+            .map(|(k, tokens, cost_usd)| {
+                (
+                    k.to_string(),
+                    Spend {
+                        tokens: *tokens,
+                        cost_usd: *cost_usd,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_counts_sums_delta_and_replaces_cumulative_per_key() {
+        let base = counts(&[("input", 100), ("cacheRead", 40)]);
+        // Delta: both-keys sum; a base-only key keeps its pre-restart spend; a
+        // current-only key needs no baseline.
+        let delta = merge_counts(&base, counts(&[("input", 10), ("output", 5)]), true);
+        assert_eq!(
+            delta,
+            counts(&[("input", 110), ("cacheRead", 40), ("output", 5)])
+        );
+        // Cumulative: the current point is already the full total, so it replaces;
+        // the base-only key still keeps its last known value.
+        let cumulative = merge_counts(&base, counts(&[("input", 10)]), false);
+        assert_eq!(cumulative, counts(&[("input", 10), ("cacheRead", 40)]));
+    }
+
+    #[test]
+    fn merge_spend_applies_each_measure_under_its_own_temporality() {
+        // Tokens delta, cost cumulative — the mixed-temporality session: per key,
+        // tokens accumulate while cost is replaced by its full total.
+        let base = spends(&[("opus", 100, 1.0)]);
+        let merged = merge_spend(&base, spends(&[("opus", 10, 3.0)]), true, false);
+        assert_eq!(merged, spends(&[("opus", 110, 3.0)]));
+    }
+
+    #[test]
+    fn a_row_persisted_without_breakdowns_deserializes_to_empty_maps() {
+        // A snapshot line written before the dimensional breakdowns existed still
+        // parses — its breakdowns read as empty (not recorded), never as a parse
+        // failure that would silently drop the row (and its totals) from reports.
+        let line = "{\"session_id\":\"S\",\"project\":\"alpha\",\"tokens\":7,\"cost_usd\":0.5,\
+                    \"active_time_s\":1.0,\"lines\":2,\"ts\":\"2026-01-01T00:00:00Z\"}";
+        let row: CostRow = serde_json::from_str(line).unwrap();
+        assert_eq!(row.tokens, 7);
+        assert!(row.tokens_by_type.is_empty());
+        assert!(row.by_model.is_empty());
+        assert!(row.by_agent.is_empty());
+    }
 }

@@ -3,7 +3,7 @@
 pub mod accumulator;
 pub mod decode;
 
-pub use accumulator::{Accumulator, SessionTotals};
+pub use accumulator::{Accumulator, SessionTotals, UNATTRIBUTED};
 pub use decode::{ToolResult, parse_logs, parse_metrics};
 
 /// The datapoint / log-record attribute carrying the Claude Code session id — the join key the

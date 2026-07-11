@@ -616,10 +616,8 @@ fn cost_snapshot_merges_by_session() {
         session_id: sid.to_string(),
         project: "p".to_string(),
         tokens,
-        cost_usd: 0.0,
-        active_time_s: 0.0,
-        lines: 0,
         ts: "2024-01-01T00:00:00Z".to_string(),
+        ..CostRow::default()
     };
     cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 10), row("S2", 5)], 0);
     cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 99)], 0); // update S1, keep S2 (retain all)
@@ -640,10 +638,8 @@ fn merge_with_no_rows_still_prunes_stale_entries() {
         session_id: "old".to_string(),
         project: "p".to_string(),
         tokens: 1,
-        cost_usd: 0.0,
-        active_time_s: 0.0,
-        lines: 0,
         ts: "2000-01-01T00:00:00Z".to_string(),
+        ..CostRow::default()
     };
     cost::merge_snapshot(&cfg.state_dir, vec![old], 0); // seed (retain all)
     assert_eq!(cost::read_snapshot(&cfg.state_dir).len(), 1);
@@ -670,10 +666,8 @@ fn cost_snapshot_prunes_rows_past_retention() {
         session_id: sid.to_string(),
         project: "p".to_string(),
         tokens: 1,
-        cost_usd: 0.0,
-        active_time_s: 0.0,
-        lines: 0,
         ts: ts.to_string(),
+        ..CostRow::default()
     };
     let now = hatel_core::now_iso_utc();
     cost::merge_snapshot(

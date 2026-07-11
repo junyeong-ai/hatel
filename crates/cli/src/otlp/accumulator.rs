@@ -9,7 +9,14 @@
 
 use std::collections::BTreeMap;
 
+use hatel_core::cost::Spend;
+
 use super::decode::MetricPoint;
+
+/// The bucket label for a series that does not carry the dimension being folded —
+/// recorded as such, never guessed into a real bucket. One spelling, shared by every
+/// breakdown (and the live view's hide-when-trivial check).
+pub const UNATTRIBUTED: &str = "(unattributed)";
 
 // Metric identities, normalized (the `claude_code.` prefix stripped) to match the
 // names `decode::parse_metrics` produces.
@@ -79,36 +86,67 @@ impl SessionTotals {
         self.metric_is_delta(LINES)
     }
 
-    /// Per-subagent (tokens, cost), bucketed by attribution. The label is the
-    /// `agent.name` (the specific subagent type) when present; otherwise the
-    /// `query_source` category (`main` / `subagent` / `auxiliary`); and only
-    /// `(unattributed)` when neither is on the series — never a guessed `main`.
-    /// This is the differentiated signal — which subagent spent the budget — that
-    /// session-level totals flatten away.
-    pub fn by_agent(&self) -> BTreeMap<String, (i64, f64)> {
-        let mut out: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    /// Per-subagent spend, bucketed by attribution. The label is the `agent.name`
+    /// (the specific subagent type) when present; otherwise the `query_source`
+    /// category (`main` / `subagent` / `auxiliary`); and only `(unattributed)` when
+    /// neither is on the series — never a guessed `main`. This is the differentiated
+    /// signal — which subagent spent the budget — that session-level totals flatten
+    /// away.
+    pub fn by_agent(&self) -> BTreeMap<String, Spend> {
+        self.spend_by(|series| {
+            attr(series, "agent.name")
+                .or_else(|| attr(series, "query_source"))
+                .unwrap_or_else(|| UNATTRIBUTED.to_string())
+        })
+    }
+
+    /// Per-model spend — the model-mix accounting (which model the budget went to),
+    /// bucketed by the series' `model` attribute.
+    pub fn by_model(&self) -> BTreeMap<String, Spend> {
+        self.spend_by(|series| attr(series, "model").unwrap_or_else(|| UNATTRIBUTED.to_string()))
+    }
+
+    /// Token counts by the series' `type` attribute (`input` / `output` /
+    /// `cacheRead` / `cacheCreation`) — the cache-hit accounting. Tokens only: the
+    /// cost metric carries no `type`, so a cost-by-type map could only ever say
+    /// `(unattributed)`.
+    pub fn tokens_by_type(&self) -> BTreeMap<String, i64> {
+        let mut out: BTreeMap<String, i64> = BTreeMap::new();
+        for ((metric, series), value) in &self.metric_series {
+            if metric != TOKENS {
+                continue;
+            }
+            let label = attr(series, "type").unwrap_or_else(|| UNATTRIBUTED.to_string());
+            *out.entry(label).or_insert(0) += *value as i64;
+        }
+        out
+    }
+
+    /// Tokens + cost summed per `label` bucket over each contributing series — the
+    /// shared fold behind every spend breakdown.
+    fn spend_by(&self, label: impl Fn(&[(String, String)]) -> String) -> BTreeMap<String, Spend> {
+        let mut out: BTreeMap<String, Spend> = BTreeMap::new();
         for ((metric, series), value) in &self.metric_series {
             if metric != TOKENS && metric != COST {
                 continue;
             }
-            let attr = |key: &str| {
-                series
-                    .iter()
-                    .find(|(k, _)| k == key)
-                    .map(|(_, v)| v.clone())
-            };
-            let label = attr("agent.name")
-                .or_else(|| attr("query_source"))
-                .unwrap_or_else(|| "(unattributed)".to_string());
-            let entry = out.entry(label).or_insert((0, 0.0));
+            let entry = out.entry(label(series)).or_default();
             if metric == TOKENS {
-                entry.0 += *value as i64;
+                entry.tokens += *value as i64;
             } else {
-                entry.1 += *value;
+                entry.cost_usd += *value;
             }
         }
         out
     }
+}
+
+/// The value of `key` on a series' attribute list.
+fn attr(series: &[(String, String)], key: &str) -> Option<String> {
+    series
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
 }
 
 #[derive(Debug, Default)]
@@ -215,12 +253,51 @@ mod tests {
         )]);
         acc.update_metrics(vec![point(COST, 1.0, false, vec![])]); // no attribution
         let agents = acc.sessions()["S"].by_agent();
-        assert_eq!(agents.get("Explore").map(|(t, _)| *t), Some(10));
-        assert_eq!(agents.get("main").map(|(t, _)| *t), Some(20));
+        assert_eq!(agents.get("Explore").map(|s| s.tokens), Some(10));
+        assert_eq!(agents.get("main").map(|s| s.tokens), Some(20));
         assert!(
-            agents.contains_key("(unattributed)"),
+            agents.contains_key(UNATTRIBUTED),
             "agentless cost is not guessed as main"
         );
+    }
+
+    #[test]
+    fn by_model_buckets_tokens_and_cost_per_model() {
+        let mut acc = Accumulator::default();
+        acc.update_metrics(vec![
+            point(
+                TOKENS,
+                10.0,
+                true,
+                vec![("model", "opus"), ("type", "input")],
+            ),
+            point(
+                TOKENS,
+                5.0,
+                true,
+                vec![("model", "opus"), ("type", "output")],
+            ),
+            point(COST, 0.5, true, vec![("model", "haiku")]),
+        ]);
+        let models = acc.sessions()["S"].by_model();
+        assert_eq!(models.get("opus").map(|s| s.tokens), Some(15));
+        assert_eq!(models.get("haiku").map(|s| s.cost_usd), Some(0.5));
+    }
+
+    #[test]
+    fn tokens_by_type_folds_the_cache_split_and_ignores_cost() {
+        let mut acc = Accumulator::default();
+        acc.update_metrics(vec![
+            point(TOKENS, 100.0, true, vec![("type", "cacheRead")]),
+            point(TOKENS, 7.0, true, vec![("type", "input")]),
+            point(TOKENS, 3.0, true, vec![]), // a typeless series is not guessed
+            point(COST, 1.0, true, vec![]),   // cost carries no type — excluded
+        ]);
+        let by_type = acc.sessions()["S"].tokens_by_type();
+        assert_eq!(by_type.get("cacheRead"), Some(&100));
+        assert_eq!(by_type.get("input"), Some(&7));
+        assert_eq!(by_type.get(UNATTRIBUTED), Some(&3));
+        assert_eq!(by_type.values().sum::<i64>(), 110);
     }
 
     #[test]
