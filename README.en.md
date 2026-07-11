@@ -171,7 +171,7 @@ In a full report (no `--kind`), each `cost` row serializes three breakdowns alon
 
 ### The MCP server — `hatel mcp`
 
-AI agents get **typed MCP tools** instead of stdout parsing — `report`, `kinds`, `doctor`, and `emit` served over a stdio MCP server, each tool returning exactly the JSON its CLI `--json` counterpart prints:
+AI agents get **typed MCP tools** instead of stdout parsing — `report`, `kinds`, `doctor`, and `emit` served over a stdio MCP server; the three read tools return exactly the JSON their CLI counterparts print (`--format json` / `--json`), and `emit` answers with its outcome (including any dropped-field warning) as text:
 
 ```sh
 claude mcp add hatel -- hatel mcp

@@ -171,7 +171,7 @@ hatel report --window 30d --kind tool --format json
 
 ### MCP 서버 — `hatel mcp`
 
-AI 에이전트에게는 stdout 파싱 대신 **타입 있는 MCP 도구**가 있습니다 — `report`·`kinds`·`doctor`·`emit`을 stdio MCP 서버로 노출하며, 각 도구는 해당 CLI `--json` 출력과 동일한 JSON을 반환합니다:
+AI 에이전트에게는 stdout 파싱 대신 **타입 있는 MCP 도구**가 있습니다 — `report`·`kinds`·`doctor`·`emit`을 stdio MCP 서버로 노출하며, 읽기 도구 셋은 해당 CLI JSON 출력(`--format json`/`--json`)과 동일한 JSON을, `emit`은 기록 결과(드롭된 필드 경고 포함)를 텍스트로 반환합니다:
 
 ```sh
 claude mcp add hatel -- hatel mcp

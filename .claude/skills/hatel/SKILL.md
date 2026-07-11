@@ -20,8 +20,9 @@ JSON (top-level `ok`, per-section `findings` with `status` `ok`/`fail`/`warn`/`n
 it when you need to branch on a specific gap.
 
 `hatel mcp` serves `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio
-(`claude mcp add hatel -- hatel mcp`); each tool returns exactly the JSON its CLI `--json`
-counterpart prints, so everything below applies to both surfaces.
+(`claude mcp add hatel -- hatel mcp`); the read tools return exactly the JSON their CLI
+counterparts print (`--format json` / `--json`), and `emit` answers with its outcome as
+text — so everything below applies to both surfaces.
 
 ## Set up / wire
 

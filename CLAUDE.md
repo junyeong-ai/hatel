@@ -40,9 +40,9 @@ uvx zizmor .github/                       # after workflow edits (security audit
 - `#[serde(deny_unknown_fields)]` on every config/schema surface — a misspelled key must
   fail loudly, never silently disable a feature.
 - **Machine outputs are one shape per question**: `--json` / `--format json` serialize
-  keys alphabetically, and each MCP tool returns exactly the JSON its CLI counterpart
-  prints. Changing one means changing both (they share the same functions — keep it that
-  way).
+  keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
+  the JSON their CLI counterparts print. Changing one means changing both (they share
+  the same functions — keep it that way).
 - **README samples are real output.** Human-facing CLI output is quoted verbatim in both
   READMEs; changing output text means updating `README.md` and `README.en.md` together
   (they are maintained line-for-line parallel, ko/en).

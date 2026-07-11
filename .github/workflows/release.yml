@@ -171,9 +171,10 @@ jobs:
             dist/*.zip
 
       # The runner-bundled `gh` publishes the release directly — no third-party action in
-      # the one job that holds a write token. An unmatched `dist/*` stays a literal glob
-      # under `set -u`, so gh fails loudly instead of publishing an empty release. A re-run
-      # after a partial publish uploads into the existing release rather than failing on it.
+      # the one job that holds a write token. An unmatched `dist/*` expands to nothing
+      # matched — the literal path — and gh errors on it, so an empty dist can never
+      # publish an empty release. A re-run after a partial publish uploads into the
+      # existing release rather than failing on it.
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

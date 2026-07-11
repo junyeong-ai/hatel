@@ -110,7 +110,7 @@ enum Command {
     },
     /// Serve `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio —
     /// the programmatic surface for agents (`claude mcp add hatel -- hatel mcp`).
-    /// Each tool returns exactly the JSON its CLI `--json` counterpart prints.
+    /// The read tools return exactly the JSON their CLI counterparts print.
     Mcp,
     /// List the registered Kinds (core + plugins).
     Kinds {

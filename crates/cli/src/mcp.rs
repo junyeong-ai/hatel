@@ -1,9 +1,10 @@
 //! `hatel mcp` — the machine-facing surface: the collector's read paths (`report`,
 //! `kinds`, `doctor`) and its one write (`emit`) as typed MCP tools over stdio, so an
-//! agent calls them in-protocol instead of shelling out and parsing stdout. Every tool
-//! returns exactly the JSON its CLI `--json` counterpart prints — one payload shape per
-//! question, however it is asked. stdout is the protocol channel; diagnostics go to
-//! stderr only.
+//! agent calls them in-protocol instead of shelling out and parsing stdout. Each read
+//! tool returns exactly the JSON its CLI counterpart prints (`--format json` /
+//! `--json`) — one payload shape per question, however it is asked; `emit` answers
+//! with its outcome as text, since the CLI write path prints nothing on success.
+//! stdout is the protocol channel; diagnostics go to stderr only.
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -94,7 +95,8 @@ impl HatelMcp {
         let cfg = Config::load();
         let reg = build_registry(&cfg).map_err(internal)?;
         let json = serde_json::to_string_pretty(&kinds_value(&reg)).unwrap_or_default();
-        Ok(text_result(json))
+        // Trailing newline included, so the payload is byte-equal to the CLI's println!.
+        Ok(text_result(format!("{json}\n")))
     }
 
     #[tool(
@@ -102,7 +104,7 @@ impl HatelMcp {
     )]
     fn doctor(&self) -> Result<CallToolResult, McpError> {
         let json = serde_json::to_string_pretty(&doctor::report_value()).unwrap_or_default();
-        Ok(text_result(json))
+        Ok(text_result(format!("{json}\n")))
     }
 
     #[tool(

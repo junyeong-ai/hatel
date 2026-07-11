@@ -5,7 +5,12 @@
 //! Counts are best-effort under OTLP retransmission: the accumulate paths (delta
 //! metrics and event counts) are not idempotent, so a replayed batch would inflate
 //! them. In the intended deployment the exporter pushes to this local receiver,
-//! which always answers 200 immediately, so retries do not occur in practice.
+//! which always answers 200 immediately, so retries do not occur in practice. The
+//! one window that survives the immediate ack is a receiver crash between a flush
+//! and the response: the persisted baseline then already holds a delta the client
+//! resends to the next receiver. Deduplicating that would take a durable per-batch
+//! identity — weight this local collector deliberately doesn't carry; cumulative
+//! series are immune either way (a replayed total replaces, never adds).
 
 use std::collections::BTreeMap;
 
