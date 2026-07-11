@@ -1,10 +1,11 @@
-//! `hatel` — the human-facing collector binary: OTLP receiver, reports,
-//! doctor, and registry introspection.
+//! `hatel` — the collector binary: OTLP receiver, reports, doctor, registry
+//! introspection, and the MCP server (the same surfaces, served as typed tools).
 
 mod claude_settings;
 mod doctor;
 mod export;
 mod init;
+mod mcp;
 mod otlp;
 mod serve;
 mod service;
@@ -103,7 +104,14 @@ enum Command {
         print: bool,
     },
     /// Verify the settings.json wiring and report policy gaps.
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio —
+    /// the programmatic surface for agents (`claude mcp add hatel -- hatel mcp`).
+    /// Each tool returns exactly the JSON its CLI `--json` counterpart prints.
+    Mcp,
     /// List the registered Kinds (core + plugins).
     Kinds {
         #[arg(long)]
@@ -171,75 +179,96 @@ fn run() -> i32 {
             }
         }
         Command::Service { remove, print } => service::run(remove, print),
-        Command::Doctor => doctor::run(),
+        Command::Doctor { json } => doctor::run(json),
+        Command::Mcp => mcp::run(),
         Command::Kinds { json } => kinds_cmd(json),
         Command::Emit { kind, fields, json } => emit_cmd(&kind, fields, json),
     }
 }
 
-/// Record one domain signal. Caller errors (unknown kind, malformed input, or — in
-/// strict mode — disallowed keys) exit non-zero so the caller knows it wasn't
-/// recorded; an IO write failure stays fail-open (the sink notes it to stderr).
-fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
+/// Why an emit was refused: `Registry` is an environment problem (the registry itself
+/// failed to load); `Rejected` is a caller problem (unknown or receiver-sourced Kind,
+/// malformed input, or — in strict mode — disallowed keys). The CLI maps them to exit
+/// codes 1 / 2, MCP to internal / invalid-params errors.
+pub(crate) enum EmitError {
+    Registry(String),
+    Rejected(String),
+}
+
+/// Record one domain signal — the write path shared by the `emit` subcommand and the
+/// MCP `emit` tool. `payload` is built lazily, only after the Kind checks pass, so an
+/// unknown Kind never blocks on a payload source (the CLI may be reading stdin).
+/// `Ok` carries the dropped-fields warning, if any — the caller decides where it
+/// surfaces (stderr for the CLI, the result text for MCP). An IO write failure stays
+/// fail-open (the sink notes it to stderr).
+pub(crate) fn emit_record(
+    kind: &str,
+    payload: impl FnOnce() -> Result<Payload, String>,
+) -> Result<Option<String>, EmitError> {
     let cfg = Config::load();
-    let reg = match build_registry(&cfg) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("emit: {e}");
-            return 1;
-        }
-    };
+    let reg = build_registry(&cfg).map_err(|e| EmitError::Registry(e.to_string()))?;
     if reg.kind(kind).is_none() {
         let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        eprintln!(
-            "emit: unknown kind {kind:?}; registered: {}",
+        return Err(EmitError::Rejected(format!(
+            "unknown kind {kind:?}; registered: {}",
             known.join(", ")
-        );
-        return 2;
+        )));
     }
     // A receiver-sourced Kind (e.g. `tool`, written from native OTel) has a single writer by
     // design — emitting one by hand would interleave fabricated records with the real stream, so
     // refuse it here the same way `bind` refuses a hook binding to it.
     if reg.kind(kind).is_some_and(|s| s.receiver_sourced) {
-        eprintln!(
-            "emit: {kind:?} is receiver-sourced (written from native OTel) — it has a single writer \
+        return Err(EmitError::Rejected(format!(
+            "{kind:?} is receiver-sourced (written from native OTel) — it has a single writer \
              and cannot be emitted by hand"
-        );
-        return 2;
+        )));
     }
-    let payload = match build_payload(fields, json) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("emit: {e}");
-            return 2;
-        }
-    };
-    // Warn loudly on a field the Kind doesn't accept — on the interactive `emit` path the
-    // user typed it, so a silent allow-list drop (correct for automatic hooks) would just
+    let payload = payload().map_err(EmitError::Rejected)?;
+    // Warn loudly on a field the Kind doesn't accept — on the emit path the caller
+    // chose it, so a silent allow-list drop (correct for automatic hooks) would just
     // hide a typo. The dropped field never reaches the sink either way.
-    if let Some(spec) = reg.kind(kind) {
+    let warning = reg.kind(kind).and_then(|spec| {
         let unknown: Vec<&str> = payload
             .keys()
             .filter(|k| !spec.fields.contains(*k))
             .map(String::as_str)
             .collect();
-        if !unknown.is_empty() {
-            let mut accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
-            accepted.sort_unstable();
-            eprintln!(
-                "emit: {kind} does not accept {unknown:?} (dropped) — accepted fields: {}",
-                accepted.join(", ")
-            );
+        if unknown.is_empty() {
+            return None;
         }
-    }
+        let mut accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
+        accepted.sort_unstable();
+        Some(format!(
+            "{kind} does not accept {unknown:?} (dropped) — accepted fields: {}",
+            accepted.join(", ")
+        ))
+    });
     match hatel_core::make_envelope(kind, payload, &reg, cfg.strict) {
         Ok(env) => {
             let mut sink = hatel_core::build_sink(&cfg);
             sink.write_record(&env);
             sink.flush();
+            Ok(warning)
+        }
+        Err(e) => Err(EmitError::Rejected(e.to_string())),
+    }
+}
+
+/// The `emit` subcommand: `emit_record` with CLI surfaces — warnings and errors to
+/// stderr, outcomes as exit codes.
+fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
+    match emit_record(kind, || build_payload(fields, json)) {
+        Ok(warning) => {
+            if let Some(w) = warning {
+                eprintln!("emit: {w}");
+            }
             0
         }
-        Err(e) => {
+        Err(EmitError::Registry(e)) => {
+            eprintln!("emit: {e}");
+            1
+        }
+        Err(EmitError::Rejected(e)) => {
             eprintln!("emit: {e}");
             2
         }
@@ -372,7 +401,7 @@ fn report_cmd(
 /// A redacted field's value is mapped to its stored hash here, exactly as the write path maps
 /// it — so the field is queried by its original value (which still never touches the ledger),
 /// rather than silently matching nothing against the stored hash.
-fn parse_filters(
+pub(crate) fn parse_filters(
     raw: &[String],
     kind: Option<&str>,
     reg: &Registry,
@@ -410,7 +439,7 @@ fn parse_filters(
 }
 
 /// Machine-readable report: per-Kind group aggregates plus the cost snapshot.
-fn report_json(reg: &Registry, cfg: &Config, window: &str, q: &report::Query) -> String {
+pub(crate) fn report_json(reg: &Registry, cfg: &Config, window: &str, q: &report::Query) -> String {
     let kinds: Vec<serde_json::Value> = reg
         .kinds()
         .filter(|s| q.kind.is_none_or(|k| s.name == k))
@@ -498,6 +527,25 @@ fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&s
     out
 }
 
+/// The registered Kinds as the `kinds --json` array — the schema-discovery payload,
+/// shared by the CLI flag and the MCP tool.
+pub(crate) fn kinds_value(reg: &Registry) -> serde_json::Value {
+    let arr: Vec<serde_json::Value> = reg
+        .kinds()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "fields": s.fields,
+                "group_key": s.group_key,
+                "redact": s.redact,
+                "measures": s.measures,
+                "receiver_sourced": s.receiver_sourced,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
 fn kinds_cmd(json: bool) -> i32 {
     let cfg = Config::load();
     let reg = match build_registry(&cfg) {
@@ -508,20 +556,10 @@ fn kinds_cmd(json: bool) -> i32 {
         }
     };
     if json {
-        let arr: Vec<serde_json::Value> = reg
-            .kinds()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.name,
-                    "fields": s.fields,
-                    "group_key": s.group_key,
-                    "redact": s.redact,
-                    "measures": s.measures,
-                    "receiver_sourced": s.receiver_sourced,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&kinds_value(&reg)).unwrap_or_default()
+        );
     } else {
         for s in reg.kinds() {
             let fields: Vec<&str> = s.fields.iter().map(String::as_str).collect();
