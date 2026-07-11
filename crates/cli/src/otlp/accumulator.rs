@@ -3,14 +3,14 @@
 //! a cumulative or gauge datapoint replaces the prior value for its series.
 //!
 //! Counts are best-effort under OTLP retransmission: the accumulate paths (delta
-//! metrics and event counts) are not idempotent, so a replayed batch would inflate
-//! them. In the intended deployment the exporter pushes to this local receiver,
-//! which always answers 200 immediately, so retries do not occur in practice. The
-//! one window that survives the immediate ack is a receiver crash between a flush
-//! and the response: the persisted baseline then already holds a delta the client
-//! resends to the next receiver. Deduplicating that would take a durable per-batch
-//! identity — weight this local collector deliberately doesn't carry; cumulative
-//! series are immune either way (a replayed total replaces, never adds).
+//! metrics and event counts) are not idempotent, so a replayed batch inflates
+//! them. The receiver answers 200 immediately to leave a client no reason to
+//! retry, but that cannot make delivery certain — an ack lost in transit replays
+//! onto the live process, and a receiver crash between a flush and the response
+//! replays onto the next one through the persisted baseline. Deduplicating either
+//! would take a durable per-batch identity — weight this local collector
+//! deliberately doesn't carry; cumulative series are immune both ways (a replayed
+//! total replaces, never adds).
 
 use std::collections::BTreeMap;
 

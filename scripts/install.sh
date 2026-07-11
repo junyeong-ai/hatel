@@ -233,14 +233,21 @@ fi
 echo
 if [ "$MCP" = true ]; then
     # Register with the absolute path, like the hook wiring — no PATH dependency.
-    # `claude mcp add` refuses an existing name rather than overwriting, so re-runs
-    # add first and fall back to replace: an existing registration is removed only
-    # once a fresh add has already failed, which keeps it intact when the config
-    # isn't writable at all (the remove would fail the same way).
+    # `claude mcp add` refuses an existing name rather than overwriting (and offers no
+    # force flag), so re-runs add first and fall back to replace: an existing
+    # registration is removed only once a fresh add has already failed, which keeps it
+    # intact when the config isn't writable at all (the remove would fail the same
+    # way). Should the re-add after that remove still fail, the gap is announced with
+    # its recovery command rather than left as a silent hole.
     if command -v claude >/dev/null 2>&1; then
         if ! claude mcp add --scope user hatel -- "$BIN_DIR/hatel" mcp 2>/dev/null; then
             claude mcp remove --scope user hatel >/dev/null 2>&1 || true
-            claude mcp add --scope user hatel -- "$BIN_DIR/hatel" mcp || rc=$?
+            if ! claude mcp add --scope user hatel -- "$BIN_DIR/hatel" mcp; then
+                rc=1
+                echo "error: re-registering the MCP server failed after its previous registration" >&2
+                echo "       was removed — register it by hand:" >&2
+                echo "         claude mcp add --scope user hatel -- $BIN_DIR/hatel mcp" >&2
+            fi
         fi
     else
         echo "error: --mcp needs the \`claude\` CLI on PATH to register the MCP server" >&2
