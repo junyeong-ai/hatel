@@ -12,8 +12,13 @@ SKILL_DIR="$HOME/.claude/skills/hatel"
 VERSION="${HATEL_VERSION:-}"
 WIRE=false
 SERVICE=false
+MCP=false
 INSTALL_SKILL=true
 SOURCE=false
+
+# Transport hardening for every download: https only (no redirect downgrade), modern
+# TLS, and a few retries against transient CDN failures.
+CURL_FLAGS=(--proto '=https' --tlsv1.2 -fsSL --retry 3)
 
 # Where the binaries and the skill come from — set by the prebuilt or the source path below.
 BINARY_SRC_DIR=""
@@ -39,6 +44,7 @@ Options:
       --source         Build from source instead of downloading (needs a checkout + cargo)
       --wire           Wire Claude Code's settings.json after install (runs `init`)
       --service        Install the receiver as a background user service (runs `service`)
+      --mcp            Register the MCP server with Claude Code (runs `claude mcp add`)
       --no-skill       Do not install the Claude Code skill
       --bin-dir DIR    Install binaries here (default: ~/.local/bin, or $INSTALL_DIR)
       --version VER    Install a specific release (e.g. 0.1.0); default is the latest
@@ -48,8 +54,8 @@ Run from a cloned repo and, if no prebuilt release exists for your platform, the
 falls back to building from source automatically.
 
 Environment:
-  INSTALL_DIR                 same as --bin-dir
-  HATEL_VERSION   same as --version
+  INSTALL_DIR      same as --bin-dir
+  HATEL_VERSION    same as --version
 EOF
 }
 
@@ -58,6 +64,7 @@ while [ "$#" -gt 0 ]; do
         --source|--build-from-source) SOURCE=true ;;
         --wire) WIRE=true ;;
         --service) SERVICE=true ;;
+        --mcp) MCP=true ;;
         --no-skill) INSTALL_SKILL=false ;;
         --bin-dir) shift; BIN_DIR="${1:?--bin-dir needs a path}" ;;
         --version) shift; VERSION="${1:?--version needs a value}" ;;
@@ -114,7 +121,8 @@ download_prebuilt() {
         url="https://github.com/$REPO/releases/latest/download/$archive"
     fi
     echo "Downloading $archive..." >&2
-    if ! curl -fsSL "$url" -o "$TMP/$archive" || ! curl -fsSL "$url.sha256" -o "$TMP/$archive.sha256"; then
+    if ! curl "${CURL_FLAGS[@]}" "$url" -o "$TMP/$archive" \
+        || ! curl "${CURL_FLAGS[@]}" "$url.sha256" -o "$TMP/$archive.sha256"; then
         return 1
     fi
     echo "Verifying checksum..." >&2
@@ -220,6 +228,23 @@ else
     echo "For gap-free collection, install the background service (launchd/systemd):"
     echo "  hatel service     # or re-run this installer with --service"
     echo "Or run it in the foreground when you want it:  hatel serve --all"
+fi
+
+echo
+if [ "$MCP" = true ]; then
+    # Register with the absolute path, like the hook wiring — no PATH dependency. An
+    # already-registered server is re-registered rather than duplicated (remove-then-add;
+    # the remove is a no-op when absent).
+    if command -v claude >/dev/null 2>&1; then
+        claude mcp remove --scope user hatel >/dev/null 2>&1 || true
+        claude mcp add --scope user hatel -- "$BIN_DIR/hatel" mcp || rc=$?
+    else
+        echo "error: --mcp needs the \`claude\` CLI on PATH to register the MCP server" >&2
+        rc=1
+    fi
+else
+    echo "To give agents typed MCP tools (report / kinds / doctor / emit):"
+    echo "  claude mcp add hatel -- $BIN_DIR/hatel mcp     # or re-run with --mcp"
 fi
 
 echo

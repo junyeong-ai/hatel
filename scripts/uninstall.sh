@@ -61,6 +61,13 @@ if [ -x "$BIN_DIR/hatel" ]; then
     "$BIN_DIR/hatel" service --remove || true
 fi
 
+# Deregister the MCP server if it was registered (installer --mcp, or by hand) — a server
+# entry pointing at a deleted binary is only a failed spawn on session start, so best-effort,
+# like the service. The name is ours; the remove is a no-op when it was never added.
+if command -v claude >/dev/null 2>&1; then
+    claude mcp remove --scope user hatel >/dev/null 2>&1 || true
+fi
+
 for bin in hatel hatel-hook; do
     if [ -f "$BIN_DIR/$bin" ]; then
         rm -f "$BIN_DIR/$bin"
