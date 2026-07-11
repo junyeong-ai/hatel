@@ -56,7 +56,7 @@ flowchart LR
 | 바이너리 | 역할 |
 |---|---|
 | `hatel-hook` | `settings.json` 훅에 연결. stdin으로 이벤트 하나를 읽어 매핑·기록 후 종료. async 런타임 없음 — **한 자릿수 밀리초 콜드스타트** (빈 프로세스 spawn 대비 약 1ms). |
-| `hatel` | 수신기(`serve`), 리포트, `init`, `service`, `doctor`, `kinds`, `emit`. |
+| `hatel` | 수신기(`serve`), 리포트, `init`, `service`, `doctor`, `kinds`, `emit`, MCP 서버(`mcp`). |
 
 ---
 
@@ -77,7 +77,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> 💡 설치하면서 바로 연결하려면 `... | bash -s -- --wire`. 특정 버전 고정은 `HATEL_VERSION=0.4.3`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
+> 💡 설치하면서 바로 연결하려면 `... | bash -s -- --wire` — 서비스·MCP 등록까지 한 번에 하려면 `--wire --service --mcp`. 특정 버전 고정은 `HATEL_VERSION=0.4.3`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
 
 > ⚠️ **비용·토큰은 수신기가 켜져 있을 때만** 잡힙니다(네이티브 OTel은 push 전용). 끄고 켜는 걸 잊지 않으려면 `hatel service`로 백그라운드 상시 실행하세요([항상 켜두기](#항상-켜두기-무중단-수집)).
 
@@ -167,6 +167,16 @@ hatel report --window 30d --kind tool --format json
 
 > 키는 알파벳 순으로 직렬화됩니다(`cost·filters·kinds·project·window`). 위는 `Bash` 그룹만 보였고, 실제 리포트엔 `Edit·Grep·Read`가 같은 형태로 이어집니다.
 
+전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로).
+
+### MCP 서버 — `hatel mcp`
+
+AI 에이전트에게는 stdout 파싱 대신 **타입 있는 MCP 도구**가 있습니다 — `report`·`kinds`·`doctor`·`emit`을 stdio MCP 서버로 노출하며, 각 도구는 해당 CLI `--json` 출력과 동일한 JSON을 반환합니다:
+
+```sh
+claude mcp add hatel -- hatel mcp
+```
+
 ---
 
 ## 명령어
@@ -177,9 +187,10 @@ hatel report --window 30d --kind tool --format json
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--filter f=v]` | 롤링 윈도우 집계 — 그룹별 레코드 수와 각 Kind `measures`의 합, 그리고 비용 스냅샷. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | `settings.json`에 텔레메트리 env + 훅을 연결/해제 — 멱등·비파괴·원자적. |
 | `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all` 실행, 무중단 수집). |
-| `doctor` | 연결을 검증하고 정책 공백을 정직하게 보고. |
+| `doctor [--json]` | 연결을 검증하고 정책 공백을 정직하게 보고 — `--json`은 같은 findings를 기계 판독용으로. |
 | `kinds [--json]` | 등록된 Kind(코어+플러그인) 목록. |
 | `emit <kind> [key=value...] [--json OBJ]` | 등록된 Kind에 도메인 신호 하나 기록 — 커스텀 지표의 프로그래밍 경로. |
+| `mcp` | `report`·`kinds`·`doctor`·`emit`을 타입 있는 MCP 도구로 노출하는 stdio 서버(에이전트용). |
 
 ### `report` — 롤링 윈도우 집계
 
@@ -290,6 +301,8 @@ export:
 ```
 
 > `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
+
+`hatel doctor --json`은 같은 findings를 안정된 JSON으로 출력합니다 — 섹션별 `findings`가 `status`(`ok`/`fail`/`warn`/`note`)와 `message`를 갖고, 최상위 `ok`와 exit code의 의미(하드 요구 실패 시에만 non-zero)는 사람용 출력과 동일합니다.
 
 ### `emit` / `kinds`
 
@@ -480,7 +493,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 crates/core   async-free 라이브러리: model, registry, schema, pii, rolling, sinks, session, hook, report
 crates/hook   가벼운 훅 바이너리(core만)
-crates/cli    수신기, 리포트, doctor (core + tokio/axum)
+crates/cli    수신기, 리포트, doctor, MCP 서버 (core + tokio/axum/rmcp)
 plugins/      선언적 플러그인 예제
 ```
 

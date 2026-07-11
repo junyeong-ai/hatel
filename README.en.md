@@ -56,7 +56,7 @@ Two small binaries do the work:
 | Binary | Role |
 |---|---|
 | `hatel-hook` | wired into `settings.json` hooks; reads one event on stdin, maps it, records matches, exits. No async runtime — **single-digit-millisecond cold start** (~1 ms over a bare process spawn). |
-| `hatel` | the receiver (`serve`), reports, `init`, `service`, `doctor`, `kinds`, `emit`. |
+| `hatel` | the receiver (`serve`), reports, `init`, `service`, `doctor`, `kinds`, `emit`, the MCP server (`mcp`). |
 
 ---
 
@@ -77,7 +77,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> 💡 Wire while installing with `... | bash -s -- --wire`. Pin a release with `HATEL_VERSION=0.4.3`. Remove everything later with `scripts/uninstall.sh`.
+> 💡 Wire while installing with `... | bash -s -- --wire` — or do the service and MCP registration in one go with `--wire --service --mcp`. Pin a release with `HATEL_VERSION=0.4.3`. Remove everything later with `scripts/uninstall.sh`.
 
 > ⚠️ **Cost and tokens are captured only while the receiver is running** (native OTel is push-only). So you don't have to remember to start it, run it as a background service with `hatel service` ([Always-on collection](#always-on-collection-no-gaps)).
 
@@ -167,6 +167,16 @@ hatel report --window 30d --kind tool --format json
 
 > Keys serialize in alphabetical order (`cost·filters·kinds·project·window`). Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape.
 
+In a full report (no `--kind`), each `cost` row serializes three breakdowns alongside its totals — `tokens_by_type` (`input`/`output`/`cacheRead`/`cacheCreation` — the cache-hit accounting), `by_model` (tokens and cost per model — the model mix), and `by_agent` (tokens and cost per subagent). In each breakdown, a series missing the attribute lands in an `(unattributed)` bucket — never guessed. Sessions recorded before the breakdowns existed show empty objects (`{}`) — exactly the fact that nothing was recorded.
+
+### The MCP server — `hatel mcp`
+
+AI agents get **typed MCP tools** instead of stdout parsing — `report`, `kinds`, `doctor`, and `emit` served over a stdio MCP server, each tool returning exactly the JSON its CLI `--json` counterpart prints:
+
+```sh
+claude mcp add hatel -- hatel mcp
+```
+
 ---
 
 ## Commands
@@ -177,9 +187,10 @@ hatel report --window 30d --kind tool --format json
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--filter f=v]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures`, plus the cost snapshot. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire/unwire the telemetry env + hooks in `settings.json` — idempotent, non-destructive, atomic. |
 | `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service (runs `serve --all` for gap-free collection). |
-| `doctor` | verify the wiring and report policy gaps honestly. |
+| `doctor [--json]` | verify the wiring and report policy gaps honestly — `--json` renders the same findings machine-readably. |
 | `kinds [--json]` | list the registered Kinds (core + plugins). |
 | `emit <kind> [key=value...] [--json OBJ]` | record one domain signal for a registered Kind — the programmatic path for custom metrics. |
+| `mcp` | stdio server exposing `report` / `kinds` / `doctor` / `emit` as typed MCP tools (for agents). |
 
 ### `report` — rolling-window aggregation
 
@@ -290,6 +301,8 @@ export:
 ```
 
 > The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
+
+`hatel doctor --json` renders the same findings as stable JSON — each section's `findings` carry a `status` (`ok`/`fail`/`warn`/`note`) and `message`, and the top-level `ok` plus the exit code semantics (non-zero only on a hard-requirement failure) match the human output.
 
 ### `emit` / `kinds`
 
@@ -480,7 +493,7 @@ The collector never fights managed policy; it adapts:
 ```
 crates/core   async-free library: model, registry, schema, pii, rolling, sinks, session, hook, report
 crates/hook   the lean hook binary (core only)
-crates/cli    the receiver, reports, doctor (core + tokio/axum)
+crates/cli    the receiver, reports, doctor, the MCP server (core + tokio/axum/rmcp)
 plugins/      example declarative plugins
 ```
 

@@ -609,6 +609,22 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
 }
 
 #[test]
+fn skill_version_tracks_the_workspace_version() {
+    // SKILL.md ships version-locked with the binaries in every release archive; its
+    // frontmatter `version` (kept for install-time tracking — not an official skill
+    // field) must move with `workspace.package.version`. This gate makes forgetting
+    // the bump a loud failure instead of silent drift.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.claude/skills/hatel/SKILL.md");
+    let text = std::fs::read_to_string(&path).expect("SKILL.md readable");
+    let want = format!("version: {}", env!("CARGO_PKG_VERSION"));
+    assert!(
+        text.lines().any(|l| l.trim() == want),
+        "SKILL.md frontmatter must carry `{want}` (the workspace version)"
+    );
+}
+
+#[test]
 fn cost_snapshot_merges_by_session() {
     use hatel_core::cost::{self, CostRow};
     let cfg = test_config(vec![]);

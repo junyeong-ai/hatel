@@ -1,5 +1,6 @@
 ---
 name: hatel
+version: 0.4.5
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
 when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
@@ -8,13 +9,19 @@ allowed-tools: Bash, Read, Edit
 # hatel
 
 Two binaries: `hatel` (the receiver — `serve`, `report`, `init`, `service`, `doctor`, `kinds`,
-`emit`) and `hatel-hook` (wired into Claude Code lifecycle events; runs automatically — never
-invoke it by hand). The receiver runs locally; by default nothing leaves the machine (opt-in
-export tees downstream — see Forwarding).
+`emit`, `mcp`) and `hatel-hook` (wired into Claude Code lifecycle events; runs automatically —
+never invoke it by hand). The receiver runs locally; by default nothing leaves the machine
+(opt-in export tees downstream — see Forwarding).
 
 Always check wiring with `hatel doctor` first when something looks off — it reports
 each gap honestly (it never fabricates a missing signal) and exits non-zero when the wiring is
-incomplete, so you can gate on it.
+incomplete, so you can gate on it. `hatel doctor --json` returns the same findings as stable
+JSON (top-level `ok`, per-section `findings` with `status` `ok`/`fail`/`warn`/`note`) — prefer
+it when you need to branch on a specific gap.
+
+`hatel mcp` serves `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio
+(`claude mcp add hatel -- hatel mcp`); each tool returns exactly the JSON its CLI `--json`
+counterpart prints, so everything below applies to both surfaces.
 
 ## Set up / wire
 
@@ -80,11 +87,16 @@ hatel kinds --json                          # every registered Kind and its fiel
 ```
 
 Reading a report: each Kind lists groups with a record count and the summed `measures`; the
-`cost` array is the latest snapshot per session (`tokens`, `cost_usd`, `active_time_s`, `lines`,
-`project`). For "which subagent costs most", the live `serve` view breaks tokens/cost down per
-subagent via `agent.name`. `report --project <label>` matches by the project's basename label;
-a Kind that carries no `project` field can never match it, so it renders as `—` (empty) — read
-that as "not applicable", not as zero usage.
+`cost` array is the latest snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`,
+`active_time_s`, `lines`, `ts`, plus three breakdowns). Answer the budget questions from those
+breakdowns: `by_agent` (tokens/cost per subagent — "which subagent costs most"), `by_model`
+(the model mix — Opus vs Haiku spend), and `tokens_by_type` (`input`/`output`/`cacheRead`/
+`cacheCreation` — compute the cache-hit ratio as `cacheRead / total`). A series missing the
+dimension lands in `(unattributed)` — report it as such, never guess. Sessions recorded before
+the breakdowns existed show `{}` (not recorded — say so rather than treating it as zero).
+`report --project <label>` matches by the project's basename label; a Kind that carries no
+`project` field can never match it, so it renders as `—` (empty) — read that as "not
+applicable", not as zero usage.
 
 `--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly
