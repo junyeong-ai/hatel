@@ -25,10 +25,11 @@ pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
     rolling::prune_archives(dir, cutoff_epoch)
 }
 
-/// Every Kind with a ledger in `dir`, recovered from the file names this sink writes. `base`
-/// appends one fixed extension to a Kind name, so stripping it is the exact inverse: an archive
-/// (`<kind>.jsonl.<stamp>.<pid>`) does not end in the extension and so cannot be mistaken for a
-/// ledger, and the Kind-name character set rejects anything else that lands in the directory.
+/// Every Kind with records in `dir`, recovered from the file names this sink writes. `base`
+/// appends one fixed extension to a Kind name, so the text before that extension is the Kind —
+/// for the active ledger and equally for an archive (`<kind>.jsonl.<stamp>.<pid>`), which the
+/// read path also reads and which can outlive its active file after a prune. The Kind-name
+/// character set rejects anything else that lands in the directory.
 pub fn stored_kinds(dir: &Path) -> std::io::Result<Vec<String>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -41,11 +42,18 @@ pub fn stored_kinds(dir: &Path) -> std::io::Result<Vec<String>> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let kind = name.strip_suffix(".jsonl")?;
+            let kind = match name.strip_suffix(".jsonl") {
+                Some(kind) => kind,
+                // Rotation owns the archive spelling, so its own matcher decides what is one —
+                // a temp file that merely contains the extension is not.
+                None if rolling::is_archive_name(&name) => name.split_once(".jsonl.")?.0,
+                None => return None,
+            };
             crate::registry::is_valid_kind_name(kind).then(|| kind.to_string())
         })
         .collect();
     kinds.sort();
+    kinds.dedup();
     Ok(kinds)
 }
 
@@ -70,5 +78,41 @@ impl Sink for JsonlSink {
         ) {
             eprintln!("hatel: jsonl write failed kind={}: {e}", env.kind);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumeration_covers_exactly_what_the_read_path_reads() {
+        // The reader takes the active ledger and its archives, so enumeration must see a Kind
+        // whose active file a prune has already removed — and must not invent one from a
+        // neighbouring file.
+        let dir = std::env::temp_dir().join(format!("ht-enum-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "tool.jsonl",
+            "tool.jsonl.20260804.1",
+            "global.rules.jsonl.20260804.1",
+            "cost_snapshot.jsonl.1.2.tmp",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        assert_eq!(
+            stored_kinds(&dir).unwrap(),
+            vec!["global.rules".to_string(), "tool".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_directory_that_was_never_written_is_empty_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("ht-enum-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(stored_kinds(&dir).unwrap(), Vec::<String>::new());
     }
 }

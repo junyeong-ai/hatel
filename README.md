@@ -227,6 +227,12 @@ hatel report --window 30d --format json            # 대시보드/스크립트�
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
 
+compaction — by session_id, ranked by count
+  (no records in this window)
+
+memory — by memory_id, ranked by count
+  (no records in this window)
+
 prompt — by session_id, ranked by count
                       session_id  count
   ██████████████████  a1b2c3d4        2

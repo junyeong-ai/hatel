@@ -2,6 +2,8 @@
 //! table or as Markdown. Both formats read the same [`Report`], so they cannot disagree about
 //! what was asked or what came back.
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::report::{
     GroupAgg, KindSection, ProjectScope, Report, cost_axes, cost_by_project, rank_value,
 };
@@ -160,12 +162,8 @@ fn text_table(
         .chain(measures.iter().copied())
         .zip(&widths)
     {
-        out.push_str(&format!(
-            "{:GUTTER$}{:>width$}",
-            "",
-            inline(header),
-            width = width
-        ));
+        out.push_str(&" ".repeat(GUTTER));
+        out.push_str(&pad_left(&inline(header), *width));
     }
     out.push('\n');
 
@@ -180,7 +178,8 @@ fn text_table(
             key_width,
         ));
         for (cell, width) in row.iter().zip(&widths) {
-            out.push_str(&format!("{:GUTTER$}{:>width$}", "", cell, width = width));
+            out.push_str(&" ".repeat(GUTTER));
+            out.push_str(&pad_left(cell, *width));
         }
         out.push('\n');
     }
@@ -269,16 +268,33 @@ pub fn escape_md_cell(s: &str) -> String {
     out
 }
 
+/// Default fractional digits, and the cap on widening them for a small magnitude.
+const DECIMALS: usize = 2;
+const MAX_DECIMALS: usize = 12;
+
 /// Digit-grouped decimal. Sums run to nine figures — `770991471` and `770,991,471` carry the same
 /// information but only one can be read at a glance — and grouping is lossless, so it says nothing
 /// about a value's unit, which a Kind does not declare.
+///
+/// A magnitude too small for the default precision widens to its first significant digit instead
+/// of rounding away: a fraction of a cent that was really spent must not print as the `0` of a
+/// project that spent nothing.
 fn fmt_num(v: f64) -> String {
     let plain = if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
-        format!("{v:.2}")
+        format!("{v:.*}", significant_decimals(v))
     };
     group_digits(&plain)
+}
+
+fn significant_decimals(v: f64) -> usize {
+    let magnitude = v.abs();
+    if magnitude == 0.0 || magnitude >= 10f64.powi(-(DECIMALS as i32)) {
+        return DECIMALS;
+    }
+    let leading_zeros = -magnitude.log10().floor() as usize;
+    leading_zeros.saturating_add(1).min(MAX_DECIMALS)
 }
 
 fn group_digits(s: &str) -> String {
@@ -305,25 +321,42 @@ fn group_digits(s: &str) -> String {
     out
 }
 
-/// Character count — the unit a terminal column and Rust's own `{:>width$}` padding are both
-/// measured in, so every width in a row is computed the same way a row is written.
+/// How many terminal columns a string occupies. Not its character count: a CJK character — which
+/// a Korean rule name or project directory is made of — takes two columns, so counting characters
+/// would leave every column to its right short by one per such character.
 fn display_width(s: &str) -> usize {
-    s.chars().count()
+    UnicodeWidthStr::width(s)
 }
 
+/// Clip to `width` terminal columns, marking the clip with an ellipsis (itself one column). A
+/// character is taken only while it fits whole, so a two-column character is never half-printed.
 fn truncate(s: &str, width: usize) -> String {
     if display_width(s) <= width {
         return s.to_string();
     }
-    s.chars()
-        .take(width.saturating_sub(1))
-        .chain(['…'])
-        .collect()
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = UnicodeWidthStr::width(c.encode_utf8(&mut [0u8; 4]) as &str);
+        if used + w > budget {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn pad_right(s: &str, width: usize) -> String {
     let pad = width.saturating_sub(display_width(s));
     format!("{s}{}", " ".repeat(pad))
+}
+
+fn pad_left(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(s));
+    format!("{}{s}", " ".repeat(pad))
 }
 
 #[cfg(test)]
@@ -398,6 +431,42 @@ mod tests {
         assert_eq!(fmt_num(-1_234.0), "-1,234");
         assert_eq!(fmt_num(999.0), "999");
         assert_eq!(fmt_num(0.0), "0");
+    }
+
+    #[test]
+    fn a_value_that_was_measured_never_prints_as_one_that_was_not() {
+        // A fraction of a cent really spent must stay distinguishable from no spend at all.
+        assert_eq!(fmt_num(0.0), "0");
+        assert_ne!(fmt_num(0.0042), fmt_num(0.0));
+        assert_eq!(fmt_num(0.0042), "0.0042");
+        assert_eq!(fmt_num(0.00000031), "0.00000031");
+        assert_eq!(fmt_num(-0.0042), "-0.0042");
+        // A magnitude below the cap still says "not zero" rather than rounding to it.
+        assert_ne!(fmt_num(1e-20), "0");
+    }
+
+    #[test]
+    fn a_wide_key_leaves_the_columns_aligned() {
+        // Group keys are project directories, git branches and plugin field values — Korean ones
+        // occupy two terminal columns per character.
+        let text = format_text(&report(vec![section(
+            "k",
+            vec![
+                group("한국어규칙이름", 1, 100.0),
+                group("ascii-rule", 1, 90.0),
+            ],
+        )]));
+        let cols = |line: &str, needle: &str| {
+            let byte = line.find(needle).unwrap();
+            UnicodeWidthStr::width(&line[..byte])
+        };
+        let wide = text.lines().find(|l| l.contains("한국어")).unwrap();
+        let ascii = text.lines().find(|l| l.contains("ascii-rule")).unwrap();
+        assert_eq!(
+            cols(wide, "100") + 3,
+            cols(ascii, "90") + 2,
+            "measure columns end at the same terminal column:\n{wide}\n{ascii}"
+        );
     }
 
     #[test]
@@ -504,19 +573,16 @@ mod tests {
 
     #[test]
     fn columns_line_up_under_a_non_ascii_header() {
-        // Widths and padding must be counted in the same unit; measuring a header in bytes while
-        // padding it in characters would shift every column right of it.
+        // Widths and padding must be counted in the same unit — terminal columns — or a header
+        // that is not plain ASCII shifts every column to its right.
         let mut s = section("k", vec![group("v", 1, 1.0)]);
         s.group_by = "규칙".to_string();
         let text = format_text(&report(vec![s]));
         let mut lines = text.lines().skip_while(|l| !l.starts_with("k —")).skip(1);
         let header = lines.next().unwrap();
         let row = lines.next().unwrap();
-        let column = |line: &str, needle: &str| {
-            line.find(needle)
-                .map(|b| line[..b].chars().count())
-                .unwrap()
-        };
+        let column =
+            |line: &str, needle: &str| UnicodeWidthStr::width(&line[..line.find(needle).unwrap()]);
         assert_eq!(column(header, "규칙"), column(row, "v"));
         assert_eq!(
             column(header, "count") + "count".len(),

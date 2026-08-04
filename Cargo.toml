@@ -15,6 +15,10 @@ toml = "1.1"
 jiff = "0.2"
 regex = "1.13"
 blake3 = "1.8"
+# Terminal column width for the report's aligned tables. A CJK group key — a Korean rule name, a
+# project directory — occupies two columns per character, so counting characters would shift every
+# column to its right. The Unicode width tables are the only correct source for that.
+unicode-width = "0.2"
 etcetera = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2.0"

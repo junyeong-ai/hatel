@@ -641,6 +641,7 @@ mod tests {
             ledger_dir: dir.join("ledger"),
             state_dir: dir,
             plugins,
+            plugin_source: hatel_core::config::PluginSource::ConfigFile,
             rotate_bytes: 10 * 1024 * 1024,
             retention_days: 90,
             disabled: false,

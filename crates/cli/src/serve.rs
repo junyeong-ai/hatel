@@ -528,6 +528,25 @@ fn render(st: &AppState) {
         let mut index = lock_index(&st.index_cache);
         index.refresh();
         let acc = lock(&st.acc);
+        let mut rows = String::new();
+        for (sid, totals) in acc.sessions() {
+            let row_ref = index.get(sid);
+            let label = row_ref
+                .map(|r| r.project_label.clone())
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| "(unknown)".to_string());
+            let key = row_ref.map(|r| r.project_key.as_str()).unwrap_or("");
+            if !passes_filter(st, key, &label) {
+                continue;
+            }
+            rows.push_str(&row(sid, &label, totals));
+            rows.push_str(&agent_rows(totals));
+        }
+        // A frame with no rows says nothing the header hasn't; drawing it every tick would fill an
+        // idle receiver's terminal with empty tables.
+        if rows.is_empty() {
+            return;
+        }
         let mut out = String::from("\n=== hatel (live) ===\n");
         out.push_str(&format!(
             "{:<8} {:<20} {:>9} {:>9} {:>8} {:>6} {:>7} {:>6} {:>9}\n",
@@ -541,19 +560,7 @@ fn render(st: &AppState) {
             "skills",
             "decisions"
         ));
-        for (sid, totals) in acc.sessions() {
-            let row_ref = index.get(sid);
-            let label = row_ref
-                .map(|r| r.project_label.clone())
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| "(unknown)".to_string());
-            let key = row_ref.map(|r| r.project_key.as_str()).unwrap_or("");
-            if !passes_filter(st, key, &label) {
-                continue;
-            }
-            out.push_str(&row(sid, &label, totals));
-            out.push_str(&agent_rows(totals));
-        }
+        out.push_str(&rows);
         out
     };
     print!("{out}");
@@ -815,6 +822,7 @@ mod tests {
             state_dir: dir.to_path_buf(),
             ledger_dir: dir.join("ledger"),
             plugins: vec![],
+            plugin_source: hatel_core::config::PluginSource::ConfigFile,
             rotate_bytes: 10 * 1024 * 1024,
             retention_days: 90,
             disabled: false,

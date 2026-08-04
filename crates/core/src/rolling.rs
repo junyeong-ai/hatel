@@ -32,7 +32,7 @@ use std::time::SystemTime;
 static ARCHIVE_SUFFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\.\d{8}\.\d+(?:\.\d+)*$").unwrap());
 
-fn is_archive_name(name: &str) -> bool {
+pub(crate) fn is_archive_name(name: &str) -> bool {
     ARCHIVE_SUFFIX.is_match(name)
 }
 

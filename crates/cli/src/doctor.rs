@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use hatel_core::config::PluginSource;
 use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings, sink};
 
 use crate::claude_settings as cs;
@@ -276,22 +277,20 @@ fn report_hooks(sec: &mut Section, files: &[cs::ScopeFile], events: &[&'static s
     }
 }
 
-/// Informational only, never a failure: a wired, hook-bound Kind that produced no records in the
-/// recent window, while sessions HAVE been starting (the index advanced). Both readings are
-/// stated because both are real — a rare event (PreCompact can stay quiet for weeks) and a
-/// silently dead binding (Claude Code renamed the event or reshaped its payload) look identical
-/// from here; the point is that the silence is *visible* where an operator already looks.
-/// Grouped per Kind (records carry no event provenance, so Kind-level is the honest granularity
-/// when one Kind is bound to several events) and gated on session recency — "no records" carries
-/// no signal when nothing has been running.
 /// Compare what the store holds against what the registry can read. A Kind whose records are on
 /// disk but whose schema is not loaded is invisible to every query — the collection worked and
 /// the reporting cannot see it — which no other check would surface, because nothing about the
 /// wiring is wrong.
 fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, cfg: &Config) {
-    let config_path = Settings::path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "(no config directory)".to_string());
+    // Name the surface the list actually came from. `HATEL_PLUGINS` replaces the file's list, so
+    // pointing at the configuration file while an override is in effect would credit it for
+    // schemas it did not supply and prescribe an edit that would go on being ignored.
+    let source = match cfg.plugin_source {
+        PluginSource::Environment => "HATEL_PLUGINS".to_string(),
+        PluginSource::ConfigFile => Settings::path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no config directory)".to_string()),
+    };
     if let Err(e) = settings {
         sec.fail(e.to_string());
         return;
@@ -301,10 +300,10 @@ fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, c
     // registry for the comparison below, which stays informative even with one plugin broken.
     match hatel_core::schema::build_registry(cfg) {
         Ok(_) => match cfg.plugins.len() {
-            0 => sec.note(format!("no plugin schemas configured ({config_path})")),
-            n => sec.ok(format!("{n} plugin schema(s) from {config_path}")),
+            0 => sec.note(format!("no plugin schemas configured ({source})")),
+            n => sec.ok(format!("{n} plugin schema(s) from {source}")),
         },
-        Err(e) => sec.fail(format!("plugin schema in {config_path}: {e}")),
+        Err(e) => sec.fail(format!("plugin schema from {source}: {e}")),
     }
     let registry = hatel_core::schema::build_registry_resilient(cfg);
     match sink::stored_kinds(cfg) {
@@ -317,7 +316,7 @@ fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, c
             if !unreadable.is_empty() {
                 sec.warn(format!(
                     "stored but unreadable — no loaded schema declares {}; add the plugin that \
-                     defines them to `plugins` in {config_path}, or their records stay uncountable",
+                     defines them to {source}, or their records stay uncountable",
                     unreadable.join(", ")
                 ));
             }
@@ -325,6 +324,14 @@ fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, c
     }
 }
 
+/// Informational only, never a failure: a wired, hook-bound Kind that produced no records in the
+/// recent window, while sessions HAVE been starting (the index advanced). Both readings are
+/// stated because both are real — a rare event (PreCompact can stay quiet for weeks) and a
+/// silently dead binding (Claude Code renamed the event or reshaped its payload) look identical
+/// from here; the point is that the silence is *visible* where an operator already looks.
+/// Grouped per Kind (records carry no event provenance, so Kind-level is the honest granularity
+/// when one Kind is bound to several events) and gated on session recency — "no records" carries
+/// no signal when nothing has been running.
 fn advise_dormant_bindings(
     sec: &mut Section,
     files: &[cs::ScopeFile],

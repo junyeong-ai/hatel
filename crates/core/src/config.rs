@@ -20,6 +20,8 @@ pub struct Config {
     /// every command resolves the same Kinds — a registry that depended on a process's ambient
     /// environment would let the write path record Kinds the read path cannot see.
     pub plugins: Vec<PathBuf>,
+    /// Where `plugins` came from, so a diagnostic can name the thing that would have to change.
+    pub plugin_source: PluginSource,
     /// JSONL ledger rotation threshold in bytes (high-volume collectors raise this).
     pub rotate_bytes: u64,
     /// Days of cost-snapshot history to retain. A session whose snapshot is older than
@@ -29,6 +31,14 @@ pub struct Config {
     pub retention_days: i64,
     pub disabled: bool,
     pub strict: bool,
+}
+
+/// Which surface supplied the plugin list. An override is worth naming: advice to edit the
+/// configuration file is wrong while an environment variable is replacing what that file says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginSource {
+    ConfigFile,
+    Environment,
 }
 
 /// Default JSONL rotation threshold.
@@ -66,14 +76,20 @@ impl Config {
             .and_then(|s| SinkKind::parse(&s))
             .unwrap_or(SinkKind::Jsonl);
         // `HATEL_PLUGINS` replaces the file's list rather than adding to it, so a shell can pin a
-        // registry exactly. Split on the OS path-list separator (`:` on Unix, `;` on Windows), so
-        // a native Windows path like `C:\plugins\x.toml` isn't split on its drive colon.
-        let plugins = match std::env::var_os("HATEL_PLUGINS") {
-            Some(s) => std::env::split_paths(&s)
-                .filter(|p| !p.as_os_str().is_empty())
-                .collect(),
-            None => settings.plugin_paths(),
-        };
+        // registry exactly. An empty value is treated as unset — as `HATEL_CONFIG` is — so an
+        // exported-but-blank variable cannot silently unregister every Kind. Split on the OS
+        // path-list separator (`:` on Unix, `;` on Windows), so a native Windows path like
+        // `C:\plugins\x.toml` isn't split on its drive colon.
+        let (plugins, plugin_source) =
+            match std::env::var_os("HATEL_PLUGINS").filter(|s| !s.is_empty()) {
+                Some(s) => (
+                    std::env::split_paths(&s)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .collect(),
+                    PluginSource::Environment,
+                ),
+                None => (settings.plugin_paths(), PluginSource::ConfigFile),
+            };
         let rotate_bytes = std::env::var("HATEL_ROTATE_BYTES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -89,6 +105,7 @@ impl Config {
             state_dir,
             ledger_dir,
             plugins,
+            plugin_source,
             rotate_bytes,
             retention_days,
             disabled: env_flag("HATEL_DISABLED"),
