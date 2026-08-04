@@ -83,6 +83,8 @@ hatel report --window 30d --format json    # machine-readable rollup + cost snap
 hatel report --project <label> --format json
 hatel report --kind <name> --format json    # scope to one Kind (omits the cost snapshot)
 hatel report --kind <name> --filter field=value   # only records matching every --filter
+hatel report --kind <name> --group-by <field>     # a dimension other than the Kind's default
+hatel report --kind <name> --sort-by <measure>    # rank by a measure other than the first
 hatel report --top 0                        # all groups, not just the top N
 hatel kinds --json                          # every registered Kind and its fields
 ```
@@ -95,9 +97,16 @@ breakdowns: `by_agent` (tokens/cost per subagent — "which subagent costs most"
 `cacheCreation` — compute the cache-hit ratio as `cacheRead / total`). A series missing the
 dimension lands in `(unattributed)` — report it as such, never guess. Sessions recorded before
 the breakdowns existed show `{}` (not recorded — say so rather than treating it as zero).
-`report --project <label>` matches by the project's basename label; a Kind that carries no
-`project` field can never match it, so it renders as `—` (empty) — read that as "not
-applicable", not as zero usage.
+`report --project <label>` matches by the project's basename label. A Kind that carries no
+`project` field records none, so a project scope cannot select it: its `project_scope` reads
+`unsupported` and it renders as a note, not an empty table — read that as "not applicable",
+never as zero usage.
+
+Each Kind section names the axes it was computed on (`group_by`, and `sort_by` — `null` means
+groups rank by record count). `--group-by` and `--sort-by` (both need `--kind`) change the
+question without touching the schema: the Kind declares the defaults, the query overrides them.
+Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
+error rather than an empty answer.
 
 `--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly
@@ -108,9 +117,12 @@ retained — say so rather than presenting it as low usage.
 
 ## Add a custom per-project metric
 
-A plugin is a TOML schema file (no code, no recompile). Point at it with
-`HATEL_PLUGINS=path/to/plugin.toml` (OS path-list separator for several), then
-confirm with `hatel kinds`. **Choose the path by where the signal originates, and
+A plugin is a TOML schema file (no code, no recompile). List it under `plugins` in
+`config.toml` (`$HATEL_CONFIG`, else `<config-dir>/hatel/config.toml`; relative paths resolve
+against that file's directory), then confirm with `hatel kinds`. Configuring it there is what
+makes the write and read paths agree — `HATEL_PLUGINS` overrides the list for one process only,
+so a Kind registered that way is invisible to any command run without it. `hatel doctor` names
+any Kind the ledger holds that no loaded schema declares. **Choose the path by where the signal originates, and
 keep one writer per Kind** (a Kind written by both paths double-counts; a
 receiver-sourced Kind like `tool` is refused by `emit` outright, exit 2):
 

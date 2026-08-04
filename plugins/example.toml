@@ -1,5 +1,5 @@
 # Example plugin — illustrative custom Kinds. This file references no real project;
-# copy it and define your own. Load it with HATEL_PLUGINS=plugins/example.toml.
+# copy it and define your own. Register it by listing it under `plugins` in config.toml.
 #
 # A custom Kind is filled by one of two paths, chosen by where the signal originates:
 #   • a signal the Claude Code lifecycle can observe → a hook binding (zero code);

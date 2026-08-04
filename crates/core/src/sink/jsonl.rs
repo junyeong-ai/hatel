@@ -25,6 +25,30 @@ pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
     rolling::prune_archives(dir, cutoff_epoch)
 }
 
+/// Every Kind with a ledger in `dir`, recovered from the file names this sink writes. `base`
+/// appends one fixed extension to a Kind name, so stripping it is the exact inverse: an archive
+/// (`<kind>.jsonl.<stamp>.<pid>`) does not end in the extension and so cannot be mistaken for a
+/// ledger, and the Kind-name character set rejects anything else that lands in the directory.
+pub fn stored_kinds(dir: &Path) -> std::io::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // No ledger directory means nothing has ever been written through this sink, which is an
+        // empty store rather than an unreadable one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut kinds: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let kind = name.strip_suffix(".jsonl")?;
+            crate::registry::is_valid_kind_name(kind).then(|| kind.to_string())
+        })
+        .collect();
+    kinds.sort();
+    Ok(kinds)
+}
+
 pub struct JsonlSink {
     dir: PathBuf,
     rotate_bytes: u64,

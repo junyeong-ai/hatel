@@ -5,7 +5,7 @@
 //! periodically and on shutdown so reports survive offline.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -91,6 +91,8 @@ struct AppState {
     /// An explicit `--project` override, matched against the display label.
     project_filter: Option<String>,
     show_all: bool,
+    /// Whether a terminal is attached to stdout, and so whether the live view has a reader.
+    live: bool,
     /// The egress forwarder, present only when `[[export]]` destinations are configured. Each
     /// received body is queued here (fire-and-forget) before local decode.
     exporter: Option<Exporter>,
@@ -111,7 +113,13 @@ pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
 }
 
 async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
-    let cfg = Arc::new(Config::load());
+    let cfg = match Config::load() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return 1;
+        }
+    };
     // The single-writer lock, taken before any work: the cost snapshot and the tool ledger assume
     // one receiver per state dir, so a second one is refused here rather than left to race. Held in
     // `_state_lock` for the whole run; the OS releases it on exit.
@@ -178,6 +186,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         current_key,
         project_filter: project,
         show_all,
+        live: std::io::stdout().is_terminal(),
         exporter,
     };
 
@@ -232,6 +241,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         loop {
             tick.tick().await;
             persist(&flush_state, false);
+            render(&flush_state);
             if last_prune.elapsed() >= PRUNE_INTERVAL {
                 last_prune = std::time::Instant::now();
                 prune_ledger(&flush_state.cfg);
@@ -292,7 +302,6 @@ async fn ingest_metrics(
     match parse_metrics(body.as_ref(), &st.tracked) {
         Ok(points) if !points.is_empty() => {
             lock(&st.acc).update_metrics(points);
-            render(&st);
         }
         Ok(_) => {}
         Err(e) => eprintln!("hatel: undecodable OTLP metrics body — {e}"),
@@ -317,7 +326,6 @@ async fn ingest_logs(
             buffer_tool_results(&st, decoded.tool_results);
             if !decoded.events.is_empty() {
                 lock(&st.acc).update_events(decoded.events);
-                render(&st);
             }
         }
         Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
@@ -505,7 +513,14 @@ async fn shutdown_signal() {
     eprintln!("\nshutting down; persisting cost snapshot…");
 }
 
+/// Draw the live per-session rollup. Called on the flush tick, not on ingest: a frame is a human
+/// view, so its cadence belongs to the reader rather than to whatever rate Claude Code happens to
+/// export at. Skipped entirely when stdout is not a terminal — under a service manager that
+/// stream is a log, and a repainted table is not something to keep forever.
 fn render(st: &AppState) {
+    if !st.live {
+        return;
+    }
     // Refresh the change-gated index cache, then build the whole frame under the locks and release
     // them before any stdout I/O, so a slow/blocked terminal can never stall OTLP ingestion. The
     // index cache is taken before the accumulator — the one lock order this and `persist` share.
@@ -819,6 +834,7 @@ mod tests {
             current_key: None,
             project_filter: None,
             show_all: true,
+            live: false,
             exporter: None,
         }
     }

@@ -11,11 +11,8 @@ mod serve;
 mod service;
 mod throttle;
 
-use std::path::Path;
-
 use clap::{Parser, Subcommand, ValueEnum};
 
-use hatel_core::cost;
 use hatel_core::schema::build_registry;
 use hatel_core::{Config, Payload, Registry, render, report};
 
@@ -60,6 +57,16 @@ enum Command {
         /// How many groups to show per Kind (0 = all).
         #[arg(long, default_value_t = report::TOP_N)]
         top: usize,
+        /// Group by this field instead of the Kind's declared `group_key` (`--group-by outcome`).
+        /// Requires `--kind`, and the field must be in that Kind's allow-list — the schema says
+        /// what a Kind records, this says which of it the question is about.
+        #[arg(long, value_name = "field", requires = "kind")]
+        group_by: Option<String>,
+        /// Rank groups by this measure instead of the Kind's first declared one
+        /// (`--sort-by violations`). Requires `--kind`, and the measure must be one the Kind
+        /// declares.
+        #[arg(long, value_name = "measure", requires = "kind")]
+        sort_by: Option<String>,
         /// Restrict to records whose field equals a value (`--filter spec=auth`; repeatable —
         /// every filter must match). Values compare against the same rendering the group-key
         /// column shows; a redacted field is matched by its original value (the query is
@@ -156,6 +163,8 @@ fn run() -> i32 {
             project,
             kind,
             top,
+            group_by,
+            sort_by,
             filter,
         } => report_cmd(
             &window,
@@ -163,6 +172,8 @@ fn run() -> i32 {
             top,
             project.as_deref(),
             kind.as_deref(),
+            group_by.as_deref(),
+            sort_by.as_deref(),
             &filter,
         ),
         Command::Init {
@@ -205,7 +216,7 @@ pub(crate) fn emit_record(
     kind: &str,
     payload: impl FnOnce() -> Result<Payload, String>,
 ) -> Result<Option<String>, EmitError> {
-    let cfg = Config::load();
+    let cfg = Config::load().map_err(|e| EmitError::Registry(e.to_string()))?;
     let reg = build_registry(&cfg).map_err(|e| EmitError::Registry(e.to_string()))?;
     if reg.kind(kind).is_none() {
         let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
@@ -324,15 +335,24 @@ fn parse_pairs(fields: &[String]) -> Result<Payload, String> {
     Ok(payload)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn report_cmd(
     window: &str,
     format: Format,
     top: usize,
     project: Option<&str>,
     kind: Option<&str>,
+    group_by: Option<&str>,
+    sort_by: Option<&str>,
     filter: &[String],
 ) -> i32 {
-    let cfg = Config::load();
+    let cfg = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("report: {e}");
+            return 1;
+        }
+    };
     let reg = match build_registry(&cfg) {
         Ok(r) => r,
         Err(e) => {
@@ -340,17 +360,7 @@ fn report_cmd(
             return 1;
         }
     };
-    if let Some(k) = kind
-        && reg.kind(k).is_none()
-    {
-        let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        eprintln!(
-            "report: unknown kind {k:?}; registered: {}",
-            known.join(", ")
-        );
-        return 2;
-    }
-    let filters = match parse_filters(filter, kind, &reg) {
+    let filters = match parse_query(&reg, kind, group_by, sort_by, filter) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("report: {e}");
@@ -368,29 +378,78 @@ fn report_cmd(
         top_n: top,
         project,
         kind,
+        group_by,
+        sort_by,
         filters: &filters,
     };
-    // `--kind` scopes the rollup to one Kind; the native cost snapshot is not a Kind, so it
-    // is shown only for the full report.
+    let report = report::Report::build(&reg, &cfg, window, &q);
     match format {
-        Format::Json => print!("{}", report_json(&reg, &cfg, window, &q)),
-        Format::Md => {
-            print!("{}", render::format_markdown(&reg, &cfg, window, &q));
-            if q.kind.is_none() {
-                print!("{}", cost_section(&cfg.state_dir, true, q.since, q.project));
-            }
-        }
-        Format::Text => {
-            print!("{}", render::format_table(&reg, &cfg, window, &q));
-            if q.kind.is_none() {
-                print!(
-                    "{}",
-                    cost_section(&cfg.state_dir, false, q.since, q.project)
-                );
-            }
-        }
+        Format::Json => print!("{}", report_json(&report)),
+        Format::Md => print!("{}", render::format_markdown(&report)),
+        Format::Text => print!("{}", render::format_text(&report)),
     }
     0
+}
+
+/// Validate every Kind-scoped part of a query against the registry and return the parsed
+/// filters. Each restriction names a field the Kind declares; one that does not could only ever
+/// match nothing, so it is rejected here rather than answered with a convincing empty result.
+pub(crate) fn parse_query(
+    reg: &Registry,
+    kind: Option<&str>,
+    group_by: Option<&str>,
+    sort_by: Option<&str>,
+    filter: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    if let Some(k) = kind
+        && reg.kind(k).is_none()
+    {
+        let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
+        return Err(format!(
+            "unknown kind {k:?}; registered: {}",
+            known.join(", ")
+        ));
+    }
+    if let Some(field) = group_by {
+        let spec = kind_of(reg, kind, "--group-by")?;
+        if !spec.fields.contains(field) {
+            let accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
+            return Err(format!(
+                "{} has no field {field:?} to group by — accepted fields: {}",
+                spec.name,
+                accepted.join(", ")
+            ));
+        }
+    }
+    if let Some(measure) = sort_by {
+        let spec = kind_of(reg, kind, "--sort-by")?;
+        if !spec.measures.iter().any(|m| m == measure) {
+            return Err(if spec.measures.is_empty() {
+                format!(
+                    "{} declares no measures, so its groups rank by record count — \
+                     --sort-by has nothing to name",
+                    spec.name
+                )
+            } else {
+                format!(
+                    "{} has no measure {measure:?} to rank by — declared measures: {}",
+                    spec.name,
+                    spec.measures.join(", ")
+                )
+            });
+        }
+    }
+    parse_filters(filter, kind, reg)
+}
+
+fn kind_of<'a>(
+    reg: &'a Registry,
+    kind: Option<&str>,
+    flag: &str,
+) -> Result<&'a hatel_core::KindSpec, String> {
+    let kind = kind.ok_or_else(|| format!("{flag} requires --kind"))?;
+    reg.kind(kind)
+        .ok_or_else(|| format!("unknown kind {kind:?}"))
 }
 
 /// Parse `--filter field=value` pairs and validate each field against the Kind's allow-list —
@@ -438,93 +497,14 @@ pub(crate) fn parse_filters(
     Ok(filters)
 }
 
-/// Machine-readable report: per-Kind group aggregates plus the cost snapshot.
-pub(crate) fn report_json(reg: &Registry, cfg: &Config, window: &str, q: &report::Query) -> String {
-    let kinds: Vec<serde_json::Value> = reg
-        .kinds()
-        .filter(|s| q.kind.is_none_or(|k| s.name == k))
-        .map(|s| {
-            serde_json::json!({
-                "kind": s.name,
-                "groups": report::aggregate(reg, cfg, &s.name, q),
-            })
-        })
-        .collect();
-    // `{field, value}` objects, not `"field=value"` strings — a value may itself contain
-    // `=`, and a machine consumer should never have to re-split what the CLI already parsed.
-    let filters: Vec<serde_json::Value> = q
-        .filters
-        .iter()
-        .map(|(field, value)| serde_json::json!({ "field": field, "value": value }))
-        .collect();
-    serde_json::to_string_pretty(&serde_json::json!({
-        "window": window,
-        "project": q.project,
-        "filters": filters,
-        "kinds": kinds,
-        "cost": if q.kind.is_some() { Vec::new() } else { cost_rows(&cfg.state_dir, q.since, q.project) },
-    }))
-    .map(|s| s + "\n")
-    .unwrap_or_default()
-}
-
-/// Cost snapshot rows within the window (`since` = epoch-second lower bound), optionally
-/// restricted to one project — so the cost section honors `--window`/`--project` exactly
-/// as the Kind aggregation does.
-fn cost_rows(state_dir: &Path, since: i64, project: Option<&str>) -> Vec<cost::CostRow> {
-    cost::read_snapshot(state_dir)
-        .into_iter()
-        .filter(|r| project.is_none_or(|p| r.project == p))
-        .filter(|r| hatel_core::ts_epoch(&r.ts).is_some_and(|t| t >= since))
-        .collect()
-}
-
-/// The native-OTel cost snapshot (written by `serve`). Read from the snapshot file,
-/// not the event ledger.
-fn cost_section(state_dir: &Path, markdown: bool, since: i64, project: Option<&str>) -> String {
-    let rows = cost_rows(state_dir, since, project);
-    if rows.is_empty() {
-        return String::new();
-    }
-    let project = |p: &str| {
-        if p.is_empty() {
-            "(unknown)".to_string()
-        } else {
-            p.to_string()
-        }
-    };
-    let short = |s: &str| s.chars().take(8).collect::<String>();
-    let mut out = String::new();
-    if markdown {
-        out.push_str("\n## cost (latest snapshot per session)\n\n");
-        out.push_str("| session | project | tokens | cost$ | active_s | lines |\n");
-        out.push_str("|---|---|---:|---:|---:|---:|\n");
-        for r in &rows {
-            out.push_str(&format!(
-                "| {} | {} | {} | {:.4} | {:.1} | {} |\n",
-                hatel_core::render::escape_md_cell(&short(&r.session_id)),
-                hatel_core::render::escape_md_cell(&project(&r.project)),
-                r.tokens,
-                r.cost_usd,
-                r.active_time_s,
-                r.lines
-            ));
-        }
-    } else {
-        out.push_str("\n--- cost (latest per session) ---\n");
-        for r in &rows {
-            out.push_str(&format!(
-                "{} {} tokens={} cost={:.4} active={:.1} lines={}\n",
-                short(&r.session_id),
-                project(&r.project),
-                r.tokens,
-                r.cost_usd,
-                r.active_time_s,
-                r.lines
-            ));
-        }
-    }
-    out
+/// The report as machine-readable JSON. Routed through `serde_json::Value`, whose object is a
+/// sorted map, so every key at every depth serializes alphabetically without a struct having to
+/// declare its fields in that order to stay that way.
+pub(crate) fn report_json(report: &report::Report) -> String {
+    serde_json::to_value(report)
+        .and_then(|v| serde_json::to_string_pretty(&v))
+        .map(|s| s + "\n")
+        .unwrap_or_default()
 }
 
 /// The registered Kinds as the `kinds --json` array — the schema-discovery payload,
@@ -547,8 +527,7 @@ pub(crate) fn kinds_value(reg: &Registry) -> serde_json::Value {
 }
 
 fn kinds_cmd(json: bool) -> i32 {
-    let cfg = Config::load();
-    let reg = match build_registry(&cfg) {
+    let reg = match Config::load().and_then(|cfg| build_registry(&cfg)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("kinds: {e}");
@@ -598,12 +577,29 @@ mod tests {
             ),
         )
         .unwrap();
-        let day_ago = hatel_core::now_epoch() - 86_400;
+        let cfg = test_cfg("costwin", vec![]);
+        let reg = build_registry(&cfg).unwrap();
+        let cost = |project| {
+            report::Report::build(
+                &reg,
+                &cfg,
+                "1d",
+                &report::Query {
+                    since: hatel_core::now_epoch() - 86_400,
+                    top_n: 0,
+                    project,
+                    kind: None,
+                    group_by: None,
+                    sort_by: None,
+                    filters: &[],
+                },
+            )
+            .cost
+        };
         // window drops the year-2000 row
-        let in_window = cost_rows(&dir, day_ago, None);
-        assert_eq!(in_window.len(), 2, "old row outside window dropped");
+        assert_eq!(cost(None).len(), 2, "old row outside window dropped");
         // project further restricts
-        let alpha = cost_rows(&dir, day_ago, Some("alpha"));
+        let alpha = cost(Some("alpha"));
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].session_id, "recent");
         std::fs::remove_dir_all(&dir).ok();
@@ -706,12 +702,19 @@ mod tests {
             top_n: 0,
             project: None,
             kind,
+            group_by: None,
+            sort_by: None,
             filters: &[],
         };
         // An empty ledger still lists one entry per Kind (with empty groups), so the
         // filter is observable without seeding records.
-        let full: serde_json::Value =
-            serde_json::from_str(&report_json(&reg, &cfg, "7d", &q(None))).unwrap();
+        let full: serde_json::Value = serde_json::from_str(&report_json(&report::Report::build(
+            &reg,
+            &cfg,
+            "7d",
+            &q(None),
+        )))
+        .unwrap();
         let full_kinds: Vec<&str> = full["kinds"]
             .as_array()
             .unwrap()
@@ -724,8 +727,13 @@ mod tests {
         );
         assert!(full_kinds.len() > 1);
 
-        let scoped: serde_json::Value =
-            serde_json::from_str(&report_json(&reg, &cfg, "7d", &q(Some("tool")))).unwrap();
+        let scoped: serde_json::Value = serde_json::from_str(&report_json(&report::Report::build(
+            &reg,
+            &cfg,
+            "7d",
+            &q(Some("tool")),
+        )))
+        .unwrap();
         let scoped_kinds: Vec<&str> = scoped["kinds"]
             .as_array()
             .unwrap()

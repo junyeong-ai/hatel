@@ -43,6 +43,8 @@ fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
         top_n,
         project,
         kind: None,
+        group_by: None,
+        sort_by: None,
         filters: &[],
     }
 }

@@ -17,6 +17,7 @@ pub mod report;
 pub mod rolling;
 pub mod schema;
 pub mod session;
+pub mod settings;
 pub mod sink;
 
 pub use config::Config;
@@ -27,6 +28,7 @@ pub use model::{
 pub use project::{ProjectRef, resolve_project};
 pub use registry::{FieldMap, HookBinding, KindSpec, Registry};
 pub use session::{SessionIndex, SessionIndexCache, SessionRow};
+pub use settings::Settings;
 pub use sink::{Sink, SinkKind, build_sink};
 
 /// One error type for the whole core crate. The hook path is fail-open and never
@@ -47,8 +49,8 @@ pub enum Error {
         #[source]
         source: toml::de::Error,
     },
-    #[error("export config parse error in {path}: {source}")]
-    ExportParse {
+    #[error("config parse error in {path}: {source}")]
+    ConfigParse {
         path: String,
         #[source]
         source: toml::de::Error,

@@ -90,30 +90,45 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 ```md
 # hatel — rolling 30d
 
-| kind | top groups |
-|---|---|
-| compaction | — |
-| memory | — |
-| prompt | a1b2c3d4(2), e5f6a7b8(1) |
-| subagent | Explore(2), code-reviewer(1) |
-| tool | Bash [count=4, duration_ms=5730, ok=3], Edit [count=4, duration_ms=1360, ok=4], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2] |
+## prompt — by session_id, ranked by count
 
-## cost (latest snapshot per session)
+| session_id | count |
+|---|---:|
+| a1b2c3d4 | 2 |
+| e5f6a7b8 | 1 |
 
-| session | project | tokens | cost$ | active_s | lines |
-|---|---|---:|---:|---:|---:|
-| a1b2c3d4 | acme-api | 248913 | 1.8423 | 1284.6 | 342 |
-| e5f6a7b8 | acme-api | 97540 | 0.7218 | 612.3 | 118 |
-| c9d0e1f2 | acme-web | 53201 | 0.4087 | 401.7 | 76 |
+## subagent — by subagent_type, ranked by count
+
+| subagent_type | count |
+|---|---:|
+| Explore | 2 |
+| code-reviewer | 1 |
+
+## tool — by tool_name, ranked by duration_ms
+
+| tool_name | count | duration_ms | ok |
+|---|---:|---:|---:|
+| Bash | 4 | 5,730 | 3 |
+| Edit | 4 | 1,360 | 4 |
+| Grep | 1 | 760 | 1 |
+| Read | 2 | 215 | 2 |
+
+## cost — by project, ranked by cost_usd
+
+| project | sessions | tokens | cost_usd | active_time_s | lines |
+|---|---:|---:|---:|---:|---:|
+| acme-api | 2 | 346,453 | 2.56 | 1,896.90 | 460 |
+| acme-web | 1 | 53,201 | 0.41 | 401.70 | 76 |
 ```
 
 **How to read it:**
 
-- The **`tool`** row is per tool: `[call count, total duration ms, successes]`. `Bash [count=4, duration_ms=5730, ok=3]` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one line**.
-- The **`cost`** table is per-session tokens, cost, active time, lines — all from **native OTel**.
+- Every section names its axes: **`by <dimension>, ranked by <measure>`**. That is the question the section answers, and both halves are yours to change — `--group-by` / `--sort-by`.
+- The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**.
+- The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, which subagent ran how often.
 
-> Before there's any data, every row reads `—`. That's normal — start the receiver and run Claude Code once and it fills in (see [Troubleshooting](#troubleshooting)).
+> A Kind with nothing in the window says so in place of its table, and Kinds you have no records for are listed the same way (omitted above for brevity). Start the receiver and run Claude Code once and they fill in (see [Troubleshooting](#troubleshooting)).
 
 ### Live view — `hatel serve`
 
@@ -184,7 +199,7 @@ claude mcp add hatel -- hatel mcp
 | Command | Purpose |
 |---|---|
 | `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP receiver + live per-session rollup (with a per-subagent token/cost breakdown when subagents run). |
-| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--filter f=v]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures`, plus the cost snapshot. |
+| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--group-by F] [--sort-by M] [--filter f=v]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures`, plus the cost snapshot. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire/unwire the telemetry env + hooks in `settings.json` — idempotent, non-destructive, atomic. |
 | `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service (runs `serve --all` for gap-free collection). |
 | `doctor [--json]` | verify the wiring and report policy gaps honestly — `--json` renders the same findings machine-readably. |
@@ -201,6 +216,8 @@ hatel report --window 30d --project acme-api       # one project
 hatel report --window 30d --kind tool              # one Kind (drops the cost section)
 hatel report --window 30d --kind tool --top 0      # all groups (default: top 5)
 hatel report --window 30d --kind tool --filter tool_name=Bash   # only matching records
+hatel report --window 30d --kind ci_check --group-by date       # a different dimension
+hatel report --window 30d --kind ci_check --sort-by failures    # a different ranking
 hatel report --window 30d --format json            # for dashboards / scripts
 ```
 
@@ -209,18 +226,32 @@ hatel report --window 30d --format json            # for dashboards / scripts
 ```text
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
-compaction       —
-memory           —
-prompt           a1b2c3d4(2), e5f6a7b8(1)
-subagent         Explore(2), code-reviewer(1)
-tool             Bash [count=3, duration_ms=4230, ok=2], Edit [count=3, duration_ms=1010, ok=3], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2]
 
---- cost (latest per session) ---
-a1b2c3d4 acme-api tokens=248913 cost=1.8423 active=1284.6 lines=342
-e5f6a7b8 acme-api tokens=97540 cost=0.7218 active=612.3 lines=118
+prompt — by session_id, ranked by count
+                      session_id  count
+  ██████████████████  a1b2c3d4        2
+  █████████░░░░░░░░░  e5f6a7b8        1
+
+subagent — by subagent_type, ranked by count
+                      subagent_type  count
+  ██████████████████  Explore            2
+  █████████░░░░░░░░░  code-reviewer      1
+
+tool — by tool_name, ranked by duration_ms
+                      tool_name  count  duration_ms  ok
+  ██████████████████  Bash           4        5,730   3
+  ███░░░░░░░░░░░░░░░  Edit           3        1,020   3
+  ██░░░░░░░░░░░░░░░░  Grep           1          760   1
+  ░░░░░░░░░░░░░░░░░░  Read           1          110   1
+
+cost — by project, ranked by cost_usd
+                      project   sessions   tokens  cost_usd  active_time_s  lines
+  ██████████████████  acme-api         2  346,453      2.56       1,896.90    460
 ```
 
 > `--filter field=value` is used with `--kind` and is repeatable (all must match). A redacted field is matched by its *original* value (hashed exactly as stored — the original never touches disk).
+
+A Kind that does not record `project` cannot be selected by a project scope, and says so in place of its table rather than showing an empty one — "outside this scope" is not "none of it happened".
 
 ### `serve` — receiver + live view
 
@@ -369,7 +400,13 @@ If the endpoint is **managed-locked** and can't be repointed, `doctor` says so p
 
 ## Custom metrics (plugins)
 
-A plugin is a single **TOML schema file** — no code, no recompile. It contributes Kinds (and optionally hook bindings) through the same loader the core uses. Point at it with `HATEL_PLUGINS=path/to/plugin.toml` (OS path-list separator for several).
+A plugin is a single **TOML schema file** — no code, no recompile. It contributes Kinds (and optionally hook bindings) through the same loader the core uses. List it under `plugins` in `config.toml`, so every command — the hook that writes, the report that reads — resolves the same Kinds:
+
+```toml
+plugins = ["schemas/aix.toml"]   # relative paths resolve against config.toml's own directory
+```
+
+`HATEL_PLUGINS` overrides the list for one process (OS path-list separator for several). `doctor` names any Kind the ledger holds that no loaded schema declares — records that were collected but that nothing can read.
 
 Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage).
 
@@ -429,7 +466,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 | `HATEL_SINK` | `jsonl` (default) / `sqlite` |
 | `HATEL_STATE_DIR` | override the state directory |
 | `HATEL_CONFIG` | override the `config.toml` path (the export destinations) |
-| `HATEL_PLUGINS` | plugin TOML paths, OS path-list separator (`:` Unix, `;` Windows) |
+| `HATEL_PLUGINS` | plugin TOML paths, overriding `config.toml`'s `plugins`; OS path-list separator (`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
 | `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, rotated ledger archives, SQLite rows (default 90, max 100000); the receiver sweeps daily, never the active ledger file |
 | `HATEL_DISABLED=1` | turn the hook into a no-op |

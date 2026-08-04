@@ -10,7 +10,7 @@ use crate::sink::build_sink;
 use crate::{Config, Payload, ProjectRef, make_envelope, project, resolve_project};
 
 pub fn run_hook(stdin: &str) -> i32 {
-    let cfg = Config::load();
+    let cfg = Config::load_resilient();
     if cfg.disabled {
         return 0;
     }

@@ -17,7 +17,7 @@ use rmcp::{
 use hatel_core::schema::build_registry;
 use hatel_core::{Config, Payload, report};
 
-use crate::{EmitError, doctor, emit_record, kinds_value, parse_filters, report_json};
+use crate::{EmitError, doctor, emit_record, kinds_value, parse_query, report_json};
 
 #[derive(Debug, Clone)]
 pub struct HatelMcp;
@@ -40,6 +40,14 @@ pub struct ReportParams {
     pub filter: Option<Vec<String>>,
     #[schemars(description = "Groups shown per Kind (0 = all; default 5)")]
     pub top: Option<usize>,
+    #[schemars(
+        description = "Group by this field instead of the Kind's declared group_key. Requires `kind`; the field must be in that Kind's allow-list."
+    )]
+    pub group_by: Option<String>,
+    #[schemars(
+        description = "Rank groups by this measure instead of the Kind's first declared one. Requires `kind`; the measure must be one that Kind declares."
+    )]
+    pub sort_by: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -59,19 +67,16 @@ impl HatelMcp {
     )]
     fn report(&self, Parameters(p): Parameters<ReportParams>) -> Result<CallToolResult, McpError> {
         let window = p.window.unwrap_or_else(|| "30d".to_string());
-        let cfg = Config::load();
+        let cfg = Config::load().map_err(internal)?;
         let reg = build_registry(&cfg).map_err(internal)?;
-        if let Some(k) = p.kind.as_deref()
-            && reg.kind(k).is_none()
-        {
-            let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-            return Err(McpError::invalid_params(
-                format!("unknown kind {k:?}; registered: {}", known.join(", ")),
-                None,
-            ));
-        }
-        let filters = parse_filters(&p.filter.unwrap_or_default(), p.kind.as_deref(), &reg)
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        let filters = parse_query(
+            &reg,
+            p.kind.as_deref(),
+            p.group_by.as_deref(),
+            p.sort_by.as_deref(),
+            &p.filter.unwrap_or_default(),
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
         let Some(window_secs) = report::parse_window(&window) else {
             return Err(McpError::invalid_params(
                 format!("invalid window {window:?} (expected e.g. 30d — days only)"),
@@ -83,16 +88,20 @@ impl HatelMcp {
             top_n: p.top.unwrap_or(report::TOP_N),
             project: p.project.as_deref(),
             kind: p.kind.as_deref(),
+            group_by: p.group_by.as_deref(),
+            sort_by: p.sort_by.as_deref(),
             filters: &filters,
         };
-        Ok(text_result(report_json(&reg, &cfg, &window, &q)))
+        Ok(text_result(report_json(&report::Report::build(
+            &reg, &cfg, &window, &q,
+        ))))
     }
 
     #[tool(
         description = "List every registered Kind (core + plugins) with its fields (the allow-list), group_key, measures, redact set, and whether it is receiver-sourced. Same JSON as `hatel kinds --json`."
     )]
     fn kinds(&self) -> Result<CallToolResult, McpError> {
-        let cfg = Config::load();
+        let cfg = Config::load().map_err(internal)?;
         let reg = build_registry(&cfg).map_err(internal)?;
         let json = serde_json::to_string_pretty(&kinds_value(&reg)).unwrap_or_default();
         // Trailing newline included, so the payload is byte-equal to the CLI's println!.

@@ -90,30 +90,45 @@ hatel report --window 30d
 ```md
 # hatel — rolling 30d
 
-| kind | top groups |
-|---|---|
-| compaction | — |
-| memory | — |
-| prompt | a1b2c3d4(2), e5f6a7b8(1) |
-| subagent | Explore(2), code-reviewer(1) |
-| tool | Bash [count=4, duration_ms=5730, ok=3], Edit [count=4, duration_ms=1360, ok=4], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2] |
+## prompt — by session_id, ranked by count
 
-## cost (latest snapshot per session)
+| session_id | count |
+|---|---:|
+| a1b2c3d4 | 2 |
+| e5f6a7b8 | 1 |
 
-| session | project | tokens | cost$ | active_s | lines |
-|---|---|---:|---:|---:|---:|
-| a1b2c3d4 | acme-api | 248913 | 1.8423 | 1284.6 | 342 |
-| e5f6a7b8 | acme-api | 97540 | 0.7218 | 612.3 | 118 |
-| c9d0e1f2 | acme-web | 53201 | 0.4087 | 401.7 | 76 |
+## subagent — by subagent_type, ranked by count
+
+| subagent_type | count |
+|---|---:|
+| Explore | 2 |
+| code-reviewer | 1 |
+
+## tool — by tool_name, ranked by duration_ms
+
+| tool_name | count | duration_ms | ok |
+|---|---:|---:|---:|
+| Bash | 4 | 5,730 | 3 |
+| Edit | 4 | 1,360 | 4 |
+| Grep | 1 | 760 | 1 |
+| Read | 2 | 215 | 2 |
+
+## cost — by project, ranked by cost_usd
+
+| project | sessions | tokens | cost_usd | active_time_s | lines |
+|---|---:|---:|---:|---:|---:|
+| acme-api | 2 | 346,453 | 2.56 | 1,896.90 | 460 |
+| acme-web | 1 | 53,201 | 0.41 | 401.70 | 76 |
 ```
 
 **읽는 법:**
 
-- **`tool`** 행은 도구별로 `[호출 수, 총 소요 ms, 성공 수]`. `Bash [count=4, duration_ms=5730, ok=3]` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공. → **평균 지연과 성공률**이 한 줄에서 나옵니다.
-- **`cost`** 표는 세션별 토큰·비용·활성시간·라인 — 전부 **네이티브 OTel**에서.
+- 모든 섹션은 자신의 축을 밝힙니다 — **`by <차원>, ranked by <측정값>`**. 그 섹션이 답하는 질문이며, 양쪽 다 `--group-by` / `--sort-by`로 바꿀 수 있습니다.
+- **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다.
+- **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번.
 
-> 아직 아무 데이터도 없다면 모든 행이 `—`로 나옵니다. 그건 정상입니다 — 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
+> 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적습니다. 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
 ### 라이브 뷰 — `hatel serve`
 
@@ -184,7 +199,7 @@ claude mcp add hatel -- hatel mcp
 | 명령 | 용도 |
 |---|---|
 | `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP 수신기 + 세션별 라이브 롤업(서브에이전트가 돌면 토큰·비용 분해 포함). |
-| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--filter f=v]` | 롤링 윈도우 집계 — 그룹별 레코드 수와 각 Kind `measures`의 합, 그리고 비용 스냅샷. |
+| `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--group-by F] [--sort-by M] [--filter f=v]` | 롤링 윈도우 집계 — 그룹별 레코드 수와 각 Kind `measures`의 합, 그리고 비용 스냅샷. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | `settings.json`에 텔레메트리 env + 훅을 연결/해제 — 멱등·비파괴·원자적. |
 | `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all` 실행, 무중단 수집). |
 | `doctor [--json]` | 연결을 검증하고 정책 공백을 정직하게 보고 — `--json`은 같은 findings를 기계 판독용으로. |
@@ -201,6 +216,8 @@ hatel report --window 30d --project acme-api       # 한 프로젝트만
 hatel report --window 30d --kind tool              # 한 Kind만(비용 섹션 생략)
 hatel report --window 30d --kind tool --top 0      # 그룹 전체(기본 상위 5)
 hatel report --window 30d --kind tool --filter tool_name=Bash   # 필드 일치만
+hatel report --window 30d --kind ci_check --group-by date       # 다른 차원으로 묶기
+hatel report --window 30d --kind ci_check --sort-by failures    # 다른 측정값으로 순위
 hatel report --window 30d --format json            # 대시보드/스크립트용
 ```
 
@@ -209,18 +226,32 @@ hatel report --window 30d --format json            # 대시보드/스크립트�
 ```text
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
-compaction       —
-memory           —
-prompt           a1b2c3d4(2), e5f6a7b8(1)
-subagent         Explore(2), code-reviewer(1)
-tool             Bash [count=3, duration_ms=4230, ok=2], Edit [count=3, duration_ms=1010, ok=3], Grep [count=1, duration_ms=760, ok=1], Read [count=2, duration_ms=215, ok=2]
 
---- cost (latest per session) ---
-a1b2c3d4 acme-api tokens=248913 cost=1.8423 active=1284.6 lines=342
-e5f6a7b8 acme-api tokens=97540 cost=0.7218 active=612.3 lines=118
+prompt — by session_id, ranked by count
+                      session_id  count
+  ██████████████████  a1b2c3d4        2
+  █████████░░░░░░░░░  e5f6a7b8        1
+
+subagent — by subagent_type, ranked by count
+                      subagent_type  count
+  ██████████████████  Explore            2
+  █████████░░░░░░░░░  code-reviewer      1
+
+tool — by tool_name, ranked by duration_ms
+                      tool_name  count  duration_ms  ok
+  ██████████████████  Bash           4        5,730   3
+  ███░░░░░░░░░░░░░░░  Edit           3        1,020   3
+  ██░░░░░░░░░░░░░░░░  Grep           1          760   1
+  ░░░░░░░░░░░░░░░░░░  Read           1          110   1
+
+cost — by project, ranked by cost_usd
+                      project   sessions   tokens  cost_usd  active_time_s  lines
+  ██████████████████  acme-api         2  346,453      2.56       1,896.90    460
 ```
 
 > `--filter field=value`는 `--kind`와 함께 쓰며 반복 가능(모두 일치해야 함). redact 필드는 *원래 값*으로 조회됩니다(저장된 해시와 동일하게 해싱해 매칭 — 원본은 디스크에 닿지 않음).
+
+`project`를 기록하지 않는 Kind는 프로젝트 스코프로 선택할 수 없으며, 빈 표 대신 그 사실을 적습니다 — "이 스코프 밖"은 "아무 일도 없었음"이 아닙니다.
 
 ### `serve` — 수신기 + 라이브 뷰
 
@@ -369,7 +400,13 @@ endpoint가 **managed-locked**라 재지정 불가면 `doctor`가 명확히 알�
 
 ## 커스텀 지표 (플러그인)
 
-플러그인은 **TOML 스키마 파일** 하나입니다 — 코드도, 재컴파일도 없습니다. 코어와 같은 로더로 Kind(그리고 선택적 훅 바인딩)를 추가합니다. `HATEL_PLUGINS=path/to/plugin.toml`로 지정(여러 개면 OS 경로 구분자).
+플러그인은 **TOML 스키마 파일** 하나입니다 — 코드도, 재컴파일도 없습니다. 코어와 같은 로더로 Kind(그리고 선택적 훅 바인딩)를 추가합니다. `config.toml`의 `plugins`에 나열하면, 기록하는 훅과 조회하는 리포트가 **같은 Kind 집합**을 봅니다:
+
+```toml
+plugins = ["schemas/aix.toml"]   # 상대 경로는 config.toml 자신의 디렉터리 기준
+```
+
+`HATEL_PLUGINS`는 한 프로세스에 한해 이 목록을 대체합니다(여러 개면 OS 경로 구분자). 로드된 스키마 중 어느 것도 선언하지 않는 Kind가 원장에 있으면 `doctor`가 이름을 알려줍니다 — 수집은 됐지만 아무도 읽을 수 없는 기록입니다.
 
 Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱).
 
@@ -429,7 +466,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 | `HATEL_SINK` | `jsonl`(기본) / `sqlite` |
 | `HATEL_STATE_DIR` | 상태 디렉터리 재정의 |
 | `HATEL_CONFIG` | `config.toml`(export 목적지) 경로 재정의 |
-| `HATEL_PLUGINS` | 플러그인 TOML 경로, OS 경로 구분자(`:` Unix, `;` Windows) |
+| `HATEL_PLUGINS` | 플러그인 TOML 경로. `config.toml`의 `plugins`를 대체. OS 경로 구분자(`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL 회전 임계값(기본 10MB) |
 | `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·회전 원장·SQLite 행(기본 90, 최대 100000). 수신기가 매일 sweep하되 활성 원장 파일은 건드리지 않음 |
 | `HATEL_DISABLED=1` | 훅을 no-op으로 |

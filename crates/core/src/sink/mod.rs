@@ -57,6 +57,21 @@ pub fn read_records(cfg: &Config, kind: &str, since: Option<i64>) -> Vec<Envelop
     }
 }
 
+/// Every Kind the backend holds records for, sorted. Each backend answers from what it owns —
+/// the JSONL sink from the file names it chose, the SQLite sink from the column it writes — so
+/// this is an exact statement about storage rather than an inference about it. It is what lets a
+/// diagnostic compare what was collected against what the current registry can read.
+///
+/// A store that has never been written yields an empty list; one that cannot be read yields an
+/// error, because "nothing was collected" and "nothing could be looked at" are the two answers a
+/// diagnostic must never confuse.
+pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
+    match cfg.sink {
+        SinkKind::Jsonl => jsonl::stored_kinds(&cfg.ledger_dir),
+        SinkKind::Sqlite => sqlite::stored_kinds(&sqlite_db_path(cfg)),
+    }
+}
+
 /// Remove stored records older than `cutoff_epoch` from the configured backend — the retention
 /// sweep, applying the same horizon the cost snapshot already honors. JSONL deletes whole
 /// rotated archives (never the active file); SQLite deletes rows. Destructive, so it belongs to

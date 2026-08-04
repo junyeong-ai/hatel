@@ -1,23 +1,252 @@
-//! Presentation. `report.rs` computes the aggregates; this formats them for a
-//! terminal table or a Markdown report. Machine-readable JSON is assembled by the
-//! CLI (it also folds in the cost snapshot).
+//! Presentation. [`crate::report`] computes the answer; this renders it — as an aligned terminal
+//! table or as Markdown. Both formats read the same [`Report`], so they cannot disagree about
+//! what was asked or what came back.
 
-use crate::Config;
-use crate::registry::Registry;
-use crate::report::{GroupAgg, Query, aggregate};
+use crate::report::{
+    GroupAgg, KindSection, ProjectScope, Report, cost_axes, cost_by_project, rank_value,
+};
 
-pub fn format_markdown(reg: &Registry, cfg: &Config, window_label: &str, q: &Query) -> String {
-    let mut out = format!("# hatel — rolling {window_label}{}\n\n", scope_label(q));
-    out.push_str("| kind | top groups |\n|---|---|\n");
-    for spec in reg.kinds().filter(|s| q.kind.is_none_or(|k| s.name == k)) {
-        let groups = aggregate(reg, cfg, &spec.name, q);
-        out.push_str(&format!(
-            "| {} | {} |\n",
-            escape_md_cell(&spec.name),
-            escape_md_cell(&summary_line(&groups))
+/// Width of the magnitude bar that prefixes a terminal row. Fixed, so rows stay aligned across
+/// sections and the eye can compare within one.
+const BAR_WIDTH: usize = 18;
+
+/// Longest group key rendered before truncation. Group keys are file paths, session ids, and
+/// rule names, and one long key must not push every numeric column off the terminal.
+const KEY_WIDTH: usize = 34;
+
+/// Space between a row's columns, and so between the bar and the key it labels.
+const GUTTER: usize = 2;
+
+pub fn format_text(report: &Report) -> String {
+    let mut out = format!(
+        "=== hatel — rolling {}{} ===\n",
+        report.window,
+        scope(report)
+    );
+    for section in &report.kinds {
+        out.push('\n');
+        out.push_str(&format!("{} — {}\n", section.kind, axes(section)));
+        out.push_str(&text_table(
+            &section.group_by,
+            "count",
+            section.sort_by.as_deref(),
+            &section.groups,
+            note(section),
+        ));
+    }
+    if let Some(groups) = cost_groups(report) {
+        let (dimension, rank) = cost_axes();
+        out.push('\n');
+        out.push_str(&format!("cost — by {dimension}, ranked by {rank}\n"));
+        out.push_str(&text_table(
+            dimension,
+            "sessions",
+            Some(rank),
+            &groups,
+            None,
         ));
     }
     out
+}
+
+pub fn format_markdown(report: &Report) -> String {
+    let mut out = format!("# hatel — rolling {}{}\n", report.window, scope(report));
+    for section in &report.kinds {
+        out.push_str(&format!("\n## {} — {}\n\n", section.kind, axes(section)));
+        out.push_str(&markdown_table(
+            &section.group_by,
+            "count",
+            &section.groups,
+            note(section),
+        ));
+    }
+    if let Some(groups) = cost_groups(report) {
+        let (dimension, rank) = cost_axes();
+        out.push_str(&format!("\n## cost — by {dimension}, ranked by {rank}\n\n"));
+        out.push_str(&markdown_table(dimension, "sessions", &groups, None));
+    }
+    out
+}
+
+/// The ranked cost rollup, or `None` when the report carries no cost rows (a Kind-scoped report,
+/// or a window with no recorded spend).
+fn cost_groups(report: &Report) -> Option<Vec<GroupAgg>> {
+    let groups = cost_by_project(&report.cost, report.top_n);
+    (!groups.is_empty()).then_some(groups)
+}
+
+/// The header's restriction summary — the project and each `field=value` filter — so a saved
+/// report states what it covers.
+fn scope(report: &Report) -> String {
+    let mut scope = report
+        .project
+        .as_ref()
+        .map(|p| format!(" — project {p}"))
+        .unwrap_or_default();
+    for f in &report.filters {
+        scope.push_str(&format!(" — {}={}", f.field, f.value));
+    }
+    scope
+}
+
+/// A section's axes in the terms the query used, so a reader knows which question was answered.
+fn axes(section: &KindSection) -> String {
+    let rank = section.sort_by.as_deref().unwrap_or("count");
+    format!(
+        "by {}, ranked by {}",
+        inline(&section.group_by),
+        inline(rank)
+    )
+}
+
+/// Collapse control characters so a value stays on the line it was written to. Field and measure
+/// names come from a plugin's TOML, which can hold a newline; one in a heading would end the
+/// heading, and one in a terminal table would break every column below it.
+fn inline(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// What to say in place of rows, when there are none to say anything about.
+fn note(section: &KindSection) -> Option<&'static str> {
+    match section.project_scope {
+        ProjectScope::Unsupported => {
+            Some("records no project, so a project scope cannot select it")
+        }
+        _ if section.groups.is_empty() => Some("no records in this window"),
+        _ => None,
+    }
+}
+
+fn text_table(
+    dimension: &str,
+    count_header: &str,
+    rank: Option<&str>,
+    groups: &[GroupAgg],
+    note: Option<&str>,
+) -> String {
+    if let Some(note) = note {
+        return format!("  ({note})\n");
+    }
+    let measures: Vec<&str> = groups
+        .first()
+        .map(|g| g.sums.iter().map(|m| m.name.as_str()).collect())
+        .unwrap_or_default();
+    let cells: Vec<Vec<String>> = groups.iter().map(numeric_cells).collect();
+    let key_width = groups
+        .iter()
+        .map(|g| display_width(key_label(&g.key)).min(KEY_WIDTH))
+        .chain(std::iter::once(display_width(dimension)))
+        .max()
+        .unwrap_or(0);
+    // Widen each column to its own cells by walking rows in step with the columns, so a row that
+    // carried a different number of measures than the header row would simply contribute nothing
+    // to the columns it lacks rather than indexing past its end.
+    let mut widths: Vec<usize> = std::iter::once(count_header)
+        .chain(measures.iter().copied())
+        .map(display_width)
+        .collect();
+    for row in &cells {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(display_width(cell));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&" ".repeat(GUTTER * 2 + BAR_WIDTH));
+    out.push_str(&pad_right(&inline(dimension), key_width));
+    for (header, width) in std::iter::once(count_header)
+        .chain(measures.iter().copied())
+        .zip(&widths)
+    {
+        out.push_str(&format!(
+            "{:GUTTER$}{:>width$}",
+            "",
+            inline(header),
+            width = width
+        ));
+    }
+    out.push('\n');
+
+    // Groups arrive ordered, so the leader sets the scale every other bar is drawn against.
+    let max = groups.first().map_or(0.0, |g| rank_value(g, rank));
+    for (group, row) in groups.iter().zip(&cells) {
+        out.push_str(&" ".repeat(GUTTER));
+        out.push_str(&bar(rank_value(group, rank), max));
+        out.push_str(&" ".repeat(GUTTER));
+        out.push_str(&pad_right(
+            &truncate(key_label(&group.key), KEY_WIDTH),
+            key_width,
+        ));
+        for (cell, width) in row.iter().zip(&widths) {
+            out.push_str(&format!("{:GUTTER$}{:>width$}", "", cell, width = width));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn markdown_table(
+    dimension: &str,
+    count_header: &str,
+    groups: &[GroupAgg],
+    note: Option<&str>,
+) -> String {
+    if let Some(note) = note {
+        return format!("_{note}_\n");
+    }
+    let measures: Vec<&str> = groups
+        .first()
+        .map(|g| g.sums.iter().map(|m| m.name.as_str()).collect())
+        .unwrap_or_default();
+    // Header cells are field and measure names, which a plugin author writes freely — they are
+    // escaped exactly as values are, or one carrying a pipe would add a column to every row.
+    let headers: Vec<String> = std::iter::once(dimension)
+        .chain(std::iter::once(count_header))
+        .chain(measures)
+        .map(escape_md_cell)
+        .collect();
+    let mut out = format!("| {} |\n", headers.join(" | "));
+    out.push_str("|---|");
+    out.push_str(&"---:|".repeat(headers.len() - 1));
+    out.push('\n');
+    for group in groups {
+        out.push_str(&format!("| {} |", escape_md_cell(key_label(&group.key))));
+        for cell in numeric_cells(group) {
+            out.push_str(&format!(" {cell} |"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A group key as a label. A record that stored an empty value for the dimension groups under the
+/// empty string; naming it keeps that row from reading as an unlabelled one, next to the em-dash
+/// that marks a record which carried no such field at all. The stored key is untouched — a machine
+/// consumer reads the value, not this.
+fn key_label(key: &str) -> &str {
+    if key.is_empty() { "(empty)" } else { key }
+}
+
+/// A group's count and measure sums as display strings, in column order.
+fn numeric_cells(group: &GroupAgg) -> Vec<String> {
+    std::iter::once(fmt_num(group.count as f64))
+        .chain(group.sums.iter().map(|m| fmt_num(m.sum)))
+        .collect()
+}
+
+/// A proportional bar of exactly [`BAR_WIDTH`] cells, linear against the leading row — so it
+/// states a share of the top group and nothing more.
+fn bar(value: f64, max: f64) -> String {
+    let filled = if max > 0.0 && value > 0.0 {
+        ((value / max) * BAR_WIDTH as f64)
+            .round()
+            .clamp(0.0, BAR_WIDTH as f64) as usize
+    } else {
+        0
+    };
+    format!("{}{}", "█".repeat(filled), "░".repeat(BAR_WIDTH - filled))
 }
 
 /// Neutralize a string for a GitHub-flavored-Markdown table cell. A literal `|` would open a new
@@ -40,65 +269,99 @@ pub fn escape_md_cell(s: &str) -> String {
     out
 }
 
-pub fn format_table(reg: &Registry, cfg: &Config, window_label: &str, q: &Query) -> String {
-    let mut out = format!("=== hatel — rolling {window_label}{} ===\n", scope_label(q));
-    for spec in reg.kinds().filter(|s| q.kind.is_none_or(|k| s.name == k)) {
-        let groups = aggregate(reg, cfg, &spec.name, q);
-        out.push_str(&format!("{:<16} {}\n", spec.name, summary_line(&groups)));
+/// Digit-grouped decimal. Sums run to nine figures — `770991471` and `770,991,471` carry the same
+/// information but only one can be read at a glance — and grouping is lossless, so it says nothing
+/// about a value's unit, which a Kind does not declare.
+fn fmt_num(v: f64) -> String {
+    let plain = if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{v:.2}")
+    };
+    group_digits(&plain)
+}
+
+fn group_digits(s: &str) -> String {
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", s),
+    };
+    let (int, frac) = match rest.split_once('.') {
+        Some((int, frac)) => (int, Some(frac)),
+        None => (rest, None),
+    };
+    let mut out = String::with_capacity(s.len() + int.len() / 3);
+    out.push_str(sign);
+    for (i, c) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if let Some(frac) = frac {
+        out.push('.');
+        out.push_str(frac);
     }
     out
 }
 
-/// The header's restriction summary — the project and each `field=value` filter — so a saved
-/// report states what it covers.
-fn scope_label(q: &Query) -> String {
-    let mut scope = q
-        .project
-        .map(|p| format!(" — project {p}"))
-        .unwrap_or_default();
-    for (field, value) in q.filters {
-        scope.push_str(&format!(" — {field}={value}"));
-    }
-    scope
+/// Character count — the unit a terminal column and Rust's own `{:>width$}` padding are both
+/// measured in, so every width in a row is computed the same way a row is written.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
 }
 
-fn summary_line(groups: &[GroupAgg]) -> String {
-    if groups.is_empty() {
-        return "—".to_string();
+fn truncate(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
     }
-    groups
-        .iter()
-        .map(group_summary)
-        .collect::<Vec<_>>()
-        .join(", ")
+    s.chars()
+        .take(width.saturating_sub(1))
+        .chain(['…'])
+        .collect()
 }
 
-/// `key(count)` for a plain Kind; `key [count=N, measure=sum, …]` when the Kind
-/// declares measures.
-fn group_summary(g: &GroupAgg) -> String {
-    if g.sums.is_empty() {
-        return format!("{}({})", g.key, g.count);
-    }
-    let measures = g
-        .sums
-        .iter()
-        .map(|m| format!("{}={}", m.name, fmt_num(m.sum)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{} [count={}, {}]", g.key, g.count, measures)
-}
-
-fn fmt_num(v: f64) -> String {
-    if v.fract() == 0.0 && v.abs() < 1e15 {
-        format!("{}", v as i64)
-    } else {
-        format!("{v:.2}")
-    }
+fn pad_right(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(display_width(s));
+    format!("{s}{}", " ".repeat(pad))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::{Filter, Measure};
+
+    fn section(kind: &str, groups: Vec<GroupAgg>) -> KindSection {
+        KindSection {
+            kind: kind.to_string(),
+            group_by: "tool_name".to_string(),
+            sort_by: Some("duration_ms".to_string()),
+            project_scope: ProjectScope::Unrestricted,
+            groups,
+        }
+    }
+
+    fn group(key: &str, count: i64, sum: f64) -> GroupAgg {
+        GroupAgg {
+            key: key.to_string(),
+            count,
+            sums: vec![Measure {
+                name: "duration_ms".to_string(),
+                sum,
+            }],
+        }
+    }
+
+    fn report(kinds: Vec<KindSection>) -> Report {
+        Report {
+            window: "30d".to_string(),
+            project: None,
+            filters: Vec::new(),
+            top_n: 5,
+            kinds,
+            cost: Vec::new(),
+        }
+    }
 
     #[test]
     fn escape_md_cell_neutralizes_pipes_and_newlines() {
@@ -110,58 +373,200 @@ mod tests {
         // becomes `a\\\|b` (literal backslash, then escaped pipe), and a Windows path stays intact.
         assert_eq!(escape_md_cell(r"a\|b"), r"a\\\|b");
         assert_eq!(escape_md_cell(r"c:\path"), r"c:\\path");
-        // Ordinary text (including the empty-group em-dash) is untouched.
         assert_eq!(escape_md_cell("Bash"), "Bash");
-        assert_eq!(escape_md_cell("—"), "—");
     }
 
     #[test]
-    fn markdown_row_stays_one_row_with_hostile_group_key() {
-        // End-to-end: a record whose group key carries a pipe and a newline must still render as a
-        // single table row with exactly the column delimiters of the header.
-        let dir = std::env::temp_dir().join(format!("ht-render-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("ledger")).unwrap();
-        let line = r#"{"ts":"2026-01-01T00:00:00Z","kind":"tool","_schema_version":1,"payload":{"session_id":"s","project":"p","tool_name":"a|b\nc","duration_ms":1,"ok":1}}"#;
-        std::fs::write(dir.join("ledger/tool.jsonl"), format!("{line}\n")).unwrap();
-        let cfg = Config {
-            sink: crate::sink::SinkKind::Jsonl,
-            state_dir: dir.clone(),
-            ledger_dir: dir.join("ledger"),
-            plugins: vec![],
-            rotate_bytes: 1 << 20,
-            retention_days: 90,
-            disabled: false,
-            strict: false,
-        };
-        let reg = crate::schema::load_core().unwrap();
-        let q = Query {
-            since: 0,
-            top_n: 10,
-            project: None,
-            kind: Some("tool"),
-            filters: &[],
-        };
-        let md = format_markdown(&reg, &cfg, "30d", &q);
-        let _ = std::fs::remove_dir_all(&dir);
-        let tool_row = md
+    fn a_hostile_group_key_stays_one_markdown_row() {
+        let md = format_markdown(&report(vec![section(
+            "tool",
+            vec![group("a|b\nc", 1, 5.0)],
+        )]));
+        let row = md
             .lines()
-            .find(|l| l.starts_with("| tool "))
-            .expect("a tool row");
+            .find(|l| l.starts_with("| a"))
+            .expect("the group row");
+        assert!(!row.contains("a|b"), "raw pipe must be escaped: {row}");
+        assert!(row.contains("a\\|b c"), "newline collapsed inline: {row}");
+        assert!(row.ends_with(" |"), "row closes cleanly: {row}");
+    }
+
+    #[test]
+    fn digits_are_grouped_without_changing_the_value() {
+        assert_eq!(fmt_num(770_991_471.0), "770,991,471");
+        assert_eq!(fmt_num(1234.5678), "1,234.57");
+        assert_eq!(fmt_num(-1_234.0), "-1,234");
+        assert_eq!(fmt_num(999.0), "999");
+        assert_eq!(fmt_num(0.0), "0");
+    }
+
+    #[test]
+    fn a_kind_that_records_no_project_says_so_instead_of_showing_nothing() {
+        // The distinction the report exists to preserve: "this Kind cannot be project-scoped" is
+        // not "this project did none of it".
+        let mut s = section("aix.rules", Vec::new());
+        s.project_scope = ProjectScope::Unsupported;
+        let mut r = report(vec![s]);
+        r.project = Some("acme".to_string());
+        let text = format_text(&r);
+        assert!(text.contains("records no project"), "{text}");
+        assert!(!text.contains("no records in this window"), "{text}");
+    }
+
+    #[test]
+    fn every_row_carries_a_bar_scaled_to_the_leader() {
+        let text = format_text(&report(vec![section(
+            "tool",
+            vec![group("Bash", 9, 100.0), group("Edit", 2, 50.0)],
+        )]));
+        let bash = text.lines().find(|l| l.contains("Bash")).unwrap();
+        let edit = text.lines().find(|l| l.contains("Edit")).unwrap();
+        assert_eq!(bash.matches('█').count(), BAR_WIDTH, "leader fills the bar");
+        assert_eq!(edit.matches('█').count(), BAR_WIDTH / 2, "half the leader");
+        assert!(bash.contains("100"), "the measure is still printed: {bash}");
+    }
+
+    #[test]
+    fn a_newline_in_a_field_name_cannot_break_the_layout() {
+        // Field names come from a plugin's TOML, where a newline is expressible. One in the axes
+        // line would end a Markdown heading early and misalign every terminal column below it.
+        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        s.group_by = "rule\nname".to_string();
+        for out in [
+            format_text(&report(vec![s.clone()])),
+            format_markdown(&report(vec![s])),
+        ] {
+            let axes = out.lines().find(|l| l.contains("rule")).unwrap();
+            assert!(axes.contains("rule name"), "collapsed inline: {axes:?}");
+        }
+    }
+
+    #[test]
+    fn markdown_headers_are_escaped_like_values() {
+        // A field name is written by a plugin author and is not character-restricted, so a pipe in
+        // one would open a column on the header row that no data row has.
+        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        s.group_by = "rule|name".to_string();
+        let md = format_markdown(&report(vec![s]));
+        let header = md.lines().find(|l| l.starts_with("| rule")).unwrap();
+        assert!(header.contains("rule\\|name"), "{header}");
+        assert_eq!(
+            header.matches(" | ").count(),
+            2,
+            "3 columns, not 4: {header}"
+        );
+    }
+
+    #[test]
+    fn an_empty_group_key_is_named_not_blank() {
+        // A record that stored an empty value must not render as an unlabelled row, and must stay
+        // distinct from the em-dash marking a record that carried no such field at all.
+        let text = format_text(&report(vec![section(
+            "aix.sessions",
+            vec![group("", 15, 1.0), group("—", 2, 1.0)],
+        )]));
+        assert!(text.contains("(empty)"), "{text}");
+        assert!(text.contains('—'), "{text}");
+    }
+
+    #[test]
+    fn bars_measure_what_the_rows_are_ordered_by() {
+        // With the ranking measure declared second, a bar drawn from the leading measure would
+        // contradict the order the rows are in — the leader's bar would not be the longest.
+        let measured = |key: &str, first: f64, second: f64| GroupAgg {
+            key: key.to_string(),
+            count: 1,
+            sums: vec![
+                Measure {
+                    name: "evaluations".to_string(),
+                    sum: first,
+                },
+                Measure {
+                    name: "violations".to_string(),
+                    sum: second,
+                },
+            ],
+        };
+        let mut s = section(
+            "aix.rules",
+            vec![
+                measured("citation", 21_000.0, 200.0),
+                measured("imports", 13_000_000.0, 100.0),
+            ],
+        );
+        s.sort_by = Some("violations".to_string());
+        let text = format_text(&report(vec![s]));
+        let citation = text.lines().find(|l| l.contains("citation")).unwrap();
+        let imports = text.lines().find(|l| l.contains("imports")).unwrap();
+        assert_eq!(citation.matches('█').count(), BAR_WIDTH);
+        assert_eq!(imports.matches('█').count(), BAR_WIDTH / 2);
+    }
+
+    #[test]
+    fn columns_line_up_under_a_non_ascii_header() {
+        // Widths and padding must be counted in the same unit; measuring a header in bytes while
+        // padding it in characters would shift every column right of it.
+        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        s.group_by = "규칙".to_string();
+        let text = format_text(&report(vec![s]));
+        let mut lines = text.lines().skip_while(|l| !l.starts_with("k —")).skip(1);
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        let column = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|b| line[..b].chars().count())
+                .unwrap()
+        };
+        assert_eq!(column(header, "규칙"), column(row, "v"));
+        assert_eq!(
+            column(header, "count") + "count".len(),
+            column(row, "1") + 1
+        );
+    }
+
+    #[test]
+    fn columns_line_up_under_their_headers() {
+        let text = format_text(&report(vec![section(
+            "tool",
+            vec![group("Bash", 155_637, 770_991_471.0)],
+        )]));
+        let mut lines = text
+            .lines()
+            .skip_while(|l| !l.starts_with("tool —"))
+            .skip(1);
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        // Column, not byte offset — a bar cell is one column and three bytes.
+        let column = |line: &str, needle: &str| {
+            line.find(needle)
+                .map(|byte| line[..byte].chars().count())
+                .unwrap_or_else(|| panic!("{needle:?} not in {line:?}"))
+        };
+        assert_eq!(
+            column(header, "tool_name"),
+            column(row, "Bash"),
+            "the dimension header sits over its keys:\n{header}\n{row}"
+        );
+        assert_eq!(
+            column(header, "duration_ms") + "duration_ms".len(),
+            column(row, "770,991,471") + "770,991,471".len(),
+            "numeric columns are right-aligned under their headers:\n{header}\n{row}"
+        );
+    }
+
+    #[test]
+    fn the_header_states_the_scope_it_covers() {
+        let mut r = report(vec![section("tool", vec![group("Bash", 1, 1.0)])]);
+        r.project = Some("acme".to_string());
+        r.filters = vec![Filter {
+            field: "spec".to_string(),
+            value: "auth".to_string(),
+        }];
         assert!(
-            !tool_row.contains("a|b"),
-            "raw pipe must be escaped: {tool_row}"
+            format_text(&r).starts_with("=== hatel — rolling 30d — project acme — spec=auth ===")
         );
         assert!(
-            tool_row.contains("a\\|b"),
-            "pipe escaped as \\|: {tool_row}"
+            format_markdown(&r).starts_with("# hatel — rolling 30d — project acme — spec=auth")
         );
-        // The newline inside the value collapsed to a space, so the text after it stays on the SAME
-        // row (no injected table row) and the row still closes cleanly.
-        assert!(
-            tool_row.contains("c [count=1"),
-            "newline collapsed; value stays one row: {tool_row}"
-        );
-        assert!(tool_row.ends_with(" |"), "row closes cleanly: {tool_row}");
     }
 }

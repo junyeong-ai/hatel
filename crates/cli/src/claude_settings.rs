@@ -69,7 +69,7 @@ fn unwireable(registry: &hatel_core::Registry) -> Vec<String> {
 }
 
 fn registry_for_wiring() -> hatel_core::Registry {
-    hatel_core::schema::build_registry_resilient(&hatel_core::Config::load())
+    hatel_core::schema::build_registry_resilient(&hatel_core::Config::load_resilient())
 }
 
 /// The receiver's default bind address — the endpoint `init` wires. Used to tell "pointed at the

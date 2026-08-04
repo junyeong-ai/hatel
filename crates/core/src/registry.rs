@@ -47,7 +47,8 @@ pub struct KindSpecRaw {
 
 /// A Kind name is also a JSONL filename component, so it is restricted to a safe
 /// character set — no path separators, no whitespace — which makes traversal impossible.
-fn is_valid_kind_name(name: &str) -> bool {
+/// The restriction is what lets the JSONL sink recover a Kind name from a file name exactly.
+pub fn is_valid_kind_name(name: &str) -> bool {
     !name.is_empty()
         && name
             .chars()

@@ -8,6 +8,24 @@ use rusqlite::{Connection, OpenFlags};
 use super::Sink;
 use crate::Envelope;
 
+/// Every Kind the table holds records for.
+pub fn stored_kinds(path: &Path) -> std::io::Result<Vec<String>> {
+    // No database file means nothing has ever been written through this sink, which is an empty
+    // store rather than an unreadable one.
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let io = |e: rusqlite::Error| std::io::Error::other(e.to_string());
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT kind FROM records ORDER BY kind")
+        .map_err(io)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(io)?;
+    rows.collect::<rusqlite::Result<Vec<String>>>().map_err(io)
+}
+
 /// Read records for `kind` back as envelopes — the read half of the storage
 /// abstraction, so a report consumes the SQLite sink exactly as it does JSONL. The
 /// time window is pushed into SQL (`ts >= since`) so the indexed backend isn't forced

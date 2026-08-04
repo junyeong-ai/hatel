@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex};
+use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings, sink};
 
 use crate::claude_settings as cs;
 
@@ -136,7 +136,8 @@ fn build_report() -> Report {
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
     // them from the registry rather than the full vocabulary — coverage is judged against these.
     let events = cs::active_events_default();
-    let cfg = Config::load();
+    let settings = Settings::load();
+    let cfg = Config::load_resilient();
 
     let settings_files = files
         .iter()
@@ -169,6 +170,7 @@ fn build_report() -> Report {
             cfg.state_dir.display()
         )),
     }
+    report_registry(&mut storage, &settings, &cfg);
 
     let mut sections = vec![native, hooks, storage];
     if let Some(export) = report_export(&env) {
@@ -282,6 +284,47 @@ fn report_hooks(sec: &mut Section, files: &[cs::ScopeFile], events: &[&'static s
 /// Grouped per Kind (records carry no event provenance, so Kind-level is the honest granularity
 /// when one Kind is bound to several events) and gated on session recency — "no records" carries
 /// no signal when nothing has been running.
+/// Compare what the store holds against what the registry can read. A Kind whose records are on
+/// disk but whose schema is not loaded is invisible to every query — the collection worked and
+/// the reporting cannot see it — which no other check would surface, because nothing about the
+/// wiring is wrong.
+fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, cfg: &Config) {
+    let config_path = Settings::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "(no config directory)".to_string());
+    if let Err(e) = settings {
+        sec.fail(e.to_string());
+        return;
+    }
+    // The strict build is what every read path performs, so its verdict is the one that decides
+    // whether the configured schemas are usable; the resilient build then still supplies a
+    // registry for the comparison below, which stays informative even with one plugin broken.
+    match hatel_core::schema::build_registry(cfg) {
+        Ok(_) => match cfg.plugins.len() {
+            0 => sec.note(format!("no plugin schemas configured ({config_path})")),
+            n => sec.ok(format!("{n} plugin schema(s) from {config_path}")),
+        },
+        Err(e) => sec.fail(format!("plugin schema in {config_path}: {e}")),
+    }
+    let registry = hatel_core::schema::build_registry_resilient(cfg);
+    match sink::stored_kinds(cfg) {
+        Err(e) => sec.fail(format!("cannot enumerate stored Kinds: {e}")),
+        Ok(stored) => {
+            let unreadable: Vec<String> = stored
+                .into_iter()
+                .filter(|k| registry.kind(k).is_none())
+                .collect();
+            if !unreadable.is_empty() {
+                sec.warn(format!(
+                    "stored but unreadable — no loaded schema declares {}; add the plugin that \
+                     defines them to `plugins` in {config_path}, or their records stay uncountable",
+                    unreadable.join(", ")
+                ));
+            }
+        }
+    }
+}
+
 fn advise_dormant_bindings(
     sec: &mut Section,
     files: &[cs::ScopeFile],

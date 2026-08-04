@@ -21,7 +21,8 @@ uvx zizmor .github/                       # after workflow edits (security audit
 ## Layout
 
 - `crates/core` — async-free library: registry/schema (Kind definitions, `core.toml`),
-  sinks (JSONL/SQLite), sessions, cost snapshot, report aggregation, PII.
+  settings (`config.toml`) and the resolved runtime config, sinks (JSONL/SQLite), sessions,
+  cost snapshot, report aggregation and its render, PII.
 - `crates/hook` — the hook binary; depends on core only, no async runtime (spawned on
   every lifecycle event — cold-start is a design constraint).
 - `crates/cli` — the `hatel` binary: `serve` (receiver), `report`, `init`, `service`,
@@ -38,7 +39,16 @@ uvx zizmor .github/                       # after workflow edits (security audit
   tool call); **fail-closed on egress privacy** (an unattributable batch is not forwarded
   to a filtered destination).
 - `#[serde(deny_unknown_fields)]` on every config/schema surface — a misspelled key must
-  fail loudly, never silently disable a feature.
+  fail loudly, never silently disable a feature. `config.toml` therefore has exactly one
+  typed shape (`settings.rs`) covering every section: a second parser over the same file
+  would have to tolerate the sections it doesn't own, and a writer that rebuilt the file
+  from its own section alone would drop the rest.
+- **A schema describes data; a query asks a question of it.** A Kind declares its fields,
+  its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
+  override those per query. Answering a new question is a query, not a schema edit.
+- **One registry for the write and read paths.** Plugins are registered in `config.toml`,
+  so a Kind the hook can record is one `report` can read; `HATEL_PLUGINS` overrides it for a
+  single process only. `doctor` names any stored Kind no loaded schema declares.
 - **Machine outputs are one shape per question**: `--json` / `--format json` serialize
   keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
   the JSON their CLI counterparts print. Changing one means changing both (they share
