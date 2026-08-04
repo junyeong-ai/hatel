@@ -22,7 +22,7 @@ use crate::{Error, Result};
 /// section is edited, so a value that arrived relative must leave relative, or each rewrite would
 /// re-anchor it against the config directory again. [`Settings::plugin_paths`] does the anchoring
 /// at the point of use instead.
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     /// Plugin schema files merged onto the core registry, in listed order.

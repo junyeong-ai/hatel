@@ -136,9 +136,14 @@ fn build_report() -> Report {
     let env = cs::effective_env(&files);
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
     // them from the registry rather than the full vocabulary — coverage is judged against these.
-    let events = cs::active_events_default();
+    // The configuration file is read exactly once and every view below is derived from that one
+    // observation: no two sections can describe different configurations, and a fault in the file
+    // is one fault, reported once, by the section that owns it.
     let settings = Settings::load();
-    let cfg = Config::load_resilient();
+    let resolved = settings.as_ref().cloned().unwrap_or_default();
+    let cfg = Config::from_settings(&resolved);
+    let registry = cs::registry_for_wiring(&cfg);
+    let events = cs::active_events(&registry);
 
     let settings_files = files
         .iter()
@@ -160,8 +165,8 @@ fn build_report() -> Report {
     advise_session_id(&mut native, &env);
 
     let mut hooks = Section::new("hooks", "hooks:");
-    report_hooks(&mut hooks, &files, &events);
-    advise_dormant_bindings(&mut hooks, &files, &events, &cfg);
+    report_hooks(&mut hooks, &files, &events, &registry);
+    advise_dormant_bindings(&mut hooks, &files, &events, &cfg, &registry);
 
     let mut storage = Section::new("storage", "storage:");
     match writable(&cfg.state_dir) {
@@ -171,10 +176,10 @@ fn build_report() -> Report {
             cfg.state_dir.display()
         )),
     }
-    report_registry(&mut storage, &settings, &cfg);
+    report_registry(&mut storage, &settings, &cfg, &registry);
 
     let mut sections = vec![native, hooks, storage];
-    if let Some(export) = report_export(&env) {
+    if let Some(export) = report_export(&env, &settings, &resolved) {
         sections.push(export);
     }
 
@@ -216,7 +221,12 @@ fn render_human(r: &Report) -> String {
 /// Report hook coverage across the canonical lifecycle events. Full coverage in an honored scope
 /// is the requirement; partial coverage is a failure because the uncovered events are silently
 /// not captured.
-fn report_hooks(sec: &mut Section, files: &[cs::ScopeFile], events: &[&'static str]) {
+fn report_hooks(
+    sec: &mut Section,
+    files: &[cs::ScopeFile],
+    events: &[&'static str],
+    registry: &hatel_core::Registry,
+) {
     let covered = cs::covered_events(files, events);
     let total = events.len();
     let managed_only = cs::managed_hooks_only(files);
@@ -269,7 +279,7 @@ fn report_hooks(sec: &mut Section, files: &[cs::ScopeFile], events: &[&'static s
     }
     // A plugin can bind any event string, but `init` only wires the events hatel knows how to wire;
     // a binding outside that set never fires, so the plugin's Kind would silently collect nothing.
-    for ev in cs::unwireable_bindings() {
+    for ev in cs::unwireable_bindings(registry) {
         sec.fail(format!(
             "a plugin binds `{ev}`, which hatel does not wire — that binding never fires \
              (the event isn't in the supported set; remove it or use a supported event)"
@@ -281,7 +291,12 @@ fn report_hooks(sec: &mut Section, files: &[cs::ScopeFile], events: &[&'static s
 /// disk but whose schema is not loaded is invisible to every query — the collection worked and
 /// the reporting cannot see it — which no other check would surface, because nothing about the
 /// wiring is wrong.
-fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, cfg: &Config) {
+fn report_registry(
+    sec: &mut Section,
+    settings: &hatel_core::Result<Settings>,
+    cfg: &Config,
+    registry: &hatel_core::Registry,
+) {
     // Name the surface the list actually came from. `HATEL_PLUGINS` replaces the file's list, so
     // pointing at the configuration file while an override is in effect would credit it for
     // schemas it did not supply and prescribe an edit that would go on being ignored.
@@ -305,7 +320,6 @@ fn report_registry(sec: &mut Section, settings: &hatel_core::Result<Settings>, c
         },
         Err(e) => sec.fail(format!("plugin schema from {source}: {e}")),
     }
-    let registry = hatel_core::schema::build_registry_resilient(cfg);
     match sink::stored_kinds(cfg) {
         Err(e) => sec.fail(format!("cannot enumerate stored Kinds: {e}")),
         Ok(stored) => {
@@ -337,6 +351,7 @@ fn advise_dormant_bindings(
     files: &[cs::ScopeFile],
     events: &[&'static str],
     cfg: &Config,
+    registry: &hatel_core::Registry,
 ) {
     let since = hatel_core::now_epoch() - DORMANT_WINDOW_DAYS * 86_400;
     let index_recent = SessionIndex::new(cfg.state_dir.clone())
@@ -346,8 +361,6 @@ fn advise_dormant_bindings(
     if !index_recent {
         return;
     }
-    // Resilient build, like the wiring derivation: a broken plugin must not silence doctor.
-    let registry = hatel_core::schema::build_registry_resilient(cfg);
     let mut bound_kinds: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
     for ev in cs::covered_events(files, events) {
@@ -377,9 +390,16 @@ fn advise_dormant_bindings(
 /// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
 /// egress-privacy and enriched-protocol notes are advisory. Returns `None` when no export is
 /// configured — no section, no failure.
-fn report_export(env: &cs::Env) -> Option<Section> {
+fn report_export(
+    env: &cs::Env,
+    settings: &hatel_core::Result<Settings>,
+    resolved: &Settings,
+) -> Option<Section> {
+    // A configuration file that would not parse is one fault about one file, already reported
+    // where the file is; repeating it here would present a second problem that does not exist.
+    settings.as_ref().ok()?;
     let mut sec = Section::new("export", "export:");
-    let export = match ExportConfig::load() {
+    let export = match ExportConfig::from_settings(resolved) {
         Ok(c) => c,
         Err(e) => {
             sec.fail(format!(

@@ -57,8 +57,10 @@ impl InsertMode {
 
 pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     let hook_cmd = cs::hook_command();
+    // One resolution per run, so every wiring decision below is taken against the same registry.
+    let registry = cs::registry_for_wiring(&hatel_core::Config::load_resilient());
     // Wire only the events some loaded Kind binds (plus SessionStart for the index).
-    let events = cs::active_events_default();
+    let events = cs::active_events(&registry);
 
     if print {
         print!("{}", cs::render_snippet(&hook_cmd, &events));
@@ -166,7 +168,7 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     }
     // A plugin binding an event hatel can't wire would silently never fire — surface it rather than
     // leave it a dead extension point.
-    for ev in cs::unwireable_bindings() {
+    for ev in cs::unwireable_bindings(&registry) {
         eprintln!(
             "  ⚠ a plugin binds `{ev}`, which hatel does not wire — that binding never fires \
              (not a supported event)"
@@ -186,6 +188,7 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
 /// A managed-locked endpoint can't be repointed and is refused; an endpoint already local, or none
 /// at all, is a no-op with guidance.
 pub fn insert(mode: InsertMode) -> i32 {
+    let registry = cs::registry_for_wiring(&hatel_core::Config::load_resilient());
     let files = cs::scope_files();
     let env = cs::effective_env(&files);
 
@@ -261,7 +264,7 @@ pub fn insert(mode: InsertMode) -> i32 {
     // Prepare and validate the settings repoint fully IN MEMORY before persisting anything — wire
     // hooks + the required telemetry env, and reject a structurally malformed env/hooks block here,
     // so neither the config nor the settings file is touched if the settings can't be wired.
-    let events = cs::active_events_default();
+    let events = cs::active_events(&registry);
     let rep = cs::wire(&mut settings, &cs::hook_command(), &events);
     if rep.malformed() {
         eprintln!(

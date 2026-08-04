@@ -42,19 +42,11 @@ pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
         .collect::<Vec<_>>()
 }
 
-/// The active events for the env-derived config — the single derivation `init` and `doctor` share.
-/// Resilient (a broken plugin is skipped, never blocking wiring of core telemetry), matching the
-/// hook's own load.
-pub fn active_events_default() -> Vec<&'static str> {
-    active_events(&registry_for_wiring())
-}
-
 /// Events some loaded Kind binds that are *not* in the wireable vocabulary — `init` can't wire
 /// them (the hook never fires for them), so the binding would silently collect nothing. `init`/
-/// `doctor` surface them loudly instead. Mirrors the `active_events`/`active_events_default` split:
-/// a pure form over a registry, plus the env-derived wrapper.
-pub fn unwireable_bindings() -> Vec<String> {
-    unwireable(&registry_for_wiring())
+/// `doctor` surface them loudly instead.
+pub fn unwireable_bindings(registry: &hatel_core::Registry) -> Vec<String> {
+    unwireable(registry)
 }
 
 fn unwireable(registry: &hatel_core::Registry) -> Vec<String> {
@@ -68,8 +60,11 @@ fn unwireable(registry: &hatel_core::Registry) -> Vec<String> {
     events
 }
 
-fn registry_for_wiring() -> hatel_core::Registry {
-    hatel_core::schema::build_registry_resilient(&hatel_core::Config::load_resilient())
+/// The registry every wiring decision is taken against, built once by the command that needs it
+/// and passed down. Resilient (a broken plugin is skipped, never blocking wiring of core
+/// telemetry), matching the hook's own load.
+pub fn registry_for_wiring(cfg: &hatel_core::Config) -> hatel_core::Registry {
+    hatel_core::schema::build_registry_resilient(cfg)
 }
 
 /// The receiver's default bind address — the endpoint `init` wires. Used to tell "pointed at the

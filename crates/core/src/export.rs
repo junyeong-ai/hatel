@@ -120,7 +120,13 @@ impl ExportConfig {
     /// simply off (empty), never an error. Only ever called by the receiver, so a bad export
     /// destination can never affect the hook.
     pub fn load() -> Result<ExportConfig> {
-        Self::validate(Settings::load()?.export)
+        Self::from_settings(&Settings::load()?)
+    }
+
+    /// Validate against settings already read — the same single-observation path [`crate::Config`]
+    /// offers, so one command need not read the configuration file twice to see both views.
+    pub fn from_settings(settings: &Settings) -> Result<ExportConfig> {
+        Self::validate(settings.export.clone())
     }
 
     /// Turn file entries into destinations. Validation is loud: an empty endpoint, an unknown

@@ -54,20 +54,22 @@ impl Config {
     /// reads or reports data takes this path: a settings file that cannot be parsed would
     /// otherwise silently yield no plugins, and so an under-reported answer that looks complete.
     pub fn load() -> Result<Self> {
-        Ok(Self::from_settings(Settings::load()?))
+        Ok(Self::from_settings(&Settings::load()?))
     }
 
     /// Resolve the configuration, degrading to the defaults on a broken file with a note on
     /// stderr. For the hook, whose contract is that telemetry never blocks a tool call — the same
     /// asymmetry [`crate::schema::build_registry_resilient`] applies to a broken plugin.
     pub fn load_resilient() -> Self {
-        Self::from_settings(Settings::load().unwrap_or_else(|e| {
+        Self::from_settings(&Settings::load().unwrap_or_else(|e| {
             eprintln!("hatel: {e}");
             Settings::default()
         }))
     }
 
-    fn from_settings(settings: Settings) -> Self {
+    /// Resolve against settings already read, so a command that needs more than one view of the
+    /// configuration file reads it once and every view describes the same observation.
+    pub fn from_settings(settings: &Settings) -> Self {
         let testing = env_flag("HATEL_TESTING");
         let state_dir = resolve_state_dir(testing);
         let ledger_dir = state_dir.join("ledger");
