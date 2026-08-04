@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.6.0
+version: 0.6.1
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
 when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
