@@ -95,8 +95,36 @@ pub fn merge_spend(
     out
 }
 
+/// The snapshot's file name. The temp a write renames from is this plus a
+/// suffix, so one owner keeps the sweep and the writer naming the same file.
+const SNAPSHOT_NAME: &str = "cost_snapshot.jsonl";
+
 fn snapshot_path(state_dir: &Path) -> PathBuf {
-    state_dir.join("cost_snapshot.jsonl")
+    state_dir.join(SNAPSHOT_NAME)
+}
+
+/// Remove temp files a write never renamed, and return how many.
+///
+/// Call only where a single writer is guaranteed — the receiver holds that
+/// guarantee by having bound the port. Under it every temp on disk was left by
+/// a writer that is gone, because the one live writer has not started. The
+/// retention sweep cannot collect these: it deletes whole archives by age, and
+/// a temp is neither.
+pub fn sweep_orphan_temps(state_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            name.starts_with(&format!("{SNAPSHOT_NAME}.")) && name.ends_with(".tmp")
+        })
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
 }
 
 pub fn read_snapshot(state_dir: &Path) -> Vec<CostRow> {
@@ -219,5 +247,29 @@ mod tests {
         assert!(row.tokens_by_type.is_empty());
         assert!(row.by_model.is_empty());
         assert!(row.by_agent.is_empty());
+    }
+
+    #[test]
+    fn a_temp_a_previous_run_never_renamed_is_swept_and_the_snapshot_is_not() {
+        let dir = std::env::temp_dir().join(format!("ht-cost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let snapshot = snapshot_path(&dir);
+        std::fs::write(&snapshot, "{}\n").unwrap();
+        std::fs::write(dir.join("cost_snapshot.jsonl.4321.0.tmp"), "").unwrap();
+        std::fs::write(dir.join("cost_snapshot.jsonl.4321.1.tmp"), "").unwrap();
+        std::fs::write(dir.join("session_index.jsonl"), "").unwrap();
+
+        assert_eq!(sweep_orphan_temps(&dir), 2);
+        assert!(
+            snapshot.exists(),
+            "the file a rename produced is not a temp"
+        );
+        assert!(dir.join("session_index.jsonl").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_state_dir_that_is_not_there_sweeps_nothing_rather_than_failing() {
+        assert_eq!(sweep_orphan_temps(Path::new("/nonexistent/hatel")), 0);
     }
 }
