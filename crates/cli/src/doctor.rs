@@ -11,8 +11,8 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use hatel_core::config::PluginSource;
-use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings, sink};
+use hatel_core::schema::UnreadableKinds;
+use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings};
 
 use crate::claude_settings as cs;
 
@@ -300,12 +300,7 @@ fn report_registry(
     // Name the surface the list actually came from. `HATEL_PLUGINS` replaces the file's list, so
     // pointing at the configuration file while an override is in effect would credit it for
     // schemas it did not supply and prescribe an edit that would go on being ignored.
-    let source = match cfg.plugin_source {
-        PluginSource::Environment => "HATEL_PLUGINS".to_string(),
-        PluginSource::ConfigFile => Settings::path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "(no config directory)".to_string()),
-    };
+    let source = cfg.plugin_source.label();
     if let Err(e) = settings {
         sec.fail(e.to_string());
         return;
@@ -320,21 +315,10 @@ fn report_registry(
         },
         Err(e) => sec.fail(format!("plugin schema from {source}: {e}")),
     }
-    match sink::stored_kinds(cfg) {
+    match UnreadableKinds::detect(registry, cfg) {
         Err(e) => sec.fail(format!("cannot enumerate stored Kinds: {e}")),
-        Ok(stored) => {
-            let unreadable: Vec<String> = stored
-                .into_iter()
-                .filter(|k| registry.kind(k).is_none())
-                .collect();
-            if !unreadable.is_empty() {
-                sec.warn(format!(
-                    "stored but unreadable — no loaded schema declares {}; add the plugin that \
-                     defines them to {source}, or their records stay uncountable",
-                    unreadable.join(", ")
-                ));
-            }
-        }
+        Ok(Some(unreadable)) => sec.warn(unreadable.to_string()),
+        Ok(None) => {}
     }
 }
 

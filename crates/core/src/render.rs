@@ -25,6 +25,9 @@ pub fn format_text(report: &Report) -> String {
         report.window,
         scope(report)
     );
+    if let Some(unreadable) = &report.unreadable_kinds {
+        out.push_str(&format!("  ({unreadable})\n"));
+    }
     for section in &report.kinds {
         out.push('\n');
         out.push_str(&format!("{} — {}\n", section.kind, axes(section)));
@@ -53,6 +56,9 @@ pub fn format_text(report: &Report) -> String {
 
 pub fn format_markdown(report: &Report) -> String {
     let mut out = format!("# hatel — rolling {}{}\n", report.window, scope(report));
+    if let Some(unreadable) = &report.unreadable_kinds {
+        out.push_str(&format!("\n_{unreadable}_\n"));
+    }
     for section in &report.kinds {
         out.push_str(&format!("\n## {} — {}\n\n", section.kind, axes(section)));
         out.push_str(&markdown_table(
@@ -393,6 +399,7 @@ mod tests {
             top_n: 5,
             kinds,
             cost: Vec::new(),
+            unreadable_kinds: None,
         }
     }
 

@@ -162,6 +162,7 @@ hatel report --window 30d --kind tool --format json
   "filters": [],
   "kinds": [
     {
+      "group_by": "tool_name",
       "groups": [
         {
           "count": 4,
@@ -172,15 +173,19 @@ hatel report --window 30d --kind tool --format json
           ]
         }
       ],
-      "kind": "tool"
+      "kind": "tool",
+      "project_scope": "unrestricted",
+      "sort_by": "duration_ms"
     }
   ],
   "project": null,
+  "top_n": 5,
+  "unreadable_kinds": null,
   "window": "30d"
 }
 ```
 
-> Keys serialize in alphabetical order (`cost·filters·kinds·project·window`). Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape.
+> Keys serialize in alphabetical order. Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape. A non-null `unreadable_kinds` means **the ledger holds Kinds no loaded schema declares** — the rollup answered over less than was collected, and the names and the place to fix it come with it (see [custom metrics](#custom-metrics-plugins)).
 
 In a full report (no `--kind`), each `cost` row serializes three breakdowns alongside its totals — `tokens_by_type` (`input`/`output`/`cacheRead`/`cacheCreation` — the cache-hit accounting), `by_model` (tokens and cost per model — the model mix), and `by_agent` (tokens and cost per subagent). In each breakdown, a series missing the attribute lands in an `(unattributed)` bucket — never guessed. Sessions recorded before the breakdowns existed show empty objects (`{}`) — exactly the fact that nothing was recorded.
 
@@ -203,7 +208,7 @@ claude mcp add hatel -- hatel mcp
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire/unwire the telemetry env + hooks in `settings.json` — idempotent, non-destructive, atomic. |
 | `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service (runs `serve --all` for gap-free collection). |
 | `doctor [--json]` | verify the wiring and report policy gaps honestly — `--json` renders the same findings machine-readably. |
-| `kinds [--json]` | list the registered Kinds (core + plugins). |
+| `kinds [--json]` | list the registered Kinds (core + plugins) — and any the ledger holds that no schema declares. |
 | `emit <kind> [key=value...] [--json OBJ]` | record one domain signal for a registered Kind — the programmatic path for custom metrics. |
 | `mcp` | stdio server exposing `report` / `kinds` / `doctor` / `emit` as typed MCP tools (for agents). |
 
@@ -359,6 +364,16 @@ subagent       group_key=subagent_type fields=[project, session_id, subagent_typ
 tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
 
+When the ledger holds a Kind no loaded schema declares, one more line follows the list — the other half of an honest answer to what was asked ("what can I query"). `--json` carries the same fact as `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`, and `unreadable_kinds` is `null` when there is no gap:
+
+```text
+$ hatel kinds
+...
+tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+
+the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
+```
+
 ---
 
 ## Forwarding to other collectors (export)
@@ -412,7 +427,14 @@ A plugin is a single **TOML schema file** — no code, no recompile. It contribu
 plugins = ["schemas/aix.toml"]   # relative paths resolve against config.toml's own directory
 ```
 
-`HATEL_PLUGINS` overrides the list for one process (OS path-list separator for several). `doctor` names any Kind the ledger holds that no loaded schema declares — records that were collected but that nothing can read.
+`HATEL_PLUGINS` overrides the list for one process (OS path-list separator for several) — a Kind registered that way is invisible to any command run without it, so durable registration belongs in `config.toml`.
+
+When the ledger holds a Kind no loaded schema declares — records that were collected but that nothing can read — **every read path** says so alongside its answer: `doctor`'s findings, the last line of `kinds` and `unreadable_kinds` in its `--json`, `unreadable_kinds` on every report, and the error for asking about that Kind with `--kind`. That is what keeps a partial registry from answering as a complete one, and each message names the surface where the schema would be listed:
+
+```text
+$ hatel report --kind team.deploy
+report: unknown kind "team.deploy" (registered: compaction, memory, prompt, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+```
 
 Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage).
 

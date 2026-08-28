@@ -86,7 +86,7 @@ hatel report --kind <name> --filter field=value   # only records matching every 
 hatel report --kind <name> --group-by <field>     # a dimension other than the Kind's default
 hatel report --kind <name> --sort-by <measure>    # rank by a measure other than the first
 hatel report --top 0                        # all groups, not just the top N
-hatel kinds --json                          # every registered Kind and its fields
+hatel kinds --json                          # queryable Kinds + any the ledger holds unreadable
 ```
 
 Reading a report: each Kind lists groups with a record count and the summed `measures`; the
@@ -100,7 +100,10 @@ the breakdowns existed show `{}` (not recorded — say so rather than treating i
 `report --project <label>` matches by the project's basename label. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",
-never as zero usage.
+never as zero usage. `unreadable_kinds` — on every report, and on `kinds --json`, whose payload
+is `{"kinds": [...], "unreadable_kinds": …}` — is non-null when the ledger holds Kinds no loaded
+schema declares: the answer covered less than was collected. Report that gap with the names and
+the surface it carries, never the totals alone.
 
 Each Kind section names the axes it was computed on (`group_by`, and `sort_by` — `null` means
 groups rank by record count). `--group-by` and `--sort-by` (both need `--kind`) change the
@@ -121,9 +124,10 @@ A plugin is a TOML schema file (no code, no recompile). List it under `plugins` 
 `config.toml` (`$HATEL_CONFIG`, else `<config-dir>/hatel/config.toml`; relative paths resolve
 against that file's directory), then confirm with `hatel kinds`. Configuring it there is what
 makes the write and read paths agree — `HATEL_PLUGINS` overrides the list for one process only,
-so a Kind registered that way is invisible to any command run without it. `hatel doctor` names
-any Kind the ledger holds that no loaded schema declares. **Choose the path by where the signal originates, and
-keep one writer per Kind** (a Kind written by both paths double-counts; a
+so a Kind registered that way is invisible to any command run without it. `doctor`, `kinds`,
+`report`, and the error from `--kind <that name>` all name such a Kind and the surface where its
+schema would be listed — listing it there is the fix. **Choose the path by where the signal
+originates, and keep one writer per Kind** (a Kind written by both paths double-counts; a
 receiver-sourced Kind like `tool` is refused by `emit` outright, exit 2):
 
 - A signal the Claude Code lifecycle can observe → a **hook binding** (zero code,

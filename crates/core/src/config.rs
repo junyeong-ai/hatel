@@ -41,6 +41,19 @@ pub enum PluginSource {
     Environment,
 }
 
+impl PluginSource {
+    /// The surface to name when prescribing a registry change. One spelling, so a diagnostic and a
+    /// query error never send the same operator to two different places.
+    pub fn label(self) -> String {
+        match self {
+            PluginSource::Environment => "HATEL_PLUGINS".to_string(),
+            PluginSource::ConfigFile => crate::Settings::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no config directory)".to_string()),
+        }
+    }
+}
+
 /// Default JSONL rotation threshold.
 pub const DEFAULT_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Default cost-snapshot retention (≫ the default 30-day report window).

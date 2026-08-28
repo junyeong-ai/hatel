@@ -162,6 +162,7 @@ hatel report --window 30d --kind tool --format json
   "filters": [],
   "kinds": [
     {
+      "group_by": "tool_name",
       "groups": [
         {
           "count": 4,
@@ -172,15 +173,19 @@ hatel report --window 30d --kind tool --format json
           ]
         }
       ],
-      "kind": "tool"
+      "kind": "tool",
+      "project_scope": "unrestricted",
+      "sort_by": "duration_ms"
     }
   ],
   "project": null,
+  "top_n": 5,
+  "unreadable_kinds": null,
   "window": "30d"
 }
 ```
 
-> 키는 알파벳 순으로 직렬화됩니다(`cost·filters·kinds·project·window`). 위는 `Bash` 그룹만 보였고, 실제 리포트엔 `Edit·Grep·Read`가 같은 형태로 이어집니다.
+> 키는 알파벳 순으로 직렬화됩니다. 위는 `Bash` 그룹만 보였고, 실제 리포트엔 `Edit·Grep·Read`가 같은 형태로 이어집니다. `unreadable_kinds`가 `null`이 아니면 **로드된 스키마가 선언하지 않는 Kind가 원장에 있다**는 뜻입니다 — 이 집계는 수집된 것보다 적게 답한 것이고, 이름과 고칠 위치가 거기 실려 옵니다([커스텀 지표](#커스텀-지표-플러그인) 참조).
 
 전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로).
 
@@ -203,7 +208,7 @@ claude mcp add hatel -- hatel mcp
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | `settings.json`에 텔레메트리 env + 훅을 연결/해제 — 멱등·비파괴·원자적. |
 | `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all` 실행, 무중단 수집). |
 | `doctor [--json]` | 연결을 검증하고 정책 공백을 정직하게 보고 — `--json`은 같은 findings를 기계 판독용으로. |
-| `kinds [--json]` | 등록된 Kind(코어+플러그인) 목록. |
+| `kinds [--json]` | 등록된 Kind(코어+플러그인) 목록 — 그리고 원장에 있으나 어떤 스키마도 선언하지 않는 Kind. |
 | `emit <kind> [key=value...] [--json OBJ]` | 등록된 Kind에 도메인 신호 하나 기록 — 커스텀 지표의 프로그래밍 경로. |
 | `mcp` | `report`·`kinds`·`doctor`·`emit`을 타입 있는 MCP 도구로 노출하는 stdio 서버(에이전트용). |
 
@@ -359,6 +364,16 @@ subagent       group_key=subagent_type fields=[project, session_id, subagent_typ
 tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
 
+원장에 있으나 어떤 로드된 스키마도 선언하지 않는 Kind가 있으면 목록 뒤에 한 줄이 더 붙습니다 — 질문한 것("무엇을 조회할 수 있나")에 대한 정직한 답의 나머지 절반입니다. `--json`은 같은 사실을 `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`로 내고, 공백이 없으면 `unreadable_kinds`는 `null`입니다:
+
+```text
+$ hatel kinds
+...
+tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+
+the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
+```
+
 ---
 
 ## 다른 컬렉터로 전달 (export)
@@ -412,7 +427,14 @@ endpoint가 **managed-locked**라 재지정 불가면 `doctor`가 명확히 알�
 plugins = ["schemas/aix.toml"]   # 상대 경로는 config.toml 자신의 디렉터리 기준
 ```
 
-`HATEL_PLUGINS`는 한 프로세스에 한해 이 목록을 대체합니다(여러 개면 OS 경로 구분자). 로드된 스키마 중 어느 것도 선언하지 않는 Kind가 원장에 있으면 `doctor`가 이름을 알려줍니다 — 수집은 됐지만 아무도 읽을 수 없는 기록입니다.
+`HATEL_PLUGINS`는 한 프로세스에 한해 이 목록을 대체합니다(여러 개면 OS 경로 구분자) — 그렇게 등록한 Kind는 그 변수 없이 실행한 명령엔 보이지 않으므로, 지속적인 등록은 `config.toml`에 합니다.
+
+로드된 스키마 중 어느 것도 선언하지 않는 Kind가 원장에 있으면 — 수집은 됐지만 아무도 읽을 수 없는 기록 — **읽기 경로 전부가** 그 사실을 함께 답합니다: `doctor`의 findings, `kinds`의 마지막 줄과 `--json`의 `unreadable_kinds`, 모든 리포트의 `unreadable_kinds`, 그리고 그 Kind를 `--kind`로 물었을 때의 에러. 부분 레지스트리가 완전한 것처럼 답하지 않게 하는 것이고, 각 메시지는 스키마를 등록할 위치까지 이름으로 지목합니다:
+
+```text
+$ hatel report --kind team.deploy
+report: unknown kind "team.deploy" (registered: compaction, memory, prompt, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+```
 
 Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱).
 

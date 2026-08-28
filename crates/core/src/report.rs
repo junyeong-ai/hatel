@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::cost::{self, CostRow};
 use crate::registry::Registry;
+use crate::schema::UnreadableKinds;
 use crate::{Config, sink, ts_epoch};
 
 /// How many groups a report shows per Kind.
@@ -123,6 +124,11 @@ pub struct Report {
     /// join table a caller reaches for when relating spend to its own records — while
     /// [`cost_by_project`] provides the ranked rollup a summary shows.
     pub cost: Vec<CostRow>,
+    /// Kinds the ledger holds that this registry cannot read. A report answered over less than
+    /// the store contains says so here, rather than presenting the part it could read as the
+    /// whole — the same honesty [`ProjectScope::Unsupported`] gives a Kind that records no
+    /// project.
+    pub unreadable_kinds: Option<UnreadableKinds>,
 }
 
 impl Report {
@@ -169,6 +175,7 @@ impl Report {
                 Some(_) => Vec::new(),
                 None => cost_rows(&cfg.state_dir, q),
             },
+            unreadable_kinds: UnreadableKinds::detect_resilient(reg, cfg),
         }
     }
 }

@@ -13,7 +13,7 @@ mod throttle;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use hatel_core::schema::build_registry;
+use hatel_core::schema::{UnreadableKinds, build_registry};
 use hatel_core::{Config, Payload, Registry, render, report};
 
 #[derive(Parser)]
@@ -219,11 +219,7 @@ pub(crate) fn emit_record(
     let cfg = Config::load().map_err(|e| EmitError::Registry(e.to_string()))?;
     let reg = build_registry(&cfg).map_err(|e| EmitError::Registry(e.to_string()))?;
     if reg.kind(kind).is_none() {
-        let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        return Err(EmitError::Rejected(format!(
-            "unknown kind {kind:?}; registered: {}",
-            known.join(", ")
-        )));
+        return Err(EmitError::Rejected(unknown_kind(kind, &reg, &cfg)));
     }
     // A receiver-sourced Kind (e.g. `tool`, written from native OTel) has a single writer by
     // design — emitting one by hand would interleave fabricated records with the real stream, so
@@ -360,7 +356,7 @@ fn report_cmd(
             return 1;
         }
     };
-    let filters = match parse_query(&reg, kind, group_by, sort_by, filter) {
+    let filters = match parse_query(&reg, &cfg, kind, group_by, sort_by, filter) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("report: {e}");
@@ -391,11 +387,33 @@ fn report_cmd(
     0
 }
 
+/// Why a Kind name did not resolve. A name the store already holds records for is not a typo but
+/// an unloaded schema, so it is answered with the surface that would load it — the registered list
+/// alone would send someone reading this to `kinds`, which knows no more than the list does.
+fn unknown_kind(kind: &str, reg: &Registry, cfg: &Config) -> String {
+    let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
+    let stored = UnreadableKinds::detect_resilient(reg, cfg)
+        .filter(|u| u.names.iter().any(|n| n == kind))
+        .map(|u| {
+            format!(
+                " — it has records in the ledger, but no loaded schema declares it; list its \
+                 plugin in {}",
+                u.plugin_source
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "unknown kind {kind:?} (registered: {}){stored}",
+        known.join(", ")
+    )
+}
+
 /// Validate every Kind-scoped part of a query against the registry and return the parsed
 /// filters. Each restriction names a field the Kind declares; one that does not could only ever
 /// match nothing, so it is rejected here rather than answered with a convincing empty result.
 pub(crate) fn parse_query(
     reg: &Registry,
+    cfg: &Config,
     kind: Option<&str>,
     group_by: Option<&str>,
     sort_by: Option<&str>,
@@ -404,11 +422,7 @@ pub(crate) fn parse_query(
     if let Some(k) = kind
         && reg.kind(k).is_none()
     {
-        let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-        return Err(format!(
-            "unknown kind {k:?}; registered: {}",
-            known.join(", ")
-        ));
+        return Err(unknown_kind(k, reg, cfg));
     }
     if let Some(field) = group_by {
         let spec = kind_of(reg, kind, "--group-by")?;
@@ -507,10 +521,14 @@ pub(crate) fn report_json(report: &report::Report) -> String {
         .unwrap_or_default()
 }
 
-/// The registered Kinds as the `kinds --json` array — the schema-discovery payload,
-/// shared by the CLI flag and the MCP tool.
-pub(crate) fn kinds_value(reg: &Registry) -> serde_json::Value {
-    let arr: Vec<serde_json::Value> = reg
+/// The `kinds --json` payload, shared by the CLI flag and the MCP tool: what this registry can
+/// query, and — as `null` when there is none — the gap between that and what the store holds. The
+/// second half is what keeps a partial registry from answering as a complete one.
+pub(crate) fn kinds_value(
+    reg: &Registry,
+    unreadable: Option<&UnreadableKinds>,
+) -> serde_json::Value {
+    let kinds: Vec<serde_json::Value> = reg
         .kinds()
         .map(|s| {
             serde_json::json!({
@@ -523,21 +541,26 @@ pub(crate) fn kinds_value(reg: &Registry) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::Value::Array(arr)
+    serde_json::json!({ "kinds": kinds, "unreadable_kinds": unreadable })
 }
 
 fn kinds_cmd(json: bool) -> i32 {
-    let reg = match Config::load().and_then(|cfg| build_registry(&cfg)) {
-        Ok(r) => r,
+    let (cfg, reg) = match Config::load().and_then(|cfg| {
+        let reg = build_registry(&cfg)?;
+        Ok((cfg, reg))
+    }) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("kinds: {e}");
             return 1;
         }
     };
+    let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&kinds_value(&reg)).unwrap_or_default()
+            serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref()))
+                .unwrap_or_default()
         );
     } else {
         for s in reg.kinds() {
@@ -548,6 +571,9 @@ fn kinds_cmd(json: bool) -> i32 {
                 s.group_key,
                 fields.join(", ")
             );
+        }
+        if let Some(unreadable) = &unreadable {
+            println!("\n{unreadable}");
         }
     }
     0
@@ -748,6 +774,56 @@ mod tests {
         );
         // the native cost section is not a Kind, so a scoped report drops it
         assert_eq!(scoped["cost"].as_array().unwrap().len(), 0);
+        std::fs::remove_dir_all(&cfg.state_dir).ok();
+    }
+
+    #[test]
+    fn an_unknown_kind_the_store_holds_is_answered_with_the_surface_that_loads_it() {
+        // A name the ledger already has records for is an unloaded schema, not a typo. The
+        // registered list alone sends whoever reads the error to `kinds`, which knows no more
+        // than that list does — the loop closes only where the schema would be listed.
+        let cfg = test_cfg("unknownkind", vec![]);
+        std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+        std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
+        let reg = build_registry(&cfg).unwrap();
+
+        let stored = unknown_kind("ci_check", &reg, &cfg);
+        assert!(stored.contains("records in the ledger"), "got: {stored}");
+        assert!(stored.contains(&cfg.plugin_source.label()), "got: {stored}");
+
+        let typo = unknown_kind("toool", &reg, &cfg);
+        assert!(
+            !typo.contains("ledger"),
+            "a name nothing stored is a typo, not an unloaded schema: {typo}"
+        );
+        assert!(typo.contains("registered: "), "got: {typo}");
+        std::fs::remove_dir_all(&cfg.state_dir).ok();
+    }
+
+    #[test]
+    fn kinds_json_reports_the_gap_between_the_registry_and_the_store() {
+        // `kinds` answers "what can I query"; a registry missing a schema the store has records
+        // for would answer it as if the partial list were the whole one.
+        let cfg = test_cfg("kindsgap", vec![]);
+        std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+        std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
+        let reg = build_registry(&cfg).unwrap();
+
+        let gap = UnreadableKinds::detect(&reg, &cfg).unwrap();
+        let value = kinds_value(&reg, gap.as_ref());
+        let names: Vec<&str> = value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"tool"), "got: {names:?}");
+        assert_eq!(
+            value["unreadable_kinds"]["names"],
+            serde_json::json!(["ci_check"])
+        );
+        // One shape either way: no gap is `null`, never an absent key.
+        assert!(kinds_value(&reg, None)["unreadable_kinds"].is_null());
         std::fs::remove_dir_all(&cfg.state_dir).ok();
     }
 }

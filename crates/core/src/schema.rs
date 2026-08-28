@@ -2,10 +2,10 @@
 //! `Registry`. This is the single path through which any Kind enters the system,
 //! so the no-collision guarantee holds uniformly for core and plugins.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::registry::{HookBinding, KindSpec, KindSpecRaw, Registry};
-use crate::{Config, Error, Result};
+use crate::{Config, Error, Result, sink};
 
 const CORE_TOML: &str = include_str!("../core.toml");
 
@@ -90,6 +90,60 @@ pub fn build_registry_resilient(cfg: &Config) -> Registry {
         }
     }
     reg
+}
+
+/// The other half of [`build_registry`]: the Kinds the store holds that no loaded schema declares.
+/// Their collection worked and every query is blind to them, which no check of the wiring can
+/// surface — nothing about the wiring is wrong. Carried by every surface that presents a Kind
+/// inventory or an answer computed over one, so a partial registry never reads as a complete one.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnreadableKinds {
+    pub names: Vec<String>,
+    /// The surface that would have to list their schema, from [`crate::config::PluginSource`].
+    pub plugin_source: String,
+}
+
+impl UnreadableKinds {
+    /// `None` when every stored Kind is declared. A store that cannot be enumerated is an error
+    /// rather than an empty answer: "nothing was collected" and "nothing could be looked at" are
+    /// the two answers a diagnostic must never confuse.
+    pub fn detect(reg: &Registry, cfg: &Config) -> std::io::Result<Option<Self>> {
+        let names: Vec<String> = sink::stored_kinds(cfg)?
+            .into_iter()
+            .filter(|k| reg.kind(k).is_none())
+            .collect();
+        Ok((!names.is_empty()).then(|| Self {
+            names,
+            plugin_source: cfg.plugin_source.label(),
+        }))
+    }
+
+    /// [`Self::detect`] for the paths whose job is to answer rather than to diagnose: an
+    /// unenumerable store is noted on stderr and read as no gap, the same fail-open the sink read
+    /// path takes, so one broken store does not turn every query into an error.
+    pub fn detect_resilient(reg: &Registry, cfg: &Config) -> Option<Self> {
+        match Self::detect(reg, cfg) {
+            Ok(found) => found,
+            Err(e) => {
+                eprintln!("hatel: cannot enumerate stored Kinds ({e})");
+                None
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for UnreadableKinds {
+    /// One sentence — the gap, its consequence, and the surface that closes it — so a diagnostic,
+    /// a report caveat and a Kind listing prescribe the same fix in the same words.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the ledger holds {}, which no loaded schema declares — those records stay \
+             uncountable until a plugin that declares them is listed in {}",
+            self.names.join(", "),
+            self.plugin_source
+        )
+    }
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use rmcp::{
     transport::stdio,
 };
 
-use hatel_core::schema::build_registry;
+use hatel_core::schema::{UnreadableKinds, build_registry};
 use hatel_core::{Config, Payload, report};
 
 use crate::{EmitError, doctor, emit_record, kinds_value, parse_query, report_json};
@@ -63,7 +63,7 @@ pub struct EmitParams {
 #[tool_router]
 impl HatelMcp {
     #[tool(
-        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. Same JSON as `hatel report --format json`."
+        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
     )]
     fn report(&self, Parameters(p): Parameters<ReportParams>) -> Result<CallToolResult, McpError> {
         let window = p.window.unwrap_or_else(|| "30d".to_string());
@@ -71,6 +71,7 @@ impl HatelMcp {
         let reg = build_registry(&cfg).map_err(internal)?;
         let filters = parse_query(
             &reg,
+            &cfg,
             p.kind.as_deref(),
             p.group_by.as_deref(),
             p.sort_by.as_deref(),
@@ -98,12 +99,14 @@ impl HatelMcp {
     }
 
     #[tool(
-        description = "List every registered Kind (core + plugins) with its fields (the allow-list), group_key, measures, redact set, and whether it is receiver-sourced. Same JSON as `hatel kinds --json`."
+        description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and whether it is receiver-sourced — plus `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`."
     )]
     fn kinds(&self) -> Result<CallToolResult, McpError> {
         let cfg = Config::load().map_err(internal)?;
         let reg = build_registry(&cfg).map_err(internal)?;
-        let json = serde_json::to_string_pretty(&kinds_value(&reg)).unwrap_or_default();
+        let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
+        let json = serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref()))
+            .unwrap_or_default();
         // Trailing newline included, so the payload is byte-equal to the CLI's println!.
         Ok(text_result(format!("{json}\n")))
     }

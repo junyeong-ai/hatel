@@ -1106,3 +1106,32 @@ fn line(tool: &str) -> String {
     })
     .to_string()
 }
+
+#[test]
+fn a_report_names_the_stored_kinds_no_loaded_schema_declares() {
+    // Collection and reporting are configured separately, so a ledger can hold a Kind whose
+    // schema is not loaded: every query is then blind to it while nothing about the wiring is
+    // wrong. A report that stayed silent would present the part it could read as the whole of
+    // what was collected.
+    let cfg = test_config(vec![]);
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    std::fs::write(cfg.ledger_dir.join("tool.jsonl"), "").unwrap();
+    let reg = load_core().unwrap();
+    let build = |cfg: &Config, reg: &_| report::Report::build(reg, cfg, "7d", &query(0, 5, None));
+    assert!(
+        build(&cfg, &reg).unreadable_kinds.is_none(),
+        "a store holding only declared Kinds has no gap to report"
+    );
+
+    std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
+    let gap = build(&cfg, &reg)
+        .unreadable_kinds
+        .expect("a stored Kind no schema declares must be named");
+    assert_eq!(gap.names, vec!["ci_check"]);
+
+    // Loading the plugin that declares it closes the gap — the report is then answering over
+    // everything the store holds, which is the state the message asks the operator to reach.
+    let with_plugin = config_in(cfg.state_dir.clone(), vec![example_plugin()]);
+    let reg = build_registry(&with_plugin).unwrap();
+    assert!(build(&with_plugin, &reg).unreadable_kinds.is_none());
+}
