@@ -572,7 +572,8 @@ plugins/      선언적 플러그인 예제
 
 ## 라이선스
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0 중 선택할 수 있습니다. [`LICENSE-MIT`](LICENSE-MIT)와
+[`LICENSE-APACHE`](LICENSE-APACHE)를 참고하세요.
 
 ---
 
