@@ -264,6 +264,8 @@ cost — by project, ranked by cost_usd
 
 A Kind that does not record `project` cannot be selected by a project scope, and says so in place of its table rather than showing an empty one — "outside this scope" is not "none of it happened".
 
+A project is the repository, not the checkout: work done in a linked worktree attributes to the repository it belongs to, so a spec branch's usage lands in that project's totals instead of a project named after the branch.
+
 ### `serve` — receiver + live view
 
 ```sh
@@ -402,7 +404,7 @@ exclude_projects = ["scratch"]               # forward every project but these�
 
 - **`raw`** — forwards the incoming OTLP byte-verbatim (protocol-agnostic, so it tees a protobuf body too).
 - **`enriched`** — injects the `project` label (joined from `session.id`) into each datapoint/record, so the downstream gains the **per-project attribution** raw OTel structurally lacks. It needs an `http/json` stream to transform; a datapoint whose session is unknown is forwarded unchanged (the label is never fabricated).
-- **`projects` / `exclude_projects`** — keep a destination from seeing some projects (allow-list or exclude-list, one or the other). Match by label (git-root basename) or key (absolute git-root path). A batch whose project can't yet be resolved **fails closed** (not forwarded to a filtered destination), so a personal project never leaks to a corporate collector on a startup race.
+- **`projects` / `exclude_projects`** — keep a destination from seeing some projects (allow-list or exclude-list, one or the other). Match by label (the repository's basename) or key (its absolute path). A batch whose project can't yet be resolved **fails closed** (not forwarded to a filtered destination), so a personal project never leaks to a corporate collector on a startup race.
 
 > **Egress is not redacted.** `raw`/`enriched` forward the full OTLP body off the host; hatel's allow-list/hashing applies to the *hook ledger*, not to this egress. `doctor` prints this as a standing warning whenever export is configured. (Because hatel is content-free by construction it carries no prompt/tool bodies, so it is still safer than pointing Claude Code's raw OTel at a corporate collector.)
 
@@ -509,7 +511,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 
 - **The allow-list is the primary defense** — the core ships **no** content-bearing fields. Prompts store length, tools store the name (never the text or arguments). This mirrors Claude Code's own default-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`.
 - `redact` fields are hashed (BLAKE3, 16 hex chars) before write.
-- Event records carry the project **label** only; the absolute git-root path lives solely in the local session index.
+- Event records carry the project **label** only; the absolute repository path lives solely in the local session index.
 - Everything stays on your machine. Failures are fail-open: a write error degrades to a stderr note and never blocks a tool call.
 
 ---
