@@ -256,33 +256,62 @@ fn prompt_stores_length_not_text() {
 fn session_start_is_recorded_in_the_index() {
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
+    let repo = temp_dir().join("myproj");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
     let mut event = serde_json::json!({
         "hook_event_name": "SessionStart",
-        "session_id": "S3", "cwd": "/tmp/myproj"
+        "session_id": "S3", "cwd": repo.to_str().unwrap()
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     let index = SessionIndex::new(cfg.state_dir.clone()).load();
     let row = index.get("S3").expect("session recorded");
     assert_eq!(row.project_label, "myproj");
-    assert_eq!(row.project_key, "/tmp/myproj");
+    assert_eq!(row.project_key, repo.to_string_lossy());
 }
 
 #[test]
 fn an_unattributable_session_start_is_not_recorded() {
-    // A SessionStart with no cwd resolves to an empty project label; it can attribute nothing, so
-    // no index row is written (the receiver treats such a session as unattributed regardless).
+    // A session outside a repository — or one whose cwd names no directory this process can
+    // resolve — has no project, so it can attribute nothing and no index row is written (the
+    // receiver treats such a session as unattributed regardless).
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
+    let outside = temp_dir();
+    for (session_id, cwd) in [("S4", ""), ("S5", outside.to_str().unwrap())] {
+        let mut event = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id, "cwd": cwd
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let index = SessionIndex::new(cfg.state_dir.clone()).load();
+    for session_id in ["S4", "S5"] {
+        assert!(
+            !index.contains_key(session_id),
+            "an unattributable session is not indexed"
+        );
+    }
+}
+
+#[test]
+fn an_unattributable_session_records_the_empty_project_label() {
+    // The label a Kind record carries for such a session is the one the cost snapshot already
+    // stores for a session it could not attribute, so both describe it the same way rather than
+    // the record naming the directory the work happened to run in.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let outside = temp_dir();
     let mut event = serde_json::json!({
-        "hook_event_name": "SessionStart",
-        "session_id": "S4", "cwd": ""
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "S6", "cwd": outside.to_str().unwrap(), "prompt": "hello"
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
-    assert!(
-        !SessionIndex::new(cfg.state_dir.clone())
-            .load()
-            .contains_key("S4"),
-        "an unattributable session is not indexed"
+    let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].payload.get("project").and_then(|v| v.as_str()),
+        Some(""),
+        "no directory lends its name to an unattributable session"
     );
 }
 

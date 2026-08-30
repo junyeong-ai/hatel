@@ -264,7 +264,7 @@ cost — by project, ranked by cost_usd
 
 A Kind that does not record `project` cannot be selected by a project scope, and says so in place of its table rather than showing an empty one — "outside this scope" is not "none of it happened".
 
-A project is the repository, not the checkout: work done in a linked worktree attributes to the repository it belongs to, so a spec branch's usage lands in that project's totals instead of a project named after the branch.
+A project is the repository, not the checkout: work done in a linked worktree attributes to the repository it belongs to, so a spec branch's usage lands in that project's totals instead of a project named after the branch. Work outside a repository has no project at all: a directory is where a project was found, not one itself, so such a session carries no project label rather than one named after the directory it ran in.
 
 ### `serve` — receiver + live view
 
@@ -511,7 +511,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 
 - **The allow-list is the primary defense** — the core ships **no** content-bearing fields. Prompts store length, tools store the name (never the text or arguments). This mirrors Claude Code's own default-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`.
 - `redact` fields are hashed (BLAKE3, 16 hex chars) before write.
-- Event records carry the project **label** only; the absolute repository path lives solely in the local session index.
+- Event records carry the project **label** only; the absolute repository path lives solely in the local session index. A session outside a repository records no label, so a home or scratch directory never becomes one.
 - Everything stays on your machine. Failures are fail-open: a write error degrades to a stderr note and never blocks a tool call.
 
 ---

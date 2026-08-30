@@ -52,11 +52,12 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
         obj.insert("git_branch".to_string(), serde_json::Value::from(branch));
     }
 
-    record_session(cfg, &event_name, &session_id, &project);
+    record_session(cfg, &event_name, &session_id, project.as_ref());
 
     if bindings.is_empty() {
         return;
     }
+    let project_label = project.as_ref().map_or("", |p| p.label.as_str());
     let mut sink = build_sink(cfg);
     for binding in bindings {
         let mut payload = Payload::new();
@@ -66,14 +67,16 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
             }
         }
         // The hook owns project attribution (from cwd); inject it only into Kinds that
-        // declare `project`, so a Kind that opts out isn't rejected under strict mode.
+        // declare `project`, so a Kind that opts out isn't rejected under strict mode. A session
+        // outside a repository carries the empty label the cost snapshot already stores for an
+        // unattributable one, so a Kind record and a cost row describe it the same way.
         if registry
             .kind(&binding.kind)
             .is_some_and(|s| s.fields.contains("project"))
         {
             payload.insert(
                 "project".to_string(),
-                serde_json::Value::from(project.label.clone()),
+                serde_json::Value::from(project_label),
             );
         }
         match make_envelope(&binding.kind, payload, registry, cfg.strict) {
@@ -87,11 +90,12 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
 /// The session → project join goes to the sink-independent index (not a Kind), so
 /// the receiver can attribute project-less OTel data regardless of the sink. Only the
 /// session start establishes it; that is all the receiver needs.
-fn record_session(cfg: &Config, event_name: &str, session_id: &str, project: &ProjectRef) {
-    // Record only an attributable session: a non-empty id AND a non-empty project label. A session
-    // with no resolvable project (an empty cwd) attributes nothing, so an unlabelled row would only
-    // add noise the receiver already treats as unattributed.
-    if event_name == "SessionStart" && !session_id.is_empty() && !project.label.is_empty() {
+fn record_session(cfg: &Config, event_name: &str, session_id: &str, project: Option<&ProjectRef>) {
+    // Record only an attributable session: a resolved project AND a non-empty id. A session
+    // outside a repository attributes nothing, so an unlabelled row would only add noise the
+    // receiver already treats as unattributed.
+    let Some(project) = project else { return };
+    if event_name == "SessionStart" && !session_id.is_empty() {
         SessionIndex::new(cfg.state_dir.clone()).record(session_id, project, cfg.rotate_bytes);
     }
 }

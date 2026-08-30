@@ -3,6 +3,11 @@
 //! joins on it. The key is the repository's main working tree as an absolute path
 //! (unique per repository, so two same-named repos never merge); the label is its
 //! basename for display.
+//!
+//! A repository is what makes a project nameable — a durable unit of work that
+//! outlives the session and means the same thing to everyone. A directory is only
+//! where one was found, so work outside a repository has no project rather than one
+//! named after whatever directory it ran in.
 
 use std::path::{Path, PathBuf};
 
@@ -12,31 +17,36 @@ pub struct ProjectRef {
     pub label: String,
 }
 
-pub fn resolve_project(cwd: &str) -> ProjectRef {
-    let start = Path::new(cwd);
-    let root = match git_root(start) {
-        // A linked worktree is a checkout of a repository, not a project of its own — work done
-        // on a branch in one belongs to the repository's totals, not to a project named after
-        // the branch it happened to be checked out for.
-        Some(tree) => main_worktree(&tree).unwrap_or(tree),
-        None => start.to_path_buf(),
-    };
+/// The project the working directory `cwd` belongs to, or `None` where there is no project to
+/// name — outside a repository, or where `cwd` names no tree this process can resolve.
+pub fn resolve_project(cwd: &str) -> Option<ProjectRef> {
+    // A linked worktree is a checkout of a repository, not a project of its own — work done on a
+    // branch in one belongs to the repository's totals, not to a project named after the branch
+    // it happened to be checked out for.
+    let tree = git_root(Path::new(cwd))?;
+    let root = main_worktree(&tree).unwrap_or(tree);
     let key = root.to_string_lossy().into_owned();
-    // A root without a basename (e.g. `/`) falls back to the full path as its label —
-    // still visible and still matchable by a filter entry — rather than an empty string,
-    // which would render as a ghost project and could never be listed in a filter.
+    // A root without a basename (a repository at `/`) falls back to the full path as its label —
+    // still visible and still matchable by a filter entry — rather than an empty string, which
+    // would render as a ghost project and could never be listed in a filter.
     let label = root
         .file_name()
         .and_then(|s| s.to_str())
         .map(str::to_string)
         .unwrap_or_else(|| key.clone());
-    ProjectRef { key, label }
+    Some(ProjectRef { key, label })
 }
 
 /// Walk up from `start` to the nearest working tree root (the directory holding `.git`).
-/// `None` outside a repository. This is the *containing* tree, so a linked worktree resolves
-/// to itself — what anything anchored at the checkout (its `.claude`, its `HEAD`) needs.
+/// `None` outside a repository, and for a `start` that is not absolute: a relative path is
+/// resolved against the calling process's own working directory, which for a hook is wherever it
+/// was spawned rather than anywhere its session is — so every answer derived from one would
+/// describe the wrong tree. This is the *containing* tree, so a linked worktree resolves to
+/// itself — what anything anchored at the checkout (its `.claude`, its `HEAD`) needs.
 pub fn git_root(start: &Path) -> Option<PathBuf> {
+    if !start.is_absolute() {
+        return None;
+    }
     let mut cur = Some(start);
     while let Some(dir) = cur {
         if dir.join(".git").exists() {
@@ -125,6 +135,11 @@ mod tests {
         std::fs::write(path, body).unwrap();
     }
 
+    /// The project for a tree these tests expect to resolve to one.
+    fn project(cwd: &Path) -> ProjectRef {
+        resolve_project(cwd.to_str().unwrap()).expect("a tree in a repository has a project")
+    }
+
     /// A repository with one linked worktree, laid out as `git worktree add` writes it: the
     /// checkout's `.git` is a file naming its private git directory, which records the shared
     /// one relatively. Returns the repository root and the checkout.
@@ -169,13 +184,26 @@ mod tests {
     }
 
     #[test]
-    fn a_root_path_labels_as_the_path_not_an_empty_string() {
-        // `/` has no basename; the label falls back to the path so the project stays
-        // visible in reports and addressable by a filter entry.
-        let p = resolve_project("/");
-        assert_eq!(p.key, "/");
-        assert_eq!(p.label, "/", "no-basename root labels as its path");
-        assert!(!p.label.is_empty());
+    fn a_tree_outside_a_repository_has_no_project() {
+        // A directory is where a project was found, not one itself. Naming a project after
+        // whatever directory the work ran in invents a home directory, a container of
+        // repositories, and every scratch directory as projects of their own.
+        let dir = scratch();
+        assert!(resolve_project(dir.to_str().unwrap()).is_none());
+        assert!(resolve_project("/").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cwd_that_is_not_absolute_names_no_tree() {
+        // A relative path resolves against whatever directory this process was started in, which
+        // has nothing to do with the session. `../..` is this crate's own repository root when the
+        // tests run there, so without the guard both answers would describe the tree the test
+        // runner happens to sit in — every dimension is absent instead of borrowed.
+        for cwd in ["", ".", "../.."] {
+            assert!(resolve_project(cwd).is_none(), "project for {cwd:?}");
+            assert!(git_branch(cwd).is_none(), "branch for {cwd:?}");
+        }
     }
 
     #[test]
@@ -199,7 +227,7 @@ mod tests {
 
         let repo = std::fs::canonicalize(&repo).unwrap();
         for from in [&checkout, &deep] {
-            let p = resolve_project(from.to_str().unwrap());
+            let p = project(from);
             assert_eq!(Path::new(&p.key), repo, "from {}", from.display());
             assert_eq!(p.label, "acme-api", "from {}", from.display());
         }
@@ -258,7 +286,7 @@ mod tests {
         let alias = base.join("wt-alias");
         std::os::unix::fs::symlink(&checkout, &alias).unwrap();
 
-        let p = resolve_project(alias.to_str().unwrap());
+        let p = project(&alias);
         assert_eq!(p.label, "repo");
         assert_eq!(
             Path::new(&p.key),
@@ -288,7 +316,7 @@ mod tests {
             &format!("gitdir: {}\n", module.join("worktrees/w").display()),
         );
 
-        let p = resolve_project(checkout.to_str().unwrap());
+        let p = project(&checkout);
         assert_eq!(p.key, checkout.to_string_lossy());
         assert_eq!(p.label, "subwt");
         assert_eq!(
@@ -308,7 +336,7 @@ mod tests {
         write(&sup.join(".git/modules/lib/HEAD"), "ref: refs/heads/dev\n");
         write(&sup.join("lib/.git"), "gitdir: ../.git/modules/lib\n");
 
-        let p = resolve_project(sup.join("lib").to_str().unwrap());
+        let p = project(&sup.join("lib"));
         assert_eq!(p.key, sup.join("lib").to_string_lossy());
         assert_eq!(p.label, "lib");
         assert_eq!(
@@ -339,7 +367,7 @@ mod tests {
             &format!("gitdir: {}\n", base.join("bare.git/worktrees/wt").display()),
         );
 
-        let p = resolve_project(checkout.to_str().unwrap());
+        let p = project(&checkout);
         assert_eq!(p.key, checkout.to_string_lossy());
         assert_eq!(p.label, "co");
         std::fs::remove_dir_all(&base).ok();

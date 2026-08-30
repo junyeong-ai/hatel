@@ -162,7 +162,8 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     };
     let current_key = std::env::current_dir()
         .ok()
-        .map(|d| resolve_project(&d.to_string_lossy()).key);
+        .and_then(|d| resolve_project(&d.to_string_lossy()))
+        .map(|p| p.key);
     let baseline = cost::read_snapshot(&cfg.state_dir)
         .into_iter()
         .map(|r| (r.session_id.clone(), r))
@@ -204,14 +205,10 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             return 1;
         }
     };
-    let scope = if show_all {
-        "all projects"
-    } else {
-        "this project only"
-    };
     println!(
-        "hatel receiver on http://{addr} ({scope}) — point \
-         OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop"
+        "hatel receiver on http://{addr} ({}) — point \
+         OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop",
+        scope_label(&state)
     );
     // Announce egress so a forwarding deployment is visible in the log (endpoint + transform only;
     // header values are never printed).
@@ -587,6 +584,19 @@ fn passes_filter(st: &AppState, project_key: &str, project_label: &str) -> bool 
     }
 }
 
+/// How the receiver describes its scope at startup, stated in the terms `passes_filter` decides
+/// by: a receiver that announced one scope while admitting another would misdescribe every row
+/// shown under it.
+fn scope_label(st: &AppState) -> &'static str {
+    if st.show_all {
+        "all projects"
+    } else if st.project_filter.is_none() && st.current_key.is_none() {
+        "all projects — no repository here to scope to"
+    } else {
+        "this project only"
+    }
+}
+
 /// Indented per-subagent breakdown, shown only when a real subagent is present, so
 /// single-agent sessions stay uncluttered (`main` / `(unattributed)` only → hidden).
 fn agent_rows(t: &SessionTotals) -> String {
@@ -850,6 +860,29 @@ mod tests {
             live: false,
             exporter: None,
         }
+    }
+
+    #[test]
+    fn the_announced_scope_is_the_one_applied() {
+        // Whatever combination the flags and the current directory produce, the banner claims a
+        // wide scope exactly when the filter admits a project it knows nothing about.
+        let dir = scratch("scope");
+        for show_all in [false, true] {
+            for project_filter in [None, Some("acme".to_string())] {
+                for current_key in [None, Some("/k/acme".to_string())] {
+                    let mut st = test_state(&dir);
+                    st.show_all = show_all;
+                    st.project_filter = project_filter.clone();
+                    st.current_key = current_key.clone();
+                    assert_eq!(
+                        scope_label(&st).starts_with("all projects"),
+                        passes_filter(&st, "/k/unrelated", "unrelated"),
+                        "show_all={show_all} filter={project_filter:?} key={current_key:?}"
+                    );
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn scratch(tag: &str) -> PathBuf {
