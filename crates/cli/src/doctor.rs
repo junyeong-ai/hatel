@@ -167,6 +167,7 @@ fn build_report() -> Report {
     let mut hooks = Section::new("hooks", "hooks:");
     report_hooks(&mut hooks, &files, &events, &registry);
     advise_dormant_bindings(&mut hooks, &files, &events, &cfg, &registry);
+    advise_unattributed_sessions(&mut hooks, &cfg);
 
     let mut storage = Section::new("storage", "storage:");
     match writable(&cfg.state_dir) {
@@ -374,6 +375,24 @@ fn advise_dormant_bindings(
 /// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
 /// egress-privacy and enriched-protocol notes are advisory. Returns `None` when no export is
 /// configured — no section, no failure.
+/// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
+/// is indistinguishable from a collection gap until something says how many sessions have one.
+fn advise_unattributed_sessions(sec: &mut Section, cfg: &Config) {
+    let sessions = SessionIndex::new(cfg.state_dir.clone()).load();
+    let without = sessions
+        .values()
+        .filter(|s| s.project_label.is_empty())
+        .count();
+    if without == 0 {
+        return;
+    }
+    sec.note(format!(
+        "{without}/{} recorded sessions have no project — only work in a repository has one — so \
+         their cost and records read as unattributed rather than under a project",
+        sessions.len()
+    ));
+}
+
 fn report_export(
     env: &cs::Env,
     settings: &hatel_core::Result<Settings>,
@@ -603,6 +622,42 @@ fn writable(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unattributed_sessions_are_named_only_when_some_exist() {
+        let dir = std::env::temp_dir().join(format!("ht-doctor-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::from_settings(&Settings::default());
+        cfg.state_dir = dir.clone();
+        let index = SessionIndex::new(dir.clone());
+        let acme = hatel_core::ProjectRef {
+            key: "/k/acme".into(),
+            label: "acme".into(),
+        };
+        let advise = |cfg: &Config| {
+            let mut sec = Section::new("hooks", "hooks:");
+            advise_unattributed_sessions(&mut sec, cfg);
+            sec.findings
+        };
+
+        index.record("S1", Some(&acme), 1 << 20);
+        assert!(
+            advise(&cfg).is_empty(),
+            "nothing to say while every session has a project"
+        );
+
+        index.record("S2", None, 1 << 20);
+        let findings = advise(&cfg);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].status, Status::Note);
+        assert!(
+            findings[0].message.starts_with("1/2 recorded sessions"),
+            "counted against every recorded session: {}",
+            findings[0].message
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn report_with(status: Status) -> Report {
         let mut sec = Section::new("native_telemetry", "native telemetry (settings.json env):");
