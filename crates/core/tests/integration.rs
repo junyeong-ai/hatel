@@ -270,10 +270,11 @@ fn session_start_is_recorded_in_the_index() {
 }
 
 #[test]
-fn an_unattributable_session_start_is_not_recorded() {
+fn an_unattributable_session_start_is_recorded_without_a_project() {
     // A session outside a repository — or one whose cwd names no directory this process can
-    // resolve — has no project, so it can attribute nothing and no index row is written (the
-    // receiver treats such a session as unattributed regardless).
+    // resolve — has no project, and is recorded as having none. The receiver reads that as an
+    // answer: a session with no project is decided, unlike one whose start it has not seen, which
+    // is the only kind worth holding egress and tool records back for.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
     let outside = temp_dir();
@@ -285,12 +286,20 @@ fn an_unattributable_session_start_is_not_recorded() {
         hatel_core::hook::process_event(&mut event, &cfg, &reg);
     }
     let index = SessionIndex::new(cfg.state_dir.clone()).load();
+    let mut cache = hatel_core::SessionIndexCache::new(cfg.state_dir.clone());
+    cache.refresh();
     for session_id in ["S4", "S5"] {
         assert!(
-            !index.contains_key(session_id),
-            "an unattributable session is not indexed"
+            index.contains_key(session_id),
+            "the session start is recorded"
         );
+        assert!(cache.is_unattributed(session_id), "with no project");
+        assert_eq!(cache.label(session_id), None, "and nothing to attribute by");
     }
+    assert!(
+        !cache.contains("never-started"),
+        "a session never seen stays undecided"
+    );
 }
 
 #[test]

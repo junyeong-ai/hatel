@@ -91,10 +91,9 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
 /// the receiver can attribute project-less OTel data regardless of the sink. Only the
 /// session start establishes it; that is all the receiver needs.
 fn record_session(cfg: &Config, event_name: &str, session_id: &str, project: Option<&ProjectRef>) {
-    // Record only an attributable session: a resolved project AND a non-empty id. A session
-    // outside a repository attributes nothing, so an unlabelled row would only add noise the
-    // receiver already treats as unattributed.
-    let Some(project) = project else { return };
+    // Every identified session start is recorded, with its project or without one. What the
+    // receiver has to tell apart is a session that has no project from one whose start it has not
+    // seen yet: the first can be answered now, and only the second is worth waiting for.
     if event_name == "SessionStart" && !session_id.is_empty() {
         SessionIndex::new(cfg.state_dir.clone()).record(session_id, project, cfg.rotate_bytes);
     }

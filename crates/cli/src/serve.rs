@@ -713,7 +713,8 @@ fn persist_tool(st: &AppState, final_flush: bool) {
                 .get(&item.result.session_id)
                 .map(|row| row.project_label.clone())
                 .filter(|l| !l.is_empty());
-            if project.is_none() && !final_flush && item.deferrals < MAX_TOOL_DEFERRALS {
+            let undecided = project.is_none() && !index.is_unattributed(&item.result.session_id);
+            if undecided && !final_flush && item.deferrals < MAX_TOOL_DEFERRALS {
                 item.deferrals += 1;
                 deferred.push(item);
             } else {
@@ -923,10 +924,10 @@ mod tests {
         // The SessionStart hook lands; the next cycle attributes the deferred outcome.
         SessionIndex::new(st.cfg.state_dir.clone()).record(
             "S1",
-            &ProjectRef {
+            Some(&ProjectRef {
                 key: "/k/alpha".into(),
                 label: "alpha".into(),
-            },
+            }),
             st.cfg.rotate_bytes,
         );
         persist(&st, false);

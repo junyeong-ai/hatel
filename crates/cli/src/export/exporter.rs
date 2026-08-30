@@ -475,10 +475,11 @@ impl Worker {
     }
 
     /// The `(label, key)` of every project a batch belongs to, for project-filtered destinations.
-    /// `Resolved` only when every `session.id` in the body is known; the two failure shapes are
-    /// kept distinct because they behave differently — `Unindexed` (sessions not in the index
-    /// *yet*, all of them listed) earns a park until those sessions appear, while
-    /// `Unattributable` (not JSON, or no `session.id` at all) fails closed immediately.
+    /// `Resolved` only when every `session.id` in the body carries a project; the two failure
+    /// shapes are kept distinct because they behave differently — `Unindexed` (sessions not in the
+    /// index *yet*, all of them listed) earns a park until those sessions appear, while
+    /// `Unattributable` (not JSON, no `session.id` at all, or a session the index has already
+    /// decided has no project) fails closed immediately, since no wait can change the answer.
     /// Resolution is over the `session.id`s actually present; in practice every Claude Code
     /// datapoint carries one and a single export body is a single session, so the set is one
     /// project the filter then accepts or rejects.
@@ -495,6 +496,9 @@ impl Worker {
             match self.index.project(&sid) {
                 Some((label, key)) => {
                     projects.insert((label.to_string(), key.to_string()));
+                }
+                None if self.index.is_unattributed(&sid) => {
+                    return BatchProjects::Unattributable;
                 }
                 None => {
                     missing.insert(sid);
@@ -685,6 +689,76 @@ mod tests {
             content_type: Some("application/json".to_string()),
             content_encoding: None,
         }
+    }
+
+    #[test]
+    fn a_session_with_no_project_fails_closed_rather_than_parking() {
+        // Waiting only helps a session the index has not seen yet. One recorded as having no
+        // project is already answered, so parking it would hold a slot for the full timeout to
+        // arrive at the same fail-closed end.
+        let dir = scratch("decided");
+        std::fs::write(
+            dir.join("session_index.jsonl"),
+            "{\"session_id\":\"S1\",\"project_key\":\"\",\"project_label\":\"\"}\n",
+        )
+        .unwrap();
+        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        worker.index.refresh();
+        assert!(
+            matches!(
+                worker.resolve_batch_projects(&metrics_body("S1"), OtlpSignal::Metrics),
+                BatchProjects::Unattributable
+            ),
+            "a session with no project is answered, not awaited"
+        );
+        assert!(
+            matches!(
+                worker.resolve_batch_projects(&metrics_body("GHOST"), OtlpSignal::Metrics),
+                BatchProjects::Unindexed(_)
+            ),
+            "a session never seen is still worth waiting for"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_batch_from_a_session_with_no_project_takes_no_park_slot() {
+        let (addr, received, server) = stub_collector().await;
+        let dir = scratch("decided-park");
+        let target = ExportTarget {
+            endpoint: format!("http://{addr}"),
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(2_000),
+        };
+        let qb = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        std::fs::write(
+            dir.join("session_index.jsonl"),
+            "{\"session_id\":\"S1\",\"project_key\":\"\",\"project_label\":\"\"}\n",
+        )
+        .unwrap();
+
+        let body = metrics_body("S1");
+        qb.fetch_add(body.len(), Ordering::Relaxed);
+        worker.handle(outbound(body)).await;
+
+        assert!(
+            worker.deferred.is_empty(),
+            "a session with no project never occupies the park a racing one needs"
+        );
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "and the filtered destination never receives it"
+        );
+        assert_eq!(
+            qb.load(Ordering::Relaxed),
+            0,
+            "bytes released at disposition"
+        );
+        server.abort();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

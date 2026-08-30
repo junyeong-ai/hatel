@@ -6,7 +6,7 @@
 //! Kind's ledger.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -44,13 +44,15 @@ impl SessionIndex {
         Self { state_dir }
     }
 
-    /// Append one session → project line. Called once per session (at start), so there is no
-    /// read-modify-write and no race between concurrent hook processes.
-    pub fn record(&self, session_id: &str, project: &ProjectRef, rotate_bytes: u64) {
+    /// Append one line for a session start: its project, or its absence. Called once per session,
+    /// so there is no read-modify-write and no race between concurrent hook processes. A session
+    /// with no project is recorded too — the index is what separates a session that has none from
+    /// one whose start has not been seen, and only the second becomes attributable by waiting.
+    pub fn record(&self, session_id: &str, project: Option<&ProjectRef>, rotate_bytes: u64) {
         let line = IndexLine {
             session_id: session_id.to_string(),
-            project_key: project.key.clone(),
-            project_label: project.label.clone(),
+            project_key: project.map_or_else(String::new, |p| p.key.clone()),
+            project_label: project.map_or_else(String::new, |p| p.label.clone()),
             ts: crate::now_iso_utc(),
         };
         let json = serde_json::to_string(&line).unwrap_or_default();
@@ -112,23 +114,19 @@ fn fold(lines: Vec<IndexLine>) -> BTreeMap<String, SessionRow> {
     best.into_iter().map(|(sid, (_, row))| (sid, row)).collect()
 }
 
-/// The session → project map a labelled row contributes — a row with an empty label can attribute
-/// nothing, so it is dropped here (the same rule the live view and enrichment apply downstream).
-fn labelled(map: BTreeMap<String, SessionRow>) -> BTreeMap<String, SessionRow> {
-    map.into_iter()
-        .filter(|(_, r)| !r.project_label.is_empty())
-        .collect()
-}
-
 /// A change-gated cache of the folded session index: it re-folds only when the index files actually
 /// change — an append, a rotation, or a prune — so a hot read path (the receiver's live render,
 /// each flush, the export forwarder) pays a directory stat rather than re-parsing the whole, and
-/// ever-growing, index on every call. Holds only labelled rows, the ones that can attribute a
-/// session.
+/// ever-growing, index on every call.
 pub struct SessionIndexCache {
     state_dir: PathBuf,
     fingerprint: Option<(usize, u64, Option<SystemTime>)>,
+    /// Sessions carrying a project — the only ones that can attribute anything.
     map: BTreeMap<String, SessionRow>,
+    /// Sessions recorded without one, kept apart so no accessor can hand out an empty label as
+    /// though it were a project, while a caller waiting on attribution can still tell a decided
+    /// session from one whose start has not been seen.
+    unattributed: BTreeSet<String>,
 }
 
 impl SessionIndexCache {
@@ -137,13 +135,14 @@ impl SessionIndexCache {
             state_dir,
             fingerprint: None,
             map: BTreeMap::new(),
+            unattributed: BTreeSet::new(),
         }
     }
 
-    /// Reload the folded map only when the index's fingerprint advanced. A fold yielding no labelled
-    /// rows while the files hold bytes is treated as a transient read race: the prior labels AND the
-    /// prior fingerprint are both kept, so the next refresh re-reads rather than caching the gap. An
-    /// index removed (state reset) folds to an empty set and is adopted, dropping stale labels.
+    /// Reload the folded index only when its fingerprint advanced. A fold yielding no rows while the
+    /// files hold bytes is treated as a transient read race: the prior state AND the prior
+    /// fingerprint are both kept, so the next refresh re-reads rather than caching the gap. An
+    /// index removed (state reset) folds to an empty set and is adopted, dropping stale rows.
     pub fn refresh(&mut self) {
         let fp = rolling::fingerprint(&self.state_dir, INDEX_BASE);
         match fp {
@@ -152,27 +151,40 @@ impl SessionIndexCache {
             Some(_) => {}
         }
         let had_bytes = matches!(fp, Some((_, bytes, _)) if bytes > 0);
-        let loaded = labelled(fold(rolling::read_parsed(
+        let rows = fold(rolling::read_parsed(
             &self.state_dir,
             INDEX_BASE,
             parse_index_line,
-        )));
+        ));
         // Adopt the new revision — and only then advance the fingerprint — when the fold produced
-        // labelled rows, or the index is genuinely empty. Otherwise keep the prior map and the prior
+        // rows, or the index is genuinely empty. Otherwise keep the prior state and the prior
         // fingerprint so the next refresh retries instead of stranding stale attribution.
-        if !loaded.is_empty() || !had_bytes {
-            self.map = loaded;
-            self.fingerprint = fp;
+        if rows.is_empty() && had_bytes {
+            return;
         }
+        let (labelled, unattributed): (BTreeMap<_, _>, BTreeMap<_, _>) = rows
+            .into_iter()
+            .partition(|(_, r)| !r.project_label.is_empty());
+        self.map = labelled;
+        self.unattributed = unattributed.into_keys().collect();
+        self.fingerprint = fp;
     }
 
     pub fn get(&self, session_id: &str) -> Option<&SessionRow> {
         self.map.get(session_id)
     }
 
-    /// Whether a session is in the index — the cheap readiness probe parked egress bodies use.
+    /// Whether the index has decided a session — it carries a project, or was recorded as having
+    /// none. The readiness probe parked egress bodies use: only an undecided session is worth
+    /// waiting for.
     pub fn contains(&self, session_id: &str) -> bool {
-        self.map.contains_key(session_id)
+        self.map.contains_key(session_id) || self.unattributed.contains(session_id)
+    }
+
+    /// Whether a session was recorded with no project, so no amount of waiting makes it
+    /// attributable.
+    pub fn is_unattributed(&self, session_id: &str) -> bool {
+        self.unattributed.contains(session_id)
     }
 
     /// The project label for a session — what enrichment injects — or `None` when unknown (never
@@ -223,12 +235,48 @@ mod tests {
             .unwrap();
     }
 
+    /// One well-formed index line, and the same bytes with its opening brace lost — a torn write,
+    /// which leaves the file non-empty while nothing in it parses. Same length by construction, so
+    /// the two can be written at one mtime to collide on the cache's fingerprint.
+    const GOOD_LINE: &str =
+        "{\"session_id\":\"S2\",\"project_key\":\"/k/\",\"project_label\":\"x\"}\n";
+
+    fn torn(line: &str) -> String {
+        line.replacen('{', " ", 1)
+    }
+
+    #[test]
+    fn a_session_recorded_without_a_project_is_decided_but_not_attributable() {
+        let dir = scratch();
+        let idx = SessionIndex::new(dir.clone());
+        idx.record("S1", Some(&pref("alpha")), 1 << 20);
+        idx.record("S2", None, 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.clone());
+        cache.refresh();
+
+        assert_eq!(cache.project("S1"), Some(("alpha", "/k/alpha")));
+        assert_eq!(
+            cache.label("S2"),
+            None,
+            "no project is never served as a label"
+        );
+        assert_eq!(cache.project("S2"), None);
+        assert!(cache.is_unattributed("S2"));
+        assert!(
+            cache.contains("S2"),
+            "a decided session is not worth waiting for"
+        );
+        assert!(!cache.contains("ghost"));
+        assert!(!cache.is_unattributed("ghost"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn record_then_load_folds_per_session() {
         let dir = scratch();
         let idx = SessionIndex::new(dir.clone());
-        idx.record("S1", &pref("alpha"), 1 << 20);
-        idx.record("S2", &pref("beta"), 1 << 20);
+        idx.record("S1", Some(&pref("alpha")), 1 << 20);
+        idx.record("S2", Some(&pref("beta")), 1 << 20);
         let map = idx.load();
         assert_eq!(map.get("S1").unwrap().project_label, "alpha");
         assert_eq!(map.get("S2").unwrap().project_key, "/k/beta");
@@ -289,8 +337,8 @@ mod tests {
         let dir = scratch();
         let idx = SessionIndex::new(dir.clone());
         // A tiny rotate threshold rolls the active file into an archive before the second append.
-        idx.record("S1", &pref("alpha"), 1);
-        idx.record("S2", &pref("beta"), 1);
+        idx.record("S1", Some(&pref("alpha")), 1);
+        idx.record("S2", Some(&pref("beta")), 1);
         // Both sessions remain readable across the archive + the active file.
         let map = idx.load();
         assert!(map.contains_key("S1") && map.contains_key("S2"));
@@ -307,7 +355,7 @@ mod tests {
     #[test]
     fn cache_serves_known_and_never_fabricates_unknown() {
         let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", &pref("alpha"), 1 << 20);
+        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
         assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
@@ -325,11 +373,11 @@ mod tests {
     fn cache_reloads_when_a_new_session_is_appended() {
         let dir = scratch();
         let idx = SessionIndex::new(dir.clone());
-        idx.record("S1", &pref("alpha"), 1 << 20);
+        idx.record("S1", Some(&pref("alpha")), 1 << 20);
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
         assert!(cache.contains("S1") && !cache.contains("S2"));
-        idx.record("S2", &pref("beta"), 1 << 20);
+        idx.record("S2", Some(&pref("beta")), 1 << 20);
         cache.refresh(); // total bytes grew → the fingerprint advanced → re-folded
         assert!(
             cache.contains("S2"),
@@ -341,7 +389,7 @@ mod tests {
     #[test]
     fn cache_drops_labels_when_the_index_is_reset() {
         let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", &pref("alpha"), 1 << 20);
+        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
         assert!(cache.contains("S1"));
@@ -358,17 +406,13 @@ mod tests {
     #[test]
     fn cache_keeps_prior_labels_when_a_nonempty_index_folds_empty() {
         let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", &pref("alpha"), 1 << 20);
+        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
         assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
-        // Overwrite with a non-empty file whose only row has an empty label (folds to nothing after
-        // the labelled filter) — a transient read race; the prior good label is kept.
-        std::fs::write(
-            dir.join(INDEX_BASE),
-            "{\"session_id\":\"S9\",\"project_key\":\"/k/\",\"project_label\":\"\"}\n",
-        )
-        .unwrap();
+        // Overwrite with a torn line: the file holds bytes but nothing parses, so the fold is
+        // empty — a transient read race, and the prior good label is kept.
+        std::fs::write(dir.join(INDEX_BASE), torn(GOOD_LINE)).unwrap();
         cache.refresh();
         assert_eq!(
             cache.label("S1").as_deref(),
@@ -382,25 +426,20 @@ mod tests {
     fn cache_recovers_after_a_transient_empty_fold_at_a_colliding_fingerprint() {
         let dir = scratch();
         let path = dir.join(INDEX_BASE);
-        // Two lines crafted to the SAME byte length, so written with an equal mtime they share a
-        // fingerprint: an empty-label row (folds to nothing) and a good row (folds to one session).
-        let empty = "{\"session_id\":\"S9\",\"project_key\":\"/k/y\",\"project_label\":\"\"}\n";
-        let good = "{\"session_id\":\"S2\",\"project_key\":\"/k/\",\"project_label\":\"x\"}\n";
-        assert_eq!(
-            empty.len(),
-            good.len(),
-            "fixture lines must collide on length"
-        );
+        // A torn line and its intact original share a byte length by construction, so written with
+        // an equal mtime they share a fingerprint.
+        let good = GOOD_LINE;
+        let empty = torn(good);
 
         // A different good session seeds the cache so it starts non-empty (its own fingerprint).
-        SessionIndex::new(dir.clone()).record("S1", &pref("alpha"), 1 << 20);
+        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
         assert!(cache.contains("S1"));
 
         // A transient empty fold: the prior label is kept and the fingerprint is NOT advanced.
         let t = SystemTime::now();
-        std::fs::write(&path, empty).unwrap();
+        std::fs::write(&path, &empty).unwrap();
         set_mtime(&path, t);
         cache.refresh();
         assert!(
