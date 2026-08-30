@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.9.1
+version: 0.9.2
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
 when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
@@ -97,7 +97,7 @@ breakdowns: `by_agent` (tokens/cost per subagent — "which subagent costs most"
 `cacheCreation` — compute the cache-hit ratio as `cacheRead / total`). A series missing the
 dimension lands in `(unattributed)` — report it as such, never guess. Sessions recorded before
 the breakdowns existed show `{}` (not recorded — say so rather than treating it as zero).
-`report --project <label>` matches by the project's basename label. A Kind that carries no
+`report --project <label>` matches by the project's basename label. A project is a repository: work done in a linked worktree rolls up to the repository it checks out, and a session run outside any repository has no project and groups under `(empty)` — report that as unattributed, never as a project of its own. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",
 never as zero usage. `unreadable_kinds` — on every report, and on `kinds --json`, whose payload

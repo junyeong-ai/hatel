@@ -35,6 +35,12 @@ uvx zizmor .github/                       # after workflow edits (security audit
 - **Never fabricate a missing signal.** A series without a dimension buckets under
   `(unattributed)`; session-less metrics are dropped, not guessed; `doctor` reports gaps
   instead of inventing fallbacks. New code follows this or doesn't merge.
+- **A project is a repository, never the directory work ran in.** A linked worktree attributes
+  to the repository it checks out; a tree outside one has no project. Every identified session
+  start is recorded either way, so the receiver can tell a session that has no project from one
+  whose start it has not seen — the first is answered now, the second is the only one worth
+  holding egress and tool records back for. Collapsing those two states again silently restores
+  a fabricated project, a saturated export park, or both.
 - **Fail-open on the local write path** (a write error is a stderr note, never a blocked
   tool call); **fail-closed on egress privacy** (an unattributable batch is not forwarded
   to a filtered destination).
