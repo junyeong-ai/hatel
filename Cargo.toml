@@ -28,7 +28,7 @@ axum = "0.8"
 # The MCP stdio server (`hatel mcp`): the official protocol SDK, so the wire format
 # tracks the evolving spec rather than a hand-rolled JSON-RPC subset. `transport-io`
 # (stdio) is not a default feature; `server` + `macros` (the tool router) are.
-rmcp = { version = "3.1", features = ["transport-io"] }
+rmcp = { version = "3.3", features = ["transport-io"] }
 # Receiver-only HTTP client for OTLP egress (the `serve` forward path). rustls so an https
 # downstream works without a system OpenSSL; no `json`/default features — we POST raw bytes.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
