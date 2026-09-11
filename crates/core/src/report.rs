@@ -7,7 +7,7 @@
 //! two apart is what lets one schema answer more than one question, and what keeps every output
 //! format rendering the same computed answer rather than deriving its own.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -100,13 +100,15 @@ pub enum ProjectScope {
 }
 
 /// One Kind's answer, self-describing: which dimension it was grouped by, which measure ranked
-/// it (`None` — and so record count — when the Kind declares no measures), and how the project
-/// scope applied.
+/// it (`None` — and so count — when the Kind declares no measures), what each group's count
+/// counts (`identity`: distinct values of that field, else records), and how the project scope
+/// applied.
 #[derive(Debug, Clone, Serialize)]
 pub struct KindSection {
     pub kind: String,
     pub group_by: String,
     pub sort_by: Option<String>,
+    pub identity: Option<String>,
     pub project_scope: ProjectScope,
     pub groups: Vec<GroupAgg>,
 }
@@ -148,6 +150,7 @@ impl Report {
                     kind: spec.name.clone(),
                     group_by: group_by.to_string(),
                     sort_by: sort_by.map(str::to_string),
+                    identity: spec.identity.clone(),
                     project_scope,
                     groups: match project_scope {
                         ProjectScope::Unsupported => Vec::new(),
@@ -234,8 +237,9 @@ pub fn cost_axes() -> (&'static str, &'static str) {
 }
 
 /// Aggregate one Kind under `q`: group in-window records by the query's dimension (the Kind's
-/// `group_key` unless overridden), count them, and sum each declared measure. Records are read
-/// from the configured storage backend (JSONL / SQLite).
+/// `group_key` unless overridden), count them, and sum each declared measure. A Kind declaring
+/// an `identity` counts the distinct entities its records describe rather than the records.
+/// Records are read from the configured storage backend (JSONL / SQLite).
 ///
 /// `kind` is the Kind being aggregated right now (the caller's loop variable); `q.kind` is
 /// the report-level restriction the caller applies when choosing which Kinds to loop over,
@@ -245,7 +249,7 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
         return Vec::new();
     };
     let dimension = q.group_by.unwrap_or(&spec.group_key);
-    let mut groups: BTreeMap<String, (i64, Vec<f64>)> = BTreeMap::new();
+    let mut groups: BTreeMap<String, (i64, Vec<f64>, BTreeSet<String>)> = BTreeMap::new();
     // `since` lets the backend skip out-of-window history (SQLite); the exact filter
     // below is the correctness gate (and does the windowing for JSONL).
     for env in sink::read_records(cfg, kind, Some(q.since)) {
@@ -275,7 +279,16 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
             .unwrap_or_else(|| MISSING_DIMENSION.to_string());
         let entry = groups
             .entry(key)
-            .or_insert_with(|| (0, vec![0.0; spec.measures.len()]));
+            .or_insert_with(|| (0, vec![0.0; spec.measures.len()], BTreeSet::new()));
+        // A repeated identity describes an entity this group already holds. A record carrying
+        // none says nothing about being the same entity as another, so it counts as its own
+        // rather than merging into one bucket of everything unidentified.
+        if let Some(identity) = &spec.identity
+            && let Some(id) = env.payload.get(identity).map(value_label)
+            && !entry.2.insert(id)
+        {
+            continue;
+        }
         entry.0 += 1;
         for (i, m) in spec.measures.iter().enumerate() {
             entry.1[i] += env.payload.get(m).map(numeric).unwrap_or(0.0);
@@ -283,7 +296,7 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
     }
     let mut rows: Vec<GroupAgg> = groups
         .into_iter()
-        .map(|(key, (count, sums))| GroupAgg {
+        .map(|(key, (count, sums, _))| GroupAgg {
             key,
             count,
             sums: spec

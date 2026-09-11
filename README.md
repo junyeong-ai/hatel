@@ -97,9 +97,9 @@ hatel report --window 30d
 | a1b2c3d4 | 2 |
 | e5f6a7b8 | 1 |
 
-## subagent — by subagent_type, ranked by count
+## subagent — by agent, ranked by count
 
-| subagent_type | count |
+| agent | count |
 |---|---:|
 | Explore | 2 |
 | code-reviewer | 1 |
@@ -126,7 +126,7 @@ hatel report --window 30d
 - 모든 섹션은 자신의 축을 밝힙니다 — **`by <차원>, ranked by <측정값>`**. 그 섹션이 답하는 질문이며, 양쪽 다 `--group-by` / `--sort-by`로 바꿀 수 있습니다.
 - **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다.
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
-- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번.
+- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다.
 
 > 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적습니다. 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
@@ -243,8 +243,8 @@ prompt — by session_id, ranked by count
   ██████████████████  a1b2c3d4        2
   █████████░░░░░░░░░  e5f6a7b8        1
 
-subagent — by subagent_type, ranked by count
-                      subagent_type  count
+subagent — by agent, ranked by count
+                      agent          count
   ██████████████████  Explore            2
   █████████░░░░░░░░░  code-reviewer      1
 
@@ -362,7 +362,7 @@ $ hatel kinds
 compaction     group_key=session_id   fields=[project, session_id, trigger]
 memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
 prompt         group_key=session_id   fields=[project, prompt_len, session_id]
-subagent       group_key=subagent_type fields=[project, session_id, subagent_type]
+subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
 tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
 
@@ -438,7 +438,7 @@ $ hatel report --kind team.deploy
 report: unknown kind "team.deploy" (registered: compaction, memory, prompt, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
 ```
 
-Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱).
+Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱), `identity`(여러 기록이 한 실체를 가리킬 때 그 실체를 식별하는 필드 — 리포트가 기록이 아니라 실체를 셉니다).
 
 커스텀 Kind는 **신호가 어디서 나오는지**에 따라 두 경로 중 하나로 채웁니다(한 Kind엔 writer 하나 — 둘 다면 이중 집계):
 

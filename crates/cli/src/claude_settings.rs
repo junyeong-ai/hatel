@@ -1241,6 +1241,7 @@ mod tests {
                 group_key: "session_id".into(),
                 redact: vec![],
                 measures: vec![],
+                identity: None,
                 receiver_sourced: false,
             })
             .unwrap(),

@@ -49,6 +49,10 @@ uvx zizmor .github/                       # after workflow edits (security audit
   typed shape (`settings.rs`) covering every section: a second parser over the same file
   would have to tolerate the sections it doesn't own, and a writer that rebuilt the file
   from its own section alone would drop the rest.
+- **A lifecycle event marks a turn boundary, not an entity.** `SubagentStart` and `SubagentStop`
+  both fire again when an agent is resumed, so a Kind bound to one counts turns unless it
+  declares the `identity` those events carry across them (`agent_id`). Before binding a Kind that
+  claims to count something, check how often its event fires per one of that thing.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
   override those per query. Answering a new question is a query, not a schema edit.

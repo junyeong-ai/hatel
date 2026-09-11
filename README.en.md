@@ -97,9 +97,9 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 | a1b2c3d4 | 2 |
 | e5f6a7b8 | 1 |
 
-## subagent — by subagent_type, ranked by count
+## subagent — by agent, ranked by count
 
-| subagent_type | count |
+| agent | count |
 |---|---:|
 | Explore | 2 |
 | code-reviewer | 1 |
@@ -126,7 +126,7 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 - Every section names its axes: **`by <dimension>, ranked by <measure>`**. That is the question the section answers, and both halves are yours to change — `--group-by` / `--sort-by`.
 - The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
-- **`prompt` / `subagent`** come from **hooks** — prompts per session, which subagent ran how often.
+- **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate.
 
 > A Kind with nothing in the window says so in place of its table, and Kinds you have no records for are listed the same way (omitted above for brevity). Start the receiver and run Claude Code once and they fill in (see [Troubleshooting](#troubleshooting)).
 
@@ -243,8 +243,8 @@ prompt — by session_id, ranked by count
   ██████████████████  a1b2c3d4        2
   █████████░░░░░░░░░  e5f6a7b8        1
 
-subagent — by subagent_type, ranked by count
-                      subagent_type  count
+subagent — by agent, ranked by count
+                      agent          count
   ██████████████████  Explore            2
   █████████░░░░░░░░░  code-reviewer      1
 
@@ -362,7 +362,7 @@ $ hatel kinds
 compaction     group_key=session_id   fields=[project, session_id, trigger]
 memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
 prompt         group_key=session_id   fields=[project, prompt_len, session_id]
-subagent       group_key=subagent_type fields=[project, session_id, subagent_type]
+subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
 tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
 
@@ -438,7 +438,7 @@ $ hatel report --kind team.deploy
 report: unknown kind "team.deploy" (registered: compaction, memory, prompt, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
 ```
 
-Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage).
+Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage), `identity` (the field identifying the entity a record describes, when several records describe the same one — a report then counts entities, not records).
 
 A custom Kind is filled by one of two paths, **chosen by where the signal originates** (keep one writer per Kind — both paths double-counts):
 

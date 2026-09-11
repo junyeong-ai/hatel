@@ -24,6 +24,10 @@ pub struct KindSpec {
     /// Numeric fields a report sums per group (durations, counts, costs). Ordered:
     /// the first is the primary metric a report ranks groups by; all are displayed.
     pub measures: Vec<String>,
+    /// The field identifying the entity a record describes, when several records can describe
+    /// the same one — a lifecycle event that fires at every turn boundary, not once per entity.
+    /// Declared, a report counts distinct values of it per group instead of counting records.
+    pub identity: Option<String>,
     /// Whether this Kind is written by the receiver from a native OTel signal (e.g. `tool` from
     /// `tool_result`) rather than by the hook. Such a Kind must not have a hook binding — that would
     /// give it two writers and double-count it — so `bind` rejects one.
@@ -41,6 +45,8 @@ pub struct KindSpecRaw {
     pub redact: Vec<String>,
     #[serde(default)]
     pub measures: Vec<String>,
+    #[serde(default)]
+    pub identity: Option<String>,
     #[serde(default)]
     pub receiver_sourced: bool,
 }
@@ -80,12 +86,26 @@ impl KindSpec {
         if let Some(m) = raw.measures.iter().find(|m| !fields.contains(*m)) {
             return Err(invalid(format!("measure '{m}' not in fields")));
         }
+        if let Some(identity) = &raw.identity {
+            if !fields.contains(identity) {
+                return Err(invalid(format!("identity '{identity}' not in fields")));
+            }
+            // Several records per entity means several values per measure, and nothing in a
+            // schema says how to combine them. Until a Kind needs that and can declare it,
+            // an identity Kind counts entities and sums nothing.
+            if !raw.measures.is_empty() {
+                return Err(invalid(
+                    "a kind with an identity may not declare measures".to_string(),
+                ));
+            }
+        }
         Ok(KindSpec {
             name: raw.name,
             fields,
             group_key: raw.group_key,
             redact,
             measures: raw.measures,
+            identity: raw.identity,
             receiver_sourced: raw.receiver_sourced,
         })
     }

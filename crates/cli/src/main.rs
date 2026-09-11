@@ -537,6 +537,7 @@ pub(crate) fn kinds_value(
                 "group_key": s.group_key,
                 "redact": s.redact,
                 "measures": s.measures,
+                "identity": s.identity,
                 "receiver_sourced": s.receiver_sourced,
             })
         })
@@ -565,11 +566,19 @@ fn kinds_cmd(json: bool) -> i32 {
     } else {
         for s in reg.kinds() {
             let fields: Vec<&str> = s.fields.iter().map(String::as_str).collect();
+            // A Kind counting entities rather than records says so here, where someone asking
+            // what they can query reads what a count will mean before they run one.
+            let identity = s
+                .identity
+                .as_ref()
+                .map(|i| format!(" identity={i}"))
+                .unwrap_or_default();
             println!(
-                "{:<14} group_key={:<12} fields=[{}]",
+                "{:<14} group_key={:<12} fields=[{}]{}",
                 s.name,
                 s.group_key,
-                fields.join(", ")
+                fields.join(", "),
+                identity
             );
         }
         if let Some(unreadable) = &unreadable {

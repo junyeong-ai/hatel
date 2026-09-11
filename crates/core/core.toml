@@ -45,8 +45,9 @@ group_key = "memory_id"
 
 [[kind]]
 name = "subagent"
-fields = ["session_id", "project", "subagent_type"]
-group_key = "subagent_type"
+fields = ["session_id", "project", "agent_id", "agent"]
+group_key = "agent"
+identity = "agent_id"
 
 [[kind]]
 name = "compaction"
@@ -74,11 +75,18 @@ map.memory_id = { from = "file_path", basename = true }
 map.memory_type = { from = "memory_type" }
 map.load_reason = { from = "load_reason" }
 
+# SubagentStop fires at every turn boundary, so an agent resumed with a message stops more than
+# once; `agent_id` is stable across those, which is what makes the spawn — not the turn — the unit
+# a report counts. `agent` is the label the event carries: the declared type for a plain subagent,
+# the operator's name for a teammate (Claude Code puts the name in that field and exposes the
+# declared type nowhere a hook can read), so it is recorded as the label it is rather than
+# asserted to be a type.
 [[binding]]
 event = "SubagentStop"
 kind = "subagent"
 map.session_id = { from = "session_id" }
-map.subagent_type = { from = "agent_type" }
+map.agent_id = { from = "agent_id" }
+map.agent = { from = "agent_type" }
 
 # One compaction fires both PreCompact and PostCompact, so only one is bound — one
 # record per compaction. PreCompact is chosen because it always fires (a compaction

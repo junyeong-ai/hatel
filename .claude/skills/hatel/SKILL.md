@@ -89,14 +89,17 @@ hatel report --top 0                        # all groups, not just the top N
 hatel kinds --json                          # queryable Kinds + any the ledger holds unreadable
 ```
 
-Reading a report: each Kind lists groups with a record count and the summed `measures`; the
-`cost` array is the latest snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`,
-`active_time_s`, `lines`, `ts`, plus three breakdowns). Answer the budget questions from those
-breakdowns: `by_agent` (tokens/cost per subagent — "which subagent costs most"), `by_model`
-(the model mix — Opus vs Haiku spend), and `tokens_by_type` (`input`/`output`/`cacheRead`/
-`cacheCreation` — compute the cache-hit ratio as `cacheRead / total`). A series missing the
-dimension lands in `(unattributed)` — report it as such, never guess. Sessions recorded before
-the breakdowns existed show `{}` (not recorded — say so rather than treating it as zero).
+Reading a report: each Kind lists groups with a count — of records, or of distinct `identity`
+values when the Kind declares one — and the summed `measures`; the `cost` array is the latest
+snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_time_s`, `lines`,
+`ts`, plus three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
+(tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
+one ran, its `agent` label being the declared type for a plain subagent and the given name for
+a teammate), `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
+(`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
+`cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
+such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
+say so rather than treating it as zero).
 `report --project <label>` matches by the project's basename label. A project is a repository: work done in a linked worktree rolls up to the repository it checks out, and a session run outside any repository has no project and groups under `(empty)` — report that as unattributed, never as a project of its own. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",
@@ -105,8 +108,8 @@ is `{"kinds": [...], "unreadable_kinds": …}` — is non-null when the ledger h
 schema declares: the answer covered less than was collected. Report that gap with the names and
 the surface it carries, never the totals alone.
 
-Each Kind section names the axes it was computed on (`group_by`, and `sort_by` — `null` means
-groups rank by record count). `--group-by` and `--sort-by` (both need `--kind`) change the
+Each Kind section names the axes it was computed on (`group_by`, `sort_by` — `null` means groups
+rank by count — and `identity`, naming what that count counts when it is not records). `--group-by` and `--sort-by` (both need `--kind`) change the
 question without touching the schema: the Kind declares the defaults, the query overrides them.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
 error rather than an empty answer.
@@ -152,7 +155,9 @@ map.spec = { from = "git_branch", capture = "^spec/(.+)$" }
 
 Per Kind: `fields` (the allow-list — anything else is dropped before write), `group_key` (what
 a report groups by), `measures` (numeric fields a report sums; first is the primary metric),
-`redact` (fields hashed before storage). Namespace plugin Kinds (`team.deploy`) so they can't
+`redact` (fields hashed before storage), `identity` (the field identifying the entity a record
+describes, when a lifecycle event fires more than once per entity; a report then counts entities,
+and such a Kind declares no measures). Namespace plugin Kinds (`team.deploy`) so they can't
 collide with core's flat names. Field-map transforms: `from` (a list tries each in order),
 `capture` (regex group 1), `len`, `present`, `basename`, `const`.
 

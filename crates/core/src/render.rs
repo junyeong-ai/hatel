@@ -375,6 +375,7 @@ mod tests {
             kind: kind.to_string(),
             group_by: "tool_name".to_string(),
             sort_by: Some("duration_ms".to_string()),
+            identity: None,
             project_scope: ProjectScope::Unrestricted,
             groups,
         }

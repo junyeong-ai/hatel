@@ -1173,3 +1173,93 @@ fn a_report_names_the_stored_kinds_no_loaded_schema_declares() {
     let reg = build_registry(&with_plugin).unwrap();
     assert!(build(&with_plugin, &reg).unreadable_kinds.is_none());
 }
+
+#[test]
+fn a_resumed_agent_counts_once_however_many_turns_it_stops_on() {
+    // SubagentStop marks a turn boundary, not a spawn: an agent resumed with a message stops
+    // again, and a teammate driven through a conversation stops on every turn. Counting records
+    // would report one agent that ran once as having run four times. `agent_id` is stable across
+    // those stops, so declaring it as the Kind's identity makes the spawn the unit.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for turn in 0..4 {
+        let mut event = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": "S", "cwd": "/tmp/x",
+            "agent_id": "a43e754af29bd6784", "agent_type": "general-purpose",
+            "turn": turn,
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].key, "general-purpose");
+    assert_eq!(groups[0].count, 1, "four stops, one agent");
+    assert_eq!(
+        hatel_core::sink::read_records(&cfg, "subagent", None).len(),
+        4,
+        "every observed stop is still stored — the deduplication is the query's, not the write's"
+    );
+}
+
+#[test]
+fn agents_without_an_identity_never_merge_into_one() {
+    // A record carrying no `agent_id` says nothing about being the same agent as another. Merging
+    // them under one bucket would undercount silently, which is the opposite failure from the
+    // over-count the identity fixes — so each counts as its own.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for _ in 0..3 {
+        let mut event = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": "S", "cwd": "/tmp/x",
+            "agent_type": "general-purpose",
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    assert_eq!(groups[0].count, 3);
+}
+
+#[test]
+fn an_identity_is_scoped_to_the_group_it_is_counted_in() {
+    // Deduplication happens per group, not across the report: were it global, which group kept an
+    // agent seen under two labels would depend on storage order, which the SQLite backend does not
+    // fix. Per group, both groups answer for what their own records say.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for agent in ["reviewer", "reviewer", "implementer"] {
+        let mut event = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": "S", "cwd": "/tmp/x",
+            "agent_id": "a1", "agent_type": agent,
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    assert_eq!(groups.len(), 2);
+    assert!(groups.iter().all(|g| g.count == 1));
+}
+
+#[test]
+fn an_identity_must_be_a_field_of_its_kind_and_exclude_measures() {
+    use hatel_core::registry::{KindSpec, KindSpecRaw};
+    let raw = |identity: Option<&str>, measures: Vec<String>| KindSpecRaw {
+        name: "k".into(),
+        fields: vec!["id".into(), "label".into(), "ms".into()],
+        group_key: "label".into(),
+        redact: vec![],
+        measures,
+        identity: identity.map(str::to_string),
+        receiver_sourced: false,
+    };
+    assert!(KindSpec::from_raw(raw(Some("id"), vec![])).is_ok());
+    assert!(
+        KindSpec::from_raw(raw(Some("agent_id"), vec![])).is_err(),
+        "an identity naming no field would silently count every record as its own entity"
+    );
+    // Several records per entity means several values per measure, and a schema has no way to say
+    // how they combine — so summing them would be a guess rather than an answer.
+    assert!(KindSpec::from_raw(raw(Some("id"), vec!["ms".into()])).is_err());
+    assert!(KindSpec::from_raw(raw(None, vec!["ms".into()])).is_ok());
+}
