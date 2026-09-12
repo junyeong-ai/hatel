@@ -164,9 +164,10 @@ fn build_report() -> Report {
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
 
+    let wiring = cs::event_wiring(&files, &events);
     let mut hooks = Section::new("hooks", "hooks:");
-    report_hooks(&mut hooks, &files, &events, &registry);
-    advise_dormant_bindings(&mut hooks, &files, &events, &cfg, &registry);
+    report_hooks(&mut hooks, &files, &wiring, &registry);
+    advise_dormant_bindings(&mut hooks, &wiring, &cfg, &registry);
     advise_unattributed_sessions(&mut hooks, &cfg);
 
     let mut storage = Section::new("storage", "storage:");
@@ -225,21 +226,21 @@ fn render_human(r: &Report) -> String {
 fn report_hooks(
     sec: &mut Section,
     files: &[cs::ScopeFile],
-    events: &[&'static str],
+    wiring: &[(&'static str, cs::Wiring)],
     registry: &hatel_core::Registry,
 ) {
-    let covered = cs::covered_events(files, events);
-    let total = events.len();
+    let covered = cs::covered(wiring);
+    let total = wiring.len();
     let managed_only = cs::managed_hooks_only(files);
 
     if covered.len() == total {
         sec.ok(format!("all {total} lifecycle events invoke `hatel-hook`"));
     } else if !covered.is_empty() {
         // Partial coverage, reported before the "blocked" case so it is never masked.
-        let missing: Vec<&str> = events
+        let missing: Vec<&str> = wiring
             .iter()
-            .copied()
-            .filter(|e| !covered.contains(e))
+            .filter(|(_, w)| *w == cs::Wiring::Missing)
+            .map(|(ev, _)| *ev)
             .collect();
         let remedy = if managed_only {
             "; deploy the rest as MANAGED hooks (allowManagedHooksOnly ignores lower scopes)"
@@ -264,6 +265,23 @@ fn report_hooks(
         };
         sec.fail(format!(
             "no hook invokes `hatel-hook` — events are not captured{remedy}"
+        ));
+    }
+
+    // Collection is not the only thing at stake: a hook wired before asynchronous wiring existed
+    // still records everything, but Claude Code waits for it every time the event fires. Nothing
+    // else would say so — coverage is complete — so an upgraded install would keep paying that
+    // latency indefinitely. A cost, not a gap: it warns rather than failing.
+    let blocking = wiring
+        .iter()
+        .filter(|(_, w)| *w == cs::Wiring::Blocking)
+        .map(|(ev, _)| *ev)
+        .collect::<Vec<_>>();
+    if !blocking.is_empty() {
+        sec.warn(format!(
+            "{} wired synchronously — the session waits for the hook each time; \
+             re-run `hatel init` to wire it asynchronously",
+            blocking.join(", ")
         ));
     }
 
@@ -333,8 +351,7 @@ fn report_registry(
 /// no signal when nothing has been running.
 fn advise_dormant_bindings(
     sec: &mut Section,
-    files: &[cs::ScopeFile],
-    events: &[&'static str],
+    wiring: &[(&'static str, cs::Wiring)],
     cfg: &Config,
     registry: &hatel_core::Registry,
 ) {
@@ -348,7 +365,7 @@ fn advise_dormant_bindings(
     }
     let mut bound_kinds: std::collections::BTreeMap<&str, Vec<&str>> =
         std::collections::BTreeMap::new();
-    for ev in cs::covered_events(files, events) {
+    for ev in cs::covered(wiring) {
         for binding in registry.bindings_for(ev) {
             bound_kinds
                 .entry(binding.kind.as_str())
@@ -657,6 +674,39 @@ mod tests {
             findings[0].message
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Complete coverage says nothing about what the coverage costs: a hook wired before
+    /// asynchronous wiring existed collects every event and delays the session on every one.
+    #[test]
+    fn wiring_that_blocks_the_session_warns_without_failing_the_exit_code() {
+        let registry = hatel_core::Registry::default();
+        let hooks = |wiring: &[(&'static str, cs::Wiring)]| {
+            let mut sec = Section::new("hooks", "hooks:");
+            report_hooks(&mut sec, &[], wiring, &registry);
+            sec.findings
+        };
+
+        let concurrent = hooks(&[
+            ("SessionStart", cs::Wiring::Concurrent),
+            ("PostToolUse", cs::Wiring::Concurrent),
+        ]);
+        assert_eq!(concurrent.len(), 1);
+        assert_eq!(concurrent[0].status, Status::Ok);
+
+        let blocking = hooks(&[
+            ("SessionStart", cs::Wiring::Blocking),
+            ("PostToolUse", cs::Wiring::Concurrent),
+        ]);
+        let warn = blocking
+            .iter()
+            .find(|f| f.status == Status::Warn)
+            .expect("a blocking hook is named");
+        assert!(warn.message.starts_with("SessionStart wired synchronously"));
+        assert!(
+            !blocking.iter().any(|f| f.status == Status::Fail),
+            "records still arrive, so it is a cost rather than a gap"
+        );
     }
 
     fn report_with(status: Status) -> Report {

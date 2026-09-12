@@ -47,6 +47,9 @@ hatel doctor               # verify and explain any gaps
   hatel drops session-less metrics rather than guess (org/user aggregation only survives at a
   downstream collector you forward the raw stream to). There is no fallback — report it as-is.
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
+- **… wired synchronously** (a warning, not a gap) → wiring written before the hook was wired
+  asynchronously. Every record still arrives, but Claude Code waits for the hook each time the
+  event fires; `hatel init` rewrites it.
 - **export forwards nothing / endpoint bypasses this receiver** → export only forwards what
   reaches hatel; the OTel endpoint must point at hatel. Run `hatel init --insert` (or, if the
   endpoint is managed-locked, only the hook ledger is available — report it as-is).
@@ -95,7 +98,8 @@ snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_tim
 `ts`, plus three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
 (tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
 one ran, its `agent` label being the declared type for a plain subagent and the given name for
-a teammate), `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
+a teammate; a row with no label is an agent Claude Code ran for itself, which spawns no
+transcript and calls no tools — report it as such, not as a subagent that went unnamed), `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
 (`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
 `cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
 such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —

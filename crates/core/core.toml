@@ -137,7 +137,9 @@ map.load_reason = { from = "load_reason" }
 # a report counts. `agent` is the label the event carries: the declared type for a plain subagent,
 # the operator's name for a teammate (Claude Code puts the name in that field and exposes the
 # declared type nowhere a hook can read), so it is recorded as the label it is rather than
-# asserted to be a type.
+# asserted to be a type. Claude Code also runs agents of its own through this event — they carry
+# no `agent_type`, so their records group under the empty label rather than being mistaken for a
+# subagent the conversation spawned.
 [[binding]]
 event = "SubagentStop"
 kind = "subagent"
@@ -146,10 +148,6 @@ map.prompt_id = { from = "prompt_id" }
 map.agent_id = { from = "agent_id" }
 map.agent = { from = "agent_type" }
 
-# One compaction fires both PreCompact and PostCompact, so only one is bound — one
-# record per compaction. PreCompact is chosen because it always fires (a compaction
-# that is interrupted may never reach PostCompact). The trigger key name is not fixed
-# in the docs, so both known spellings are tried.
 [[binding]]
 event = "UserPromptExpansion"
 kind = "command"
@@ -157,6 +155,10 @@ map.session_id = { from = "session_id" }
 map.prompt_id = { from = "prompt_id" }
 map.command_name = { from = "command_name" }
 
+# One compaction fires both PreCompact and PostCompact, so only one is bound — one
+# record per compaction. PreCompact is chosen because it always fires (a compaction
+# that is interrupted may never reach PostCompact). The trigger key name is not fixed
+# in the docs, so both known spellings are tried.
 [[binding]]
 event = "PreCompact"
 kind = "compaction"

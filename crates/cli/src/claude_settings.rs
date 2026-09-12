@@ -272,31 +272,73 @@ fn scope_wires_hook(f: &ScopeFile) -> bool {
         .unwrap_or(false)
 }
 
-/// Which of the canonical `EVENTS` our hook is wired for, counting only scopes whose hooks
-/// Claude Code actually honors (under `allowManagedHooksOnly`, just the managed scope). `doctor`
-/// compares this to `EVENTS` so partial coverage — most lifecycle events silently uncaptured — is
-/// reported rather than passing as fully wired on the strength of a single event.
-pub fn covered_events(files: &[ScopeFile], events: &[&'static str]) -> Vec<&'static str> {
+/// How one lifecycle event is wired, across the scopes Claude Code honors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wiring {
+    /// No entry of ours — the event is not captured.
+    Missing,
+    /// Ours, but at least one entry runs synchronously: Claude Code waits for the hook every time
+    /// the event fires. Records still arrive, so this is a cost, not a gap.
+    Blocking,
+    /// Every entry of ours runs without the session waiting on it.
+    Concurrent,
+}
+
+/// How each of `events` is wired, counting only scopes whose hooks Claude Code actually honors
+/// (under `allowManagedHooksOnly`, just the managed scope). One traversal answers both questions
+/// asked of the wiring — whether the event is captured, and whether capturing it delays the
+/// session — so the two can never drift apart. Partial coverage is therefore reported rather than
+/// passing as fully wired on the strength of a single event.
+pub fn event_wiring(files: &[ScopeFile], events: &[&'static str]) -> Vec<(&'static str, Wiring)> {
     let managed_only = managed_hooks_only(files);
     events
         .iter()
         .copied()
-        .filter(|ev| {
-            files
+        .map(|ev| {
+            let ours = files
                 .iter()
-                .any(|f| (!managed_only || f.name == "managed") && scope_event_has_hook(f, ev))
+                .filter(|f| !managed_only || f.name == "managed")
+                .flat_map(|f| scope_event_entries(f, ev))
+                .filter(|e| entry_is_our_hook(e));
+            let mut wired = false;
+            let mut blocking = false;
+            for entry in ours {
+                wired = true;
+                // A second scope wiring the same event asynchronously does not undo the wait the
+                // blocking one imposes, so any blocking entry decides the event.
+                blocking |= !entry_is_async(entry);
+            }
+            let w = match (wired, blocking) {
+                (false, _) => Wiring::Missing,
+                (true, true) => Wiring::Blocking,
+                (true, false) => Wiring::Concurrent,
+            };
+            (ev, w)
         })
         .collect()
 }
 
-/// Whether a scope wires our hook for one specific event.
-fn scope_event_has_hook(f: &ScopeFile, ev: &str) -> bool {
+/// The events of `wiring` that are captured at all, whatever it costs to capture them.
+pub fn covered(wiring: &[(&'static str, Wiring)]) -> Vec<&'static str> {
+    wiring
+        .iter()
+        .filter(|(_, w)| *w != Wiring::Missing)
+        .map(|(ev, _)| *ev)
+        .collect()
+}
+
+/// Every hook entry configured for one event in one scope, groups flattened — the granularity at
+/// which both "is it ours" and "does it block" are decided.
+fn scope_event_entries<'a>(f: &'a ScopeFile, ev: &str) -> impl Iterator<Item = &'a Value> {
     f.load
         .value()
         .and_then(|v| v.get("hooks"))
         .and_then(|h| h.get(ev))
         .and_then(|e| e.as_array())
-        .is_some_and(|groups| event_array_has_hook(groups))
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+        .flatten()
 }
 
 /// Whether a blocked (non-managed) scope wires the hook while managed-only is in force.
@@ -388,12 +430,19 @@ fn command_is_our_hook(command: &str) -> bool {
     }
 }
 
+/// Whether an entry runs without the session waiting on it. Claude Code reads a missing `async`
+/// as false, so an entry written before asynchronous wiring reads as blocking — which is what it
+/// is. This is the one part of the wiring's shape that holds regardless of which install owns it,
+/// so it is what `doctor` judges; `wire` adds the path on top, because it writes for one install.
+fn entry_is_async(entry: &Value) -> bool {
+    entry.get("async").and_then(Value::as_bool) == Some(true)
+}
+
 /// Whether one entry is the wiring this version writes — the command and the `async` flag both.
 /// An entry of ours that differs in either is stale (the binary moved, or it predates asynchronous
 /// wiring) and is replaced rather than left in place.
 fn entry_is_current(entry: &Value, command: &str) -> bool {
-    entry.get("command").and_then(|c| c.as_str()) == Some(command)
-        && entry.get("async").and_then(Value::as_bool) == Some(true)
+    entry.get("command").and_then(|c| c.as_str()) == Some(command) && entry_is_async(entry)
 }
 
 /// Whether a group holds the current wiring.
@@ -555,7 +604,7 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
             // Walk the whole vocabulary so a re-run converges to *exactly* the active set: ensure
             // our hook on active events, and strip it from inactive ones — otherwise an upgrade that
             // drops an event (a Kind losing its binding) would leave the hook firing on it for no
-            // record, which `covered_events` (scoped to the active set) couldn't even see.
+            // record, which `event_wiring` (scoped to the active set) couldn't even see.
             let mut pruned_empty: Vec<&'static str> = Vec::new();
             for ev in EVENTS {
                 let active = events.contains(&ev);
@@ -1113,24 +1162,81 @@ mod tests {
     }
 
     #[test]
-    fn covered_events_reports_partial_wiring() {
+    fn partial_wiring_leaves_the_rest_missing() {
         let files = one_scope(json!({
             "hooks": {
                 "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }],
                 "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": CMD }] }]
             }
         }));
-        let covered = covered_events(&files, &EVENTS);
+        let covered = covered(&event_wiring(&files, &EVENTS));
         assert_eq!(covered.len(), 2);
         assert!(covered.contains(&"SessionStart") && covered.contains(&"UserPromptSubmit"));
         assert!(!covered.contains(&"SessionEnd"));
     }
 
     #[test]
-    fn covered_events_is_complete_after_wire() {
+    fn wire_leaves_every_event_covered_and_none_blocking() {
         let mut s = json!({});
         wire(&mut s, CMD, &EVENTS);
-        assert_eq!(covered_events(&one_scope(s), &EVENTS).len(), EVENTS.len());
+        let wiring = event_wiring(&one_scope(s), &EVENTS);
+        assert_eq!(covered(&wiring).len(), EVENTS.len());
+        assert!(wiring.iter().all(|(_, w)| *w == Wiring::Concurrent));
+    }
+
+    /// Wiring written before `async` existed still collects everything, so coverage alone reports
+    /// it as healthy — the state every upgraded install is in until `init` runs again.
+    #[test]
+    fn wiring_that_predates_async_is_covered_but_blocking() {
+        let files = one_scope(json!({
+            "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }] }
+        }));
+        let wiring = event_wiring(&files, &EVENTS);
+        assert_eq!(covered(&wiring), vec!["SessionStart"]);
+        assert_eq!(
+            wiring
+                .iter()
+                .find(|(ev, _)| *ev == "SessionStart")
+                .unwrap()
+                .1,
+            Wiring::Blocking
+        );
+    }
+
+    /// Two scopes can wire the same event, and both hooks run — so an asynchronous entry beside a
+    /// blocking one does not spare the session the wait the blocking one imposes.
+    #[test]
+    fn a_blocking_entry_decides_an_event_another_scope_wires_asynchronously() {
+        let files = vec![
+            scope(
+                "user",
+                json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": CMD }] }] } }),
+            ),
+            scope(
+                "project",
+                json!({ "hooks": { "SessionStart": [hook_group(CMD)] } }),
+            ),
+        ];
+        assert_eq!(
+            event_wiring(&files, &["SessionStart"]),
+            vec![("SessionStart", Wiring::Blocking)]
+        );
+    }
+
+    /// Only our own entries are judged: a user's synchronous hook sharing the event is their
+    /// business, and reading it as ours would send them to `hatel init` for something it cannot fix.
+    #[test]
+    fn a_foreign_synchronous_hook_does_not_make_our_wiring_blocking() {
+        let files = one_scope(json!({
+            "hooks": { "SessionStart": [
+                { "hooks": [{ "type": "command", "command": "/usr/local/bin/their-hook" }] },
+                hook_group(CMD)
+            ] }
+        }));
+        assert_eq!(
+            event_wiring(&files, &["SessionStart"]),
+            vec![("SessionStart", Wiring::Concurrent)]
+        );
     }
 
     fn scope(name: &'static str, v: Value) -> ScopeFile {
@@ -1151,7 +1257,7 @@ mod tests {
             scope("managed", json!({ "allowManagedHooksOnly": true })),
         ];
         // the user hook is configured but blocked, so it covers nothing and is flagged distinctly
-        assert!(covered_events(&files, &EVENTS).is_empty());
+        assert!(covered(&event_wiring(&files, &EVENTS)).is_empty());
         assert!(hook_wired_but_blocked(&files));
     }
 
@@ -1160,7 +1266,7 @@ mod tests {
         let mut managed = json!({ "allowManagedHooksOnly": true });
         wire(&mut managed, CMD, &EVENTS);
         let files = vec![scope("managed", managed)];
-        assert_eq!(covered_events(&files, &EVENTS).len(), EVENTS.len());
+        assert_eq!(covered(&event_wiring(&files, &EVENTS)).len(), EVENTS.len());
         assert!(!hook_wired_but_blocked(&files));
     }
 
