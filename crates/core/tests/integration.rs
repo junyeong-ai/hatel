@@ -149,22 +149,6 @@ fn duplicate_kind_is_a_hard_error() {
 }
 
 #[test]
-fn hook_binding_to_a_receiver_sourced_kind_is_rejected() {
-    // `tool` is written by the receiver from the native `tool_result` event. A plugin that also
-    // hook-binds it would double-write the Kind — the registry must reject the binding loudly,
-    // rather than silently produce two records per tool call.
-    let dir = temp_dir();
-    let plugin = dir.join("dbl.toml");
-    std::fs::write(
-        &plugin,
-        "[[binding]]\nevent = \"PostToolUse\"\nkind = \"tool\"\nmap.session_id = { from = \"session_id\" }\n",
-    )
-    .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("receiver-sourced"), "got: {err}");
-}
-
-#[test]
 fn bound_events_surfaces_an_out_of_vocabulary_binding() {
     // Core accepts a binding to any event string (it doesn't own the wiring vocabulary); the
     // registry surfaces every bound event so the CLI can flag one it can't wire, rather than let
@@ -183,22 +167,6 @@ fn bound_events_surfaces_an_out_of_vocabulary_binding() {
         bound.contains(&"PreToolUse"),
         "bound events include the out-of-vocab one: {bound:?}"
     );
-}
-
-#[test]
-fn a_plugin_kind_cannot_declare_receiver_sourced() {
-    // `receiver_sourced` is core-only: the receiver writes only Kinds it has a native handler for,
-    // so a plugin declaring it would create a Kind nothing ever writes (and that can't be
-    // hook-bound either) — a dead extension point. Reject it loudly at load.
-    let dir = temp_dir();
-    let plugin = dir.join("rs.toml");
-    std::fs::write(
-        &plugin,
-        "[[kind]]\nname = \"team.native\"\nfields = [\"session_id\"]\ngroup_key = \"session_id\"\nreceiver_sourced = true\n",
-    )
-    .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
-    assert!(format!("{err}").contains("core-only"), "got: {err}");
 }
 
 #[test]
@@ -1251,7 +1219,6 @@ fn an_identity_must_name_a_field_of_its_kind() {
         redact: vec![],
         measures: vec!["ms".into()],
         identity: identity.map(str::to_string),
-        receiver_sourced: false,
     };
     assert!(KindSpec::from_raw(raw(Some("id"))).is_ok());
     assert!(
@@ -1379,4 +1346,91 @@ measures = ["ms"]
     );
     assert_eq!(jsonl[0].count, sqlite[0].count);
     assert_eq!(jsonl[0].sums[0].sum, sqlite[0].sums[0].sum);
+}
+
+#[test]
+fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
+    // Only a subagent's call carries `agent_id`, so its absence names the main agent. Without the
+    // field a session's tool counts are one undifferentiated total, which is what hides delegated
+    // work inside the figure for the session that delegated it.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let call = |use_id: &str, agent: Option<&str>| {
+        let mut event = serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/x",
+            "tool_name": "Bash", "tool_use_id": use_id, "prompt_id": "P", "duration_ms": 12,
+        });
+        if let Some(a) = agent {
+            event["agent_id"] = serde_json::Value::from(a);
+        }
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    };
+    call("t1", None);
+    call("t2", Some("a9"));
+    call("t3", Some("a9"));
+    let groups = report::aggregate(
+        &reg,
+        &cfg,
+        "tool",
+        &report::Query {
+            group_by: Some("agent_id"),
+            ..query(0, 0, None)
+        },
+    );
+    let by_key: std::collections::BTreeMap<&str, i64> =
+        groups.iter().map(|g| (g.key.as_str(), g.count)).collect();
+    assert_eq!(by_key.get("a9"), Some(&2), "the subagent's two calls");
+    assert_eq!(
+        by_key.get("—"),
+        Some(&1),
+        "the main agent's call carries no agent_id and is not invented one"
+    );
+}
+
+#[test]
+fn a_failed_call_and_a_returning_one_land_in_the_same_kind() {
+    // A tool call fires exactly one of PostToolUse / PostToolUseFailure, so the two bindings write
+    // one record per call and `ok` tells them apart. Summing `ok` over a group is its success count.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for (event_name, use_id) in [
+        ("PostToolUse", "t1"),
+        ("PostToolUse", "t2"),
+        ("PostToolUseFailure", "t3"),
+    ] {
+        let mut event = serde_json::json!({
+            "hook_event_name": event_name, "session_id": "S", "cwd": "/tmp/x",
+            "tool_name": "Bash", "tool_use_id": use_id, "duration_ms": 10,
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].key, "Bash");
+    assert_eq!(groups[0].count, 3, "three calls");
+    let ok = groups[0].sums.iter().find(|m| m.name == "ok").unwrap();
+    assert_eq!(ok.sum, 2.0, "two of the three returned");
+}
+
+#[test]
+fn one_call_delivered_twice_counts_once() {
+    // A repository that binds the hook on top of the user's settings delivers each event twice.
+    // `tool_use_id` identifies the call itself, so the second delivery joins the call it repeats.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for _ in 0..2 {
+        let mut event = serde_json::json!({
+            "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/x",
+            "tool_name": "Read", "tool_use_id": "t1", "duration_ms": 7,
+        });
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
+    assert_eq!(groups[0].count, 1);
+    let ms = groups[0]
+        .sums
+        .iter()
+        .find(|m| m.name == "duration_ms")
+        .unwrap();
+    assert_eq!(ms.sum, 7.0, "the duplicate does not double the duration");
 }

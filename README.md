@@ -46,8 +46,8 @@ flowchart LR
 
 | | 무엇을 주나 | 왜 필요한가 |
 |---|---|---|
-| **① 네이티브 OTel** (push) | 토큰·비용·활성시간·라인, 서브에이전트 귀속(`agent.name`), 도구별 소요/성공 | 정확한 숫자. 단, 와이어에 **프로젝트가 없음** |
-| **② 훅** (event) | 프로젝트(`cwd`), 프롬프트 크기, 메모리 로드, 서브에이전트 종료, 압축 | "어느 프로젝트·무슨 일"의 맥락 |
+| **① 네이티브 OTel** (push) | 토큰·비용·활성시간·라인, 서브에이전트 귀속(`agent.name`) | 정확한 숫자. 단, 와이어에 **프로젝트가 없음** |
+| **② 훅** (event) | 프로젝트(`cwd`), 세션 시작과 재개 비용, 프롬프트 크기, 메모리 로드, 도구 호출, 서브에이전트, 압축 | "어느 프로젝트·무슨 일"의 맥락 |
 
 > **핵심**: ①의 숫자엔 프로젝트 라벨이 없습니다. hatel이 ②의 세션→프로젝트 매핑을 `session.id`로 조인해 **프로젝트별 귀속**을 만듭니다. 그래서 `acme-api`가 토큰을 얼마 썼는지가 한 줄로 나옵니다.
 
@@ -132,7 +132,7 @@ hatel report --window 30d
 **읽는 법:**
 
 - 모든 섹션은 자신의 축을 밝힙니다 — **`by <차원>, ranked by <측정값>`**. 그 섹션이 답하는 질문이며, 양쪽 다 `--group-by` / `--sort-by`로 바꿀 수 있습니다.
-- **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다.
+- **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다. `--group-by agent_id`는 위임된 호출을 갈라 보여주고(값이 없는 행이 메인 에이전트입니다), `--group-by prompt_id`는 한 요청이 유발한 작업량을 묶습니다.
 - **`session`** 섹션은 세션이 어떻게 시작됐는지(`startup`·`resume`·`fork`)와, 재개가 프롬프트 캐시를 다시 세우는 데 든 비용입니다. `/resume`은 같은 세션을 다시 시작하므로 한 세션이 여러 번 집계되며, 이 비용은 세션 총계 어디에도 나타나지 않습니다. `cache_likely_expired`로 묶으면 피할 수 있었던 지출이 갈립니다.
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다.
@@ -294,7 +294,7 @@ hatel init --print         # 쓰지 않고 블록만 출력(managed/org 설정�
 hatel init --remove        # 깔끔히 해제(네이티브 텔레메트리 env는 남김)
 ```
 
-`init`은 **로드된 Kind가 소비하는 이벤트만** 연결합니다(세션→프로젝트 인덱스를 위해 `SessionStart`는 항상). 도구 호출은 여기 없습니다 — 도구의 소요·성공은 훅이 아니라 네이티브 `tool_result` 이벤트에서 옵니다.
+`init`은 **로드된 Kind가 소비하는 이벤트만** 연결합니다(세션→프로젝트 인덱스를 위해 `SessionStart`는 항상). 어떤 Kind도 바인딩하지 않는 이벤트는 연결되지 않으므로, 훅이 기록 없이 실행되는 일이 없습니다.
 
 Claude Code 자신의 텔레메트리 설정은 `settings.json`의 `env`에 있어야 합니다 — 그게 Claude Code가 세션 시작 시 읽는 유일한 채널이고, 그 `OTEL_*` 변수는 의도적으로 훅 서브프로세스에 **전달되지 않습니다**. 두 레이어가 분리된 이유가 바로 이것입니다. 전체 형태:
 
@@ -373,7 +373,7 @@ memory         group_key=memory_id    fields=[load_reason, memory_id, memory_typ
 prompt         group_key=session_id   fields=[project, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
-tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 ```
 
 원장에 있으나 어떤 로드된 스키마도 선언하지 않는 Kind가 있으면 목록 뒤에 한 줄이 더 붙습니다 — 질문한 것("무엇을 조회할 수 있나")에 대한 정직한 답의 나머지 절반입니다. `--json`은 같은 사실을 `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`로 내고, 공백이 없으면 `unreadable_kinds`는 `null`입니다:
@@ -381,7 +381,7 @@ tool           group_key=tool_name    fields=[duration_ms, ok, project, session_
 ```text
 $ hatel kinds
 ...
-tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 
 the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
 ```
@@ -555,7 +555,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | 증상 | 원인 / 해결 |
 |---|---|
 | **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
-| **`prompt`·`subagent`는 잡히는데 `cost`·`tokens`·`tool`이 비어있음** | 이 셋은 전부 **수신기**를 거쳐 옵니다 — 비용·토큰은 네이티브 OTel 메트릭, `tool`은 네이티브 `tool_result` 이벤트입니다. 훅 원장(`prompt`·`subagent`·`memory`·`compaction`)은 수신기 없이도 쌓이지만, 이 셋은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
+| **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
 | **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`는 `agent_id`로 생성을 세므로 영향을 받지 않습니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |

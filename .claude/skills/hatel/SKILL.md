@@ -132,8 +132,7 @@ makes the write and read paths agree — `HATEL_PLUGINS` overrides the list for 
 so a Kind registered that way is invisible to any command run without it. `doctor`, `kinds`,
 `report`, and the error from `--kind <that name>` all name such a Kind and the surface where its
 schema would be listed — listing it there is the fix. **Choose the path by where the signal
-originates, and keep one writer per Kind** (a Kind written by both paths double-counts; a
-receiver-sourced Kind like `tool` is refused by `emit` outright, exit 2):
+originates, and keep one writer per Kind** — a Kind written by both paths double-counts:
 
 - A signal the Claude Code lifecycle can observe → a **hook binding** (zero code,
   auto-attributed to the session's project).

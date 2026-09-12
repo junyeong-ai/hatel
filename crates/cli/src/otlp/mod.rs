@@ -4,7 +4,7 @@ pub mod accumulator;
 pub mod decode;
 
 pub use accumulator::{Accumulator, SessionTotals, UNATTRIBUTED};
-pub use decode::{ToolResult, parse_logs, parse_metrics};
+pub use decode::{parse_logs, parse_metrics};
 
 /// The datapoint / log-record attribute carrying the Claude Code session id — the join key the
 /// receiver attributes on. Read identically by the typed decode and the lossless export walker, so

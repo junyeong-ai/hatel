@@ -221,15 +221,6 @@ pub(crate) fn emit_record(
     if reg.kind(kind).is_none() {
         return Err(EmitError::Rejected(unknown_kind(kind, &reg, &cfg)));
     }
-    // A receiver-sourced Kind (e.g. `tool`, written from native OTel) has a single writer by
-    // design — emitting one by hand would interleave fabricated records with the real stream, so
-    // refuse it here the same way `bind` refuses a hook binding to it.
-    if reg.kind(kind).is_some_and(|s| s.receiver_sourced) {
-        return Err(EmitError::Rejected(format!(
-            "{kind:?} is receiver-sourced (written from native OTel) — it has a single writer \
-             and cannot be emitted by hand"
-        )));
-    }
     let payload = payload().map_err(EmitError::Rejected)?;
     // Warn loudly on a field the Kind doesn't accept — on the emit path the caller
     // chose it, so a silent allow-list drop (correct for automatic hooks) would just
@@ -538,7 +529,6 @@ pub(crate) fn kinds_value(
                 "redact": s.redact,
                 "measures": s.measures,
                 "identity": s.identity,
-                "receiver_sourced": s.receiver_sourced,
             })
         })
         .collect();

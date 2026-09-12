@@ -65,53 +65,27 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
     Ok(out)
 }
 
-/// One decoded `tool_result` event: a single tool call's outcome. This is the only OTel signal
-/// carrying a tool's wall-clock `duration_ms` and `success`, so the `tool` Kind is sourced here
-/// rather than from the (duration/outcome-less) `PostToolUse` hook.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolResult {
-    pub session_id: String,
-    pub tool_name: String,
-    pub duration_ms: i64,
-    pub ok: bool,
-}
-
-/// Everything the receiver folds from one logs body: per-call `tool_result` outcomes and the
-/// counted-event `(session_id, normalized_name)` pairs. Both come from a single deserialize and a
-/// single walk of the records — the body is decoded once, not once per consumer.
-#[derive(Debug, Default, PartialEq)]
-pub struct LogsDecoded {
-    pub tool_results: Vec<ToolResult>,
-    pub events: Vec<(String, String)>,
-}
-
-/// Decode one OTLP/JSON logs body. Names are normalized by stripping the `claude_code.` prefix so a
-/// match holds whether the wire form is prefixed or bare. A record yields a `ToolResult` when it is
-/// a `tool_result` carrying both identifying fields (`session.id`, `tool_name`) — `duration_ms` and
-/// `success` are read leniently (proto3-JSON may encode them as number, string, or bool), and an
-/// absent `success` is a success (a `tool_result` fires on completion, so its absence is a missing
-/// annotation, never evidence of failure). A record yields a counted-event pair when its
-/// (normalized) `event.name` is in `counted` and it carries a `session.id`.
-pub fn parse_logs(bytes: &[u8], counted: &BTreeSet<String>) -> Result<LogsDecoded, String> {
+/// Decode one OTLP/JSON logs body into counted-event `(session_id, normalized_name)` pairs. Names
+/// are normalized by stripping the `claude_code.` prefix so a match holds whether the wire form is
+/// prefixed or bare. A record yields a pair when its normalized `event.name` is in `counted` and it
+/// carries a `session.id`.
+pub fn parse_logs(
+    bytes: &[u8],
+    counted: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
     let req: LogsRequest =
         serde_json::from_slice(bytes).map_err(|e| format!("invalid OTLP/JSON logs body: {e}"))?;
     let counted: BTreeSet<&str> = counted.iter().map(|s| normalize(s)).collect();
-    let mut out = LogsDecoded::default();
+    let mut out = Vec::new();
     for rl in &req.resource_logs {
         for sl in &rl.scope_logs {
             for record in &sl.log_records {
                 let mut event = String::new();
                 let mut session = String::new();
-                let mut tool = String::new();
-                let mut duration = 0i64;
-                let mut ok = true;
                 for kv in &record.attributes {
                     match kv.key.as_str() {
                         "event.name" => event = kv.value.as_string(),
                         super::SESSION_ID => session = kv.value.as_string(),
-                        "tool_name" => tool = kv.value.as_string(),
-                        "duration_ms" => duration = kv.value.as_f64() as i64,
-                        "success" => ok = kv.value.as_bool(),
                         _ => {}
                     }
                 }
@@ -119,37 +93,14 @@ pub fn parse_logs(bytes: &[u8], counted: &BTreeSet<String>) -> Result<LogsDecode
                     continue;
                 }
                 let name = normalize(&event);
-                // A record is independently a per-call `tool_result` outcome and/or a counted event
-                // — `tool_result` has no privileged status, so a config that ever counts it is
-                // honoured, exactly as the two source signals this merged. The session id is moved
-                // into whichever consumes it; it is cloned only when (by such a config) both do.
-                let is_tool = name == "tool_result" && !tool.is_empty();
-                let is_counted = counted.contains(name);
-                match (is_tool, is_counted) {
-                    (true, true) => {
-                        out.events.push((session.clone(), name.to_string()));
-                        out.tool_results.push(ToolResult {
-                            session_id: session,
-                            tool_name: tool,
-                            duration_ms: duration,
-                            ok,
-                        });
-                    }
-                    (true, false) => out.tool_results.push(ToolResult {
-                        session_id: session,
-                        tool_name: tool,
-                        duration_ms: duration,
-                        ok,
-                    }),
-                    (false, true) => out.events.push((session, name.to_string())),
-                    (false, false) => {}
+                if counted.contains(name) {
+                    out.push((session, name.to_string()));
                 }
             }
         }
     }
     Ok(out)
 }
-
 pub fn normalize(event: &str) -> &str {
     event.strip_prefix("claude_code.").unwrap_or(event)
 }
@@ -308,30 +259,6 @@ impl AnyValue {
         }
         String::new()
     }
-
-    /// Numeric value of an attribute, accepting proto3-JSON's number-or-string encodings
-    /// (`duration_ms` may arrive as `intValue:"23"` or `doubleValue:23`).
-    fn as_f64(&self) -> f64 {
-        if let Some(i) = &self.int_value {
-            return json_to_f64(i);
-        }
-        if let Some(d) = self.double_value {
-            return d;
-        }
-        self.string_value
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
-    }
-
-    /// Boolean value of an attribute, accepting a JSON bool or the string `"true"` (proto3-JSON
-    /// may encode `success` either way).
-    fn as_bool(&self) -> bool {
-        if let Some(b) = self.bool_value {
-            return b;
-        }
-        self.string_value.as_deref() == Some("true")
-    }
 }
 
 #[cfg(test)]
@@ -368,101 +295,6 @@ mod tests {
         assert_eq!(
             points[0].series,
             vec![("type".to_string(), "output".to_string())]
-        );
-    }
-
-    #[test]
-    fn tool_result_decodes_duration_and_outcome() {
-        let body = serde_json::json!({
-            "resourceLogs": [{ "scopeLogs": [{ "logRecords": [
-                { "attributes": [
-                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
-                    {"key": "session.id", "value": {"stringValue": "S1"}},
-                    {"key": "tool_name", "value": {"stringValue": "Bash"}},
-                    {"key": "duration_ms", "value": {"intValue": "23"}},
-                    {"key": "success", "value": {"boolValue": true}}
-                ]},
-                { "attributes": [
-                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
-                    {"key": "session.id", "value": {"stringValue": "S1"}},
-                    {"key": "tool_name", "value": {"stringValue": "Edit"}},
-                    {"key": "duration_ms", "value": {"doubleValue": 5.0}},
-                    {"key": "success", "value": {"stringValue": "false"}}
-                ]},
-                // A non-tool_result event is ignored.
-                { "attributes": [
-                    {"key": "event.name", "value": {"stringValue": "claude_code.tool_decision"}},
-                    {"key": "session.id", "value": {"stringValue": "S1"}}
-                ]}
-            ]}]}]
-        })
-        .to_string();
-        let r = parse_logs(body.as_bytes(), &BTreeSet::new())
-            .unwrap()
-            .tool_results;
-        assert_eq!(r.len(), 2);
-        assert_eq!(
-            r[0],
-            ToolResult {
-                session_id: "S1".into(),
-                tool_name: "Bash".into(),
-                duration_ms: 23,
-                ok: true
-            }
-        );
-        assert_eq!(
-            r[1],
-            ToolResult {
-                session_id: "S1".into(),
-                tool_name: "Edit".into(),
-                duration_ms: 5,
-                ok: false
-            }
-        );
-    }
-
-    #[test]
-    fn tool_result_without_success_attribute_is_a_success() {
-        // `tool_result` fires on completion; a missing `success` is a missing annotation, not a
-        // failure — never fabricate a failure.
-        let body = serde_json::json!({
-            "resourceLogs": [{ "scopeLogs": [{ "logRecords": [{ "attributes": [
-                {"key": "event.name", "value": {"stringValue": "tool_result"}},
-                {"key": "session.id", "value": {"stringValue": "S1"}},
-                {"key": "tool_name", "value": {"stringValue": "Read"}},
-                {"key": "duration_ms", "value": {"intValue": "9"}}
-            ]}]}]}]
-        })
-        .to_string();
-        let r = parse_logs(body.as_bytes(), &BTreeSet::new())
-            .unwrap()
-            .tool_results;
-        assert_eq!(r.len(), 1);
-        assert!(r[0].ok, "absent success defaults to ok");
-    }
-
-    #[test]
-    fn a_tool_result_that_is_also_counted_yields_both_an_outcome_and_an_event() {
-        // `tool_result` has no privileged status: if a config lists it among counted events, the
-        // one record is recorded as a tool outcome AND tallied as an event — the independent
-        // behaviour of the two signals this decode merged.
-        let counted: BTreeSet<String> = ["tool_result"].iter().map(|s| s.to_string()).collect();
-        let body = serde_json::json!({
-            "resourceLogs": [{ "scopeLogs": [{ "logRecords": [{ "attributes": [
-                {"key": "event.name", "value": {"stringValue": "claude_code.tool_result"}},
-                {"key": "session.id", "value": {"stringValue": "S1"}},
-                {"key": "tool_name", "value": {"stringValue": "Bash"}},
-                {"key": "duration_ms", "value": {"intValue": "7"}}
-            ]}]}]}]
-        })
-        .to_string();
-        let d = parse_logs(body.as_bytes(), &counted).unwrap();
-        assert_eq!(d.tool_results.len(), 1, "recorded as a tool outcome");
-        assert_eq!(d.tool_results[0].tool_name, "Bash");
-        assert_eq!(
-            d.events,
-            vec![("S1".to_string(), "tool_result".to_string())],
-            "and tallied as a counted event"
         );
     }
 
@@ -547,7 +379,7 @@ mod tests {
             }]}]}]
         })
         .to_string();
-        let pairs = parse_logs(body.as_bytes(), &counted).unwrap().events;
+        let pairs = parse_logs(body.as_bytes(), &counted).unwrap();
         assert_eq!(
             pairs,
             vec![("S1".to_string(), "skill_activated".to_string())]
@@ -565,7 +397,7 @@ mod tests {
         assert!(parse_metrics(b"{}", &tracked()).unwrap().is_empty());
         assert_eq!(
             parse_logs(b"{}", &BTreeSet::new()).unwrap(),
-            LogsDecoded::default()
+            Vec::<(String, String)>::new()
         );
     }
 }

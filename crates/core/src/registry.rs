@@ -29,10 +29,6 @@ pub struct KindSpec {
     /// Declared, a report counts distinct values of it per group and represents each entity by
     /// its first record, measures included.
     pub identity: Option<String>,
-    /// Whether this Kind is written by the receiver from a native OTel signal (e.g. `tool` from
-    /// `tool_result`) rather than by the hook. Such a Kind must not have a hook binding — that would
-    /// give it two writers and double-count it — so `bind` rejects one.
-    pub receiver_sourced: bool,
 }
 
 /// The raw, deserialized form of a `[[kind]]` table before validation.
@@ -48,8 +44,6 @@ pub struct KindSpecRaw {
     pub measures: Vec<String>,
     #[serde(default)]
     pub identity: Option<String>,
-    #[serde(default)]
-    pub receiver_sourced: bool,
 }
 
 /// A Kind name is also a JSONL filename component, so it is restricted to a safe
@@ -99,7 +93,6 @@ impl KindSpec {
             redact,
             measures: raw.measures,
             identity: raw.identity,
-            receiver_sourced: raw.receiver_sourced,
         })
     }
 }
@@ -268,15 +261,6 @@ impl Registry {
                 binding.event
             )));
         };
-        // A receiver-sourced Kind (e.g. `tool`, written from the native `tool_result` event) must
-        // have exactly one writer; a hook binding would double-count it, so reject it loudly.
-        if spec.receiver_sourced {
-            return Err(invalid(format!(
-                "binding for event '{}' targets receiver-sourced kind '{}' — it is written from \
-                 native OTel and cannot be hook-bound",
-                binding.event, binding.kind
-            )));
-        }
         // Every output field a binding writes must be allow-listed by the target Kind,
         // and every capture regex must compile — both checked here, loudly, at startup,
         // rather than silently dropping a mistyped field or a bad pattern at event time.

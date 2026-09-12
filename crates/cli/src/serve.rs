@@ -7,7 +7,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,16 +18,12 @@ use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
-use hatel_core::sink::build_sink;
 use hatel_core::{
-    Config, ExportConfig, Payload, Registry, SessionIndex, SessionIndexCache, make_envelope,
-    now_iso_utc, resolve_project,
+    Config, ExportConfig, SessionIndex, SessionIndexCache, now_iso_utc, resolve_project,
 };
 
 use crate::export::{Exporter, OtlpSignal};
-use crate::otlp::{
-    Accumulator, SessionTotals, ToolResult, UNATTRIBUTED, parse_logs, parse_metrics,
-};
+use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the retention sweep repeats while serving (it also runs once at startup). Daily is
@@ -40,42 +35,13 @@ const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// OTLP/HTTP body cap. Far above any real batch (axum's 2 MB default would silently
 /// 413 a large export and lose it), but bounded so a runaway body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-/// Cap on tool outcomes buffered between flushes — a memory backstop (like the export queue's byte
-/// cap) so a stalled `persist` can't grow the buffer without bound. Far above a realistic 30s burst.
-const MAX_TOOL_BUFFER: usize = 100_000;
-/// Re-log the cumulative tool-buffer drop count once per this many drops (throttled, not per-drop).
-const TOOL_DROP_LOG_EVERY: u64 = 1_000;
-/// How many persist cycles a tool outcome whose session isn't in the index yet is held back
-/// before it is written unattributed. The `tool_result` batch can race the SessionStart hook's
-/// index append; a few cycles (~2 min at the 30s cadence) absorbs that race, while a session
-/// that never appears (started before hatel was wired) isn't held hostage forever. The export
-/// path absorbs the same race with `exporter::DEFER_TIMEOUT` — deadline-based because that loop
-/// has no cadence, and fail-closed because egress privacy outranks delivery; here the ledger
-/// fails open into an honest unattributed record, because local data outranks attribution.
-const MAX_TOOL_DEFERRALS: u8 = 4;
-
-/// A buffered `tool_result` outcome plus how many persist cycles it has been deferred waiting
-/// for its session to appear in the index.
-struct BufferedTool {
-    result: ToolResult,
-    deferrals: u8,
-}
-
 #[derive(Clone)]
 struct AppState {
     acc: Arc<Mutex<Accumulator>>,
     tracked: Arc<BTreeSet<String>>,
     counted: Arc<BTreeSet<String>>,
-    /// The full registry, for sanitizing receiver-written `tool` records (the `tool` Kind's
-    /// field allow-list is what keeps the rich, PII-bearing `tool_result` event content-free).
-    registry: Arc<Registry>,
     /// `tool_result` outcomes decoded since the last flush, written to the ledger by `persist`
     /// (off the request path), exactly as cost is snapshotted — never blocking ingestion on I/O.
-    /// Bounded by `MAX_TOOL_BUFFER`; overflow is dropped and counted in `tool_dropped`.
-    tool_buffer: Arc<Mutex<Vec<BufferedTool>>>,
-    /// Cumulative tool outcomes dropped because the buffer was full (an honest undercount surfaced
-    /// to stderr), mirroring the export queue's drop accounting.
-    tool_dropped: Arc<AtomicU64>,
     cfg: Arc<Config>,
     /// The change-gated session→project map, shared by the live render, each flush, and (via the
     /// exporter) egress — re-folded only when the index files change, so a growing index is not
@@ -178,9 +144,6 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         acc: Arc::new(Mutex::new(Accumulator::default())),
         tracked: Arc::new(registry.tracked_metrics.clone()),
         counted: Arc::new(registry.counted_events.clone()),
-        registry: registry.clone(),
-        tool_buffer: Arc::new(Mutex::new(Vec::new())),
-        tool_dropped: Arc::new(AtomicU64::new(0)),
         cfg: cfg.clone(),
         index_cache: Arc::new(Mutex::new(SessionIndexCache::new(cfg.state_dir.clone()))),
         baseline: Arc::new(baseline),
@@ -242,7 +205,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         let mut last_prune = std::time::Instant::now();
         loop {
             tick.tick().await;
-            persist(&flush_state, false);
+            persist_cost(&flush_state);
             render(&flush_state);
             if last_prune.elapsed() >= PRUNE_INTERVAL {
                 last_prune = std::time::Instant::now();
@@ -257,7 +220,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     }
     flush_task.abort();
     let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
-    persist(&state, true);
+    persist_cost(&state);
     // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
     // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
     if let Some(exporter) = &state.exporter {
@@ -325,9 +288,8 @@ async fn ingest_logs(
     // come from the single walk.
     match parse_logs(body.as_ref(), &st.counted) {
         Ok(decoded) => {
-            buffer_tool_results(&st, decoded.tool_results);
-            if !decoded.events.is_empty() {
-                lock(&st.acc).update_events(decoded.events);
+            if !decoded.is_empty() {
+                lock(&st.acc).update_events(decoded);
             }
         }
         Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
@@ -353,11 +315,6 @@ fn body_headers(headers: &HeaderMap) -> (Option<String>, Option<String>) {
 /// Recover a poisoned accumulator lock rather than cascading panics through every
 /// handler — a daemon stays up even if one request panicked mid-update.
 fn lock(m: &Mutex<Accumulator>) -> std::sync::MutexGuard<'_, Accumulator> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Same poison-recovery for the tool-result buffer.
-fn lock_buf(m: &Mutex<Vec<BufferedTool>>) -> std::sync::MutexGuard<'_, Vec<BufferedTool>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -453,42 +410,6 @@ fn acquire_state_lock(_state_dir: &Path) -> LockOutcome {
     // writer, so refuse rather than run without that guarantee (never a silent no-op). Unreachable
     // on real targets — unix and windows cover every platform that can run the receiver.
     LockOutcome::Failed("the receiver's single-writer lock is unsupported on this platform".into())
-}
-
-/// Count dropped tool outcomes and log the cumulative total once per `TOOL_DROP_LOG_EVERY` drops
-/// (throttled to avoid per-batch spam), mirroring the export queue's drop accounting.
-fn record_tool_drop(counter: &AtomicU64, n: u64) {
-    let before = counter.fetch_add(n, Ordering::Relaxed);
-    if crate::throttle::should_log(before, n, TOOL_DROP_LOG_EVERY) {
-        eprintln!(
-            "hatel: tool buffer full — dropped {} tool record(s) so far (persist falling behind)",
-            before + n
-        );
-    }
-}
-
-/// Buffer decoded `tool_result` outcomes for the ledger (written off the request path by
-/// `persist`). Bounded by `MAX_TOOL_BUFFER`: when `persist` falls behind, the remaining room is
-/// filled and the rest dropped and counted, so the buffer is a hard bound — an honest undercount,
-/// never a blocked request.
-fn buffer_tool_results(st: &AppState, results: Vec<ToolResult>) {
-    if results.is_empty() {
-        return;
-    }
-    let mut buf = lock_buf(&st.tool_buffer);
-    let room = MAX_TOOL_BUFFER.saturating_sub(buf.len());
-    let fresh = |result| BufferedTool {
-        result,
-        deferrals: 0,
-    };
-    if results.len() <= room {
-        buf.extend(results.into_iter().map(fresh));
-    } else {
-        let total = results.len();
-        buf.extend(results.into_iter().take(room).map(fresh));
-        drop(buf);
-        record_tool_drop(&st.tool_dropped, (total - room) as u64);
-    }
 }
 
 async fn shutdown_signal() {
@@ -672,89 +593,6 @@ fn prune_ledger(cfg: &Config) {
     }
 }
 
-/// Persist both OTel-derived stores off the request path: the per-session cost snapshot and the
-/// buffered per-call tool outcomes. Each resolves project attribution under the index-cache lock and
-/// releases it before writing, so a flush never holds a lock across I/O. `final_flush` is the
-/// shutdown pass: nothing may stay buffered after it.
-fn persist(st: &AppState, final_flush: bool) {
-    persist_cost(st);
-    persist_tool(st, final_flush);
-}
-
-/// Drain the tool-result buffer into the ledger as `tool` records, joining each call's project
-/// from the session index. Written via the configured sink (the same write path the hook uses),
-/// so `report` aggregates tool latency and success rate exactly like any other Kind. `tool.jsonl`
-/// has a single writer — this — since the `tool` Kind has no hook binding. Buffered outcomes since
-/// the last flush survive a graceful stop (the shutdown path flushes), but — unlike cost, which
-/// re-derives from the cumulative OTel metric on restart — these are discrete events with no
-/// resend, so an ungraceful kill loses that ≤30s window.
-///
-/// An outcome whose session isn't in the index yet is deferred (re-buffered) for up to
-/// `MAX_TOOL_DEFERRALS` cycles rather than written unattributed immediately — the batch can race
-/// the SessionStart hook's index append, and a record's project is fixed at write time. Once the
-/// deferrals are exhausted, or on the final flush, it is written with an empty project: recording
-/// reality (outcome known, attribution unknown) rather than dropping data. A deferred record's
-/// envelope timestamp is its (later) write time, exactly like every buffered outcome — at most
-/// ~2 min of skew against day-scale report windows.
-fn persist_tool(st: &AppState, final_flush: bool) {
-    let drained = std::mem::take(&mut *lock_buf(&st.tool_buffer));
-    if drained.is_empty() {
-        return;
-    }
-    // Resolve each outcome's project under the cache lock, partitioning into write-now (with its
-    // resolved label) and defer-again, then release the lock before the sink writes below.
-    let mut to_write: Vec<(ToolResult, String)> = Vec::new();
-    let mut deferred: Vec<BufferedTool> = Vec::new();
-    {
-        let mut index = lock_index(&st.index_cache);
-        index.refresh();
-        for mut item in drained {
-            let project = index
-                .get(&item.result.session_id)
-                .map(|row| row.project_label.clone())
-                .filter(|l| !l.is_empty());
-            let undecided = project.is_none() && !index.is_unattributed(&item.result.session_id);
-            if undecided && !final_flush && item.deferrals < MAX_TOOL_DEFERRALS {
-                item.deferrals += 1;
-                deferred.push(item);
-            } else {
-                to_write.push((item.result, project.unwrap_or_default()));
-            }
-        }
-    }
-    if !to_write.is_empty() {
-        let mut sink = build_sink(&st.cfg);
-        for (r, project) in to_write {
-            let mut payload = Payload::new();
-            payload.insert("session_id".into(), r.session_id.into());
-            payload.insert("project".into(), project.into());
-            payload.insert("tool_name".into(), r.tool_name.into());
-            payload.insert("duration_ms".into(), r.duration_ms.into());
-            payload.insert("ok".into(), i64::from(r.ok).into());
-            // Only these five fields are ever inserted, so the rich `tool_result` event — which also
-            // carries the user's email and tool input — stays out of the ledger. The Kind's field
-            // allow-list applied by `make_envelope` is defense-in-depth on top of that.
-            match make_envelope("tool", payload, &st.registry, st.cfg.strict) {
-                Ok(env) => sink.write_record(&env),
-                Err(e) => eprintln!("hatel: tool record dropped — {e}"),
-            }
-        }
-        sink.flush();
-    }
-    if !deferred.is_empty() {
-        // Re-buffer the deferred outcomes under the same hard bound as ingestion — arrivals since
-        // the drain have first claim on the room, so the cap can never overshoot.
-        let mut buf = lock_buf(&st.tool_buffer);
-        let room = MAX_TOOL_BUFFER.saturating_sub(buf.len());
-        let total = deferred.len();
-        buf.extend(deferred.into_iter().take(room));
-        if total > room {
-            drop(buf);
-            record_tool_drop(&st.tool_dropped, (total - room) as u64);
-        }
-    }
-}
-
 fn persist_cost(st: &AppState) {
     let now = now_iso_utc();
     // Resolve totals and attribution under the index + accumulator locks, dropping both before the
@@ -829,7 +667,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use hatel_core::{Envelope, ProjectRef, sink};
 
     /// A minimal receiver state over a scratch dir — just enough for the persist path.
     fn test_state(dir: &Path) -> AppState {
@@ -849,9 +686,6 @@ mod tests {
             acc: Arc::new(Mutex::new(Accumulator::default())),
             tracked: Arc::new(registry.tracked_metrics.clone()),
             counted: Arc::new(registry.counted_events.clone()),
-            registry,
-            tool_buffer: Arc::new(Mutex::new(Vec::new())),
-            tool_dropped: Arc::new(AtomicU64::new(0)),
             index_cache: Arc::new(Mutex::new(SessionIndexCache::new(dir.to_path_buf()))),
             cfg: Arc::new(cfg),
             baseline: Arc::new(BTreeMap::new()),
@@ -890,82 +724,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ht-serve-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn buffer_tool(st: &AppState, sid: &str) {
-        lock_buf(&st.tool_buffer).push(BufferedTool {
-            result: ToolResult {
-                session_id: sid.into(),
-                tool_name: "Bash".into(),
-                duration_ms: 5,
-                ok: true,
-            },
-            deferrals: 0,
-        });
-    }
-
-    fn tool_records(st: &AppState) -> Vec<Envelope> {
-        sink::read_records(&st.cfg, "tool", None)
-    }
-
-    #[test]
-    fn an_unindexed_tool_outcome_is_deferred_then_attributed() {
-        let dir = scratch("defer");
-        let st = test_state(&dir);
-        buffer_tool(&st, "S1");
-        // The session isn't indexed yet (the tool_result batch raced the SessionStart
-        // hook) — the outcome is deferred, not written with an empty project.
-        persist(&st, false);
-        assert!(
-            tool_records(&st).is_empty(),
-            "unindexed outcome is deferred"
-        );
-        assert_eq!(lock_buf(&st.tool_buffer).len(), 1, "still buffered");
-        // The SessionStart hook lands; the next cycle attributes the deferred outcome.
-        SessionIndex::new(st.cfg.state_dir.clone()).record(
-            "S1",
-            Some(&ProjectRef {
-                key: "/k/alpha".into(),
-                label: "alpha".into(),
-            }),
-            st.cfg.rotate_bytes,
-        );
-        persist(&st, false);
-        let recs = tool_records(&st);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(
-            recs[0].payload.get("project").and_then(|v| v.as_str()),
-            Some("alpha"),
-            "deferred outcome written with its project once the index catches up"
-        );
-        assert!(lock_buf(&st.tool_buffer).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn deferrals_exhaust_to_an_honest_unattributed_record() {
-        let dir = scratch("exhaust");
-        let st = test_state(&dir);
-        buffer_tool(&st, "GHOST"); // a session that never gets indexed
-        for cycle in 0..MAX_TOOL_DEFERRALS {
-            persist(&st, false);
-            assert!(
-                tool_records(&st).is_empty(),
-                "cycle {cycle}: still deferred"
-            );
-        }
-        // Deferrals exhausted — written with an empty project (outcome known,
-        // attribution unknown) rather than held or dropped.
-        persist(&st, false);
-        let recs = tool_records(&st);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(
-            recs[0].payload.get("project").and_then(|v| v.as_str()),
-            Some(""),
-            "exhausted deferral records reality: unattributed"
-        );
-        assert!(lock_buf(&st.tool_buffer).is_empty());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1017,7 +775,7 @@ mod tests {
                 delta: true,
             },
         ]);
-        persist(&st, false);
+        persist_cost(&st);
         let rows = cost::read_snapshot(&st.cfg.state_dir);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
@@ -1056,18 +814,6 @@ mod tests {
             }),
             "agentless series are recorded as such, never guessed"
         );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn the_final_flush_writes_unresolved_outcomes_immediately() {
-        let dir = scratch("final");
-        let st = test_state(&dir);
-        buffer_tool(&st, "GHOST");
-        // Shutdown pass: nothing may stay buffered, deferred or not.
-        persist(&st, true);
-        assert_eq!(tool_records(&st).len(), 1, "final flush writes everything");
-        assert!(lock_buf(&st.tool_buffer).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

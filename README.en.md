@@ -46,8 +46,8 @@ flowchart LR
 
 | | What it gives | Why it's needed |
 |---|---|---|
-| **① Native OTel** (push) | tokens, cost, active time, lines, per-subagent attribution (`agent.name`), per-tool duration/outcome | exact numbers — but **no project on the wire** |
-| **② Hooks** (event) | project (`cwd`), prompt sizes, memory loads, subagent stops, compactions | the "which project, what happened" context |
+| **① Native OTel** (push) | tokens, cost, active time, lines, per-subagent attribution (`agent.name`) | exact numbers — but **no project on the wire** |
+| **② Hooks** (event) | project (`cwd`), session starts and what resuming cost, prompt sizes, memory loads, tool calls, subagents, compactions | the "which project, what happened" context |
 
 > **The key idea**: ①'s numbers have no project label. hatel joins ②'s session→project mapping on `session.id` to produce **per-project attribution**. That's how "how much did `acme-api` spend" becomes one line.
 
@@ -132,7 +132,7 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 **How to read it:**
 
 - Every section names its axes: **`by <dimension>, ranked by <measure>`**. That is the question the section answers, and both halves are yours to change — `--group-by` / `--sort-by`.
-- The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**.
+- The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**. `--group-by agent_id` separates delegated calls (the row with no value is the main agent), and `--group-by prompt_id` groups the work one request set off.
 - The **`session`** section is how each session began (`startup` / `resume` / `fork`) and what resuming cost to re-establish the prompt cache. `/resume` starts the same session again, so one session is counted more than once, and this spend appears in no session total. Grouping by `cache_likely_expired` separates the part that was avoidable.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate.
@@ -294,7 +294,7 @@ hatel init --print         # print the block instead of writing (for managed/org
 hatel init --remove        # cleanly undo (leaves the native telemetry env)
 ```
 
-`init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the session→project index). Tool calls aren't here — their duration and outcome come from the native `tool_result` event, not a hook.
+`init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the session→project index). An event no Kind binds is left unwired, so the hook never runs for no record.
 
 Claude Code's own telemetry config must live in `settings.json` `env` — that is the only channel Claude Code reads at session start, and those `OTEL_*` vars are deliberately **not** passed to hook subprocesses. That is exactly why the two layers are separate. The full shape:
 
@@ -373,7 +373,7 @@ memory         group_key=memory_id    fields=[load_reason, memory_id, memory_typ
 prompt         group_key=session_id   fields=[project, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
-tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 ```
 
 When the ledger holds a Kind no loaded schema declares, one more line follows the list — the other half of an honest answer to what was asked ("what can I query"). `--json` carries the same fact as `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`, and `unreadable_kinds` is `null` when there is no gap:
@@ -381,7 +381,7 @@ When the ledger holds a Kind no loaded schema declares, one more line follows th
 ```text
 $ hatel kinds
 ...
-tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 
 the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
 ```
@@ -555,7 +555,7 @@ The collector never fights managed policy; it adapts:
 | Symptom | Cause / fix |
 |---|---|
 | **Report is all `—`** | No data yet. ① `hatel doctor` to confirm wiring → ② run the receiver (`hatel serve --all` or `hatel service`) → ③ do some work in Claude Code → `hatel report` again. |
-| **`prompt`/`subagent` show up but `cost`/`tokens`/`tool` are empty** | All three come **through the receiver** — cost/tokens are native OTel metrics, and `tool` is the native `tool_result` event. The hook ledger (`prompt`, `subagent`, `memory`, `compaction`) accrues without the receiver, but these three need it running *at that moment*. Run `hatel service` for always-on. |
+| **Hook Kinds show up but `cost`/`tokens` are empty** | Cost and tokens are native OTel metrics, so they come **through the receiver**. The hook ledger accrues without it, but those two need it running *at that moment*. Run `hatel service` for always-on. |
 | **A hook Kind's numbers look doubled** | `hatel-hook` is reached twice for one event — bound in both the user `settings.json` and a project `.claude/settings.json`, or the project one calls a wrapper script that runs `hatel-hook` again. Hook envelopes carry no event-unique identifier, so hatel cannot tell a duplicate delivery from a genuine repeat; remove one of the two bindings. `subagent` is unaffected — it counts spawns by `agent_id`. |
 | **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
 | **`emit` drops a field** | The field isn't in the Kind's allow-list. stderr prints the accepted fields (`accepted fields: …`) — fix the typo. |

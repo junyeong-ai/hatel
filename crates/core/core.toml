@@ -19,19 +19,17 @@ counted_events = [
 ]
 
 # ── Kinds ──
-# The `tool` Kind is written by the receiver from the native `tool_result` OTel event
-# (the only signal carrying a tool's wall-clock duration and success); every other Kind
-# is hook-written. Its `project` is joined from `session.id` through the session index,
-# exactly as cost/token attribution is. `duration_ms` and `ok` (1 success / 0 failure)
-# are measures, so a report sums them per tool — call count, total time, and successes,
-# from which average latency and success rate follow.
 
+# One record per tool call that returned, keyed on the call's own `tool_use_id`. `agent_id` is
+# present only when a subagent made the call, so its absence names the main agent — the dimension
+# a session-level tool count flattens away. `duration_ms` is time until the call returned: a
+# backgrounded command returns as soon as it is accepted, so its figure is acceptance, not work.
 [[kind]]
 name = "tool"
-fields = ["session_id", "project", "tool_name", "duration_ms", "ok"]
+fields = ["session_id", "project", "prompt_id", "agent_id", "tool_name", "tool_use_id", "duration_ms", "ok"]
 group_key = "tool_name"
+identity = "tool_use_id"
 measures = ["duration_ms", "ok"]
-receiver_sourced = true
 
 [[kind]]
 name = "prompt"
@@ -70,7 +68,31 @@ group_key = "session_id"
 
 # ── Hook bindings (event → kind, with declarative field maps) ──
 # `project` is injected by the hook from the cwd; it is never mapped here.
-# (`tool` has no binding — it is receiver-written from the OTel `tool_result` event.)
+
+# A returning tool call fires exactly one of these two, so the pair writes one record per call and
+# `ok` distinguishes them. A call blocked before it ran fires neither — `PreToolUse` alone marks
+# that, and binding it would file an attempt as a call.
+[[binding]]
+event = "PostToolUse"
+kind = "tool"
+map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
+map.agent_id = { from = "agent_id" }
+map.tool_name = { from = "tool_name" }
+map.tool_use_id = { from = "tool_use_id" }
+map.duration_ms = { from = "duration_ms" }
+map.ok = { const = 1 }
+
+[[binding]]
+event = "PostToolUseFailure"
+kind = "tool"
+map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
+map.agent_id = { from = "agent_id" }
+map.tool_name = { from = "tool_name" }
+map.tool_use_id = { from = "tool_use_id" }
+map.duration_ms = { from = "duration_ms" }
+map.ok = { const = 0 }
 
 # A fresh start carries `source` alone; the cost fields accompany a resumed or forked one, so a
 # fresh start contributes zero to the sums rather than a guessed value.

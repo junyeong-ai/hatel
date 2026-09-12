@@ -19,10 +19,11 @@ const HOOK_BIN: &str = "hatel-hook";
 /// (see [`active_events`]): `SessionStart` (for the session→project index) plus every event a
 /// loaded Kind binds. The rest stay in the vocabulary so a plugin can bind them — e.g. `PostToolUse`
 /// for a tool-driven Kind — without firing the hook on events nothing consumes.
-pub const EVENTS: [&str; 8] = [
+pub const EVENTS: [&str; 9] = [
     "SessionStart",
     "SessionEnd",
     "PostToolUse",
+    "PostToolUseFailure",
     "UserPromptSubmit",
     "SubagentStop",
     "InstructionsLoaded",
@@ -32,8 +33,7 @@ pub const EVENTS: [&str; 8] = [
 
 /// The events to actually wire for a given registry: `SessionStart` (needed for the session index
 /// even though no Kind binds it) plus every vocabulary event some loaded Kind binds. This is what
-/// keeps the hook off events nothing consumes — no `PostToolUse` spawn per tool call when the
-/// `tool` Kind is sourced from native OTel, no dead `SessionEnd`/`PostCompact` wiring.
+/// keeps the hook off events nothing consumes — no dead `SessionEnd`/`PostCompact` wiring.
 pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
     EVENTS
         .iter()
@@ -1217,12 +1217,13 @@ mod tests {
             "SubagentStop",
             "InstructionsLoaded",
             "PreCompact",
+            "PostToolUse",
+            "PostToolUseFailure",
         ] {
             assert!(active.contains(&ev), "{ev} should be wired");
         }
-        // Vocabulary events nothing binds are NOT wired: tool is OTel-sourced, and SessionEnd /
-        // PostCompact have no binding — so the hook never fires on a tool call for no record.
-        for ev in ["PostToolUse", "SessionEnd", "PostCompact"] {
+        // Vocabulary events nothing binds are NOT wired, so the hook never fires for no record.
+        for ev in ["SessionEnd", "PostCompact"] {
             assert!(
                 !active.contains(&ev),
                 "{ev} should not be wired (nothing binds it)"
@@ -1242,7 +1243,6 @@ mod tests {
                 redact: vec![],
                 measures: vec![],
                 identity: None,
-                receiver_sourced: false,
             })
             .unwrap(),
         )
