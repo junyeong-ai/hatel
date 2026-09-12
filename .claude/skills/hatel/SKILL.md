@@ -104,9 +104,12 @@ transcript and calls no tools — report it as such, not as a subagent that went
 `cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
 such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
 say so rather than treating it as zero). Spend does not end there: the `session` Kind carries what
-rebuilding the prompt cache cost each time a context was re-established (`resume`, `fork`, `clear`,
-`compact`), which no cost row includes — add it when asked what a project or a period actually
-cost.
+rebuilding the prompt cache cost each time a context was re-established, which no cost row includes
+— `hatel report --kind session` groups by `source` (`resume` · `fork` · `clear` · `compact` ·
+`startup`) and sums `estimated_cache_write_usd` and `context_tokens`; `since_last_response_s` and
+`cache_likely_expired` say how long the gap was and whether the cache had gone cold. Add that sum
+when asked what a project or a period actually cost. A fresh `startup` carries no such field at all
+rather than a zero, so it contributes nothing instead of diluting the average.
 `report --project <label>` matches by the project's basename label. A project is a repository: work done in a linked worktree rolls up to the repository it checks out, and a session run outside any repository has no project and groups under `(empty)` — report that as unattributed, never as a project of its own. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",
@@ -168,8 +171,9 @@ map.spec = { from = "git_branch", capture = "^spec/(.+)$" }
 Per Kind: `fields` (the allow-list — anything else is dropped before write), `group_key` (what
 a report groups by), `measures` (numeric fields a report sums; first is the primary metric),
 `redact` (fields hashed before storage), `identity` (the field identifying the entity a record
-describes, when a lifecycle event fires more than once per entity; a report then counts entities,
-and such a Kind declares no measures). Namespace plugin Kinds (`team.deploy`) so they can't
+describes, when a lifecycle event fires more than once per entity; a report then counts entities
+rather than records, representing each by its earliest one, and sums the measures over what
+survives). Namespace plugin Kinds (`team.deploy`) so they can't
 collide with core's flat names. Field-map transforms: `from` (a list tries each in order),
 `capture` (regex group 1), `len`, `present`, `basename`, `const`.
 
