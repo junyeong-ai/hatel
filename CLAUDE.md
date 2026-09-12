@@ -11,12 +11,15 @@ The toolchain is pinned by `rust-toolchain.toml`; edition 2024, resolver 3. CI d
 warnings — run the same gates locally before considering work done:
 
 ```sh
-cargo test --workspace --locked
-cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
+RUSTFLAGS="-D warnings" cargo test --workspace --locked
+RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
 cargo fmt --all --check
 actionlint .github/workflows/*.yml        # after workflow edits
 uvx zizmor .github/                       # after workflow edits (security audit)
 ```
+
+`RUSTFLAGS` is what the workflows set, so omitting it locally lets a warning through that CI
+rejects.
 
 ## Layout
 

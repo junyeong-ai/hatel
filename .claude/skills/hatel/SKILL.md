@@ -117,7 +117,9 @@ rank by count — and `identity`, naming what that count counts when it is not r
 the Kind declares the defaults, the query overrides them. Two dimensions every turn-scoped Kind
 carries: `--group-by prompt_id` groups one request's work (its tool calls, its subagents), and on
 `tool`, `--group-by agent_id` separates a subagent's calls from the main agent's — the row with no
-value is the main agent, which never carries one.
+value is the main agent, which never carries one. The `command` Kind answers which slash commands
+and skills were explicitly invoked; a skill the model loads on its own expands nothing and is not
+counted there.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
 error rather than an empty answer.
 
