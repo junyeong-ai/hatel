@@ -1242,26 +1242,23 @@ fn an_identity_is_scoped_to_the_group_it_is_counted_in() {
 }
 
 #[test]
-fn an_identity_must_be_a_field_of_its_kind_and_exclude_measures() {
+fn an_identity_must_name_a_field_of_its_kind() {
     use hatel_core::registry::{KindSpec, KindSpecRaw};
-    let raw = |identity: Option<&str>, measures: Vec<String>| KindSpecRaw {
+    let raw = |identity: Option<&str>| KindSpecRaw {
         name: "k".into(),
         fields: vec!["id".into(), "label".into(), "ms".into()],
         group_key: "label".into(),
         redact: vec![],
-        measures,
+        measures: vec!["ms".into()],
         identity: identity.map(str::to_string),
         receiver_sourced: false,
     };
-    assert!(KindSpec::from_raw(raw(Some("id"), vec![])).is_ok());
+    assert!(KindSpec::from_raw(raw(Some("id"))).is_ok());
     assert!(
-        KindSpec::from_raw(raw(Some("agent_id"), vec![])).is_err(),
+        KindSpec::from_raw(raw(Some("agent_id"))).is_err(),
         "an identity naming no field would silently count every record as its own entity"
     );
-    // Several records per entity means several values per measure, and a schema has no way to say
-    // how they combine — so summing them would be a guess rather than an answer.
-    assert!(KindSpec::from_raw(raw(Some("id"), vec!["ms".into()])).is_err());
-    assert!(KindSpec::from_raw(raw(None, vec!["ms".into()])).is_ok());
+    assert!(KindSpec::from_raw(raw(None)).is_ok());
 }
 
 #[test]
@@ -1331,4 +1328,55 @@ fn a_fresh_start_carries_no_resume_cost_rather_than_a_zero() {
             "{absent} must be absent, not zero"
         );
     }
+}
+
+#[test]
+fn both_backends_represent_an_entity_by_the_same_record() {
+    // An identity Kind reports each entity once, carrying that entity's first record — measures
+    // included. That answer is only defined if every backend hands records to the reader in the
+    // same order, so the two are compared against one another rather than each against itself.
+    let dir = temp_dir();
+    let plugin = dir.join("ordered.toml");
+    std::fs::write(
+        &plugin,
+        r#"
+[[kind]]
+name = "ord.job"
+fields = ["job_id", "stage", "ms"]
+group_key = "stage"
+identity = "job_id"
+measures = ["ms"]
+"#,
+    )
+    .unwrap();
+    let records = [
+        ("j1", "build", 10.0),
+        ("j1", "build", 99.0),
+        ("j2", "build", 5.0),
+    ];
+    let answer = |sink: SinkKind| {
+        let mut cfg = config_in(temp_dir(), vec![plugin.clone()]);
+        cfg.sink = sink;
+        let reg = build_registry(&cfg).unwrap();
+        let mut out = hatel_core::build_sink(&cfg);
+        for (job, stage, ms) in records {
+            let mut payload = Payload::new();
+            payload.insert("job_id".into(), job.into());
+            payload.insert("stage".into(), stage.into());
+            payload.insert("ms".into(), ms.into());
+            out.write_record(&make_envelope("ord.job", payload, &reg, true).unwrap());
+        }
+        out.flush();
+        report::aggregate(&reg, &cfg, "ord.job", &query(0, 0, None))
+    };
+    let jsonl = answer(SinkKind::Jsonl);
+    let sqlite = answer(SinkKind::Sqlite);
+    assert_eq!(jsonl.len(), 1);
+    assert_eq!(jsonl[0].count, 2, "two jobs, three records");
+    assert_eq!(
+        jsonl[0].sums[0].sum, 15.0,
+        "the first record of j1 represents it, so 10 + 5 rather than 99"
+    );
+    assert_eq!(jsonl[0].count, sqlite[0].count);
+    assert_eq!(jsonl[0].sums[0].sum, sqlite[0].sums[0].sum);
 }

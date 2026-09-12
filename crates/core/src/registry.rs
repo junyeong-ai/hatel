@@ -26,7 +26,8 @@ pub struct KindSpec {
     pub measures: Vec<String>,
     /// The field identifying the entity a record describes, when several records can describe
     /// the same one — a lifecycle event that fires at every turn boundary, not once per entity.
-    /// Declared, a report counts distinct values of it per group instead of counting records.
+    /// Declared, a report counts distinct values of it per group and represents each entity by
+    /// its first record, measures included.
     pub identity: Option<String>,
     /// Whether this Kind is written by the receiver from a native OTel signal (e.g. `tool` from
     /// `tool_result`) rather than by the hook. Such a Kind must not have a hook binding — that would
@@ -86,18 +87,10 @@ impl KindSpec {
         if let Some(m) = raw.measures.iter().find(|m| !fields.contains(*m)) {
             return Err(invalid(format!("measure '{m}' not in fields")));
         }
-        if let Some(identity) = &raw.identity {
-            if !fields.contains(identity) {
-                return Err(invalid(format!("identity '{identity}' not in fields")));
-            }
-            // Several records per entity means several values per measure, and nothing in a
-            // schema says how to combine them. Until a Kind needs that and can declare it,
-            // an identity Kind counts entities and sums nothing.
-            if !raw.measures.is_empty() {
-                return Err(invalid(
-                    "a kind with an identity may not declare measures".to_string(),
-                ));
-            }
+        if let Some(identity) = &raw.identity
+            && !fields.contains(identity)
+        {
+            return Err(invalid(format!("identity '{identity}' not in fields")));
         }
         Ok(KindSpec {
             name: raw.name,

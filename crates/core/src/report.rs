@@ -238,8 +238,9 @@ pub fn cost_axes() -> (&'static str, &'static str) {
 
 /// Aggregate one Kind under `q`: group in-window records by the query's dimension (the Kind's
 /// `group_key` unless overridden), count them, and sum each declared measure. A Kind declaring
-/// an `identity` counts the distinct entities its records describe rather than the records.
-/// Records are read from the configured storage backend (JSONL / SQLite).
+/// an `identity` counts the distinct entities its records describe rather than the records, and
+/// each entity contributes its first record's measures. Records are read from the configured
+/// storage backend (JSONL / SQLite), which hands them over in write order.
 ///
 /// `kind` is the Kind being aggregated right now (the caller's loop variable); `q.kind` is
 /// the report-level restriction the caller applies when choosing which Kinds to loop over,
