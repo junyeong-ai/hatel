@@ -171,7 +171,7 @@ fn bound_events_surfaces_an_out_of_vocabulary_binding() {
 
 #[test]
 fn tool_kind_allow_list_keeps_it_content_free() {
-    // The `tool` Kind is written by the receiver from the native `tool_result` event, which also
+    // The `tool` Kind is written from the tool-completion hooks, whose envelopes also
     // carries the user's email and full tool input. Its field allow-list is the guard that keeps
     // the ledger content-free: anything outside duration/outcome identity is dropped at envelope
     // time, so PII and tool content can never reach the sink.
@@ -242,7 +242,7 @@ fn an_unattributable_session_start_is_recorded_without_a_project() {
     // A session outside a repository — or one whose cwd names no directory this process can
     // resolve — has no project, and is recorded as having none. The receiver reads that as an
     // answer: a session with no project is decided, unlike one whose start it has not seen, which
-    // is the only kind worth holding egress and tool records back for.
+    // is the only kind worth holding an egress batch back for.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
     let outside = temp_dir();
@@ -1298,10 +1298,12 @@ fn a_fresh_start_carries_no_resume_cost_rather_than_a_zero() {
 }
 
 #[test]
-fn both_backends_represent_an_entity_by_the_same_record() {
-    // An identity Kind reports each entity once, carrying that entity's first record — measures
-    // included. That answer is only defined if every backend hands records to the reader in the
-    // same order, so the two are compared against one another rather than each against itself.
+fn both_backends_represent_an_entity_by_its_earliest_record() {
+    // An identity Kind reports each entity once, carrying that entity's earliest record — measures
+    // included. Storage order does not supply that: the JSONL reader returns the active file before
+    // its older archives, so a rotation puts the newest record first. The two backends are compared
+    // against one another, with a rotation forced between the records, so an answer that depends on
+    // storage layout cannot pass.
     let dir = temp_dir();
     let plugin = dir.join("ordered.toml");
     std::fs::write(
@@ -1316,24 +1318,28 @@ measures = ["ms"]
 "#,
     )
     .unwrap();
+    // The last record written stays in the active file, which the JSONL reader lists before the
+    // archives — so the entity's LATEST record is the one storage order offers first.
     let records = [
         ("j1", "build", 10.0),
-        ("j1", "build", 99.0),
         ("j2", "build", 5.0),
+        ("j1", "build", 99.0),
     ];
     let answer = |sink: SinkKind| {
         let mut cfg = config_in(temp_dir(), vec![plugin.clone()]);
         cfg.sink = sink;
+        // One record per file, so the active file holds the newest and the archives the older.
+        cfg.rotate_bytes = 1;
         let reg = build_registry(&cfg).unwrap();
-        let mut out = hatel_core::build_sink(&cfg);
         for (job, stage, ms) in records {
             let mut payload = Payload::new();
             payload.insert("job_id".into(), job.into());
             payload.insert("stage".into(), stage.into());
             payload.insert("ms".into(), ms.into());
+            let mut out = hatel_core::build_sink(&cfg);
             out.write_record(&make_envelope("ord.job", payload, &reg, true).unwrap());
+            out.flush();
         }
-        out.flush();
         report::aggregate(&reg, &cfg, "ord.job", &query(0, 0, None))
     };
     let jsonl = answer(SinkKind::Jsonl);
@@ -1342,12 +1348,11 @@ measures = ["ms"]
     assert_eq!(jsonl[0].count, 2, "two jobs, three records");
     assert_eq!(
         jsonl[0].sums[0].sum, 15.0,
-        "the first record of j1 represents it, so 10 + 5 rather than 99"
+        "j1's earliest record represents it, so 10 + 5 rather than 99"
     );
     assert_eq!(jsonl[0].count, sqlite[0].count);
     assert_eq!(jsonl[0].sums[0].sum, sqlite[0].sums[0].sum);
 }
-
 #[test]
 fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
     // Only a subagent's call carries `agent_id`, so its absence names the main agent. Without the

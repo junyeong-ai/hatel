@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::cost::{self, CostRow};
 use crate::registry::Registry;
 use crate::schema::UnreadableKinds;
-use crate::{Config, sink, ts_epoch};
+use crate::{Config, Envelope, sink, ts_epoch};
 
 /// How many groups a report shows per Kind.
 pub const TOP_N: usize = 5;
@@ -239,8 +239,8 @@ pub fn cost_axes() -> (&'static str, &'static str) {
 /// Aggregate one Kind under `q`: group in-window records by the query's dimension (the Kind's
 /// `group_key` unless overridden), count them, and sum each declared measure. A Kind declaring
 /// an `identity` counts the distinct entities its records describe rather than the records, and
-/// each entity contributes its first record's measures. Records are read from the configured
-/// storage backend (JSONL / SQLite), which hands them over in write order.
+/// each entity contributes its earliest record's measures. Records are read from the configured
+/// storage backend (JSONL / SQLite) in no particular order and put in time order here.
 ///
 /// `kind` is the Kind being aggregated right now (the caller's loop variable); `q.kind` is
 /// the report-level restriction the caller applies when choosing which Kinds to loop over,
@@ -251,15 +251,27 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
     };
     let dimension = q.group_by.unwrap_or(&spec.group_key);
     let mut groups: BTreeMap<String, (i64, Vec<f64>, BTreeSet<String>)> = BTreeMap::new();
-    // `since` lets the backend skip out-of-window history (SQLite); the exact filter
-    // below is the correctness gate (and does the windowing for JSONL).
-    for env in sink::read_records(cfg, kind, Some(q.since)) {
-        // A record with an unparseable timestamp is dropped (not silently bucketed at
-        // epoch 0, which would flip between always-in and always-out by window size).
-        match ts_epoch(&env.ts) {
-            Some(ts) if ts >= q.since => {}
-            _ => continue,
-        }
+    // `since` lets the backend skip out-of-window history (SQLite); the filter here is the
+    // correctness gate (and does the windowing for JSONL). A record with an unparseable timestamp
+    // is dropped rather than silently bucketed at epoch 0, which would flip between always-in and
+    // always-out by window size.
+    let mut records: Vec<(jiff::Timestamp, Envelope)> =
+        sink::read_records(cfg, kind, Some(q.since))
+            .into_iter()
+            .filter_map(|env| {
+                let ts = env.ts.parse::<jiff::Timestamp>().ok()?;
+                (ts.as_second() >= q.since).then_some((ts, env))
+            })
+            .collect();
+    // An identity Kind reports each entity's earliest record, which the storage order does not
+    // supply: the JSONL reader returns the active file before its older archives, and an
+    // asynchronous hook can write within one file out of the order its records are stamped in.
+    // Ordering here — the one place that needs it — is what makes the answer the same whichever
+    // backend served it.
+    if spec.identity.is_some() {
+        records.sort_by_key(|(ts, _)| *ts);
+    }
+    for (_, env) in records {
         if let Some(p) = q.project
             && env.payload.get("project").and_then(|v| v.as_str()) != Some(p)
         {

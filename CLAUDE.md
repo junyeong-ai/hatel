@@ -39,7 +39,7 @@ uvx zizmor .github/                       # after workflow edits (security audit
   to the repository it checks out; a tree outside one has no project. Every identified session
   start is recorded either way, so the receiver can tell a session that has no project from one
   whose start it has not seen — the first is answered now, the second is the only one worth
-  holding egress and tool records back for. Collapsing those two states again silently restores
+  holding an egress batch back for. Collapsing those two states again silently restores
   a fabricated project, a saturated export park, or both.
 - **Fail-open on the local write path** (a write error is a stderr note, never a blocked
   tool call); **fail-closed on egress privacy** (an unattributable batch is not forwarded

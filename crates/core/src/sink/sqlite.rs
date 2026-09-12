@@ -53,14 +53,9 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
         .and_then(|s| jiff::Timestamp::from_second(s.saturating_sub(1)).ok())
         .map(|t| t.to_string())
         .unwrap_or_default();
-    // Ordered by write time, then rowid for records sharing a timestamp, so this backend hands
-    // the reader the same sequence the append-only JSONL does. A Kind with an `identity` is
-    // represented by the first record of each entity, which is only a defined answer when both
-    // backends agree on which record is first.
-    let mut stmt = match conn.prepare(
-        "SELECT ts, schema_version, payload FROM records \
-         WHERE kind = ?1 AND ts >= ?2 ORDER BY ts, rowid",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT ts, schema_version, payload FROM records WHERE kind = ?1 AND ts >= ?2")
+    {
         Ok(s) => s,
         Err(e) => {
             eprintln!("hatel: sqlite query prepare failed ({e})");

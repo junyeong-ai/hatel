@@ -27,7 +27,7 @@ pub struct KindSpec {
     /// The field identifying the entity a record describes, when several records can describe
     /// the same one — a lifecycle event that fires at every turn boundary, not once per entity.
     /// Declared, a report counts distinct values of it per group and represents each entity by
-    /// its first record, measures included.
+    /// its earliest record, measures included.
     pub identity: Option<String>,
 }
 

@@ -40,8 +40,6 @@ struct AppState {
     acc: Arc<Mutex<Accumulator>>,
     tracked: Arc<BTreeSet<String>>,
     counted: Arc<BTreeSet<String>>,
-    /// `tool_result` outcomes decoded since the last flush, written to the ledger by `persist`
-    /// (off the request path), exactly as cost is snapshotted — never blocking ingestion on I/O.
     cfg: Arc<Config>,
     /// The change-gated session→project map, shared by the live render, each flush, and (via the
     /// exporter) egress — re-folded only when the index files change, so a growing index is not
@@ -283,9 +281,7 @@ async fn ingest_logs(
         let (ct, ce) = body_headers(&headers);
         exporter.enqueue(OtlpSignal::Logs, body.clone(), ct, ce);
     }
-    // Decode the body once: the per-call tool outcomes (buffered for the ledger, written off the
-    // request path by `persist`) and the counted-event tallies (folded into the live view) both
-    // come from the single walk.
+    // Decode the body once for the counted-event tallies the live view folds.
     match parse_logs(body.as_ref(), &st.counted) {
         Ok(decoded) => {
             if !decoded.is_empty() {

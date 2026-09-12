@@ -47,16 +47,16 @@ fields = ["session_id", "project", "prompt_id", "agent_id", "agent"]
 group_key = "agent"
 identity = "agent_id"
 
-# One record per session start. A session starts more than once — `/resume` and `/fork` on an
-# existing conversation each fire `SessionStart` again — so the record counts starts, not sessions,
-# and carries no identity: a start has no identifier of its own. `source` names what began it, and
-# for a resumed start Claude Code computes what re-establishing the prompt cache costs, which is
-# the spend a session-level total never shows.
+# One record per session start. A session starts more than once: `resume`, `fork`, `clear` and
+# `compact` each fire `SessionStart` again on an existing conversation, so the record counts starts
+# rather than sessions and carries no identity — a start has no identifier of its own. `source`
+# names what began it, and where a start re-establishes an existing context Claude Code computes
+# what rebuilding the prompt cache costs, which is spend a session-level total never shows.
 [[kind]]
 name = "session"
 fields = ["session_id", "project", "source", "context_tokens", "since_last_response_s", "estimated_cache_write_usd", "cache_likely_expired"]
 group_key = "source"
-measures = ["estimated_cache_write_usd", "context_tokens", "since_last_response_s"]
+measures = ["estimated_cache_write_usd", "context_tokens"]
 
 # Explicit slash-command and skill invocations, one record per expansion. The name is the whole
 # signal: the arguments and the expanded prompt are the operator's own text and stay out of the

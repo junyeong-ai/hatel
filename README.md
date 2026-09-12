@@ -99,11 +99,12 @@ hatel report --window 30d
 
 ## session — by source, ranked by estimated_cache_write_usd
 
-| source | count | estimated_cache_write_usd | context_tokens | since_last_response_s |
-|---|---:|---:|---:|---:|
-| resume | 12 | 5.04 | 487,220 | 9,412 |
-| fork | 2 | 0.71 | 71,026 | 344 |
-| startup | 4 | 0 | 0 | 0 |
+| source | count | estimated_cache_write_usd | context_tokens |
+|---|---:|---:|---:|
+| resume | 12 | 5.04 | 487,220 |
+| compact | 5 | 1.93 | 186,540 |
+| fork | 2 | 0.71 | 71,026 |
+| startup | 4 | 0 | 0 |
 
 ## subagent — by agent, ranked by count
 
@@ -133,7 +134,7 @@ hatel report --window 30d
 
 - 모든 섹션은 자신의 축을 밝힙니다 — **`by <차원>, ranked by <측정값>`**. 그 섹션이 답하는 질문이며, 양쪽 다 `--group-by` / `--sort-by`로 바꿀 수 있습니다.
 - **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다. `--group-by agent_id`는 위임된 호출을 갈라 보여주고(값이 없는 행이 메인 에이전트입니다), `--group-by prompt_id`는 한 요청이 유발한 작업량을 묶습니다.
-- **`session`** 섹션은 세션이 어떻게 시작됐는지(`startup`·`resume`·`fork`)와, 재개가 프롬프트 캐시를 다시 세우는 데 든 비용입니다. `/resume`은 같은 세션을 다시 시작하므로 한 세션이 여러 번 집계되며, 이 비용은 세션 총계 어디에도 나타나지 않습니다. `cache_likely_expired`로 묶으면 피할 수 있었던 지출이 갈립니다.
+- **`session`** 섹션은 컨텍스트를 세운 시점을 셉니다 — `startup` 외에 `resume`·`fork`·`clear`·`compact`가 모두 기존 대화에서 `SessionStart`를 다시 일으키므로, 한 세션이 여러 번 집계됩니다. 측정값은 그렇게 다시 세울 때 프롬프트 캐시를 재작성한 비용이고, 세션 총계 어디에도 나타나지 않습니다. `cache_likely_expired`로 묶으면 피할 수 있었던 지출이 갈립니다.
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다.
 
@@ -560,7 +561,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 |---|---|
 | **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
 | **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
-| **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`는 `agent_id`로 생성을 세므로 영향을 받지 않습니다. |
+| **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`와 `tool`은 각각 `agent_id`·`tool_use_id`로 실체를 세므로 영향을 받지 않습니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |
 | **수신기가 안 뜸 / 곧바로 종료** | 같은 state 디렉터리에 다른 수신기가 이미 락을 잡고 있습니다(단일-writer). 기존 것을 쓰거나 `hatel service`로 관리하세요. |

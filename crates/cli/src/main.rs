@@ -198,7 +198,7 @@ fn run() -> i32 {
 }
 
 /// Why an emit was refused: `Registry` is an environment problem (the registry itself
-/// failed to load); `Rejected` is a caller problem (unknown or receiver-sourced Kind,
+/// failed to load); `Rejected` is a caller problem (unknown Kind,
 /// malformed input, or — in strict mode — disallowed keys). The CLI maps them to exit
 /// codes 1 / 2, MCP to internal / invalid-params errors.
 pub(crate) enum EmitError {

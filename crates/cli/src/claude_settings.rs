@@ -554,8 +554,8 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
         Value::Object(hooks) => {
             // Walk the whole vocabulary so a re-run converges to *exactly* the active set: ensure
             // our hook on active events, and strip it from inactive ones — otherwise an upgrade that
-            // drops an event (e.g. `tool` moving to native OTel) would leave the hook firing on it
-            // for no record, which `covered_events` (scoped to the active set) couldn't even see.
+            // drops an event (a Kind losing its binding) would leave the hook firing on it for no
+            // record, which `covered_events` (scoped to the active set) couldn't even see.
             let mut pruned_empty: Vec<&'static str> = Vec::new();
             for ev in EVENTS {
                 let active = events.contains(&ev);

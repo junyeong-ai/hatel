@@ -34,10 +34,8 @@ const MAX_DEFERRED: usize = 64;
 /// How long a deferred body waits for *its own* sessions to reach the index before it is dropped
 /// for the filtered destinations. The race it absorbs (an OTLP batch beating the SessionStart
 /// hook's index append) resolves in seconds; minutes is generous, and past that the session is
-/// evidently never going to be indexed (it predates the wiring). The receiver's ledger absorbs
-/// the same race with `serve::MAX_TOOL_DEFERRALS` — cycle-counted because its flush loop has a
-/// fixed cadence, and fail-open because local data outranks attribution; here egress privacy
-/// outranks delivery, so an unresolved body fails closed.
+/// evidently never going to be indexed (it predates the wiring). Egress privacy outranks delivery,
+/// so an unresolved body fails closed.
 const DEFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Cap on establishing the TCP/TLS connection, so a downstream that accepts the socket but never
 /// responds can't pin the drain task past this.

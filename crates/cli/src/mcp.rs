@@ -99,7 +99,7 @@ impl HatelMcp {
     }
 
     #[tool(
-        description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and whether it is receiver-sourced — plus `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`."
+        description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and the identity a count is of when one is declared — plus `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`."
     )]
     fn kinds(&self) -> Result<CallToolResult, McpError> {
         let cfg = Config::load().map_err(internal)?;
