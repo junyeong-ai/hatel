@@ -294,7 +294,7 @@ hatel init --print         # print the block instead of writing (for managed/org
 hatel init --remove        # cleanly undo (leaves the native telemetry env)
 ```
 
-`init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the session→project index). An event no Kind binds is left unwired, so the hook never runs for no record.
+`init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the session→project index). An event no Kind binds is left unwired, so the hook never runs for no record. The wiring is `async`, so a tool call never waits on a record being written — a collection gap is what `hatel doctor` is for.
 
 Claude Code's own telemetry config must live in `settings.json` `env` — that is the only channel Claude Code reads at session start, and those `OTEL_*` vars are deliberately **not** passed to hook subprocesses. That is exactly why the two layers are separate. The full shape:
 
@@ -308,11 +308,14 @@ Claude Code's own telemetry config must live in `settings.json` `env` — that i
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"
   },
   "hooks": {
-    "SessionStart":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "InstructionsLoaded":[{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "PreCompact":        [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }]
+    "SessionStart":        [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "UserPromptExpansion": [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PostToolUse":         [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PostToolUseFailure":  [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "UserPromptSubmit":    [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "SubagentStop":        [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "InstructionsLoaded":  [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PreCompact":          [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}]
   }
 }
 ```

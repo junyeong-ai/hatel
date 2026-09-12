@@ -388,18 +388,20 @@ fn command_is_our_hook(command: &str) -> bool {
     }
 }
 
-/// Whether one entry runs *exactly* this command — distinguishes the current wiring from one of
-/// ours that's stale (our basename, but a different absolute path after the binary moved).
-fn entry_has_command(entry: &Value, command: &str) -> bool {
+/// Whether one entry is the wiring this version writes — the command and the `async` flag both.
+/// An entry of ours that differs in either is stale (the binary moved, or it predates asynchronous
+/// wiring) and is replaced rather than left in place.
+fn entry_is_current(entry: &Value, command: &str) -> bool {
     entry.get("command").and_then(|c| c.as_str()) == Some(command)
+        && entry.get("async").and_then(Value::as_bool) == Some(true)
 }
 
-/// Whether a group has an entry running exactly this command.
-fn group_has_command(group: &Value, command: &str) -> bool {
+/// Whether a group holds the current wiring.
+fn group_is_current(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
         .and_then(|h| h.as_array())
-        .is_some_and(|entries| entries.iter().any(|e| entry_has_command(e, command)))
+        .is_some_and(|entries| entries.iter().any(|e| entry_is_current(e, command)))
 }
 
 /// Whether a matcher group's `hooks` array is present and empty — i.e. removing our entries left
@@ -419,7 +421,7 @@ fn strip_our_entries(groups: &mut [Value], keep_current: Option<&str>) -> bool {
         if let Some(Value::Array(entries)) = group.get_mut("hooks") {
             let before = entries.len();
             entries.retain(|e| {
-                !entry_is_our_hook(e) || keep_current.is_some_and(|cmd| entry_has_command(e, cmd))
+                !entry_is_our_hook(e) || keep_current.is_some_and(|cmd| entry_is_current(e, cmd))
             });
             removed |= entries.len() != before;
         }
@@ -438,11 +440,12 @@ pub fn render_snippet(hook_cmd: &str, events: &[&'static str]) -> String {
         .map(|(k, v, _)| format!("    {k:?}: {v:?}"))
         .collect::<Vec<_>>()
         .join(",\n");
+    // The group is serialized from the same builder `wire` uses, so a snippet pasted into managed
+    // settings is the wiring `init` would have written rather than a second spelling of it.
+    let group = serde_json::to_string(&hook_group(hook_cmd)).unwrap_or_default();
     let hooks = events
         .iter()
-        .map(|e| {
-            format!("    {e:?}: [{{ \"hooks\": [{{ \"type\": \"command\", \"command\": {hook_cmd:?} }}] }}]")
-        })
+        .map(|e| format!("    {e:?}: [{group}]"))
         .collect::<Vec<_>>()
         .join(",\n");
     format!("{{\n  \"env\": {{\n{env}\n  }},\n  \"hooks\": {{\n{hooks}\n  }}\n}}\n")
@@ -581,8 +584,8 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
                         } else {
                             // Active event: drop any group our strip emptied, then ensure our hook.
                             groups.retain(|g| !group_hooks_is_empty(g));
-                            if groups.iter().any(|g| group_has_command(g, hook_cmd)) {
-                                // Already wired to the current path; a repoint (stale removed) is a change.
+                            if groups.iter().any(|g| group_is_current(g, hook_cmd)) {
+                                // Already the current wiring; a repoint (stale removed) is a change.
                                 if removed {
                                     rep.events_added.push(ev);
                                 } else {
@@ -610,8 +613,12 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
     rep
 }
 
+/// Telemetry never delays the session it observes: the hook is wired asynchronously, so a tool call
+/// returns without waiting for the record to be written. hatel exits 0 and prints nothing on the
+/// happy path either way, so nothing that reaches the operator is given up for it — a collection
+/// gap is surfaced by `doctor`, which is where it is looked for.
 fn hook_group(hook_cmd: &str) -> Value {
-    json!({ "hooks": [{ "type": "command", "command": hook_cmd }] })
+    json!({ "hooks": [{ "type": "command", "command": hook_cmd, "async": true }] })
 }
 
 /// What `unwire` removed.
@@ -728,6 +735,33 @@ mod tests {
             "stale group is repointed in place, not added alongside"
         );
         assert_eq!(groups[0]["hooks"][0]["command"], CMD);
+        assert!(rep.events_added.contains(&"UserPromptSubmit"));
+    }
+
+    #[test]
+    fn the_printed_snippet_is_the_wiring_init_writes() {
+        // Two spellings of the hook group drift apart silently — a snippet pasted into managed
+        // settings must be the same wiring `wire` produces, asynchronous flag included.
+        let snippet = render_snippet(CMD, &["SessionStart"]);
+        let group = serde_json::to_string(&hook_group(CMD)).unwrap();
+        assert!(
+            snippet.contains(&group),
+            "snippet must embed the built group, got: {snippet}"
+        );
+    }
+
+    #[test]
+    fn wire_upgrades_a_synchronous_entry_of_ours() {
+        // An entry written before the wiring became asynchronous runs the right command but blocks
+        // the event it observes. It is ours, so it is replaced in place rather than left or doubled.
+        let mut s = json!({ "hooks": {
+            "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": CMD }] }]
+        }});
+        let rep = wire(&mut s, CMD, &EVENTS);
+        let groups = s["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "replaced in place, not added alongside");
+        assert_eq!(groups[0]["hooks"][0]["command"], CMD);
+        assert_eq!(groups[0]["hooks"][0]["async"], true);
         assert!(rep.events_added.contains(&"UserPromptSubmit"));
     }
 
@@ -1154,7 +1188,7 @@ mod tests {
             "stale event key pruned, no empty cruft"
         );
         // The active events remain wired, and a user hook elsewhere would have survived.
-        assert!(group_has_command(&s["hooks"]["SessionStart"][0], CMD));
+        assert!(group_is_current(&s["hooks"]["SessionStart"][0], CMD));
     }
 
     #[test]

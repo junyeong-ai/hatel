@@ -294,7 +294,7 @@ hatel init --print         # 쓰지 않고 블록만 출력(managed/org 설정�
 hatel init --remove        # 깔끔히 해제(네이티브 텔레메트리 env는 남김)
 ```
 
-`init`은 **로드된 Kind가 소비하는 이벤트만** 연결합니다(세션→프로젝트 인덱스를 위해 `SessionStart`는 항상). 어떤 Kind도 바인딩하지 않는 이벤트는 연결되지 않으므로, 훅이 기록 없이 실행되는 일이 없습니다.
+`init`은 **로드된 Kind가 소비하는 이벤트만** 연결합니다(세션→프로젝트 인덱스를 위해 `SessionStart`는 항상). 어떤 Kind도 바인딩하지 않는 이벤트는 연결되지 않으므로, 훅이 기록 없이 실행되는 일이 없습니다. 배선은 `async`라 도구 호출이 기록을 기다리지 않습니다 — 수집 공백은 `hatel doctor`가 알려주는 자리입니다.
 
 Claude Code 자신의 텔레메트리 설정은 `settings.json`의 `env`에 있어야 합니다 — 그게 Claude Code가 세션 시작 시 읽는 유일한 채널이고, 그 `OTEL_*` 변수는 의도적으로 훅 서브프로세스에 **전달되지 않습니다**. 두 레이어가 분리된 이유가 바로 이것입니다. 전체 형태:
 
@@ -308,11 +308,14 @@ Claude Code 자신의 텔레메트리 설정은 `settings.json`의 `env`에 있�
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318"
   },
   "hooks": {
-    "SessionStart":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "SubagentStop":      [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "InstructionsLoaded":[{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }],
-    "PreCompact":        [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }]
+    "SessionStart":        [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "UserPromptExpansion": [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PostToolUse":         [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PostToolUseFailure":  [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "UserPromptSubmit":    [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "SubagentStop":        [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "InstructionsLoaded":  [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}],
+    "PreCompact":          [{"hooks":[{"async":true,"command":"hatel-hook","type":"command"}]}]
   }
 }
 ```
