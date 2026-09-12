@@ -1263,3 +1263,72 @@ fn an_identity_must_be_a_field_of_its_kind_and_exclude_measures() {
     assert!(KindSpec::from_raw(raw(Some("id"), vec!["ms".into()])).is_err());
     assert!(KindSpec::from_raw(raw(None, vec!["ms".into()])).is_ok());
 }
+
+#[test]
+fn each_start_of_one_session_counts_its_own_resume_cost() {
+    // `/resume` re-enters an existing conversation under the SAME session id, firing SessionStart
+    // again and paying to re-establish the prompt cache each time. Counting sessions rather than
+    // starts would collapse every resume into the first one and lose that spend entirely.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let mut fresh = serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
+        "source": "startup",
+    });
+    hatel_core::hook::process_event(&mut fresh, &cfg, &reg);
+    for usd in [0.40, 0.55] {
+        let mut resumed = serde_json::json!({
+            "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
+            "source": "resume", "context_tokens": 40_000,
+            "seconds_since_last_response": 30, "estimated_cache_write_usd": usd,
+            "prompt_cache_likely_expired": false,
+        });
+        hatel_core::hook::process_event(&mut resumed, &cfg, &reg);
+    }
+    let groups = report::aggregate(&reg, &cfg, "session", &query(0, 0, None));
+    let resume = groups
+        .iter()
+        .find(|g| g.key == "resume")
+        .expect("resume group");
+    assert_eq!(resume.count, 2, "two resumes of one session are two starts");
+    let spend = resume
+        .sums
+        .iter()
+        .find(|m| m.name == "estimated_cache_write_usd")
+        .unwrap();
+    assert!(
+        (spend.sum - 0.95).abs() < 1e-9,
+        "resume cost sums across starts"
+    );
+}
+
+#[test]
+fn a_fresh_start_carries_no_resume_cost_rather_than_a_zero() {
+    // A fresh start has no cache to re-establish, so Claude Code sends no cost fields at all.
+    // The record must omit them — a stored zero would be indistinguishable from a resume that
+    // genuinely cost nothing.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let mut fresh = serde_json::json!({
+        "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
+        "source": "startup",
+    });
+    hatel_core::hook::process_event(&mut fresh, &cfg, &reg);
+    let recs = hatel_core::sink::read_records(&cfg, "session", None);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].payload.get("source").and_then(|v| v.as_str()),
+        Some("startup")
+    );
+    for absent in [
+        "estimated_cache_write_usd",
+        "context_tokens",
+        "since_last_response_s",
+        "cache_likely_expired",
+    ] {
+        assert!(
+            !recs[0].payload.contains_key(absent),
+            "{absent} must be absent, not zero"
+        );
+    }
+}

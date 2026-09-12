@@ -99,7 +99,9 @@ a teammate), `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_
 (`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
 `cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
 such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
-say so rather than treating it as zero).
+say so rather than treating it as zero). Spend does not end there: the `session` Kind carries what
+each `/resume` or `/fork` paid to re-establish the prompt cache, which no cost row includes — add
+it when asked what a project or a period actually cost.
 `report --project <label>` matches by the project's basename label. A project is a repository: work done in a linked worktree rolls up to the repository it checks out, and a session run outside any repository has no project and groups under `(empty)` — report that as unattributed, never as a project of its own. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",

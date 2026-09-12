@@ -49,6 +49,17 @@ fields = ["session_id", "project", "agent_id", "agent"]
 group_key = "agent"
 identity = "agent_id"
 
+# One record per session start. A session starts more than once — `/resume` and `/fork` on an
+# existing conversation each fire `SessionStart` again — so the record counts starts, not sessions,
+# and carries no identity: a start has no identifier of its own. `source` names what began it, and
+# for a resumed start Claude Code computes what re-establishing the prompt cache costs, which is
+# the spend a session-level total never shows.
+[[kind]]
+name = "session"
+fields = ["session_id", "project", "source", "context_tokens", "since_last_response_s", "estimated_cache_write_usd", "cache_likely_expired"]
+group_key = "source"
+measures = ["estimated_cache_write_usd", "context_tokens", "since_last_response_s"]
+
 [[kind]]
 name = "compaction"
 fields = ["session_id", "project", "trigger"]
@@ -60,6 +71,18 @@ group_key = "session_id"
 # ── Hook bindings (event → kind, with declarative field maps) ──
 # `project` is injected by the hook from the cwd; it is never mapped here.
 # (`tool` has no binding — it is receiver-written from the OTel `tool_result` event.)
+
+# A fresh start carries `source` alone; the cost fields accompany a resumed or forked one, so a
+# fresh start contributes zero to the sums rather than a guessed value.
+[[binding]]
+event = "SessionStart"
+kind = "session"
+map.session_id = { from = "session_id" }
+map.source = { from = "source" }
+map.context_tokens = { from = "context_tokens" }
+map.since_last_response_s = { from = "seconds_since_last_response" }
+map.estimated_cache_write_usd = { from = "estimated_cache_write_usd" }
+map.cache_likely_expired = { from = "prompt_cache_likely_expired" }
 
 [[binding]]
 event = "UserPromptSubmit"

@@ -97,6 +97,14 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 | a1b2c3d4 | 2 |
 | e5f6a7b8 | 1 |
 
+## session — by source, ranked by estimated_cache_write_usd
+
+| source | count | estimated_cache_write_usd | context_tokens | since_last_response_s |
+|---|---:|---:|---:|---:|
+| resume | 12 | 5.04 | 487,220 | 9,412 |
+| fork | 2 | 0.71 | 71,026 | 344 |
+| startup | 4 | 0 | 0 | 0 |
+
 ## subagent — by agent, ranked by count
 
 | agent | count |
@@ -125,6 +133,7 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 
 - Every section names its axes: **`by <dimension>, ranked by <measure>`**. That is the question the section answers, and both halves are yours to change — `--group-by` / `--sort-by`.
 - The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**.
+- The **`session`** section is how each session began (`startup` / `resume` / `fork`) and what resuming cost to re-establish the prompt cache. `/resume` starts the same session again, so one session is counted more than once, and this spend appears in no session total. Grouping by `cache_likely_expired` separates the part that was avoidable.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate.
 
@@ -362,6 +371,7 @@ $ hatel kinds
 compaction     group_key=session_id   fields=[project, session_id, trigger]
 memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
 prompt         group_key=session_id   fields=[project, prompt_len, session_id]
+session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
 tool           group_key=tool_name    fields=[duration_ms, ok, project, session_id, tool_name]
 ```
@@ -435,7 +445,7 @@ When the ledger holds a Kind no loaded schema declares — records that were col
 
 ```text
 $ hatel report --kind team.deploy
-report: unknown kind "team.deploy" (registered: compaction, memory, prompt, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+report: unknown kind "team.deploy" (registered: compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
 ```
 
 Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage), `identity` (the field identifying the entity a record describes, when several records describe the same one — a report then counts entities, not records).
