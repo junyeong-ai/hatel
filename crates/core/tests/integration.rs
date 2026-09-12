@@ -1434,3 +1434,68 @@ fn one_call_delivered_twice_counts_once() {
         .unwrap();
     assert_eq!(ms.sum, 7.0, "the duplicate does not double the duration");
 }
+
+#[test]
+fn a_command_record_keeps_the_name_and_nothing_the_operator_typed() {
+    // The envelope carries the arguments and the expanded prompt alongside the name. Only the name
+    // answers "which commands get used", and the other two are the operator's own text.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let mut event = serde_json::json!({
+        "hook_event_name": "UserPromptExpansion", "session_id": "S", "cwd": "/tmp/x",
+        "prompt_id": "P1", "expansion_type": "slash_command", "command_name": "hatel",
+        "command_args": "a secret argument", "prompt": "/hatel a secret argument",
+    });
+    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    let recs = hatel_core::sink::read_records(&cfg, "command", None);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        recs[0].payload.get("command_name").and_then(|v| v.as_str()),
+        Some("hatel")
+    );
+    for leaked in ["command_args", "prompt", "expansion_type"] {
+        assert!(
+            !recs[0].payload.contains_key(leaked),
+            "{leaked} must not be stored"
+        );
+    }
+}
+
+#[test]
+fn one_turn_joins_its_records_across_kinds() {
+    // `prompt_id` is the turn. Carrying it on every turn-scoped Kind is what lets one query ask
+    // what a single request set off, without a schema that models turns.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let mut prompt = serde_json::json!({
+        "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/x",
+        "prompt_id": "T1", "prompt": "do the thing",
+    });
+    hatel_core::hook::process_event(&mut prompt, &cfg, &reg);
+    let mut call = serde_json::json!({
+        "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/x",
+        "prompt_id": "T1", "tool_name": "Bash", "tool_use_id": "t1", "duration_ms": 5,
+    });
+    hatel_core::hook::process_event(&mut call, &cfg, &reg);
+    let mut agent = serde_json::json!({
+        "hook_event_name": "SubagentStop", "session_id": "S", "cwd": "/tmp/x",
+        "prompt_id": "T1", "agent_id": "a1", "agent_type": "general-purpose",
+    });
+    hatel_core::hook::process_event(&mut agent, &cfg, &reg);
+    let turn = |kind: &str| {
+        report::aggregate(
+            &reg,
+            &cfg,
+            kind,
+            &report::Query {
+                group_by: Some("prompt_id"),
+                ..query(0, 0, None)
+            },
+        )
+    };
+    for kind in ["prompt", "tool", "subagent"] {
+        let groups = turn(kind);
+        assert_eq!(groups.len(), 1, "{kind} groups under one turn");
+        assert_eq!(groups[0].key, "T1", "{kind} carries the turn it belongs to");
+    }
+}

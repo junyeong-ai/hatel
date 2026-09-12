@@ -33,7 +33,7 @@ measures = ["duration_ms", "ok"]
 
 [[kind]]
 name = "prompt"
-fields = ["session_id", "project", "prompt_len"]
+fields = ["session_id", "project", "prompt_id", "prompt_len"]
 group_key = "session_id"
 
 [[kind]]
@@ -43,7 +43,7 @@ group_key = "memory_id"
 
 [[kind]]
 name = "subagent"
-fields = ["session_id", "project", "agent_id", "agent"]
+fields = ["session_id", "project", "prompt_id", "agent_id", "agent"]
 group_key = "agent"
 identity = "agent_id"
 
@@ -58,16 +58,27 @@ fields = ["session_id", "project", "source", "context_tokens", "since_last_respo
 group_key = "source"
 measures = ["estimated_cache_write_usd", "context_tokens", "since_last_response_s"]
 
+# Explicit slash-command and skill invocations, one record per expansion. The name is the whole
+# signal: the arguments and the expanded prompt are the operator's own text and stay out of the
+# ledger. A skill the model loads on its own expands nothing and is not counted here.
+[[kind]]
+name = "command"
+fields = ["session_id", "project", "prompt_id", "command_name"]
+group_key = "command_name"
+
 [[kind]]
 name = "compaction"
-fields = ["session_id", "project", "trigger"]
+fields = ["session_id", "project", "prompt_id", "trigger"]
 group_key = "session_id"
 
 # Native-OTel cost/tokens are a snapshot, not a hook event — they live in a
 # rewritten snapshot file (see cost.rs), not as a Kind in the append-only sink.
 
 # ── Hook bindings (event → kind, with declarative field maps) ──
-# `project` is injected by the hook from the cwd; it is never mapped here.
+# `project` is injected by the hook from the cwd; it is never mapped here. `prompt_id` names the
+# turn an event belongs to, so one request's tool calls, subagents and compactions group together
+# under `--group-by prompt_id`. Session-scoped events carry none and are not given one:
+# `InstructionsLoaded` fires outside any turn.
 
 # A returning tool call fires exactly one of these two, so the pair writes one record per call and
 # `ok` distinguishes them. A call blocked before it ran fires neither — `PreToolUse` alone marks
@@ -110,6 +121,7 @@ map.cache_likely_expired = { from = "prompt_cache_likely_expired" }
 event = "UserPromptSubmit"
 kind = "prompt"
 map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
 map.prompt_len = { from = "prompt", len = true }
 
 [[binding]]
@@ -130,6 +142,7 @@ map.load_reason = { from = "load_reason" }
 event = "SubagentStop"
 kind = "subagent"
 map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
 map.agent_id = { from = "agent_id" }
 map.agent = { from = "agent_type" }
 
@@ -138,7 +151,15 @@ map.agent = { from = "agent_type" }
 # that is interrupted may never reach PostCompact). The trigger key name is not fixed
 # in the docs, so both known spellings are tried.
 [[binding]]
+event = "UserPromptExpansion"
+kind = "command"
+map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
+map.command_name = { from = "command_name" }
+
+[[binding]]
 event = "PreCompact"
 kind = "compaction"
 map.session_id = { from = "session_id" }
+map.prompt_id = { from = "prompt_id" }
 map.trigger = { from = ["trigger", "compact_trigger"] }

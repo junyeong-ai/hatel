@@ -19,9 +19,10 @@ const HOOK_BIN: &str = "hatel-hook";
 /// (see [`active_events`]): `SessionStart` (for the session→project index) plus every event a
 /// loaded Kind binds. The rest stay in the vocabulary so a plugin can bind them — e.g. `PostToolUse`
 /// for a tool-driven Kind — without firing the hook on events nothing consumes.
-pub const EVENTS: [&str; 9] = [
+pub const EVENTS: [&str; 10] = [
     "SessionStart",
     "SessionEnd",
+    "UserPromptExpansion",
     "PostToolUse",
     "PostToolUseFailure",
     "UserPromptSubmit",
@@ -1219,6 +1220,7 @@ mod tests {
             "PreCompact",
             "PostToolUse",
             "PostToolUseFailure",
+            "UserPromptExpansion",
         ] {
             assert!(active.contains(&ev), "{ev} should be wired");
         }

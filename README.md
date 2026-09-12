@@ -368,11 +368,12 @@ hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # 도�
 
 ```text
 $ hatel kinds
-compaction     group_key=session_id   fields=[project, session_id, trigger]
+command        group_key=command_name fields=[command_name, project, prompt_id, session_id]
+compaction     group_key=session_id   fields=[project, prompt_id, session_id, trigger]
 memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
-prompt         group_key=session_id   fields=[project, prompt_len, session_id]
+prompt         group_key=session_id   fields=[project, prompt_id, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
-subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
+subagent       group_key=agent        fields=[agent, agent_id, project, prompt_id, session_id] identity=agent_id
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 ```
 
@@ -445,7 +446,7 @@ plugins = ["schemas/aix.toml"]   # 상대 경로는 config.toml 자신의 디렉
 
 ```text
 $ hatel report --kind team.deploy
-report: unknown kind "team.deploy" (registered: compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+report: unknown kind "team.deploy" (registered: command, compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
 ```
 
 Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱), `identity`(여러 기록이 한 실체를 가리킬 때 그 실체를 식별하는 필드 — 리포트가 기록이 아니라 실체를 셉니다).

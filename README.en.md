@@ -368,11 +368,12 @@ hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # reco
 
 ```text
 $ hatel kinds
-compaction     group_key=session_id   fields=[project, session_id, trigger]
+command        group_key=command_name fields=[command_name, project, prompt_id, session_id]
+compaction     group_key=session_id   fields=[project, prompt_id, session_id, trigger]
 memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
-prompt         group_key=session_id   fields=[project, prompt_len, session_id]
+prompt         group_key=session_id   fields=[project, prompt_id, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
-subagent       group_key=agent        fields=[agent, agent_id, project, session_id] identity=agent_id
+subagent       group_key=agent        fields=[agent, agent_id, project, prompt_id, session_id] identity=agent_id
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
 ```
 
@@ -445,7 +446,7 @@ When the ledger holds a Kind no loaded schema declares — records that were col
 
 ```text
 $ hatel report --kind team.deploy
-report: unknown kind "team.deploy" (registered: compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+report: unknown kind "team.deploy" (registered: command, compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
 ```
 
 Per Kind: `fields` (the single allow-list), `group_key` (the field a report groups by), `measures` (numeric fields a report **sums** — the first is the ranking metric), `redact` (hashed before storage), `identity` (the field identifying the entity a record describes, when several records describe the same one — a report then counts entities, not records).
