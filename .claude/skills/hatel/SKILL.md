@@ -135,7 +135,8 @@ again, an @-import as `include` with `parent_file_path`; a load a file access se
 `trigger_file_path` and skips a file the context already holds — so report a missing load as "not
 announced", never as "not in context". `prompt_id` is the latest prompt submitted at load time, not
 proof the load was lazy. The `command` Kind answers which slash commands and skills were explicitly
-invoked; a skill the model loads on its own expands nothing and is not counted there.
+invoked; a skill the model loads on its own expands nothing and is not counted there —
+`--kind tool --filter tool_name=Skill --group-by skill` names those.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
 error rather than an empty answer.
 
@@ -183,8 +184,10 @@ a report groups by), `measures` (numeric fields a report sums; first is the prim
 describes, when a lifecycle event fires more than once per entity; a report then counts entities
 rather than records, representing each by its earliest one, and sums the measures over what
 survives). Namespace plugin Kinds (`team.deploy`) so they can't
-collide with core's flat names. Field-map transforms: `from` (a list tries each in order),
-`capture` (regex group 1), `len`, `present`, `basename`, `repo_path`, `const`.
+collide with core's flat names. Field-map transforms: `from` (a list tries each in order; a JSON
+Pointer such as `/tool_input/skill` reads a nested value), `capture` (regex group 1), `len`,
+`present`, `basename`, `repo_path`, `const`; `when = { tool_name = "Skill" }` writes the field only
+for events whose sources equal those values.
 
 `emit` records a domain signal directly (`key=value` is a string, `key:=value` is JSON):
 

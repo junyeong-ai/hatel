@@ -1393,6 +1393,66 @@ fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
 }
 
 #[test]
+fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
+    // A skill the model loads on its own expands no command, so the `Skill` call is the only
+    // record of which skill it was. Another tool's input can carry a `skill` key of its own, and
+    // that is the operator's content.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for (event, tool, id, input) in [
+        (
+            "PostToolUse",
+            "Skill",
+            "t1",
+            serde_json::json!({"skill": "greet", "args": "a secret"}),
+        ),
+        (
+            "PostToolUseFailure",
+            "Skill",
+            "t2",
+            serde_json::json!({"skill": "greet"}),
+        ),
+        (
+            "PostToolUse",
+            "mcp__kb__search",
+            "t3",
+            serde_json::json!({"skill": "internal note"}),
+        ),
+    ] {
+        let mut e = serde_json::json!({
+            "hook_event_name": event, "session_id": "S", "cwd": "/tmp/x", "prompt_id": "P",
+            "tool_name": tool, "tool_use_id": id, "duration_ms": 3, "tool_input": input,
+        });
+        hatel_core::hook::process_event(&mut e, &cfg, &reg);
+    }
+    let recs = hatel_core::sink::read_records(&cfg, "tool", None);
+    let skill_of = |id: &str| {
+        let rec = recs
+            .iter()
+            .find(|r| r.payload.get("tool_use_id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap();
+        assert!(!rec.payload.contains_key("tool_input"));
+        rec.payload.get("skill").and_then(|v| v.as_str())
+    };
+    assert_eq!(skill_of("t1"), Some("greet"));
+    assert_eq!(skill_of("t2"), Some("greet"));
+    assert_eq!(skill_of("t3"), None);
+    let filters = [("tool_name".to_string(), "Skill".to_string())];
+    let groups = report::aggregate(
+        &reg,
+        &cfg,
+        "tool",
+        &report::Query {
+            group_by: Some("skill"),
+            filters: &filters,
+            ..query(0, 0, None)
+        },
+    );
+    assert_eq!(groups.len(), 1);
+    assert_eq!((groups[0].key.as_str(), groups[0].count), ("greet", 2));
+}
+
+#[test]
 fn a_failed_call_and_a_returning_one_land_in_the_same_kind() {
     // A tool call fires exactly one of PostToolUse / PostToolUseFailure, so the two bindings write
     // one record per call and `ok` tells them apart. Summing `ok` over a group is its success count.

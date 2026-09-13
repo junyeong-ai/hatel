@@ -24,9 +24,12 @@ counted_events = [
 # present only when a subagent made the call, so its absence names the main agent — the dimension
 # a session-level tool count flattens away. `duration_ms` is time until the call returned: a
 # backgrounded command returns as soon as it is accepted, so its figure is acceptance, not work.
+# `skill` names the skill a `Skill` call loaded: a skill the model invokes on its own expands no
+# command, so this is the only record of which one it was. Every other tool's input is content and
+# stays out.
 [[kind]]
 name = "tool"
-fields = ["session_id", "project", "prompt_id", "agent_id", "tool_name", "tool_use_id", "duration_ms", "ok"]
+fields = ["session_id", "project", "prompt_id", "agent_id", "tool_name", "tool_use_id", "duration_ms", "ok", "skill"]
 group_key = "tool_name"
 identity = "tool_use_id"
 measures = ["duration_ms", "ok"]
@@ -100,6 +103,7 @@ map.tool_name = { from = "tool_name" }
 map.tool_use_id = { from = "tool_use_id" }
 map.duration_ms = { from = "duration_ms" }
 map.ok = { const = 1 }
+map.skill = { from = "/tool_input/skill", when = { tool_name = "Skill" } }
 
 [[binding]]
 event = "PostToolUseFailure"
@@ -111,6 +115,7 @@ map.tool_name = { from = "tool_name" }
 map.tool_use_id = { from = "tool_use_id" }
 map.duration_ms = { from = "duration_ms" }
 map.ok = { const = 0 }
+map.skill = { from = "/tool_input/skill", when = { tool_name = "Skill" } }
 
 # A fresh start carries `source` alone; the cost fields accompany a resumed or forked one, so a
 # fresh start contributes zero to the sums rather than a guessed value.

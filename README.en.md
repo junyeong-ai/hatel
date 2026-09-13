@@ -137,7 +137,7 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 - The **`session`** section counts the times a context was established — besides `startup`, each of `resume`, `fork`, `clear` and `compact` fires `SessionStart` again on an existing conversation, so one session is counted more than once. The measures are what rebuilding the prompt cache cost on those starts, spend that appears in no session total. Grouping by `cache_likely_expired` separates the part that was avoidable.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - The **`memory`** section is which instruction files entered context, named by their path in the repository (outside it, `~/…` under home and absolute elsewhere); the same path in two repositories shares a row until you add `--project` or `--group-by project`. Rebuilding context (`session_start`, `compact`) announces every file again, an @-imported one as `include` with `parent_file_path`. A load a file access set off carries `trigger_file_path`, the file that pulled it in, and skips a file the context already holds, so a missing load does not mean the file was absent. `prompt_id` is the latest prompt submitted when the load happened.
-- The **`command`** section is the slash commands and skills that were explicitly invoked. A skill the model loads on its own expands nothing, so it is not counted here.
+- The **`command`** section is the slash commands and skills that were explicitly invoked. A skill the model loads on its own expands nothing, so it is not counted here; `--kind tool --filter tool_name=Skill --group-by skill` names those.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate. An `(empty)` row is an agent Claude Code ran for itself — not one the conversation spawned, so it carries no type, keeps no transcript, and makes no tool calls.
 
 > A Kind with nothing in the window says so in place of its table, and Kinds you have no records for are listed the same way (omitted above for brevity). Start the receiver and run Claude Code once and they fill in (see [Troubleshooting](#troubleshooting)).
@@ -381,7 +381,7 @@ memory         group_key=file_path    fields=[file_path, load_reason, memory_typ
 prompt         group_key=session_id   fields=[project, prompt_id, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, prompt_id, session_id] identity=agent_id
-tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 ```
 
 When the ledger holds a Kind no loaded schema declares, one more line follows the list — the other half of an honest answer to what was asked ("what can I query"). `--json` carries the same fact as `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`, and `unreadable_kinds` is `null` when there is no gap:
@@ -389,7 +389,7 @@ When the ledger holds a Kind no loaded schema declares, one more line follows th
 ```text
 $ hatel kinds
 ...
-tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, tool_name, tool_use_id] identity=tool_use_id
+tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 
 the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
 ```
@@ -476,7 +476,7 @@ map.service    = { from = "tool_name" }
 map.ok         = { from = "tool_response", present = true }
 ```
 
-> Field-map transforms: `from` (passthrough; a list tries each in order), `capture` (regex group 1), `len` (string length), `present` (field present → bool), `basename` (final path component), `repo_path` (path relative to the repository checkout the session runs in; outside it, `~/…` under home, otherwise unchanged), `const`. A transform that doesn't apply omits the field — never fabricated. Only when a binding maps from `git_branch` does the hook read it from `.git/HEAD` (no subprocess), so a spec slug derives with zero code: `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }`.
+> Field-map transforms: `from` (passthrough; a list tries each in order; a JSON Pointer such as `/tool_input/skill` reads a nested value), `capture` (regex group 1), `len` (string length), `present` (field present → bool), `basename` (final path component), `repo_path` (path relative to the repository checkout the session runs in; outside it, `~/…` under home, otherwise unchanged), `const`. `when = { tool_name = "Skill" }` writes the field only for events whose sources equal those values. A transform that doesn't apply omits the field — never fabricated. Only when a binding maps from `git_branch` does the hook read it from `.git/HEAD` (no subprocess), so a spec slug derives with zero code: `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }`.
 
 **2) `emit`** — for a domain signal that is *not* a Claude Code event (a spec-gate decision, a rule-check rollup, a deploy outcome). Your tooling records it directly:
 

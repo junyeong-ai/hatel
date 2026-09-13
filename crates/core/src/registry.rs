@@ -99,7 +99,9 @@ impl KindSpec {
 
 /// The source field(s) a `FieldMap` reads. A single key, or several tried in
 /// order (the first present wins) — which lets a binding tolerate a field whose
-/// exact name is version-sensitive without ever guessing a value.
+/// exact name is version-sensitive without ever guessing a value. A key names a
+/// top-level field of the event; a JSON Pointer (RFC 6901, starting with `/`) names
+/// a value nested inside one. No hook event has a top-level key starting with `/`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum FromSpec {
@@ -143,6 +145,29 @@ pub struct FieldMap {
     /// A constant value, independent of stdin.
     #[serde(default, rename = "const")]
     pub constant: Option<serde_json::Value>,
+    /// Sources that must equal these values for the field to be written at all — how one binding
+    /// keeps a field to the events it describes, such as an argument of one tool only.
+    #[serde(default)]
+    pub when: BTreeMap<String, serde_json::Value>,
+}
+
+fn source<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    if key.starts_with('/') {
+        event.pointer(key)
+    } else {
+        event.get(key)
+    }
+}
+
+/// The top-level field a source reads from: the key itself, or a pointer's first segment.
+fn root_field(key: &str) -> std::borrow::Cow<'_, str> {
+    match key.strip_prefix('/') {
+        Some(pointer) => {
+            let first = pointer.split('/').next().unwrap_or("");
+            std::borrow::Cow::Owned(first.replace("~1", "/").replace("~0", "~"))
+        }
+        None => std::borrow::Cow::Borrowed(key),
+    }
 }
 
 impl FieldMap {
@@ -177,20 +202,29 @@ impl FieldMap {
                 return Err("a non-const map needs a non-empty `from` source");
             }
         }
+        if self.when.keys().any(String::is_empty) {
+            return Err("a `when` condition needs a non-empty source");
+        }
         Ok(())
     }
 
     /// Whether this mapping reads `key` as a source — used to decide, per event,
     /// whether a synthetic field like `git_branch` is worth computing at all.
     pub fn references(&self, key: &str) -> bool {
-        match &self.from {
-            Some(FromSpec::One(s)) => s == key,
-            Some(FromSpec::Many(v)) => v.iter().any(|s| s == key),
-            None => false,
-        }
+        let from = self.from.as_ref().map_or(&[][..], FromSpec::keys);
+        from.iter()
+            .chain(self.when.keys())
+            .any(|k| root_field(k) == key)
     }
 
     pub fn apply(&self, stdin: &serde_json::Value) -> Option<serde_json::Value> {
+        if !self
+            .when
+            .iter()
+            .all(|(k, want)| source(stdin, k) == Some(want))
+        {
+            return None;
+        }
         if let Some(c) = &self.constant {
             return Some(c.clone());
         }
@@ -198,10 +232,10 @@ impl FieldMap {
         if self.present {
             let has = keys
                 .iter()
-                .any(|k| stdin.get(k).map(|v| !v.is_null()).unwrap_or(false));
+                .any(|k| source(stdin, k).is_some_and(|v| !v.is_null()));
             return Some(serde_json::Value::Bool(has));
         }
-        let value = keys.iter().find_map(|k| stdin.get(k))?;
+        let value = keys.iter().find_map(|k| source(stdin, k))?;
         if self.len {
             return Some(serde_json::Value::from(value.as_str()?.chars().count()));
         }
@@ -382,6 +416,39 @@ mod tests {
         )
         .unwrap();
         reg
+    }
+
+    #[test]
+    fn a_pointer_reads_a_nested_value_and_when_keeps_it_to_matching_events() {
+        let fm: FieldMap =
+            toml::from_str("from = \"/tool_input/skill\"\nwhen = { tool_name = \"Skill\" }")
+                .unwrap();
+        let event =
+            |tool: &str| serde_json::json!({"tool_name": tool, "tool_input": {"skill": "greet"}});
+        assert_eq!(fm.apply(&event("Skill")), Some("greet".into()));
+        assert_eq!(fm.apply(&event("Bash")), None);
+        assert_eq!(fm.apply(&serde_json::json!({"tool_name": "Skill"})), None);
+    }
+
+    #[test]
+    fn a_source_is_referenced_through_a_pointer_or_a_condition() {
+        let pointer: FieldMap = toml::from_str("from = \"/git_branch\"").unwrap();
+        let condition: FieldMap =
+            toml::from_str("from = \"x\"\nwhen = { git_branch = \"main\" }").unwrap();
+        let escaped: FieldMap = toml::from_str("from = \"/a~1b/c\"").unwrap();
+        assert!(pointer.references("git_branch"));
+        assert!(condition.references("git_branch"));
+        assert!(escaped.references("a/b"));
+        assert!(!escaped.references("a"));
+    }
+
+    #[test]
+    fn a_condition_without_a_source_is_rejected() {
+        let binding: HookBinding = toml::from_str(
+            "event = \"SessionStart\"\nkind = \"k\"\nmap.thing = { from = \"x\", when = { \"\" = 1 } }",
+        )
+        .unwrap();
+        assert!(reg_with_kind().bind(binding).is_err());
     }
 
     #[test]
