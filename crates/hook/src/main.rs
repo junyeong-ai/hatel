@@ -10,6 +10,10 @@ use std::io::Read;
 const MAX_STDIN_BYTES: u64 = 64 * 1024 * 1024;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("hatel-hook {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let mut buf = String::new();
     let _ = std::io::stdin()
         .take(MAX_STDIN_BYTES)

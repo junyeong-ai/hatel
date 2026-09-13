@@ -47,6 +47,9 @@ hatel doctor               # verify and explain any gaps
   hatel drops session-less metrics rather than guess (org/user aggregation only survives at a
   downstream collector you forward the raw stream to). There is no fallback — report it as-is.
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
+- **wired hook … names no version / is <version> while this hatel is …** (a warning) → the hook
+  writing records is a different build from the `hatel` reading them, so fields can differ from
+  what `kinds` lists. Reinstall so both come from one release before trusting a Kind's shape.
 - **… wired synchronously** (a warning, not a gap) → wiring written before the hook was wired
   asynchronously. Every record still arrives, but Claude Code waits for the hook each time the
   event fires; `hatel init` rewrites it.

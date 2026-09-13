@@ -294,7 +294,10 @@ fn report_hooks(
             sec.fail(format!(
                 "wired hook `{cmd}` is missing on disk — re-run `hatel init` to repoint it"
             ));
+            continue;
         }
+        let (status, message) = hook_build_finding(&cmd, cs::wired_hook_build(&cmd));
+        sec.push(status, message);
     }
     // A plugin can bind any event string, but `init` only wires the events hatel knows how to wire;
     // a binding outside that set never fires, so the plugin's Kind would silently collect nothing.
@@ -303,6 +306,36 @@ fn report_hooks(
             "a plugin binds `{ev}`, which hatel does not wire — that binding never fires \
              (the event isn't in the supported set; remove it or use a supported event)"
         ));
+    }
+}
+
+/// Judge the build answering at a wired hook against this one. They are installed together and
+/// compile the same schema, so a skew means what is being written and what is being read describe
+/// different shapes — a cost the coverage check cannot see, since the wiring is complete.
+fn hook_build_finding(cmd: &str, build: cs::HookBuild) -> (Status, String) {
+    let ours = env!("CARGO_PKG_VERSION");
+    match build {
+        cs::HookBuild::Version(v) if v == ours => {
+            (Status::Ok, format!("wired hook is this build ({v})"))
+        }
+        cs::HookBuild::Version(v) => (
+            Status::Warn,
+            format!(
+                "wired hook `{cmd}` is {v} while this hatel is {ours} — reinstall so records are \
+                 written in the shape queries read"
+            ),
+        ),
+        cs::HookBuild::Unreported => (
+            Status::Warn,
+            format!(
+                "wired hook `{cmd}` names no version, as every build before 0.14.0 does — reinstall \
+                 so it matches this hatel ({ours})"
+            ),
+        ),
+        cs::HookBuild::Unrunnable(e) => (
+            Status::Fail,
+            format!("wired hook `{cmd}` cannot be run ({e}) — no events are captured"),
+        ),
     }
 }
 
@@ -639,6 +672,27 @@ fn writable(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_build_is_judged_against_this_one() {
+        let ours = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            hook_build_finding("/x/hatel-hook", cs::HookBuild::Version(ours.to_string())).0,
+            Status::Ok
+        );
+        // A skew and a build too old to name itself are the same cost — records written in a shape
+        // these queries do not describe — while a hook that cannot run captures nothing at all.
+        for build in [
+            cs::HookBuild::Version("0.0.1".to_string()),
+            cs::HookBuild::Unreported,
+        ] {
+            assert_eq!(hook_build_finding("/x/hatel-hook", build).0, Status::Warn);
+        }
+        assert_eq!(
+            hook_build_finding("/x/hatel-hook", cs::HookBuild::Unrunnable("no".into())).0,
+            Status::Fail
+        );
+    }
 
     #[test]
     fn unattributed_sessions_are_named_only_when_some_exist() {

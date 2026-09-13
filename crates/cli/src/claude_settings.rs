@@ -389,6 +389,35 @@ pub fn wired_hook_commands(files: &[ScopeFile]) -> Vec<String> {
     cmds
 }
 
+/// What a wired hook answers when asked which build it is. The hook and this binary ship in one
+/// archive and compile one schema, so a build other than this one writes records in a shape the
+/// queries here do not describe.
+pub enum HookBuild {
+    Version(String),
+    /// It ran and named no version — every build before `--version` existed answers this way.
+    Unreported,
+    Unrunnable(String),
+}
+
+/// Ask the hook wired at `command` which build it is. Stdin is closed so a build that predates
+/// `--version` reads an empty event and records nothing instead of waiting for one.
+pub fn wired_hook_build(command: &str) -> HookBuild {
+    let out = std::process::Command::new(command)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match out {
+        Err(e) => HookBuild::Unrunnable(e.to_string()),
+        Ok(out) => String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .strip_prefix(HOOK_BIN)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map_or(HookBuild::Unreported, |v| HookBuild::Version(v.to_string())),
+    }
+}
+
 /// Whether one event's value (an array of matcher groups) already invokes our hook.
 fn event_has_hook(event: &Value) -> bool {
     event
