@@ -146,7 +146,8 @@ pub struct FieldMap {
     #[serde(default, rename = "const")]
     pub constant: Option<serde_json::Value>,
     /// Sources that must equal these values for the field to be written at all — how one binding
-    /// keeps a field to the events it describes, such as an argument of one tool only.
+    /// keeps a field to the events it describes, such as an argument of one tool only. Equality is
+    /// JSON equality, type included (`"1"` is not `1`), and a missing source matches nothing.
     #[serde(default)]
     pub when: BTreeMap<String, serde_json::Value>,
 }
@@ -191,18 +192,19 @@ impl FieldMap {
             return Err("at most one of capture/len/present/basename/repo_path/const may be set");
         }
         // A non-const map needs a `from` with at least one usable source key. Absent, an empty list
-        // (`from = []`), or only blank keys (`from = ""`) are all the same dead mapping — they would
-        // always omit — so reject them loudly at load rather than silently emit nothing.
+        // (`from = []`), or only blank keys (`from = ""`, `from = "/"`) are all the same dead
+        // mapping — they would always omit — so reject them loudly at load rather than silently
+        // emit nothing.
         if self.constant.is_none() {
             let has_source = self
                 .from
                 .as_ref()
-                .is_some_and(|f| f.keys().iter().any(|k| !k.is_empty()));
+                .is_some_and(|f| f.keys().iter().any(|k| !root_field(k).is_empty()));
             if !has_source {
                 return Err("a non-const map needs a non-empty `from` source");
             }
         }
-        if self.when.keys().any(String::is_empty) {
+        if self.when.keys().any(|k| root_field(k).is_empty()) {
             return Err("a `when` condition needs a non-empty source");
         }
         Ok(())
@@ -456,7 +458,12 @@ mod tests {
         // `from = []`, `from = ""`, and `from = ["", ""]` are all dead mappings — a non-const map
         // with no usable source key always omits — so they must fail at load, not silently emit
         // nothing. (`from` absent is already rejected; this covers the present-but-empty forms.)
-        for from in ["from = []", "from = \"\"", "from = [\"\", \"\"]"] {
+        for from in [
+            "from = []",
+            "from = \"\"",
+            "from = [\"\", \"\"]",
+            "from = \"/\"",
+        ] {
             let binding: HookBinding = toml::from_str(&format!(
                 "event = \"SessionStart\"\nkind = \"k\"\nmap.thing = {{ {from} }}"
             ))

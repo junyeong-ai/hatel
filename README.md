@@ -565,7 +565,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
 | **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
 | **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`와 `tool`은 각각 `agent_id`·`tool_use_id`로 실체를 세므로 영향을 받지 않습니다. |
-| **`doctor`에 `⚠ wired hook … names no version` 또는 `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드여서, 조회가 설명하지 않는 형식으로 기록이 쌓입니다. 둘이 같은 릴리스가 되도록 다시 설치하세요. |
+| **`doctor`에 `⚠ wired hook … names no version` 또는 `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드여서, 기록의 필드가 `hatel kinds`가 보여주는 것과 다를 수 있습니다. 둘이 같은 릴리스가 되도록 다시 설치하세요. |
 | **`doctor`에 `⚠ … wired synchronously`** | 0.12 이전에 배선된 설정입니다. 기록은 전부 남지만 이벤트마다 Claude Code가 훅을 기다립니다. `hatel init`을 다시 실행하면 비동기로 다시 씁니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |

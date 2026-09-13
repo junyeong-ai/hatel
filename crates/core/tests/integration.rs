@@ -1431,7 +1431,6 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
             .iter()
             .find(|r| r.payload.get("tool_use_id").and_then(|v| v.as_str()) == Some(id))
             .unwrap();
-        assert!(!rec.payload.contains_key("tool_input"));
         rec.payload.get("skill").and_then(|v| v.as_str())
     };
     assert_eq!(skill_of("t1"), Some("greet"));

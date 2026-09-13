@@ -285,12 +285,17 @@ fn report_hooks(
         ));
     }
 
+    // Only an absolute path names the binary Claude Code runs; a bare name resolves through the
+    // session's PATH, which this process cannot see, so it is judged neither missing nor stale.
     // A wired hook whose absolute path no longer resolves silently stops collection, while the
     // basename-based coverage check above still counts it — so a moved/reinstalled binary doesn't
     // pass as healthy. (`hatel init` repoints it.)
     for cmd in cs::wired_hook_commands(files) {
         let p = Path::new(&cmd);
-        if p.is_absolute() && !p.exists() {
+        if !p.is_absolute() {
+            continue;
+        }
+        if !p.exists() {
             sec.fail(format!(
                 "wired hook `{cmd}` is missing on disk — re-run `hatel init` to repoint it"
             ));
@@ -321,15 +326,16 @@ fn hook_build_finding(cmd: &str, build: cs::HookBuild) -> (Status, String) {
         cs::HookBuild::Version(v) => (
             Status::Warn,
             format!(
-                "wired hook `{cmd}` is {v} while this hatel is {ours} — reinstall so records are \
-                 written in the shape queries read"
+                "wired hook `{cmd}` is {v} while this hatel is {ours} — its records can differ \
+                 from the fields `hatel kinds` lists; reinstall both from one release"
             ),
         ),
         cs::HookBuild::Unreported => (
             Status::Warn,
             format!(
-                "wired hook `{cmd}` names no version, as every build before 0.14.0 does — reinstall \
-                 so it matches this hatel ({ours})"
+                "wired hook `{cmd}` names no version, as a build from before `--version` does — \
+                 its records can differ from the fields this hatel ({ours}) lists; reinstall both \
+                 from one release"
             ),
         ),
         cs::HookBuild::Unrunnable(e) => (
@@ -760,6 +766,31 @@ mod tests {
         assert!(
             !blocking.iter().any(|f| f.status == Status::Fail),
             "records still arrive, so it is a cost rather than a gap"
+        );
+    }
+
+    #[test]
+    fn a_hook_wired_by_bare_name_is_not_judged_through_this_shells_path() {
+        let files = [cs::ScopeFile {
+            name: "managed",
+            path: std::path::PathBuf::from("x"),
+            load: cs::Load::Found(serde_json::json!({ "hooks": {
+                "SessionStart": [{ "hooks": [{ "type": "command", "command": "hatel-hook" }] }]
+            }})),
+        }];
+        let mut sec = Section::new("hooks", "hooks:");
+        report_hooks(
+            &mut sec,
+            &files,
+            &[("SessionStart", cs::Wiring::Concurrent)],
+            &hatel_core::Registry::default(),
+        );
+        assert!(
+            sec.findings
+                .iter()
+                .all(|f| !f.message.contains("wired hook")),
+            "{:?}",
+            sec.findings.iter().map(|f| &f.message).collect::<Vec<_>>()
         );
     }
 
