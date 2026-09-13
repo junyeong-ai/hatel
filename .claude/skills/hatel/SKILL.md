@@ -2,7 +2,7 @@
 name: hatel
 version: 0.12.3
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
-when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
+when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, which CLAUDE.md or rules got loaded, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
 ---
 
@@ -124,7 +124,12 @@ rank by count — and `identity`, naming what that count counts when it is not r
 the Kind declares the defaults, the query overrides them. Two dimensions every turn-scoped Kind
 carries: `--group-by prompt_id` groups one request's work (its tool calls, its subagents), and on
 `tool`, `--group-by agent_id` separates a subagent's calls from the main agent's — the row with no
-value is the main agent, which never carries one. The `command` Kind answers which slash commands
+value is the main agent, which never carries one. The `memory` Kind answers which instruction
+files (CLAUDE.md, rules) entered context: `file_path` is the path in the repository, `load_reason`
+says why, and a lazy load carries `trigger_file_path` and its `prompt_id`. Eager loads
+(`session_start`, `compact`) repeat for every file on each context rebuild, and a file the context
+already holds is not loaded again — so report a missing load as "not announced", never as "not in
+context". The `command` Kind answers which slash commands
 and skills were explicitly invoked; a skill the model loads on its own expands nothing and is not
 counted there.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
