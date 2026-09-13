@@ -441,9 +441,9 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
     let out = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = out.take(HOOK_ANSWER_BYTES + 1).read_to_string(&mut text);
-        let _ = tx.send(text);
+        let mut bytes = Vec::new();
+        let _ = out.take(HOOK_ANSWER_BYTES + 1).read_to_end(&mut bytes);
+        let _ = tx.send(bytes);
     });
     let no_answer =
         || HookBuild::Unverified(format!("no answer within {}s", deadline.as_secs_f32()));
@@ -466,17 +466,20 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
             Err(e) => return HookBuild::Unverified(e.to_string()),
         }
     };
-    let Ok(stdout) = rx.recv_timeout(deadline.saturating_sub(started.elapsed())) else {
+    let Ok(answer) = rx.recv_timeout(deadline.saturating_sub(started.elapsed())) else {
         return no_answer();
     };
     // The size of the answer is judged before the exit it ended in: a hook that writes past what is
     // read ends on the closed pipe, and that end is this probe's doing rather than its own.
-    if stdout.len() as u64 > HOOK_ANSWER_BYTES {
+    if answer.len() as u64 > HOOK_ANSWER_BYTES {
         return HookBuild::Unverified(format!("answered with more than {HOOK_ANSWER_BYTES} bytes"));
     }
     if !status.success() {
         return HookBuild::Unverified(status.to_string());
     }
+    let Ok(stdout) = String::from_utf8(answer) else {
+        return HookBuild::Unverified("answered with bytes that are not text".to_string());
+    };
     stdout
         .trim()
         .strip_prefix(HOOK_BIN)
@@ -1278,6 +1281,12 @@ mod tests {
         );
         let got = answer("cat >/dev/null");
         assert!(matches!(got, HookBuild::Unreported), "{got:?}");
+        // Bytes that are not text are an answer that was given, not one that was withheld.
+        let got = answer("printf '\\377\\377\\377'");
+        assert!(
+            matches!(&got, HookBuild::Unverified(r) if r.contains("not text")),
+            "{got:?}"
+        );
         // A flood is not an answer, and it is never held whole to find that out.
         let got = answer("head -c 200000 /dev/zero | tr '\\0' x");
         assert!(

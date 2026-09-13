@@ -229,8 +229,8 @@ impl FieldMap {
         Ok(())
     }
 
-    /// Whether this mapping reads `key` as a source — used to decide, per event,
-    /// whether a synthetic field like `git_branch` is worth computing at all.
+    /// Whether this mapping reads `key`, as a source or as a condition — used to decide, per
+    /// event, whether a synthetic field like `git_branch` is worth computing at all.
     pub fn references(&self, key: &str) -> bool {
         let from = self.from.as_ref().map_or(&[][..], FromSpec::keys);
         from.iter()
