@@ -138,7 +138,8 @@ again, an @-import as `include` with `parent_file_path`; a load a file access se
 announced", never as "not in context". `prompt_id` is the latest prompt submitted at load time, not
 proof the load was lazy. The `command` Kind answers which slash commands and skills were explicitly
 invoked; a skill the model loads on its own expands nothing and is not counted there —
-`--kind tool --filter tool_name=Skill --group-by skill` names those.
+`--kind tool --filter tool_name=Skill --group-by skill` names those — the skill each call asked
+for, a failed call included, so add `--filter ok=1` to count the ones that ran.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
 error rather than an empty answer.
 

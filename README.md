@@ -137,7 +137,7 @@ hatel report --window 30d
 - **`session`** 섹션은 컨텍스트를 세운 시점을 셉니다 — `startup` 외에 `resume`·`fork`·`clear`·`compact`가 모두 기존 대화에서 `SessionStart`를 다시 일으키므로, 한 세션이 여러 번 집계됩니다. 측정값은 그렇게 다시 세울 때 프롬프트 캐시를 재작성한 비용이고, 세션 총계 어디에도 나타나지 않습니다. `cache_likely_expired`로 묶으면 피할 수 있었던 지출이 갈립니다.
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`memory`** 섹션은 어떤 지침 파일이 컨텍스트에 들어왔는지를 저장소 안 경로(저장소 밖이면 홈 아래는 `~/…`, 나머지는 절대 경로)로 보여줍니다. 두 저장소의 같은 경로는 `--project`나 `--group-by project`를 더하기 전까지 한 행으로 합쳐집니다. 컨텍스트를 다시 세우면(`session_start`, `compact`) 모든 파일이 다시 알려지고, @-import된 파일은 `parent_file_path`를 가진 `include`로 알려집니다. 파일 접근이 일으킨 로드는 그 파일(`trigger_file_path`)을 싣고, 컨텍스트가 이미 가진 파일은 건너뛰므로 로드 기록이 없다고 파일이 없었던 것은 아닙니다. `prompt_id`는 로드가 일어난 시점에 마지막으로 제출된 프롬프트입니다.
-- **`command`** 섹션은 명시적으로 호출한 슬래시 명령과 스킬입니다. 모델이 스스로 불러온 스킬은 확장을 일으키지 않으므로 여기 없고, `--kind tool --filter tool_name=Skill --group-by skill`이 그 이름을 보여줍니다.
+- **`command`** 섹션은 명시적으로 호출한 슬래시 명령과 스킬입니다. 모델이 스스로 불러온 스킬은 확장을 일으키지 않으므로 여기 없고, `--kind tool --filter tool_name=Skill --group-by skill`이 그 이름을 보여주며, 실패한 호출도 함께 셉니다.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다. 라벨이 없는 `(empty)` 행은 Claude Code가 스스로 돌린 에이전트입니다 — 대화가 띄운 것이 아니어서 유형도 대화 기록도 없고 도구도 쓰지 않습니다.
 
 > 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적습니다. 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
@@ -349,7 +349,7 @@ native telemetry (settings.json env):
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `~/.local/bin/hatel-hook` is this build (0.14.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.14.0)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel

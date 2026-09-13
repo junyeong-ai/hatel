@@ -24,9 +24,9 @@ counted_events = [
 # present only when a subagent made the call, so its absence names the main agent — the dimension
 # a session-level tool count flattens away. `duration_ms` is time until the call returned: a
 # backgrounded command returns as soon as it is accepted, so its figure is acceptance, not work.
-# `skill` names the skill a `Skill` call loaded: a skill the model invokes on its own expands no
-# command, so this is the only record of which one it was. Every other tool's input is content and
-# stays out.
+# `skill` names the skill a `Skill` call asked for, a failed call included: a skill the model
+# invokes on its own expands no command, so this is the only record of which one it was. Every
+# other tool's input is content and stays out.
 [[kind]]
 name = "tool"
 fields = ["session_id", "project", "prompt_id", "agent_id", "tool_name", "tool_use_id", "duration_ms", "ok", "skill"]

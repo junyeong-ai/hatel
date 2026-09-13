@@ -137,7 +137,7 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 - The **`session`** section counts the times a context was established — besides `startup`, each of `resume`, `fork`, `clear` and `compact` fires `SessionStart` again on an existing conversation, so one session is counted more than once. The measures are what rebuilding the prompt cache cost on those starts, spend that appears in no session total. Grouping by `cache_likely_expired` separates the part that was avoidable.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - The **`memory`** section is which instruction files entered context, named by their path in the repository (outside it, `~/…` under home and absolute elsewhere); the same path in two repositories shares a row until you add `--project` or `--group-by project`. Rebuilding context (`session_start`, `compact`) announces every file again, an @-imported one as `include` with `parent_file_path`. A load a file access set off carries `trigger_file_path`, the file that pulled it in, and skips a file the context already holds, so a missing load does not mean the file was absent. `prompt_id` is the latest prompt submitted when the load happened.
-- The **`command`** section is the slash commands and skills that were explicitly invoked. A skill the model loads on its own expands nothing, so it is not counted here; `--kind tool --filter tool_name=Skill --group-by skill` names those.
+- The **`command`** section is the slash commands and skills that were explicitly invoked. A skill the model loads on its own expands nothing, so it is not counted here; `--kind tool --filter tool_name=Skill --group-by skill` names those, a call that failed included.
 - **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate. An `(empty)` row is an agent Claude Code ran for itself — not one the conversation spawned, so it carries no type, keeps no transcript, and makes no tool calls.
 
 > A Kind with nothing in the window says so in place of its table, and Kinds you have no records for are listed the same way (omitted above for brevity). Start the receiver and run Claude Code once and they fill in (see [Troubleshooting](#troubleshooting)).
@@ -349,7 +349,7 @@ native telemetry (settings.json env):
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `~/.local/bin/hatel-hook` is this build (0.14.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.14.0)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel
