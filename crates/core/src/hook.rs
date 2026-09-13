@@ -39,8 +39,8 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
 
     // The git branch is a dimension neither OTel nor the hook stdin carries; inject
     // it so a field map can derive e.g. a spec slug from `spec/<slug>`. Read it only
-    // when a binding for this event actually maps from it — the common events
-    // (tool/prompt/…) never touch the filesystem for a field they don't use.
+    // when a binding for this event actually reads it, whether as a source or a condition — the
+    // common events (tool/prompt/…) never touch the filesystem for a field they don't use.
     let needs_branch = bindings
         .iter()
         .any(|b| b.map.values().any(|m| m.references("git_branch")));

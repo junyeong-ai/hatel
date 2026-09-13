@@ -398,8 +398,12 @@ pub enum HookBuild {
     /// It ran cleanly and named no version — every build before `--version` existed answers this
     /// way.
     Unreported,
-    /// It could not be started, did not exit successfully, or did not answer in time.
-    Unrunnable(String),
+    /// It ran and gave no usable answer: a failed exit, or none in time. What it does with a hook
+    /// event is untouched by that, so this says the build is unknown, never that nothing is
+    /// collected.
+    Unverified(String),
+    /// It could not be started at all, which is what Claude Code's own spawn would meet.
+    Unspawnable(String),
 }
 
 /// How long `doctor` waits for a hook to name its build. A diagnostic that waits on a stalled
@@ -424,7 +428,7 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return HookBuild::Unrunnable(e.to_string()),
+        Err(e) => return HookBuild::Unspawnable(e.to_string()),
     };
     let started = std::time::Instant::now();
     // Stdout is drained while the hook runs, so a large write cannot stall it, and received under
@@ -437,23 +441,25 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
         let _ = tx.send(text);
     });
     let no_answer =
-        || HookBuild::Unrunnable(format!("no answer within {}s", deadline.as_secs_f32()));
+        || HookBuild::Unverified(format!("no answer within {}s", deadline.as_secs_f32()));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
+            // The kill reaches the hook, not whatever it may have spawned; nothing hatel ships
+            // spawns anything, and reaching further would need a process group per platform.
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return no_answer();
             }
-            Err(e) => return HookBuild::Unrunnable(e.to_string()),
+            Err(e) => return HookBuild::Unverified(e.to_string()),
         }
     };
     if !status.success() {
-        return HookBuild::Unrunnable(status.to_string());
+        return HookBuild::Unverified(status.to_string());
     }
     let Ok(stdout) = rx.recv_timeout(deadline.saturating_sub(started.elapsed())) else {
         return no_answer();
@@ -1263,13 +1269,13 @@ mod tests {
         }
         for body in ["echo 'hatel-hook 9.9.9'; exit 3", "kill -9 $$"] {
             let got = answer(body);
-            assert!(matches!(got, HookBuild::Unrunnable(_)), "{body}: {got:?}");
+            assert!(matches!(got, HookBuild::Unverified(_)), "{body}: {got:?}");
         }
         let silent = std::time::Duration::from_millis(300);
         for body in ["exec sleep 30", "sleep 3 & echo 'hatel-hook 9.9.9'"] {
             let got = probe_script(body, silent);
             assert!(
-                matches!(&got, HookBuild::Unrunnable(r) if r.contains("no answer")),
+                matches!(&got, HookBuild::Unverified(r) if r.contains("no answer")),
                 "{body}: {got:?}"
             );
         }

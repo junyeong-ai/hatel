@@ -1418,6 +1418,12 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
             "t3",
             serde_json::json!({"skill": "internal note"}),
         ),
+        (
+            "PostToolUse",
+            "Skill",
+            "t4",
+            serde_json::json!({"skill": {"args": "a secret"}}),
+        ),
     ] {
         let mut e = serde_json::json!({
             "hook_event_name": event, "session_id": "S", "cwd": "/tmp/x", "prompt_id": "P",
@@ -1436,6 +1442,11 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
     assert_eq!(skill_of("t1"), Some("greet"));
     assert_eq!(skill_of("t2"), Some("greet"));
     assert_eq!(skill_of("t3"), None);
+    assert_eq!(
+        skill_of("t4"),
+        None,
+        "a source that is not one value is not stored"
+    );
     let filters = [("tool_name".to_string(), "Skill".to_string())];
     let groups = report::aggregate(
         &reg,
@@ -1447,8 +1458,14 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
             ..query(0, 0, None)
         },
     );
-    assert_eq!(groups.len(), 1);
-    assert_eq!((groups[0].key.as_str(), groups[0].count), ("greet", 2));
+    let by_key: std::collections::BTreeMap<&str, i64> =
+        groups.iter().map(|g| (g.key.as_str(), g.count)).collect();
+    assert_eq!(by_key.get("greet"), Some(&2));
+    assert_eq!(
+        by_key.get("—"),
+        Some(&1),
+        "the call whose skill was not one value is still a call, under no skill"
+    );
 }
 
 #[test]

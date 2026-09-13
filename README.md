@@ -476,7 +476,7 @@ map.service    = { from = "tool_name" }
 map.ok         = { from = "tool_response", present = true }
 ```
 
-> 필드맵 변환: `from`(패스스루; 리스트면 순서대로 시도; `/tool_input/skill` 같은 JSON Pointer는 중첩 값을 읽음), `capture`(정규식 그룹 1), `len`(문자열 길이), `present`(존재 여부 bool), `basename`(경로 마지막 조각), `repo_path`(세션이 도는 저장소 체크아웃 기준 상대 경로; 그 밖이면 홈 아래는 `~/…`, 나머지는 그대로), `const`. `when = { tool_name = "Skill" }`은 소스 값이 일치하는 이벤트에만 필드를 씁니다. 적용 안 되는 변환은 필드를 생략 — 절대 지어내지 않습니다. 바인딩이 `git_branch`를 쓸 때만 훅이 `.git/HEAD`를 읽어(서브프로세스 없음) `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }` 같은 슬러그 유도가 가능합니다.
+> 필드맵 변환: `from`(패스스루; 리스트면 순서대로 시도; `/tool_input/skill` 같은 JSON Pointer는 중첩 값을 읽음), `capture`(정규식 그룹 1), `len`(문자열 길이), `present`(존재 여부 bool), `basename`(경로 마지막 조각), `repo_path`(세션이 도는 저장소 체크아웃 기준 상대 경로; 그 밖이면 홈 아래는 `~/…`, 나머지는 그대로), `const`. `when = { tool_name = "Skill" }`은 소스 값이 일치하는 이벤트에만 필드를 씁니다. 적용 안 되는 변환은 필드를 생략 — 절대 지어내지 않습니다. 바인딩이 `git_branch`를 소스나 조건으로 읽을 때만 훅이 `.git/HEAD`를 읽어(서브프로세스 없음) `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }` 같은 슬러그 유도가 가능합니다.
 
 **2) `emit`** — Claude Code 이벤트가 *아닌* 도메인 신호(스펙-게이트 결정, 룰-체크 롤업, 배포 결과). 당신의 도구가 직접 기록:
 

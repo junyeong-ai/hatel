@@ -160,6 +160,16 @@ fn source<'a>(event: &'a serde_json::Value, key: &str) -> Option<&'a serde_json:
     }
 }
 
+/// Whether a source names a pointer that reads nothing: RFC 6901 spells `~` and `/` inside a
+/// segment as `~0` and `~1`, and any other `~` is an escape no key carries.
+fn unreadable_pointer(key: &str) -> bool {
+    key.starts_with('/')
+        && key
+            .split('~')
+            .skip(1)
+            .any(|rest| !rest.starts_with(['0', '1']))
+}
+
 /// The top-level field a source reads from: the key itself, or a pointer's first segment.
 fn root_field(key: &str) -> std::borrow::Cow<'_, str> {
     match key.strip_prefix('/') {
@@ -206,6 +216,15 @@ impl FieldMap {
         }
         if self.when.keys().any(|k| root_field(k).is_empty()) {
             return Err("a `when` condition needs a non-empty source");
+        }
+        let sources = self
+            .from
+            .as_ref()
+            .map_or(&[][..], FromSpec::keys)
+            .iter()
+            .chain(self.when.keys());
+        if sources.into_iter().any(|k| unreadable_pointer(k)) {
+            return Err("a pointer source escapes `~` as `~0` and `/` as `~1`, and nothing else");
         }
         Ok(())
     }
@@ -261,7 +280,9 @@ impl FieldMap {
             let caps = re.captures(value.as_str()?)?;
             return Some(serde_json::Value::from(caps.get(1)?.as_str()));
         }
-        Some(value.clone())
+        // One field holds one value. An object or an array at the source is a document the event
+        // shaped, not a measurement, so it is omitted rather than stored whole.
+        (!value.is_object() && !value.is_array()).then(|| value.clone())
     }
 }
 
@@ -430,6 +451,31 @@ mod tests {
         assert_eq!(fm.apply(&event("Skill")), Some("greet".into()));
         assert_eq!(fm.apply(&event("Bash")), None);
         assert_eq!(fm.apply(&serde_json::json!({"tool_name": "Skill"})), None);
+    }
+
+    #[test]
+    fn a_pointer_whose_escapes_read_nothing_is_rejected() {
+        // `~` outside `~0`/`~1` names no key, so such a pointer always omits — the dead mapping the
+        // empty-source guard rejects, in the one spelling that looks like a working path.
+        for from in [
+            "from = \"/tool_input/sk~2ill\"",
+            "from = \"/tool_input/skill~\"",
+        ] {
+            let binding: HookBinding = toml::from_str(&format!(
+                "event = \"PostToolUse\"\nkind = \"k\"\nmap.thing = {{ {from} }}"
+            ))
+            .unwrap();
+            let err = reg_with_kind().bind(binding);
+            assert!(
+                matches!(&err, Err(Error::InvalidSpec { reason, .. }) if reason.contains("pointer source")),
+                "`{from}` reads nothing, got {err:?}"
+            );
+        }
+        let ok: HookBinding = toml::from_str(
+            "event = \"PostToolUse\"\nkind = \"k\"\nmap.thing = { from = \"/a~1b/c~0d\" }",
+        )
+        .unwrap();
+        assert!(reg_with_kind().bind(ok).is_ok(), "valid escapes still load");
     }
 
     #[test]
