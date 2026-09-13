@@ -392,30 +392,71 @@ pub fn wired_hook_commands(files: &[ScopeFile]) -> Vec<String> {
 /// What a wired hook answers when asked which build it is. The hook and this binary ship in one
 /// archive and compile one schema, so a build other than this one writes records in a shape the
 /// queries here do not describe.
+#[derive(Debug)]
 pub enum HookBuild {
     Version(String),
-    /// It ran and named no version — every build before `--version` existed answers this way.
+    /// It ran cleanly and named no version — every build before `--version` existed answers this
+    /// way.
     Unreported,
+    /// It could not be started, did not exit successfully, or did not answer in time.
     Unrunnable(String),
 }
+
+/// How long `doctor` waits for a hook to name its build. A diagnostic that waits on a stalled
+/// binary never reports anything, and a hook answering `--version` does no work at all.
+const HOOK_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Ask the hook wired at `command` which build it is. Stdin is closed so a build that predates
 /// `--version` reads an empty event and records nothing instead of waiting for one.
 pub fn wired_hook_build(command: &str) -> HookBuild {
-    let out = std::process::Command::new(command)
+    probe_hook_build(command, HOOK_PROBE_DEADLINE)
+}
+
+fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = match Command::new(command)
         .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    match out {
-        Err(e) => HookBuild::Unrunnable(e.to_string()),
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .strip_prefix(HOOK_BIN)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map_or(HookBuild::Unreported, |v| HookBuild::Version(v.to_string())),
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return HookBuild::Unrunnable(e.to_string()),
+    };
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return HookBuild::Unrunnable(format!(
+                    "no answer within {}s",
+                    deadline.as_secs_f32()
+                ));
+            }
+            Err(e) => return HookBuild::Unrunnable(e.to_string()),
+        }
+    };
+    if !status.success() {
+        return HookBuild::Unrunnable(status.to_string());
     }
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    stdout
+        .trim()
+        .strip_prefix(HOOK_BIN)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map_or(HookBuild::Unreported, |v| HookBuild::Version(v.to_string()))
 }
 
 /// Whether one event's value (an array of matcher groups) already invokes our hook.
@@ -1180,6 +1221,47 @@ mod tests {
         // a command that merely contains the name is NOT ours
         assert!(!command_is_our_hook("/usr/local/bin/hatel-hook-shim"));
         assert!(!command_is_our_hook("my-hatel-hook"));
+    }
+
+    #[cfg(unix)]
+    fn script(body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ht-probe-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(HOOK_BIN);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_build_is_read_only_from_a_clean_and_timely_exit() {
+        let probe = |body: &str| wired_hook_build(script(body).to_str().unwrap());
+        let got = probe("echo 'hatel-hook 9.9.9'");
+        assert!(
+            matches!(&got, HookBuild::Version(v) if v == "9.9.9"),
+            "{got:?}"
+        );
+        let got = probe("cat >/dev/null");
+        assert!(matches!(got, HookBuild::Unreported), "{got:?}");
+        for body in ["echo 'hatel-hook 9.9.9'; exit 3", "kill -9 $$"] {
+            let got = probe(body);
+            assert!(matches!(got, HookBuild::Unrunnable(_)), "{body}: {got:?}");
+        }
+        let got = probe_hook_build(
+            script("sleep 30").to_str().unwrap(),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(
+            matches!(&got, HookBuild::Unrunnable(r) if r.contains("no answer")),
+            "{got:?}"
+        );
     }
 
     fn one_scope(v: Value) -> Vec<ScopeFile> {
