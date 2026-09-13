@@ -398,12 +398,11 @@ pub enum HookBuild {
     /// It ran cleanly and named no version — every build before `--version` existed answers this
     /// way.
     Unreported,
-    /// It ran and gave no usable answer: a failed exit, or none in time. What it does with a hook
-    /// event is untouched by that, so this says the build is unknown, never that nothing is
-    /// collected.
+    /// No usable answer: it could not be started here, exited with a failure, or did not answer in
+    /// time. Claude Code runs a hook through a shell, which starts what this cannot, and a hook
+    /// event is nothing like `--version`, so this says the build is unknown and never that nothing
+    /// is collected.
     Unverified(String),
-    /// It could not be started at all, which is what Claude Code's own spawn would meet.
-    Unspawnable(String),
 }
 
 /// How long `doctor` waits for a hook to name its build. A diagnostic that waits on a stalled
@@ -428,11 +427,13 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
         .spawn()
     {
         Ok(child) => child,
-        Err(e) => return HookBuild::Unspawnable(e.to_string()),
+        Err(e) => return HookBuild::Unverified(e.to_string()),
     };
     let started = std::time::Instant::now();
     // Stdout is drained while the hook runs, so a large write cannot stall it, and received under
-    // the same deadline, so a process it leaves holding the pipe cannot hold `doctor`.
+    // the same deadline, so a process it leaves holding the pipe delays no answer. The thread
+    // itself ends when that process closes the pipe, which in a long-lived server holds one
+    // thread until it does.
     let mut out = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

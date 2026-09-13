@@ -346,10 +346,6 @@ fn hook_build_finding(cmd: &str, build: cs::HookBuild) -> (Status, String) {
                  fields this hatel ({ours}) lists is unknown"
             ),
         ),
-        cs::HookBuild::Unspawnable(e) => (
-            Status::Fail,
-            format!("wired hook `{cmd}` cannot be started ({e}) — no events are captured"),
-        ),
     }
 }
 
@@ -694,20 +690,17 @@ mod tests {
             hook_build_finding("/x/hatel-hook", cs::HookBuild::Version(ours.to_string())).0,
             Status::Ok
         );
-        // A skew, a build too old to name itself, and one that never answered all leave the same
-        // question — which fields its records carry — while a hook that cannot start captures
-        // nothing at all.
+        // A skew, a build too old to name itself, and one that gave no answer all leave the same
+        // question: which fields its records carry. None of them says the hook collects nothing —
+        // only a path that is not there does, which the check above owns.
         for build in [
             cs::HookBuild::Version("0.0.1".to_string()),
             cs::HookBuild::Unreported,
             cs::HookBuild::Unverified("no answer within 5s".to_string()),
+            cs::HookBuild::Unverified("permission denied".to_string()),
         ] {
             assert_eq!(hook_build_finding("/x/hatel-hook", build).0, Status::Warn);
         }
-        assert_eq!(
-            hook_build_finding("/x/hatel-hook", cs::HookBuild::Unspawnable("no".into())).0,
-            Status::Fail
-        );
     }
 
     #[test]
