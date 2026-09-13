@@ -320,9 +320,10 @@ fn report_hooks(
 fn hook_build_finding(cmd: &str, build: cs::HookBuild) -> (Status, String) {
     let ours = env!("CARGO_PKG_VERSION");
     match build {
-        cs::HookBuild::Version(v) if v == ours => {
-            (Status::Ok, format!("wired hook is this build ({v})"))
-        }
+        cs::HookBuild::Version(v) if v == ours => (
+            Status::Ok,
+            format!("wired hook `{cmd}` is this build ({v})"),
+        ),
         cs::HookBuild::Version(v) => (
             Status::Warn,
             format!(
@@ -333,9 +334,9 @@ fn hook_build_finding(cmd: &str, build: cs::HookBuild) -> (Status, String) {
         cs::HookBuild::Unreported => (
             Status::Warn,
             format!(
-                "wired hook `{cmd}` names no version, as a build from before `--version` does — \
-                 its records can differ from the fields this hatel ({ours}) lists; reinstall both \
-                 from one release"
+                "wired hook `{cmd}` names no version (a build from before `--version`, or a wrapper \
+                 that drops its arguments) — its records can differ from the fields this hatel \
+                 ({ours}) lists; reinstall both from one release"
             ),
         ),
         cs::HookBuild::Unrunnable(e) => (

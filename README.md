@@ -349,7 +349,7 @@ native telemetry (settings.json env):
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook is this build (0.14.0)
+  ✓ wired hook `~/.local/bin/hatel-hook` is this build (0.14.0)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel

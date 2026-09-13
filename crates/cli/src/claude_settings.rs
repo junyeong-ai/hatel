@@ -427,6 +427,17 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
         Err(e) => return HookBuild::Unrunnable(e.to_string()),
     };
     let started = std::time::Instant::now();
+    // Stdout is drained while the hook runs, so a large write cannot stall it, and received under
+    // the same deadline, so a process it leaves holding the pipe cannot hold `doctor`.
+    let mut out = child.stdout.take().expect("stdout is piped");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+    let no_answer =
+        || HookBuild::Unrunnable(format!("no answer within {}s", deadline.as_secs_f32()));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -436,10 +447,7 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return HookBuild::Unrunnable(format!(
-                    "no answer within {}s",
-                    deadline.as_secs_f32()
-                ));
+                return no_answer();
             }
             Err(e) => return HookBuild::Unrunnable(e.to_string()),
         }
@@ -447,10 +455,9 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
     if !status.success() {
         return HookBuild::Unrunnable(status.to_string());
     }
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
+    let Ok(stdout) = rx.recv_timeout(deadline.saturating_sub(started.elapsed())) else {
+        return no_answer();
+    };
     stdout
         .trim()
         .strip_prefix(HOOK_BIN)
@@ -1224,7 +1231,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn script(body: &str) -> std::path::PathBuf {
+    fn probe_script(body: &str, deadline: std::time::Duration) -> HookBuild {
         use std::os::unix::fs::PermissionsExt;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -1236,32 +1243,36 @@ mod tests {
         let path = dir.join(HOOK_BIN);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        let build = probe_hook_build(path.to_str().unwrap(), deadline);
+        std::fs::remove_dir_all(&dir).ok();
+        build
     }
 
     #[cfg(unix)]
     #[test]
     fn a_hook_build_is_read_only_from_a_clean_and_timely_exit() {
-        let probe = |body: &str| wired_hook_build(script(body).to_str().unwrap());
-        let got = probe("echo 'hatel-hook 9.9.9'");
+        let answer = |body: &str| probe_script(body, HOOK_PROBE_DEADLINE);
+        let got = answer("echo 'hatel-hook 9.9.9'");
         assert!(
             matches!(&got, HookBuild::Version(v) if v == "9.9.9"),
             "{got:?}"
         );
-        let got = probe("cat >/dev/null");
-        assert!(matches!(got, HookBuild::Unreported), "{got:?}");
+        for body in ["cat >/dev/null", "head -c 200000 /dev/zero | tr '\\0' x"] {
+            let got = answer(body);
+            assert!(matches!(got, HookBuild::Unreported), "{body}: {got:?}");
+        }
         for body in ["echo 'hatel-hook 9.9.9'; exit 3", "kill -9 $$"] {
-            let got = probe(body);
+            let got = answer(body);
             assert!(matches!(got, HookBuild::Unrunnable(_)), "{body}: {got:?}");
         }
-        let got = probe_hook_build(
-            script("sleep 30").to_str().unwrap(),
-            std::time::Duration::from_millis(200),
-        );
-        assert!(
-            matches!(&got, HookBuild::Unrunnable(r) if r.contains("no answer")),
-            "{got:?}"
-        );
+        let silent = std::time::Duration::from_millis(300);
+        for body in ["exec sleep 30", "sleep 3 & echo 'hatel-hook 9.9.9'"] {
+            let got = probe_script(body, silent);
+            assert!(
+                matches!(&got, HookBuild::Unrunnable(r) if r.contains("no answer")),
+                "{body}: {got:?}"
+            );
+        }
     }
 
     fn one_scope(v: Value) -> Vec<ScopeFile> {
