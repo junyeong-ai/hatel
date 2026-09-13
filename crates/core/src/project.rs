@@ -63,7 +63,8 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
 /// otherwise — a file of no repository has no shorter name that stays unique.
 ///
 /// The match is lexical: `path` and `cwd` must spell the tree the same way, as the two fields of one
-/// Claude Code event do. A symlink, case or prefix alias on one side leaves the path as given.
+/// Claude Code event do. A symlink, case or prefix alias on one side defeats that anchor, and the
+/// path falls to the next.
 pub fn repo_path(path: &str, cwd: &str) -> String {
     let home = etcetera::home_dir().ok();
     anchored(path, git_root(Path::new(cwd)).as_deref(), home.as_deref())
