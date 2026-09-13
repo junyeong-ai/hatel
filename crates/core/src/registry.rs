@@ -136,7 +136,8 @@ pub struct FieldMap {
     /// Take the final path component of the source string.
     #[serde(default)]
     pub basename: bool,
-    /// Name the source path as the repository names it (see [`crate::project::repo_path`]).
+    /// Name the source path as the repository holding the event's `cwd` names it (see
+    /// [`crate::project::repo_path`]).
     #[serde(default)]
     pub repo_path: bool,
     /// A constant value, independent of stdin.

@@ -37,12 +37,12 @@ fields = ["session_id", "project", "prompt_id", "prompt_len"]
 group_key = "session_id"
 
 # One record per instruction file entering context. `file_path` is the file as its repository names
-# it, so a nested `CLAUDE.md` and the root one stay apart. An eager load (`session_start`,
-# `compact`) is announced for every file each time context is rebuilt; a lazy one carries
-# `trigger_file_path`, the file whose access pulled it in, and an `include` carries
-# `parent_file_path`, the file that imported it. A file the context already holds — read directly,
-# or loaded since the last compaction — is not announced again, so an absent load does not mean an
-# absent file.
+# it, so a nested `CLAUDE.md` and the root one stay apart, and `project` separates the same path in
+# two repositories. Rebuilding context (`session_start`, `compact`) announces every file again, an
+# @-imported one as `include` with `parent_file_path`. A load a file access set off carries
+# `trigger_file_path` and skips a file the context already holds — read directly, or loaded since
+# the last compaction — so an absent load does not mean an absent file. `prompt_id` is the latest
+# prompt submitted when the load happened.
 [[kind]]
 name = "memory"
 fields = ["session_id", "project", "prompt_id", "file_path", "memory_type", "load_reason", "trigger_file_path", "parent_file_path"]

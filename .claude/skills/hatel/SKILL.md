@@ -125,11 +125,12 @@ the Kind declares the defaults, the query overrides them. Two dimensions every t
 carries: `--group-by prompt_id` groups one request's work (its tool calls, its subagents), and on
 `tool`, `--group-by agent_id` separates a subagent's calls from the main agent's — the row with no
 value is the main agent, which never carries one. The `memory` Kind answers which instruction
-files (CLAUDE.md, rules) entered context: `file_path` is the path in the repository, `load_reason`
-says why, and a lazy load carries `trigger_file_path` and its `prompt_id`. Eager loads
-(`session_start`, `compact`) repeat for every file on each context rebuild, and a file the context
-already holds is not loaded again — so report a missing load as "not announced", never as "not in
-context". The `command` Kind answers which slash commands
+files (CLAUDE.md, rules) entered context: `file_path` is the path in the repository (add
+`--group-by project` across repositories), and `load_reason` says why. A context rebuild
+(`session_start`, `compact`) announces every file again, an @-import as `include` with
+`parent_file_path`; a load a file access set off carries `trigger_file_path` and skips a file the
+context already holds — so report a missing load as "not announced", never as "not in context".
+`prompt_id` is the latest prompt submitted at load time, not proof the load was lazy. The `command` Kind answers which slash commands
 and skills were explicitly invoked; a skill the model loads on its own expands nothing and is not
 counted there.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud

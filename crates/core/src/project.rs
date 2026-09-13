@@ -9,7 +9,7 @@
 //! where one was found, so work outside a repository has no project rather than one
 //! named after whatever directory it ran in.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectRef {
@@ -69,10 +69,15 @@ pub fn repo_path(path: &str, cwd: &str) -> String {
 fn anchored(path: &str, tree: Option<&Path>, home: Option<&Path>) -> String {
     let under = |root: &Path| {
         let rest = Path::new(path).strip_prefix(root).ok()?;
-        let parts: Vec<_> = rest
+        // A `..` left after the strip can climb out of the root, so the name would place a file
+        // outside it inside it; only a normalized path is renamed.
+        let parts = rest
             .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect();
+            .map(|c| match c {
+                Component::Normal(part) => Some(part.to_string_lossy()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
         (!parts.is_empty()).then(|| parts.join("/"))
     };
     if let Some(rel) = tree.and_then(under) {
@@ -235,6 +240,11 @@ mod tests {
             name("CLAUDE.md"),
             "CLAUDE.md",
             "a relative path has no anchor"
+        );
+        assert_eq!(
+            name("/home/u/src/acme/../acme-web/CLAUDE.md"),
+            "/home/u/src/acme/../acme-web/CLAUDE.md",
+            "a path that climbs out of an anchor is not named from it"
         );
     }
 
