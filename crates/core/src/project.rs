@@ -57,6 +57,33 @@ pub fn git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// A file path as the repository names it: relative to the working tree `cwd` is in, so the same
+/// file reads the same from every checkout and no two files of one tree share a name. A path
+/// outside that tree is written from `~` when it lies under the home directory and kept as given
+/// otherwise — a file of no repository has no shorter name that stays unique.
+pub fn repo_path(path: &str, cwd: &str) -> String {
+    let home = etcetera::home_dir().ok();
+    anchored(path, git_root(Path::new(cwd)).as_deref(), home.as_deref())
+}
+
+fn anchored(path: &str, tree: Option<&Path>, home: Option<&Path>) -> String {
+    let under = |root: &Path| {
+        let rest = Path::new(path).strip_prefix(root).ok()?;
+        let parts: Vec<_> = rest
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("/"))
+    };
+    if let Some(rel) = tree.and_then(under) {
+        return rel;
+    }
+    if let Some(rel) = home.and_then(under) {
+        return format!("~/{rel}");
+    }
+    path.to_string()
+}
+
 /// Current git branch for `cwd`, read from the containing working tree's own `HEAD` (no
 /// subprocess), so a linked worktree reports the branch it is on rather than the main
 /// checkout's. `None` on a detached HEAD or outside a repo — never a guessed value.
@@ -181,6 +208,48 @@ mod tests {
         std::fs::write(repo.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
         assert_eq!(git_branch(repo.to_str().unwrap()).as_deref(), Some("wt"));
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_path_is_named_from_the_nearest_anchor_that_contains_it() {
+        let tree = Path::new("/home/u/src/acme");
+        let home = Path::new("/home/u");
+        let name = |p| anchored(p, Some(tree), Some(home));
+        assert_eq!(name("/home/u/src/acme/CLAUDE.md"), "CLAUDE.md");
+        assert_eq!(
+            name("/home/u/src/acme/crates/core/CLAUDE.md"),
+            "crates/core/CLAUDE.md"
+        );
+        assert_eq!(name("/home/u/.claude/CLAUDE.md"), "~/.claude/CLAUDE.md");
+        assert_eq!(
+            name("/home/u/src/acme-web/CLAUDE.md"),
+            "~/src/acme-web/CLAUDE.md",
+            "a sibling sharing the tree's name as a prefix is outside the tree"
+        );
+        assert_eq!(
+            name("/etc/claude-code/CLAUDE.md"),
+            "/etc/claude-code/CLAUDE.md"
+        );
+        assert_eq!(anchored("/home/u/x.md", None, None), "/home/u/x.md");
+        assert_eq!(
+            name("CLAUDE.md"),
+            "CLAUDE.md",
+            "a relative path has no anchor"
+        );
+    }
+
+    #[test]
+    fn a_path_is_named_relative_to_the_checkout_it_sits_in() {
+        let base = scratch();
+        let (_, checkout) = repo_with_worktree(&base);
+        let cwd = checkout.join("crates/core");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let rule = checkout.join(".claude/rules/testing.md");
+        assert_eq!(
+            repo_path(rule.to_str().unwrap(), cwd.to_str().unwrap()),
+            ".claude/rules/testing.md"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

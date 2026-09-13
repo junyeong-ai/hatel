@@ -175,7 +175,7 @@ describes, when a lifecycle event fires more than once per entity; a report then
 rather than records, representing each by its earliest one, and sums the measures over what
 survives). Namespace plugin Kinds (`team.deploy`) so they can't
 collide with core's flat names. Field-map transforms: `from` (a list tries each in order),
-`capture` (regex group 1), `len`, `present`, `basename`, `const`.
+`capture` (regex group 1), `len`, `present`, `basename`, `repo_path`, `const`.
 
 `emit` records a domain signal directly (`key=value` is a string, `key:=value` is JSON):
 

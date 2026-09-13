@@ -246,7 +246,7 @@ $ hatel report --window 30d --project acme-api --format text
 compaction — by session_id, ranked by count
   (no records in this window)
 
-memory — by memory_id, ranked by count
+memory — by file_path, ranked by count
   (no records in this window)
 
 prompt — by session_id, ranked by count
@@ -375,7 +375,7 @@ hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # reco
 $ hatel kinds
 command        group_key=command_name fields=[command_name, project, prompt_id, session_id]
 compaction     group_key=session_id   fields=[project, prompt_id, session_id, trigger]
-memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
+memory         group_key=file_path    fields=[file_path, load_reason, memory_type, parent_file_path, project, prompt_id, session_id, trigger_file_path]
 prompt         group_key=session_id   fields=[project, prompt_id, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, prompt_id, session_id] identity=agent_id
@@ -474,7 +474,7 @@ map.service    = { from = "tool_name" }
 map.ok         = { from = "tool_response", present = true }
 ```
 
-> Field-map transforms: `from` (passthrough; a list tries each in order), `capture` (regex group 1), `len` (string length), `present` (field present → bool), `basename` (final path component), `const`. A transform that doesn't apply omits the field — never fabricated. Only when a binding maps from `git_branch` does the hook read it from `.git/HEAD` (no subprocess), so a spec slug derives with zero code: `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }`.
+> Field-map transforms: `from` (passthrough; a list tries each in order), `capture` (regex group 1), `len` (string length), `present` (field present → bool), `basename` (final path component), `repo_path` (path relative to the repository checkout the session runs in; outside it, `~/…` under home, otherwise absolute), `const`. A transform that doesn't apply omits the field — never fabricated. Only when a binding maps from `git_branch` does the hook read it from `.git/HEAD` (no subprocess), so a spec slug derives with zero code: `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }`.
 
 **2) `emit`** — for a domain signal that is *not* a Claude Code event (a spec-gate decision, a rule-check rollup, a deploy outcome). Your tooling records it directly:
 

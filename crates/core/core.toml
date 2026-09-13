@@ -36,10 +36,17 @@ name = "prompt"
 fields = ["session_id", "project", "prompt_id", "prompt_len"]
 group_key = "session_id"
 
+# One record per instruction file entering context. `file_path` is the file as its repository names
+# it, so a nested `CLAUDE.md` and the root one stay apart. An eager load (`session_start`,
+# `compact`) is announced for every file each time context is rebuilt; a lazy one carries
+# `trigger_file_path`, the file whose access pulled it in, and an `include` carries
+# `parent_file_path`, the file that imported it. A file the context already holds — read directly,
+# or loaded since the last compaction — is not announced again, so an absent load does not mean an
+# absent file.
 [[kind]]
 name = "memory"
-fields = ["session_id", "project", "memory_id", "memory_type", "load_reason"]
-group_key = "memory_id"
+fields = ["session_id", "project", "prompt_id", "file_path", "memory_type", "load_reason", "trigger_file_path", "parent_file_path"]
+group_key = "file_path"
 
 [[kind]]
 name = "subagent"
@@ -76,9 +83,9 @@ group_key = "session_id"
 
 # ── Hook bindings (event → kind, with declarative field maps) ──
 # `project` is injected by the hook from the cwd; it is never mapped here. `prompt_id` names the
-# turn an event belongs to, so one request's tool calls, subagents and compactions group together
-# under `--group-by prompt_id`. Session-scoped events carry none and are not given one:
-# `InstructionsLoaded` fires outside any turn.
+# turn an event belongs to, so one request's tool calls, subagents, memory loads and compactions
+# group together under `--group-by prompt_id`. An event raised before any prompt carries none and
+# is not given one.
 
 # A returning tool call fires exactly one of these two, so the pair writes one record per call and
 # `ok` distinguishes them. A call blocked before it ran fires neither — `PreToolUse` alone marks
@@ -128,9 +135,12 @@ map.prompt_len = { from = "prompt", len = true }
 event = "InstructionsLoaded"
 kind = "memory"
 map.session_id = { from = "session_id" }
-map.memory_id = { from = "file_path", basename = true }
+map.prompt_id = { from = "prompt_id" }
+map.file_path = { from = "file_path", repo_path = true }
 map.memory_type = { from = "memory_type" }
 map.load_reason = { from = "load_reason" }
+map.trigger_file_path = { from = "trigger_file_path", repo_path = true }
+map.parent_file_path = { from = "parent_file_path", repo_path = true }
 
 # SubagentStop fires at every turn boundary, so an agent resumed with a message stops more than
 # once; `agent_id` is stable across those, which is what makes the spawn — not the turn — the unit

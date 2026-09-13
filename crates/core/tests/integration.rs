@@ -1467,6 +1467,84 @@ fn a_command_record_keeps_the_name_and_nothing_the_operator_typed() {
 }
 
 #[test]
+fn memory_files_are_told_apart_by_their_path_in_the_repository() {
+    // Every directory level can hold its own `CLAUDE.md`, so a final path component alone merges
+    // the root file with each nested one and says nothing about which rule was loaded.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let repo = temp_dir().join("acme");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let cwd = repo.join("crates/api");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let at = |rel: &str| repo.join(rel).to_string_lossy().into_owned();
+    let cwd = cwd.to_string_lossy().into_owned();
+    for mut event in [
+        serde_json::json!({
+            "hook_event_name": "InstructionsLoaded", "session_id": "S", "cwd": cwd,
+            "file_path": at("CLAUDE.md"), "memory_type": "Project", "load_reason": "session_start",
+        }),
+        serde_json::json!({
+            "hook_event_name": "InstructionsLoaded", "session_id": "S", "cwd": cwd,
+            "prompt_id": "T1", "file_path": at("crates/api/CLAUDE.md"), "memory_type": "Project",
+            "load_reason": "nested_traversal", "trigger_file_path": at("crates/api/src/lib.rs"),
+        }),
+        serde_json::json!({
+            "hook_event_name": "InstructionsLoaded", "session_id": "S", "cwd": cwd,
+            "prompt_id": "T1", "file_path": at("docs/style.md"), "memory_type": "Project",
+            "load_reason": "include", "trigger_file_path": at("crates/api/src/lib.rs"),
+            "parent_file_path": at("crates/api/CLAUDE.md"),
+        }),
+    ] {
+        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    }
+
+    let recs = hatel_core::sink::read_records(&cfg, "memory", None);
+    let fields = |i: usize| {
+        recs[i]
+            .payload
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str().unwrap()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(recs.len(), 3);
+    assert_eq!(
+        fields(0),
+        [
+            ("file_path", "CLAUDE.md"),
+            ("load_reason", "session_start"),
+            ("memory_type", "Project"),
+            ("project", "acme"),
+            ("session_id", "S"),
+        ]
+    );
+    assert_eq!(
+        fields(1),
+        [
+            ("file_path", "crates/api/CLAUDE.md"),
+            ("load_reason", "nested_traversal"),
+            ("memory_type", "Project"),
+            ("project", "acme"),
+            ("prompt_id", "T1"),
+            ("session_id", "S"),
+            ("trigger_file_path", "crates/api/src/lib.rs"),
+        ]
+    );
+    assert_eq!(
+        fields(2),
+        [
+            ("file_path", "docs/style.md"),
+            ("load_reason", "include"),
+            ("memory_type", "Project"),
+            ("parent_file_path", "crates/api/CLAUDE.md"),
+            ("project", "acme"),
+            ("prompt_id", "T1"),
+            ("session_id", "S"),
+            ("trigger_file_path", "crates/api/src/lib.rs"),
+        ]
+    );
+}
+
+#[test]
 fn one_turn_joins_its_records_across_kinds() {
     // `prompt_id` is the turn. Carrying it on every turn-scoped Kind is what lets one query ask
     // what a single request set off, without a schema that models turns.

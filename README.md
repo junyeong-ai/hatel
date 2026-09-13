@@ -246,7 +246,7 @@ $ hatel report --window 30d --project acme-api --format text
 compaction — by session_id, ranked by count
   (no records in this window)
 
-memory — by memory_id, ranked by count
+memory — by file_path, ranked by count
   (no records in this window)
 
 prompt — by session_id, ranked by count
@@ -375,7 +375,7 @@ hatel emit ci_check check=lint runs:=14000 failures:=3 project=acme-api   # 도�
 $ hatel kinds
 command        group_key=command_name fields=[command_name, project, prompt_id, session_id]
 compaction     group_key=session_id   fields=[project, prompt_id, session_id, trigger]
-memory         group_key=memory_id    fields=[load_reason, memory_id, memory_type, project, session_id]
+memory         group_key=file_path    fields=[file_path, load_reason, memory_type, parent_file_path, project, prompt_id, session_id, trigger_file_path]
 prompt         group_key=session_id   fields=[project, prompt_id, prompt_len, session_id]
 session        group_key=source       fields=[cache_likely_expired, context_tokens, estimated_cache_write_usd, project, session_id, since_last_response_s, source]
 subagent       group_key=agent        fields=[agent, agent_id, project, prompt_id, session_id] identity=agent_id
@@ -474,7 +474,7 @@ map.service    = { from = "tool_name" }
 map.ok         = { from = "tool_response", present = true }
 ```
 
-> 필드맵 변환: `from`(패스스루; 리스트면 순서대로 시도), `capture`(정규식 그룹 1), `len`(문자열 길이), `present`(존재 여부 bool), `basename`(경로 마지막 조각), `const`. 적용 안 되는 변환은 필드를 생략 — 절대 지어내지 않습니다. 바인딩이 `git_branch`를 쓸 때만 훅이 `.git/HEAD`를 읽어(서브프로세스 없음) `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }` 같은 슬러그 유도가 가능합니다.
+> 필드맵 변환: `from`(패스스루; 리스트면 순서대로 시도), `capture`(정규식 그룹 1), `len`(문자열 길이), `present`(존재 여부 bool), `basename`(경로 마지막 조각), `repo_path`(세션이 도는 저장소 체크아웃 기준 상대 경로; 그 밖이면 홈 아래는 `~/…`, 나머지는 절대 경로), `const`. 적용 안 되는 변환은 필드를 생략 — 절대 지어내지 않습니다. 바인딩이 `git_branch`를 쓸 때만 훅이 `.git/HEAD`를 읽어(서브프로세스 없음) `map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }` 같은 슬러그 유도가 가능합니다.
 
 **2) `emit`** — Claude Code 이벤트가 *아닌* 도메인 신호(스펙-게이트 결정, 룰-체크 롤업, 배포 결과). 당신의 도구가 직접 기록:
 

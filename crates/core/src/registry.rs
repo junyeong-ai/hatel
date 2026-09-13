@@ -136,6 +136,9 @@ pub struct FieldMap {
     /// Take the final path component of the source string.
     #[serde(default)]
     pub basename: bool,
+    /// Name the source path as the repository names it (see [`crate::project::repo_path`]).
+    #[serde(default)]
+    pub repo_path: bool,
     /// A constant value, independent of stdin.
     #[serde(default, rename = "const")]
     pub constant: Option<serde_json::Value>,
@@ -152,13 +155,14 @@ impl FieldMap {
             self.len,
             self.present,
             self.basename,
+            self.repo_path,
         ]
         .iter()
         .filter(|x| **x)
         .count()
             + usize::from(self.constant.is_some());
         if transforms > 1 {
-            return Err("at most one of capture/len/present/basename/const may be set");
+            return Err("at most one of capture/len/present/basename/repo_path/const may be set");
         }
         // A non-const map needs a `from` with at least one usable source key. Absent, an empty list
         // (`from = []`), or only blank keys (`from = ""`) are all the same dead mapping — they would
@@ -207,6 +211,13 @@ impl FieldMap {
                 .and_then(|x| x.to_str())
                 .unwrap_or(s);
             return Some(serde_json::Value::from(base));
+        }
+        if self.repo_path {
+            let cwd = stdin.get("cwd").and_then(serde_json::Value::as_str);
+            return Some(serde_json::Value::from(crate::project::repo_path(
+                value.as_str()?,
+                cwd.unwrap_or(""),
+            )));
         }
         if let Some(pat) = &self.capture {
             let re = regex::Regex::new(pat).ok()?;
