@@ -20,7 +20,7 @@
 
 - **🧩 Two signals, joined** — Claude Code emits **native OpenTelemetry** (tokens, cost) and **lifecycle hooks** (project, prompts, subagents). hatel joins them on `session.id`. Native OTel has no "which project" on the wire — hatel fills that in.
 - **📦 Zero infrastructure** — two small static binaries (the receiver + the hook), a local OTLP collector. No Docker, no dashboard to host, no external dependency.
-- **🔒 Privacy first** — prompts store *length only*, tools store *name only* (never the text or arguments). By default everything stays on your machine.
+- **🔒 Privacy first** — prompts store *length only*, tools store *name only* (a `Skill` call also the skill it loaded; never the text or any other argument). By default everything stays on your machine.
 - **🧱 Extensible** — add a custom metric with one TOML file (no code, no recompile). Record CI / deploy / gate outcomes with one `emit`.
 - **🔌 Sit in front of a corporate collector** — keep your existing OTLP collector; hatel sits in front and tees to it, injecting the project label.
 
@@ -527,7 +527,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 
 ## Privacy
 
-- **The allow-list is the primary defense** — the core ships **no** content-bearing fields. Prompts store length, tools store the name (never the text or arguments). This mirrors Claude Code's own default-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`.
+- **The allow-list is the primary defense** — the core ships **no** content-bearing fields. Prompts store length, tools store the name — a `Skill` call also the name of the skill it loaded, which no other signal carries; never the text or any other argument. This mirrors Claude Code's own default-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`.
 - `redact` fields are hashed (BLAKE3, 16 hex chars) before write.
 - Event records carry the project **label** only; the absolute repository path lives solely in the local session index. A session outside a repository records no label, so a home or scratch directory never becomes one.
 - Everything stays on your machine. Failures are fail-open: a write error degrades to a stderr note and never blocks a tool call.
@@ -565,7 +565,7 @@ The collector never fights managed policy; it adapts:
 | **Report is all `—`** | No data yet. ① `hatel doctor` to confirm wiring → ② run the receiver (`hatel serve --all` or `hatel service`) → ③ do some work in Claude Code → `hatel report` again. |
 | **Hook Kinds show up but `cost`/`tokens` are empty** | Cost and tokens are native OTel metrics, so they come **through the receiver**. The hook ledger accrues without it, but those two need it running *at that moment*. Run `hatel service` for always-on. |
 | **A hook Kind's numbers look doubled** | `hatel-hook` is reached twice for one event — bound in both the user `settings.json` and a project `.claude/settings.json`, or the project one calls a wrapper script that runs `hatel-hook` again. Hook envelopes carry no event-unique identifier, so hatel cannot tell a duplicate delivery from a genuine repeat; remove one of the two bindings. `subagent` and `tool` are unaffected — they count entities by `agent_id` and `tool_use_id`. |
-| **`doctor` shows `⚠ wired hook … names no version` or `… is <version> while this hatel is …`** | The hook Claude Code runs is a different build from `hatel`, so its records can differ from the fields `hatel kinds` lists. Reinstall so both come from one release. |
+| **`doctor` shows `⚠ wired hook … names no version` or `… is <version> while this hatel is …`** | The hook Claude Code runs is a different build from `hatel`, or could not say which build it is, so its records can differ from the fields `hatel kinds` lists. Reinstall so both come from one release, or check the wrapper that answers for it. |
 | **`doctor` shows `⚠ … wired synchronously`** | Wiring written before 0.12. Every record still arrives, but Claude Code waits for the hook each time the event fires. Re-run `hatel init` to rewrite it asynchronously. |
 | **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
 | **`emit` drops a field** | The field isn't in the Kind's allow-list. stderr prints the accepted fields (`accepted fields: …`) — fix the typo. |

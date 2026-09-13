@@ -405,6 +405,10 @@ pub enum HookBuild {
     Unverified(String),
 }
 
+/// How much of a hook's answer is read. A build name is one short line, and a deadline bounds time
+/// rather than memory, so anything longer is not the answer this asks for.
+const HOOK_ANSWER_BYTES: u64 = 256;
+
 /// How long `doctor` waits for a hook to name its build. A diagnostic that waits on a stalled
 /// binary never reports anything, and a hook answering `--version` does no work at all.
 const HOOK_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -434,11 +438,11 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
     // the same deadline, so a process it leaves holding the pipe delays no answer. The thread
     // itself ends when that process closes the pipe, which in a long-lived server holds one
     // thread until it does.
-    let mut out = child.stdout.take().expect("stdout is piped");
+    let out = child.stdout.take().expect("stdout is piped");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut text = String::new();
-        let _ = out.read_to_string(&mut text);
+        let _ = out.take(HOOK_ANSWER_BYTES + 1).read_to_string(&mut text);
         let _ = tx.send(text);
     });
     let no_answer =
@@ -452,19 +456,27 @@ fn probe_hook_build(command: &str, deadline: std::time::Duration) -> HookBuild {
             // The kill reaches the hook, not whatever it may have spawned; nothing hatel ships
             // spawns anything, and reaching further would need a process group per platform.
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                // Reaping waits on a process that is ending; a kill that did not land leaves one
+                // that is not, and waiting on it would outlast the deadline it just broke.
+                if child.kill().is_ok() {
+                    let _ = child.wait();
+                }
                 return no_answer();
             }
             Err(e) => return HookBuild::Unverified(e.to_string()),
         }
     };
-    if !status.success() {
-        return HookBuild::Unverified(status.to_string());
-    }
     let Ok(stdout) = rx.recv_timeout(deadline.saturating_sub(started.elapsed())) else {
         return no_answer();
     };
+    // The size of the answer is judged before the exit it ended in: a hook that writes past what is
+    // read ends on the closed pipe, and that end is this probe's doing rather than its own.
+    if stdout.len() as u64 > HOOK_ANSWER_BYTES {
+        return HookBuild::Unverified(format!("answered with more than {HOOK_ANSWER_BYTES} bytes"));
+    }
+    if !status.success() {
+        return HookBuild::Unverified(status.to_string());
+    }
     stdout
         .trim()
         .strip_prefix(HOOK_BIN)
@@ -1264,10 +1276,14 @@ mod tests {
             matches!(&got, HookBuild::Version(v) if v == "9.9.9"),
             "{got:?}"
         );
-        for body in ["cat >/dev/null", "head -c 200000 /dev/zero | tr '\\0' x"] {
-            let got = answer(body);
-            assert!(matches!(got, HookBuild::Unreported), "{body}: {got:?}");
-        }
+        let got = answer("cat >/dev/null");
+        assert!(matches!(got, HookBuild::Unreported), "{got:?}");
+        // A flood is not an answer, and it is never held whole to find that out.
+        let got = answer("head -c 200000 /dev/zero | tr '\\0' x");
+        assert!(
+            matches!(&got, HookBuild::Unverified(r) if r.contains("more than")),
+            "{got:?}"
+        );
         for body in ["echo 'hatel-hook 9.9.9'; exit 3", "kill -9 $$"] {
             let got = answer(body);
             assert!(matches!(got, HookBuild::Unverified(_)), "{body}: {got:?}");

@@ -20,7 +20,7 @@
 
 - **🧩 두 신호를 하나로** — Claude Code가 내보내는 **네이티브 OpenTelemetry**(토큰·비용)와 **라이프사이클 훅**(프로젝트·프롬프트·서브에이전트)을 `session.id`로 조인. OTel 숫자엔 "어느 프로젝트"가 없는데, hatel이 그걸 채웁니다.
 - **📦 제로 인프라** — 작은 정적 바이너리 둘(수신기 + 훅)이 전부인 로컬 OTLP 수집기. 도커도, 대시보드도, 외부 의존도 없음.
-- **🔒 프라이버시 우선** — 프롬프트는 *길이만*, 도구는 *이름만* 저장(본문·인자는 저장 안 함). 기본적으로 전부 로컬에만.
+- **🔒 프라이버시 우선** — 프롬프트는 *길이만*, 도구는 *이름만* 저장(`Skill` 호출은 불러온 스킬 이름까지. 본문과 그 밖의 인자는 저장 안 함). 기본적으로 전부 로컬에만.
 - **🧱 확장 가능** — TOML 한 장으로 커스텀 지표 추가(코드·재컴파일 없음). CI·배포·게이트 결과도 `emit` 한 줄로 기록.
 - **🔌 사내 컬렉터 앞에 끼우기** — 기존 OTLP 컬렉터를 그대로 두고, hatel이 앞에 앉아 프로젝트 라벨을 주입해 전달.
 
@@ -527,7 +527,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 ## 프라이버시
 
-- **allow-list가 1차 방어** — 코어엔 본문 필드가 **없습니다**. 프롬프트는 길이만, 도구는 이름만(텍스트·인자 저장 안 함). Claude Code 자신의 기본-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`와 동일한 입장.
+- **allow-list가 1차 방어** — 코어엔 본문 필드가 **없습니다**. 프롬프트는 길이만, 도구는 이름만 저장하고, `Skill` 호출은 불러온 스킬 이름까지 남깁니다(다른 신호가 싣지 않는 값입니다). 본문과 그 밖의 인자는 저장하지 않습니다. Claude Code 자신의 기본-off `OTEL_LOG_USER_PROMPTS` / `OTEL_LOG_TOOL_DETAILS`와 동일한 입장.
 - `redact` 필드는 저장 전 해싱(BLAKE3, 16 hex).
 - 이벤트 레코드는 프로젝트 **라벨**만 — 저장소 절대 경로는 로컬 세션 인덱스에만. 저장소 밖 세션은 라벨을 기록하지 않으므로 홈이나 스크래치 디렉터리가 라벨이 되는 일은 없습니다.
 - 전부 로컬에. 실패는 fail-open: 쓰기 오류는 stderr 메모로 degrade되지 도구 호출을 막지 않습니다.
@@ -565,7 +565,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
 | **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
 | **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`와 `tool`은 각각 `agent_id`·`tool_use_id`로 실체를 세므로 영향을 받지 않습니다. |
-| **`doctor`에 `⚠ wired hook … names no version` 또는 `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드여서, 기록의 필드가 `hatel kinds`가 보여주는 것과 다를 수 있습니다. 둘이 같은 릴리스가 되도록 다시 설치하세요. |
+| **`doctor`에 `⚠ wired hook … names no version` 또는 `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드이거나, 어느 빌드인지 답하지 못한 경우입니다. 기록의 필드가 `hatel kinds`가 보여주는 것과 다를 수 있습니다. 둘이 같은 릴리스가 되도록 다시 설치하거나, 대신 답하는 래퍼를 확인하세요. |
 | **`doctor`에 `⚠ … wired synchronously`** | 0.12 이전에 배선된 설정입니다. 기록은 전부 남지만 이벤트마다 Claude Code가 훅을 기다립니다. `hatel init`을 다시 실행하면 비동기로 다시 씁니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |

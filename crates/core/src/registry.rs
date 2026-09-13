@@ -256,7 +256,11 @@ impl FieldMap {
                 .any(|k| source(stdin, k).is_some_and(|v| !v.is_null()));
             return Some(serde_json::Value::Bool(has));
         }
-        let value = keys.iter().find_map(|k| source(stdin, k))?;
+        // A source carrying null is a field the event left unset, which is the same as one it does
+        // not carry: the next source is tried, and nothing is written if none answers.
+        let value = keys
+            .iter()
+            .find_map(|k| source(stdin, k).filter(|v| !v.is_null()))?;
         if self.len {
             return Some(serde_json::Value::from(value.as_str()?.chars().count()));
         }
@@ -451,6 +455,24 @@ mod tests {
         assert_eq!(fm.apply(&event("Skill")), Some("greet".into()));
         assert_eq!(fm.apply(&event("Bash")), None);
         assert_eq!(fm.apply(&serde_json::json!({"tool_name": "Skill"})), None);
+    }
+
+    #[test]
+    fn a_source_carrying_null_is_a_source_that_answers_nothing() {
+        // A key an event carries as null holds no value, and storing one would put a field in the
+        // ledger that the event never named.
+        let fm: FieldMap = toml::from_str("from = [\"a\", \"b\"]").unwrap();
+        assert_eq!(fm.apply(&serde_json::json!({"a": null})), None);
+        assert_eq!(
+            fm.apply(&serde_json::json!({"a": null, "b": "x"})),
+            Some("x".into()),
+            "a null source falls through to the next"
+        );
+        let present: FieldMap = toml::from_str("from = \"a\"\npresent = true").unwrap();
+        assert_eq!(
+            present.apply(&serde_json::json!({"a": null})),
+            Some(false.into())
+        );
     }
 
     #[test]
