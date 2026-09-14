@@ -129,10 +129,10 @@ rank by count — and `identity`, naming what that count counts when it is not r
 the Kind declares the defaults, the query overrides them. Two dimensions every turn-scoped Kind
 carries: `--group-by prompt_id` groups one request's work (its tool calls, its subagents, its
 memory loads), and on `tool`, `--group-by agent_id` separates a subagent's calls from the main
-agent's — the row with no value is the main agent, which never carries one. The `memory` Kind
-answers which instruction files (CLAUDE.md, rules) entered context: `file_path` is the path in the
-repository, else `~/…` under home, else absolute (add `--group-by project` across repositories),
-and `load_reason` says why. A context rebuild (`session_start`, `compact`) announces every file
+agent's — the row with no value (`—` in text, `key: null` in JSON) is the main agent, which never
+carries one. The `memory` Kind answers which instruction files (CLAUDE.md, rules) entered context:
+`file_path` is the path in the repository, else `~/…` under home, else absolute (add `--group-by
+project` across repositories), and `load_reason` says why. A context rebuild (`session_start`, `compact`) announces every file
 again, an @-import as `include` with `parent_file_path`; a load a file access set off carries
 `trigger_file_path` and skips a file the context already holds — so report a missing load as "not
 announced", never as "not in context". `prompt_id` is the latest prompt submitted at load time, not

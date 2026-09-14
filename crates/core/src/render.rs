@@ -144,7 +144,7 @@ fn text_table(
     let cells: Vec<Vec<String>> = groups.iter().map(numeric_cells).collect();
     let key_width = groups
         .iter()
-        .map(|g| display_width(key_label(&g.key)).min(KEY_WIDTH))
+        .map(|g| display_width(key_label(g.key.as_deref())).min(KEY_WIDTH))
         .chain(std::iter::once(display_width(dimension)))
         .max()
         .unwrap_or(0);
@@ -180,7 +180,7 @@ fn text_table(
         out.push_str(&bar(rank_value(group, rank), max));
         out.push_str(&" ".repeat(GUTTER));
         out.push_str(&pad_right(
-            &truncate(key_label(&group.key), KEY_WIDTH),
+            &truncate(key_label(group.key.as_deref()), KEY_WIDTH),
             key_width,
         ));
         for (cell, width) in row.iter().zip(&widths) {
@@ -217,7 +217,10 @@ fn markdown_table(
     out.push_str(&"---:|".repeat(headers.len() - 1));
     out.push('\n');
     for group in groups {
-        out.push_str(&format!("| {} |", escape_md_cell(key_label(&group.key))));
+        out.push_str(&format!(
+            "| {} |",
+            escape_md_cell(key_label(group.key.as_deref()))
+        ));
         for cell in numeric_cells(group) {
             out.push_str(&format!(" {cell} |"));
         }
@@ -226,12 +229,15 @@ fn markdown_table(
     out
 }
 
-/// A group key as a label. A record that stored an empty value for the dimension groups under the
-/// empty string; naming it keeps that row from reading as an unlabelled one, next to the em-dash
-/// that marks a record which carried no such field at all. The stored key is untouched — a machine
-/// consumer reads the value, not this.
-fn key_label(key: &str) -> &str {
-    if key.is_empty() { "(empty)" } else { key }
+/// A group key as a label. A record that carried no such field at all shows an em-dash, and one
+/// that stored an empty value is named, so neither row reads as an unlabelled one. The stored key
+/// is untouched — a machine consumer reads the value, not this.
+fn key_label(key: Option<&str>) -> &str {
+    match key {
+        None => "—",
+        Some("") => "(empty)",
+        Some(key) => key,
+    }
 }
 
 /// A group's count and measure sums as display strings, in column order.
@@ -381,9 +387,9 @@ mod tests {
         }
     }
 
-    fn group(key: &str, count: i64, sum: f64) -> GroupAgg {
+    fn group(key: Option<&str>, count: i64, sum: f64) -> GroupAgg {
         GroupAgg {
-            key: key.to_string(),
+            key: key.map(str::to_string),
             count,
             sums: vec![Measure {
                 name: "duration_ms".to_string(),
@@ -421,7 +427,7 @@ mod tests {
     fn a_hostile_group_key_stays_one_markdown_row() {
         let md = format_markdown(&report(vec![section(
             "tool",
-            vec![group("a|b\nc", 1, 5.0)],
+            vec![group(Some("a|b\nc"), 1, 5.0)],
         )]));
         let row = md
             .lines()
@@ -460,8 +466,8 @@ mod tests {
         let text = format_text(&report(vec![section(
             "k",
             vec![
-                group("한국어규칙이름", 1, 100.0),
-                group("ascii-rule", 1, 90.0),
+                group(Some("한국어규칙이름"), 1, 100.0),
+                group(Some("ascii-rule"), 1, 90.0),
             ],
         )]));
         let cols = |line: &str, needle: &str| {
@@ -494,7 +500,7 @@ mod tests {
     fn every_row_carries_a_bar_scaled_to_the_leader() {
         let text = format_text(&report(vec![section(
             "tool",
-            vec![group("Bash", 9, 100.0), group("Edit", 2, 50.0)],
+            vec![group(Some("Bash"), 9, 100.0), group(Some("Edit"), 2, 50.0)],
         )]));
         let bash = text.lines().find(|l| l.contains("Bash")).unwrap();
         let edit = text.lines().find(|l| l.contains("Edit")).unwrap();
@@ -507,7 +513,7 @@ mod tests {
     fn a_newline_in_a_field_name_cannot_break_the_layout() {
         // Field names come from a plugin's TOML, where a newline is expressible. One in the axes
         // line would end a Markdown heading early and misalign every terminal column below it.
-        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        let mut s = section("k", vec![group(Some("v"), 1, 1.0)]);
         s.group_by = "rule\nname".to_string();
         for out in [
             format_text(&report(vec![s.clone()])),
@@ -522,7 +528,7 @@ mod tests {
     fn markdown_headers_are_escaped_like_values() {
         // A field name is written by a plugin author and is not character-restricted, so a pipe in
         // one would open a column on the header row that no data row has.
-        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        let mut s = section("k", vec![group(Some("v"), 1, 1.0)]);
         s.group_by = "rule|name".to_string();
         let md = format_markdown(&report(vec![s]));
         let header = md.lines().find(|l| l.starts_with("| rule")).unwrap();
@@ -540,7 +546,7 @@ mod tests {
         // distinct from the em-dash marking a record that carried no such field at all.
         let text = format_text(&report(vec![section(
             "aix.sessions",
-            vec![group("", 15, 1.0), group("—", 2, 1.0)],
+            vec![group(Some(""), 15, 1.0), group(None, 2, 1.0)],
         )]));
         assert!(text.contains("(empty)"), "{text}");
         assert!(text.contains('—'), "{text}");
@@ -551,7 +557,7 @@ mod tests {
         // With the ranking measure declared second, a bar drawn from the leading measure would
         // contradict the order the rows are in — the leader's bar would not be the longest.
         let measured = |key: &str, first: f64, second: f64| GroupAgg {
-            key: key.to_string(),
+            key: Some(key.to_string()),
             count: 1,
             sums: vec![
                 Measure {
@@ -583,7 +589,7 @@ mod tests {
     fn columns_line_up_under_a_non_ascii_header() {
         // Widths and padding must be counted in the same unit — terminal columns — or a header
         // that is not plain ASCII shifts every column to its right.
-        let mut s = section("k", vec![group("v", 1, 1.0)]);
+        let mut s = section("k", vec![group(Some("v"), 1, 1.0)]);
         s.group_by = "규칙".to_string();
         let text = format_text(&report(vec![s]));
         let mut lines = text.lines().skip_while(|l| !l.starts_with("k —")).skip(1);
@@ -602,7 +608,7 @@ mod tests {
     fn columns_line_up_under_their_headers() {
         let text = format_text(&report(vec![section(
             "tool",
-            vec![group("Bash", 155_637, 770_991_471.0)],
+            vec![group(Some("Bash"), 155_637, 770_991_471.0)],
         )]));
         let mut lines = text
             .lines()
@@ -630,7 +636,7 @@ mod tests {
 
     #[test]
     fn the_header_states_the_scope_it_covers() {
-        let mut r = report(vec![section("tool", vec![group("Bash", 1, 1.0)])]);
+        let mut r = report(vec![section("tool", vec![group(Some("Bash"), 1, 1.0)])]);
         r.project = Some("acme".to_string());
         r.filters = vec![Filter {
             field: "spec".to_string(),

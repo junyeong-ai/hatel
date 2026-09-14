@@ -45,10 +45,12 @@ pub struct Measure {
 }
 
 /// One group's aggregate: its key, how many records it had, and the sum of each
-/// declared measure (in `measures` order).
+/// declared measure (in `measures` order). The key is `None` for the records that carry no
+/// value for the dimension at all — distinct from ones whose value is empty, which group under
+/// the empty string — so a machine reader tells an absent field from any value by shape.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupAgg {
-    pub key: String,
+    pub key: Option<String>,
     pub count: i64,
     pub sums: Vec<Measure>,
 }
@@ -213,7 +215,7 @@ pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
     let mut groups: Vec<GroupAgg> = by_project
         .into_iter()
         .map(|(key, (count, sums))| GroupAgg {
-            key: key.to_string(),
+            key: Some(key.to_string()),
             count,
             sums: ["tokens", COST_RANK, "active_time_s", "lines"]
                 .iter()
@@ -250,7 +252,7 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
         return Vec::new();
     };
     let dimension = q.group_by.unwrap_or(&spec.group_key);
-    let mut groups: BTreeMap<String, (i64, Vec<f64>, BTreeSet<String>)> = BTreeMap::new();
+    let mut groups: BTreeMap<Option<String>, (i64, Vec<f64>, BTreeSet<String>)> = BTreeMap::new();
     // `since` lets the backend skip out-of-window history (SQLite); the filter here is the
     // correctness gate (and does the windowing for JSONL). A record with an unparseable timestamp
     // is dropped rather than silently bucketed at epoch 0, which would flip between always-in and
@@ -285,11 +287,7 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
         {
             continue;
         }
-        let key = env
-            .payload
-            .get(dimension)
-            .map(value_label)
-            .unwrap_or_else(|| MISSING_DIMENSION.to_string());
+        let key = env.payload.get(dimension).map(value_label);
         let entry = groups
             .entry(key)
             .or_insert_with(|| (0, vec![0.0; spec.measures.len()], BTreeSet::new()));
@@ -329,10 +327,6 @@ pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<Gro
     rows
 }
 
-/// A record that does not carry the grouping dimension. Distinct from a record whose value for
-/// it is empty, which groups under its own (empty) key.
-const MISSING_DIMENSION: &str = "—";
-
 /// The value a group is ranked by: its sum of `measure`, or its record count when the Kind
 /// declares no measures. A renderer drawing magnitude reads it from here too, so a bar can never
 /// describe a different quantity than the order it appears in.
@@ -348,13 +342,14 @@ pub fn rank_value(group: &GroupAgg, measure: Option<&str>) -> f64 {
     }
 }
 
-/// Order groups by `measure` descending, then by key so ties are stable.
+/// Order groups by `measure` descending, then by key so ties are stable, the records carrying
+/// no value for the dimension after every named group.
 fn rank(groups: &mut [GroupAgg], measure: Option<&str>) {
     groups.sort_by(|a, b| {
         rank_value(b, measure)
             .partial_cmp(&rank_value(a, measure))
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| (a.key.is_none(), &a.key).cmp(&(b.key.is_none(), &b.key)))
     });
 }
 
@@ -389,7 +384,7 @@ mod tests {
 
     fn group(key: &str, count: i64, sums: &[(&str, f64)]) -> GroupAgg {
         GroupAgg {
-            key: key.to_string(),
+            key: Some(key.to_string()),
             count,
             sums: sums
                 .iter()
@@ -419,16 +414,16 @@ mod tests {
             ),
         ];
         rank(&mut groups, Some("evaluations"));
-        assert_eq!(groups[0].key, "noisy");
+        assert_eq!(groups[0].key.as_deref(), Some("noisy"));
         rank(&mut groups, Some("violations"));
-        assert_eq!(groups[0].key, "real");
+        assert_eq!(groups[0].key.as_deref(), Some("real"));
     }
 
     #[test]
     fn a_measureless_kind_ranks_by_record_count() {
         let mut groups = vec![group("few", 2, &[]), group("many", 40, &[])];
         rank(&mut groups, None);
-        assert_eq!(groups[0].key, "many");
+        assert_eq!(groups[0].key.as_deref(), Some("many"));
     }
 
     #[test]
@@ -452,13 +447,13 @@ mod tests {
             ],
             0,
         );
-        assert_eq!(groups[0].key, "alpha");
+        assert_eq!(groups[0].key.as_deref(), Some("alpha"));
         assert_eq!(groups[0].count, 2, "the group count is sessions");
         assert_eq!(groups[0].sums[0].sum, 40.0, "tokens summed across sessions");
         assert_eq!(groups[0].sums[1].sum, 10.0);
-        assert_eq!(groups[1].key, "beta");
+        assert_eq!(groups[1].key.as_deref(), Some("beta"));
         // A row whose project was never resolved keys on the empty string it holds, so a real
         // project can never absorb its spend — whatever that project is called.
-        assert_eq!(groups[2].key, "");
+        assert_eq!(groups[2].key.as_deref(), Some(""));
     }
 }

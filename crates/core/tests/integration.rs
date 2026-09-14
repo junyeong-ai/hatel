@@ -467,7 +467,7 @@ fn report_filter_restricts_to_matching_records() {
     };
     let groups = report::aggregate(&reg, &cfg, "tool", &q);
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].key, "Bash");
+    assert_eq!(groups[0].key.as_deref(), Some("Bash"));
     assert_eq!(groups[0].count, 2);
     // A numeric field matches its rendered form, and multiple filters AND-combine.
     let filters = vec![
@@ -812,7 +812,7 @@ fn report_sums_measures_and_coerces_numeric_strings() {
     .unwrap();
     let groups = report::aggregate(&reg, &cfg, "ci_check", &query(0, 5, None));
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].key, "lint");
+    assert_eq!(groups[0].key.as_deref(), Some("lint"));
     assert_eq!(groups[0].count, 2);
     // runs: 14000 (number) + "1000" (numeric string, coerced) = 15000
     assert_eq!(groups[0].sums[0].name, "runs");
@@ -1161,7 +1161,7 @@ fn a_resumed_agent_counts_once_however_many_turns_it_stops_on() {
     }
     let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].key, "general-purpose");
+    assert_eq!(groups[0].key.as_deref(), Some("general-purpose"));
     assert_eq!(groups[0].count, 1, "four stops, one agent");
     assert_eq!(
         hatel_core::sink::read_records(&cfg, "subagent", None).len(),
@@ -1252,7 +1252,7 @@ fn each_start_of_one_session_counts_its_own_resume_cost() {
     let groups = report::aggregate(&reg, &cfg, "session", &query(0, 0, None));
     let resume = groups
         .iter()
-        .find(|g| g.key == "resume")
+        .find(|g| g.key.as_deref() == Some("resume"))
         .expect("resume group");
     assert_eq!(resume.count, 2, "two resumes of one session are two starts");
     let spend = resume
@@ -1382,11 +1382,15 @@ fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
             ..query(0, 0, None)
         },
     );
-    let by_key: std::collections::BTreeMap<&str, i64> =
-        groups.iter().map(|g| (g.key.as_str(), g.count)).collect();
-    assert_eq!(by_key.get("a9"), Some(&2), "the subagent's two calls");
+    let by_key: std::collections::BTreeMap<Option<&str>, i64> =
+        groups.iter().map(|g| (g.key.as_deref(), g.count)).collect();
     assert_eq!(
-        by_key.get("—"),
+        by_key.get(&Some("a9")),
+        Some(&2),
+        "the subagent's two calls"
+    );
+    assert_eq!(
+        by_key.get(&None),
         Some(&1),
         "the main agent's call carries no agent_id and is not invented one"
     );
@@ -1458,11 +1462,11 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
             ..query(0, 0, None)
         },
     );
-    let by_key: std::collections::BTreeMap<&str, i64> =
-        groups.iter().map(|g| (g.key.as_str(), g.count)).collect();
-    assert_eq!(by_key.get("greet"), Some(&2));
+    let by_key: std::collections::BTreeMap<Option<&str>, i64> =
+        groups.iter().map(|g| (g.key.as_deref(), g.count)).collect();
+    assert_eq!(by_key.get(&Some("greet")), Some(&2));
     assert_eq!(
-        by_key.get("—"),
+        by_key.get(&None),
         Some(&1),
         "the call whose skill was not one value is still a call, under no skill"
     );
@@ -1487,7 +1491,7 @@ fn a_failed_call_and_a_returning_one_land_in_the_same_kind() {
     }
     let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
-    assert_eq!(groups[0].key, "Bash");
+    assert_eq!(groups[0].key.as_deref(), Some("Bash"));
     assert_eq!(groups[0].count, 3, "three calls");
     let ok = groups[0].sums.iter().find(|m| m.name == "ok").unwrap();
     assert_eq!(ok.sum, 2.0, "two of the three returned");
@@ -1655,6 +1659,10 @@ fn one_turn_joins_its_records_across_kinds() {
     for kind in ["prompt", "tool", "subagent"] {
         let groups = turn(kind);
         assert_eq!(groups.len(), 1, "{kind} groups under one turn");
-        assert_eq!(groups[0].key, "T1", "{kind} carries the turn it belongs to");
+        assert_eq!(
+            groups[0].key.as_deref(),
+            Some("T1"),
+            "{kind} carries the turn it belongs to"
+        );
     }
 }
