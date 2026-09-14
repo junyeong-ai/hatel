@@ -287,7 +287,7 @@ hatel serve --all      # every project sharing this collector
 hatel serve --project acme-api   # one project (by label)
 ```
 
-The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
+The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running (`{"service":"hatel","version":"0.18.0"}`) — what `doctor` compares its own against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
 
 ### `init` — wire into Claude Code
 
@@ -348,9 +348,12 @@ native telemetry (settings.json env):
   ✓ OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from user)
   ✓ session.id included in metrics (default on)
 
+receiver:
+  ✓ receiver at 127.0.0.1:4318 is this build (0.18.0)
+
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.17.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.0)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel
@@ -361,7 +364,7 @@ export:
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
 
-> The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
+> The `receiver:` section appears when a signal is routed to a local receiver, and asks it over the wire (`GET /healthz` on the OTLP port) — nothing listening means native metrics and logs are being dropped, and a receiver keeps the binary it started from, so after an upgrade it can answer as an older build. The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
 
 `hatel doctor --json` renders the same findings as stable JSON — each section's `findings` carry a `status` (`ok`/`fail`/`warn`/`note`) and `message`, and the top-level `ok` plus the exit code semantics (non-zero only on a hard-requirement failure) match the human output.
 
@@ -541,11 +544,12 @@ Native OTel is push-only — tokens and cost are captured only while the receive
 
 ```sh
 hatel service           # install + start: runs `serve --all`, kept alive across login/failure
+hatel service --restart # restart it so it runs the binary now on disk (nothing to do when none is installed)
 hatel service --remove  # stop and remove it
 hatel service --print   # print the unit instead of installing — to inspect or hand to MDM
 ```
 
-> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. (`scripts/install.sh --service` does this in the same step as install.)
+> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` after replacing the binaries (a no-op when no service is installed), and `hatel doctor` says which build answers on the port.
 
 ---
 
@@ -567,6 +571,8 @@ The collector never fights managed policy; it adapts:
 | **Hook Kinds show up but `cost`/`tokens` are empty** | Cost and tokens are native OTel metrics, so they come **through the receiver**. The hook ledger accrues without it, but those two need it running *at that moment*. Run `hatel service` for always-on. |
 | **A hook Kind's numbers look doubled** | `hatel-hook` is reached twice for one event — bound in both the user `settings.json` and a project `.claude/settings.json`, or the project one calls a wrapper script that runs `hatel-hook` again. Hook envelopes carry no event-unique identifier, so hatel cannot tell a duplicate delivery from a genuine repeat; remove one of the two bindings. `subagent` and `tool` are unaffected — they count entities by `agent_id` and `tool_use_id`. |
 | **`doctor` shows `⚠ wired hook … names no version` / `… did not name its build` / `… is <version> while this hatel is …`** | The hook Claude Code runs is a different build from `hatel`, or could not say which build it is, so its records can differ from the fields `hatel kinds` lists. Reinstall so both come from one release, or check the wrapper that answers for it. |
+| **`doctor` shows `⚠ nothing listens at 127.0.0.1:4318`** | No receiver is running, so native metrics and logs are dropped as Claude Code pushes them (the hook ledger still accrues). `hatel serve --all` now, or `hatel service` for gap-free collection. |
+| **`doctor` shows `⚠ receiver at … is build <version>, not this build`** | The receiver kept the binary it started from across an upgrade. `hatel service --restart` (or restart your own `serve`). `• something answers … but not as a hatel receiver` is a build before 0.18.0 or another collector on that port. |
 | **`doctor` shows `⚠ … wired synchronously`** | Wiring written before 0.12. Every record still arrives, but Claude Code waits for the hook each time the event fires. Re-run `hatel init` to rewrite it asynchronously. |
 | **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
 | **`emit` drops a field** | The field isn't in the Kind's allow-list. stderr prints the accepted fields (`accepted fields: …`) — fix the typo. |

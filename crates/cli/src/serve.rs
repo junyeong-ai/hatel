@@ -13,7 +13,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
@@ -24,6 +24,7 @@ use hatel_core::{
 
 use crate::export::{Exporter, OtlpSignal};
 use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
+use crate::receiver;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the retention sweep repeats while serving (it also runs once at startup). Daily is
@@ -155,6 +156,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
         .route("/v1/logs", post(ingest_logs))
+        .route(receiver::IDENTITY_PATH, get(identity))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
 
@@ -249,6 +251,11 @@ type IngestResponse = (StatusCode, Json<serde_json::Value>);
 
 fn ok() -> IngestResponse {
     (StatusCode::OK, Json(serde_json::json!({})))
+}
+
+/// Which build is answering here — what `doctor` compares its own against.
+async fn identity() -> Json<receiver::Identity> {
+    Json(receiver::Identity::this_build())
 }
 
 async fn ingest_metrics(

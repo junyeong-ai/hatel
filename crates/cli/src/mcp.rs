@@ -65,74 +65,104 @@ impl HatelMcp {
     #[tool(
         description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
     )]
-    fn report(&self, Parameters(p): Parameters<ReportParams>) -> Result<CallToolResult, McpError> {
-        let window = p.window.unwrap_or_else(|| "30d".to_string());
-        let cfg = Config::load().map_err(internal)?;
-        let reg = build_registry(&cfg).map_err(internal)?;
-        let filters = parse_query(
-            &reg,
-            &cfg,
-            p.kind.as_deref(),
-            p.group_by.as_deref(),
-            p.sort_by.as_deref(),
-            &p.filter.unwrap_or_default(),
-        )
-        .map_err(|e| McpError::invalid_params(e, None))?;
-        let Some(window_secs) = report::parse_window(&window) else {
-            return Err(McpError::invalid_params(
-                format!("invalid window {window:?} (expected e.g. 30d — days only)"),
-                None,
-            ));
-        };
-        let q = report::Query {
-            since: hatel_core::now_epoch().saturating_sub(window_secs),
-            top_n: p.top.unwrap_or(report::TOP_N),
-            project: p.project.as_deref(),
-            kind: p.kind.as_deref(),
-            group_by: p.group_by.as_deref(),
-            sort_by: p.sort_by.as_deref(),
-            filters: &filters,
-        };
-        Ok(text_result(report_json(&report::Report::build(
-            &reg, &cfg, &window, &q,
-        ))))
+    async fn report(
+        &self,
+        Parameters(p): Parameters<ReportParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(move || report_tool(p)).await?
     }
 
     #[tool(
         description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and the identity a count is of when one is declared — plus `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`."
     )]
-    fn kinds(&self) -> Result<CallToolResult, McpError> {
-        let cfg = Config::load().map_err(internal)?;
-        let reg = build_registry(&cfg).map_err(internal)?;
-        let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
-        let json = serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref()))
-            .unwrap_or_default();
-        // Trailing newline included, so the payload is byte-equal to the CLI's println!.
-        Ok(text_result(format!("{json}\n")))
+    async fn kinds(&self) -> Result<CallToolResult, McpError> {
+        blocking(kinds_tool).await?
     }
 
     #[tool(
         description = "Verify the Claude Code ↔ collector wiring. `ok: false` means a hard requirement failed; each section's findings carry a status (ok / fail / warn / note) and the message names the gap and its fix. `snippet` is the managed-settings paste block. Same JSON as `hatel doctor --json`."
     )]
-    fn doctor(&self) -> Result<CallToolResult, McpError> {
-        let json = serde_json::to_string_pretty(&doctor::report_value()).unwrap_or_default();
-        Ok(text_result(format!("{json}\n")))
+    async fn doctor(&self) -> Result<CallToolResult, McpError> {
+        blocking(|| {
+            let json = serde_json::to_string_pretty(&doctor::report_value()).unwrap_or_default();
+            text_result(format!("{json}\n"))
+        })
+        .await
     }
 
     #[tool(
         description = "Record one domain signal for a registered Kind — the programmatic path for project metrics that aren't derived from a Claude Code hook (a gate decision, a check rollup, a deploy outcome). The payload is allow-list-filtered and redacted like any other record; include attribution (e.g. `project`) as fields."
     )]
-    fn emit(&self, Parameters(p): Parameters<EmitParams>) -> Result<CallToolResult, McpError> {
-        let payload: Payload = p.payload.into_iter().collect();
-        match emit_record(&p.kind, || Ok(payload)) {
-            Ok(None) => Ok(text_result(format!("recorded {}", p.kind))),
-            Ok(Some(warning)) => Ok(text_result(format!(
-                "recorded {} — warning: {warning}",
-                p.kind
-            ))),
-            Err(EmitError::Registry(e)) => Err(internal(e)),
-            Err(EmitError::Rejected(e)) => Err(McpError::invalid_params(e, None)),
-        }
+    async fn emit(
+        &self,
+        Parameters(p): Parameters<EmitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(move || emit_tool(p)).await?
+    }
+}
+
+/// Every tool answers from the ledger on disk or from the receiver over the wire — blocking work,
+/// run off the runtime's workers so the stdio transport keeps serving while one call reads a large
+/// ledger or waits on a probe.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, McpError> {
+    tokio::task::spawn_blocking(work).await.map_err(internal)
+}
+
+fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
+    let window = p.window.unwrap_or_else(|| "30d".to_string());
+    let cfg = Config::load().map_err(internal)?;
+    let reg = build_registry(&cfg).map_err(internal)?;
+    let filters = parse_query(
+        &reg,
+        &cfg,
+        p.kind.as_deref(),
+        p.group_by.as_deref(),
+        p.sort_by.as_deref(),
+        &p.filter.unwrap_or_default(),
+    )
+    .map_err(|e| McpError::invalid_params(e, None))?;
+    let Some(window_secs) = report::parse_window(&window) else {
+        return Err(McpError::invalid_params(
+            format!("invalid window {window:?} (expected e.g. 30d — days only)"),
+            None,
+        ));
+    };
+    let q = report::Query {
+        since: hatel_core::now_epoch().saturating_sub(window_secs),
+        top_n: p.top.unwrap_or(report::TOP_N),
+        project: p.project.as_deref(),
+        kind: p.kind.as_deref(),
+        group_by: p.group_by.as_deref(),
+        sort_by: p.sort_by.as_deref(),
+        filters: &filters,
+    };
+    Ok(text_result(report_json(&report::Report::build(
+        &reg, &cfg, &window, &q,
+    ))))
+}
+
+fn kinds_tool() -> Result<CallToolResult, McpError> {
+    let cfg = Config::load().map_err(internal)?;
+    let reg = build_registry(&cfg).map_err(internal)?;
+    let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
+    let json =
+        serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref())).unwrap_or_default();
+    // Trailing newline included, so the payload is byte-equal to the CLI's println!.
+    Ok(text_result(format!("{json}\n")))
+}
+
+fn emit_tool(p: EmitParams) -> Result<CallToolResult, McpError> {
+    let payload: Payload = p.payload.into_iter().collect();
+    match emit_record(&p.kind, || Ok(payload)) {
+        Ok(None) => Ok(text_result(format!("recorded {}", p.kind))),
+        Ok(Some(warning)) => Ok(text_result(format!(
+            "recorded {} — warning: {warning}",
+            p.kind
+        ))),
+        Err(EmitError::Registry(e)) => Err(internal(e)),
+        Err(EmitError::Rejected(e)) => Err(McpError::invalid_params(e, None)),
     }
 }
 

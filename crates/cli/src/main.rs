@@ -7,6 +7,7 @@ mod export;
 mod init;
 mod mcp;
 mod otlp;
+mod receiver;
 mod serve;
 mod service;
 mod throttle;
@@ -104,11 +105,15 @@ enum Command {
     /// systemd --user on Linux) for gap-free collection — the unit runs `serve --all`.
     Service {
         /// Remove the service instead of installing it.
-        #[arg(long, conflicts_with = "print")]
+        #[arg(long, conflicts_with_all = ["print", "restart"])]
         remove: bool,
         /// Print the unit file instead of installing it.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "restart")]
         print: bool,
+        /// Restart the installed service so it runs the binary now on disk; nothing to do when
+        /// none is installed or loaded.
+        #[arg(long)]
+        restart: bool,
     },
     /// Verify the settings.json wiring and report policy gaps.
     Doctor {
@@ -189,7 +194,19 @@ fn run() -> i32 {
                 init::run(scope, print, remove)
             }
         }
-        Command::Service { remove, print } => service::run(remove, print),
+        Command::Service {
+            remove,
+            print,
+            restart,
+        } => service::run(if remove {
+            service::Action::Remove
+        } else if print {
+            service::Action::Print
+        } else if restart {
+            service::Action::Restart
+        } else {
+            service::Action::Install
+        }),
         Command::Doctor { json } => doctor::run(json),
         Command::Mcp => mcp::run(),
         Command::Kinds { json } => kinds_cmd(json),

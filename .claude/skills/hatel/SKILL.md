@@ -47,6 +47,13 @@ hatel doctor               # verify and explain any gaps
   hatel drops session-less metrics rather than guess (org/user aggregation only survives at a
   downstream collector you forward the raw stream to). There is no fallback — report it as-is.
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
+- **nothing listens at 127.0.0.1:4318** (a warning) → no receiver is running, so native metrics
+  and logs are dropped as they are pushed (the hook ledger still accrues); `hatel serve --all`,
+  or `hatel service` for gap-free collection.
+- **receiver at … is build <version>, not this build** (a warning) → the receiver kept the binary
+  it started from across an upgrade; `hatel service --restart` (or restart the `serve` you run).
+  **something answers … but not as a hatel receiver** is a build before 0.18.0 or another
+  collector on that port — say which is unknown rather than assume.
 - **wired hook … is <version> while this hatel is …** (a warning) → the hook writing records is a
   different build from the `hatel` reading them, so its fields can differ from what `kinds` lists.
 - **wired hook … names no version / did not name its build** (a warning) → which build writes the

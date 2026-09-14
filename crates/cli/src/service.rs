@@ -2,8 +2,11 @@
 //! captured gap-free, not only while `serve` runs in a terminal. macOS uses a launchd LaunchAgent,
 //! Linux a systemd `--user` unit; the unit runs `serve --all` from this exact binary. Like `init`,
 //! the binary owns this OS integration (rather than a copy-pasted plist/unit), so it is consistent,
-//! idempotent, and `--print`-able for managed or customized setups. Other platforms are reported
-//! honestly as unsupported — run `serve --all` under your own supervisor.
+//! idempotent, and `--print`-able for managed or customized setups. `--restart` is what an
+//! upgrade needs: a running receiver keeps the binary it started from, so the installer restarts
+//! the service — and only if one is installed and running, never installing one as a side effect.
+//! Other platforms are reported honestly as unsupported — run `serve --all` under your own
+//! supervisor.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Write as _;
@@ -16,7 +19,15 @@ use std::process::{Command, Stdio};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_NAME: &str = "hatel";
 
-pub fn run(remove: bool, print: bool) -> i32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Install,
+    Remove,
+    Print,
+    Restart,
+}
+
+pub fn run(action: Action) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -26,12 +37,15 @@ pub fn run(remove: bool, print: bool) -> i32 {
     };
 
     #[cfg(target_os = "macos")]
-    return macos(&exe, remove, print);
+    return macos(&exe, action);
     #[cfg(target_os = "linux")]
-    return linux(&exe, remove, print);
+    return linux(&exe, action);
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (&exe, remove, print);
+        if action == Action::Restart {
+            println!("no receiver service to restart on this platform");
+            return 0;
+        }
         eprintln!(
             "service: automated install is supported on macOS (launchd) and Linux (systemd --user) \
              only; run `{} serve --all` under your platform's service manager",
@@ -42,7 +56,7 @@ pub fn run(remove: bool, print: bool) -> i32 {
 }
 
 #[cfg(target_os = "macos")]
-fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
+fn macos(exe: &Path, action: Action) -> i32 {
     let label = format!("dev.{SERVICE_NAME}");
     let exe_xml = xml_escape(&exe.display().to_string());
     let plist = format!(
@@ -57,7 +71,7 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
 </dict></plist>
 "#
     );
-    if print {
+    if action == Action::Print {
         print!("{plist}");
         return 0;
     }
@@ -67,9 +81,40 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
     };
     let path = home.join(format!("Library/LaunchAgents/{label}.plist"));
 
-    if remove {
+    if action == Action::Remove {
         quiet(Command::new("launchctl").arg("unload").arg(&path));
         return remove_unit(&path);
+    }
+    if action == Action::Restart {
+        if !path.exists() {
+            println!("no receiver service installed");
+            return 0;
+        }
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let target = format!("gui/{}/{label}", unsafe { libc::getuid() });
+        // `print` answers only for a loaded service; an installed-but-unloaded one was stopped
+        // on purpose, and a restart is not the place to undo that.
+        if !succeeds(Command::new("launchctl").args(["print", &target])) {
+            println!("the receiver service is installed but not loaded; `hatel service` loads it");
+            return 0;
+        }
+        return match Command::new("launchctl")
+            .args(["kickstart", "-k", &target])
+            .status()
+        {
+            Ok(s) if s.success() => {
+                println!("restarted the receiver service; `hatel doctor` says which build answers");
+                0
+            }
+            Ok(s) => {
+                eprintln!("service: `launchctl kickstart -k {target}` exited {s}");
+                1
+            }
+            Err(e) => {
+                eprintln!("service: launchctl not found ({e})");
+                1
+            }
+        };
     }
 
     if let Err(e) = write_unit(&path, plist.as_bytes()) {
@@ -107,12 +152,12 @@ fn macos(exe: &Path, remove: bool, print: bool) -> i32 {
 }
 
 #[cfg(target_os = "linux")]
-fn linux(exe: &Path, remove: bool, print: bool) -> i32 {
+fn linux(exe: &Path, action: Action) -> i32 {
     let exec = systemd_exec_arg(&exe.display().to_string());
     let unit = format!(
         "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
     );
-    if print {
+    if action == Action::Print {
         print!("{unit}");
         return 0;
     }
@@ -123,11 +168,43 @@ fn linux(exe: &Path, remove: bool, print: bool) -> i32 {
     let svc = format!("{SERVICE_NAME}.service");
     let path = home.join(format!(".config/systemd/user/{svc}"));
 
-    if remove {
+    if action == Action::Remove {
         quiet(Command::new("systemctl").args(["--user", "disable", "--now", &svc]));
         let r = remove_unit(&path);
         quiet(Command::new("systemctl").args(["--user", "daemon-reload"]));
         return r;
+    }
+    if action == Action::Restart {
+        if !path.exists() {
+            println!("no receiver service installed");
+            return 0;
+        }
+        // A unit that is not active was stopped on purpose, or its manager is out of reach from
+        // here (no session bus); a restart is not the place to start one or to fail an install.
+        if !succeeds(Command::new("systemctl").args(["--user", "is-active", "--quiet", &svc])) {
+            println!(
+                "the receiver service is installed but not running (or its manager is not \
+                 reachable from here); `hatel service` starts it"
+            );
+            return 0;
+        }
+        return match Command::new("systemctl")
+            .args(["--user", "try-restart", &svc])
+            .status()
+        {
+            Ok(s) if s.success() => {
+                println!("restarted the receiver service; `hatel doctor` says which build answers");
+                0
+            }
+            Ok(s) => {
+                eprintln!("service: `systemctl --user try-restart {svc}` exited {s}");
+                1
+            }
+            Err(e) => {
+                eprintln!("service: systemctl not found ({e})");
+                1
+            }
+        };
     }
 
     if let Err(e) = write_unit(&path, unit.as_bytes()) {
@@ -193,7 +270,17 @@ fn systemd_exec_arg(path: &str) -> String {
 /// fail when nothing is installed yet, and the loader's stderr would just be confusing noise.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn quiet(cmd: &mut Command) {
-    let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = succeeds(cmd);
+}
+
+/// Whether a command exits zero, its output discarded — for a question asked of the service
+/// manager, where the exit code is the answer.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn succeeds(cmd: &mut Command) -> bool {
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

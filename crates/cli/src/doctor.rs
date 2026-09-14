@@ -14,6 +14,8 @@ use serde::Serialize;
 use hatel_core::schema::UnreadableKinds;
 use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings};
 
+use crate::receiver;
+
 use crate::claude_settings as cs;
 
 /// A resolved entry from the merged settings `env`: `&(value, source-scope)`.
@@ -164,6 +166,8 @@ fn build_report() -> Report {
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
 
+    let receiver = report_receiver(&env);
+
     let wiring = cs::event_wiring(&files, &events);
     let mut hooks = Section::new("hooks", "hooks:");
     report_hooks(&mut hooks, &files, &wiring, &registry);
@@ -180,7 +184,9 @@ fn build_report() -> Report {
     }
     report_registry(&mut storage, &settings, &cfg, &registry);
 
-    let mut sections = vec![native, hooks, storage];
+    let mut sections = vec![native];
+    sections.extend(receiver);
+    sections.extend([hooks, storage]);
     if let Some(export) = report_export(&env, &settings, &resolved) {
         sections.push(export);
     }
@@ -435,6 +441,53 @@ fn advise_dormant_bindings(
 /// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
 /// egress-privacy and enriched-protocol notes are advisory. Returns `None` when no export is
 /// configured — no section, no failure.
+/// Whether a receiver answers where Claude Code pushes, and which build it is. Native metrics and
+/// logs are push-only, so nothing listening means they are dropped, not deferred; and a receiver
+/// keeps the binary it started from, so after an upgrade the build on the port can lag the one
+/// diagnosing it. Asked over the wire because that is the only witness. Returns `None` when no
+/// signal is routed to a local receiver — a remote collector is not this receiver's to answer for.
+fn report_receiver(env: &cs::Env) -> Option<Section> {
+    let (metrics, logs) = effective_otlp_endpoints(env);
+    let mut authorities: Vec<String> = [metrics, logs]
+        .into_iter()
+        .flatten()
+        .filter(|(endpoint, _)| cs::is_local_receiver(endpoint))
+        .map(|(endpoint, _)| receiver::authority(endpoint))
+        .collect();
+    authorities.dedup();
+    if authorities.is_empty() {
+        return None;
+    }
+    let ours = env!("CARGO_PKG_VERSION");
+    let mut sec = Section::new("receiver", "receiver:");
+    for authority in authorities {
+        match receiver::probe(&authority) {
+            receiver::Probe::Build(v) if v == ours => {
+                sec.ok(format!("receiver at {authority} is this build ({ours})"));
+            }
+            receiver::Probe::Build(v) => sec.warn(format!(
+                "receiver at {authority} is build {v}, not this build ({ours}) — it keeps the \
+                 binary it started from; `hatel service --restart`, or restart your `serve`"
+            )),
+            receiver::Probe::Foreign => sec.note(format!(
+                "something answers at {authority} but not as a hatel receiver — a build from \
+                 before {}, or another collector",
+                receiver::IDENTITY_SINCE
+            )),
+            receiver::Probe::Unreachable(e) if authority.starts_with("[::1]:") => sec.warn(format!(
+                "nothing listens at {authority} ({e}) — the receiver binds 127.0.0.1, so point the \
+                 endpoint at http://127.0.0.1:{}",
+                authority.trim_start_matches("[::1]:")
+            )),
+            receiver::Probe::Unreachable(e) => sec.warn(format!(
+                "nothing listens at {authority} ({e}) — native metrics and logs are dropped until \
+                 a receiver runs: `hatel serve --all` now, or `hatel service` for gap-free collection"
+            )),
+        }
+    }
+    Some(sec)
+}
+
 /// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
 /// is indistinguishable from a collection gap until something says how many sessions have one.
 fn advise_unattributed_sessions(sec: &mut Section, cfg: &Config) {
@@ -701,6 +754,72 @@ mod tests {
         ] {
             assert_eq!(hook_build_finding("/x/hatel-hook", build).0, Status::Warn);
         }
+    }
+
+    #[test]
+    fn the_receiver_is_asked_only_where_a_signal_is_local() {
+        let env_with = |endpoint: &str| -> cs::Env {
+            [(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                (endpoint.to_string(), "user"),
+            )]
+            .into_iter()
+            .collect()
+        };
+        // A remote collector is not this receiver's to answer for: no section at all.
+        assert!(report_receiver(&env_with("https://collector.acme.internal:4318")).is_none());
+        // A local port nothing listens on is a dropped stream, named as such.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let sec = report_receiver(&env_with(&format!("http://127.0.0.1:{port}"))).unwrap();
+        assert_eq!(sec.findings.len(), 1);
+        assert_eq!(sec.findings[0].status, Status::Warn);
+        assert!(sec.findings[0].message.starts_with("nothing listens at"));
+        // Two signals to the same local port are one question, asked once.
+        let mut env = env_with(&format!("http://127.0.0.1:{port}"));
+        env.insert(
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_string(),
+            (format!("http://127.0.0.1:{port}/v1/logs"), "user"),
+        );
+        assert_eq!(report_receiver(&env).unwrap().findings.len(), 1);
+    }
+
+    #[test]
+    fn a_receiver_build_is_judged_against_this_one() {
+        use std::io::{Read as _, Write as _};
+        let answering = |version: &str| -> cs::Env {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let body = format!(r#"{{"service":"hatel","version":"{version}"}}"#);
+            std::thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = s.read(&mut [0u8; 1024]);
+                let _ = s.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+            });
+            [(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                (format!("http://127.0.0.1:{port}"), "user"),
+            )]
+            .into_iter()
+            .collect()
+        };
+        let ours = env!("CARGO_PKG_VERSION");
+        let same = report_receiver(&answering(ours)).unwrap();
+        assert_eq!(same.findings[0].status, Status::Ok);
+        let older = report_receiver(&answering("0.0.1")).unwrap();
+        assert_eq!(older.findings[0].status, Status::Warn);
+        assert!(
+            older.findings[0]
+                .message
+                .contains("is build 0.0.1, not this build")
+        );
     }
 
     #[test]

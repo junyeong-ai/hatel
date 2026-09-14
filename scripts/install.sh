@@ -75,7 +75,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/hatel-install.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+# The staged binaries (`.<name>.<pid>` beside the target) go too: they exist only between a copy
+# and the rename that installs them.
+trap 'rm -rf "$TMP" "$BIN_DIR"/.hatel.$$ "$BIN_DIR"/.hatel-hook.$$' EXIT
 
 # Map this machine to a release target triple. Linux uses the static musl build so the binary
 # runs regardless of the host glibc version — the common curl|bash portability pitfall. Returns
@@ -174,15 +176,22 @@ elif ! download_prebuilt; then
     fi
 fi
 
-mkdir -p "$BIN_DIR"
 for bin in hatel hatel-hook; do
     [ -x "$BINARY_SRC_DIR/$bin" ] || { echo "did not produce $bin" >&2; exit 1; }
-    cp "$BINARY_SRC_DIR/$bin" "$BIN_DIR/$bin"
-    chmod +x "$BIN_DIR/$bin"
+done
+mkdir -p "$BIN_DIR"
+for bin in hatel hatel-hook; do
+    # Staged beside the target and renamed into place: the hook is spawned on every lifecycle
+    # event and the receiver may be running, so the path must never hold a half-written file,
+    # and a running executable cannot be overwritten in place (Linux refuses with ETXTBSY).
+    staged="$BIN_DIR/.$bin.$$"
+    cp "$BINARY_SRC_DIR/$bin" "$staged"
+    chmod +x "$staged"
     # Ad-hoc sign on macOS so Gatekeeper doesn't kill a freshly-copied binary.
     if [ "$(uname -s)" = "Darwin" ]; then
-        codesign --force --sign - "$BIN_DIR/$bin" 2>/dev/null || true
+        codesign --force --sign - "$staged" 2>/dev/null || true
     fi
+    mv -f "$staged" "$BIN_DIR/$bin"
 done
 echo "Installed hatel, hatel-hook -> $BIN_DIR"
 
@@ -225,6 +234,9 @@ echo
 if [ "$SERVICE" = true ]; then
     "$BIN_DIR/hatel" service || rc=$?
 else
+    # A running receiver keeps the binary it started from; a service installed earlier is
+    # restarted onto this one (a no-op when none is installed).
+    "$BIN_DIR/hatel" service --restart || rc=$?
     echo "For gap-free collection, install the background service (launchd/systemd):"
     echo "  hatel service     # or re-run this installer with --service"
     echo "Or run it in the foreground when you want it:  hatel serve --all"

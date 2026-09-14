@@ -287,7 +287,7 @@ hatel serve --all      # 이 컬렉터를 공유하는 모든 프로젝트
 hatel serve --project acme-api   # 특정 프로젝트(라벨)만
 ```
 
-수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
+수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드를 답합니다(`{"service":"hatel","version":"0.18.0"}`) — `doctor`가 자기 빌드와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
 
 ### `init` — Claude Code에 연결
 
@@ -348,9 +348,12 @@ native telemetry (settings.json env):
   ✓ OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from user)
   ✓ session.id included in metrics (default on)
 
+receiver:
+  ✓ receiver at 127.0.0.1:4318 is this build (0.18.0)
+
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.17.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.0)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel
@@ -361,7 +364,7 @@ export:
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
 
-> `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
+> `receiver:` 섹션은 신호가 로컬 수신기로 향할 때 나타나며, 수신기에 직접 물어봅니다(OTLP 포트의 `GET /healthz`) — 아무것도 듣지 않으면 네이티브 메트릭·로그가 버려지고 있는 것이고, 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드 뒤에는 옛 빌드로 답할 수 있습니다. `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
 
 `hatel doctor --json`은 같은 findings를 안정된 JSON으로 출력합니다 — 섹션별 `findings`가 `status`(`ok`/`fail`/`warn`/`note`)와 `message`를 갖고, 최상위 `ok`와 exit code의 의미(하드 요구 실패 시에만 non-zero)는 사람용 출력과 동일합니다.
 
@@ -541,11 +544,12 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 ```sh
 hatel service           # 설치+시작: `serve --all` 실행, 로그인/실패에 무관하게 유지
+hatel service --restart # 재시작해 지금 디스크에 있는 바이너리로 띄움(서비스가 없으면 아무것도 안 함)
 hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. (`scripts/install.sh --service`가 설치와 같은 단계에서 이걸 합니다.)
+> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않음), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다.
 
 ---
 
@@ -567,6 +571,8 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
 | **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`와 `tool`은 각각 `agent_id`·`tool_use_id`로 실체를 세므로 영향을 받지 않습니다. |
 | **`doctor`에 `⚠ wired hook … names no version` / `… did not name its build` / `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드이거나, 어느 빌드인지 답하지 못한 경우입니다. 기록의 필드가 `hatel kinds`가 보여주는 것과 다를 수 있습니다. 둘이 같은 릴리스가 되도록 다시 설치하거나, 대신 답하는 래퍼를 확인하세요. |
+| **`doctor`에 `⚠ nothing listens at 127.0.0.1:4318`** | 수신기가 돌고 있지 않아 Claude Code가 보내는 네이티브 메트릭·로그가 그대로 버려집니다(훅 원장은 계속 쌓임). 지금은 `hatel serve --all`, 무중단 수집은 `hatel service`. |
+| **`doctor`에 `⚠ receiver at … is build <버전>, not this build`** | 수신기가 업그레이드 전의 바이너리를 계속 실행하고 있습니다. `hatel service --restart`(직접 띄운 `serve`면 다시 실행). `• something answers … but not as a hatel receiver`는 0.18.0 이전 빌드이거나 그 포트의 다른 수집기입니다. |
 | **`doctor`에 `⚠ … wired synchronously`** | 0.12 이전에 배선된 설정입니다. 기록은 전부 남지만 이벤트마다 Claude Code가 훅을 기다립니다. `hatel init`을 다시 실행하면 비동기로 다시 씁니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |
