@@ -1063,12 +1063,15 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
     // line rather than from the records the window admits — an archive older than the window is
     // exactly what places the reach before it.
     let reg = load_core().unwrap();
-    let stamped = |ts: &str, project: &str| {
-        serde_json::json!({
-            "ts": ts, "kind": "tool", "_schema_version": 1,
-            "payload": {"session_id": "S", "project": project, "tool_name": "Bash"}
-        })
-        .to_string()
+    // A record carrying no `project` at all — a tree outside any repository — sits in the store
+    // under no project's reach, the way the aggregate leaves it out of every project's groups.
+    let stamped = |ts: &str, project: Option<&str>| {
+        let mut payload = serde_json::json!({"session_id": "S", "tool_name": "Bash"});
+        if let Some(p) = project {
+            payload["project"] = serde_json::Value::String(p.to_string());
+        }
+        serde_json::json!({"ts": ts, "kind": "tool", "_schema_version": 1, "payload": payload})
+            .to_string()
     };
     for sink in [SinkKind::Jsonl, SinkKind::Sqlite] {
         let cfg = Config {
@@ -1092,23 +1095,30 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
                 std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
                 std::fs::write(
                     cfg.ledger_dir.join("tool.jsonl"),
-                    format!("{}\n", stamped("2026-03-01T00:00:00Z", "p")),
+                    format!(
+                        "{}\n{}\n",
+                        stamped("2026-02-01T00:00:00Z", None),
+                        stamped("2026-03-01T00:00:00Z", Some("p"))
+                    ),
                 )
                 .unwrap();
                 std::fs::write(
                     cfg.ledger_dir.join("tool.jsonl.20260101.1"),
                     format!(
                         "{}\n{}\n",
-                        stamped("2026-01-01T00:00:00Z", "q"),
-                        stamped("2026-01-02T00:00:00Z", "q")
+                        stamped("2026-01-01T00:00:00Z", Some("q")),
+                        stamped("2026-01-02T00:00:00Z", Some("q"))
                     ),
                 )
                 .unwrap();
             }
             SinkKind::Sqlite => {
                 let mut s = hatel_core::sink::build_sink(&cfg);
-                for (ts, project) in [("2026-03-01T00:00:00Z", "p"), ("2026-01-01T00:00:00Z", "q")]
-                {
+                for (ts, project) in [
+                    ("2026-02-01T00:00:00Z", None),
+                    ("2026-03-01T00:00:00Z", Some("p")),
+                    ("2026-01-01T00:00:00Z", Some("q")),
+                ] {
                     s.write_record(
                         &hatel_core::Envelope::from_json_line(&stamped(ts, project)).unwrap(),
                     );
@@ -1122,7 +1132,8 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
             "{sink:?}: the oldest record, wherever it is held"
         );
         // Scoped to a project, the reach is that project's own oldest record: another project's
-        // archive says nothing about whether this one was being recorded then.
+        // archive says nothing about whether this one was being recorded then, and neither does
+        // the older record ahead of it in the same file that names no project.
         assert_eq!(
             section(&cfg, Some("p")).retained_since.as_deref(),
             Some("2026-03-01T00:00:00Z"),
