@@ -422,7 +422,7 @@ exclude_projects = ["scratch"]               # 이 프로젝트만 빼고 전부
 
 - **`raw`** — 들어온 OTLP를 바이트 그대로 전달(프로토콜 무관, protobuf 본문도 tee).
 - **`enriched`** — `session.id`로 조인한 `project` 라벨을 각 datapoint/record에 주입 → 다운스트림이 raw OTel엔 구조적으로 없는 **프로젝트별 귀속**을 얻습니다. 변환하려면 `http/json` 스트림 필요. 세션을 모르는 datapoint는 그대로 전달(라벨을 절대 지어내지 않음).
-- **`projects` / `exclude_projects`** — 특정 프로젝트를 목적지에서 가리기(허용-목록 또는 제외-목록, 둘 중 하나). 라벨(저장소 basename) 또는 키(저장소 절대 경로)로 매칭. 프로젝트를 아직 못 푼 배치는 **fail-closed**(필터 목적지로 전달 안 함) — 개인 프로젝트가 startup race에 사내 컬렉터로 새지 않습니다.
+- **`projects` / `exclude_projects`** — 특정 프로젝트를 목적지에서 가리기(허용-목록 또는 제외-목록, 둘 중 하나). 라벨(저장소 basename) 또는 키(파일 시스템이 심볼릭 링크를 따라가 푼 저장소 절대 경로)로 매칭. 프로젝트를 아직 못 푼 배치는 **fail-closed**(필터 목적지로 전달 안 함) — 개인 프로젝트가 startup race에 사내 컬렉터로 새지 않습니다.
 
 > **egress는 redact되지 않습니다.** `raw`/`enriched`는 전체 OTLP 본문을 호스트 밖으로 보냅니다. hatel의 allow-list/해싱은 *훅 원장*에 적용되지 *이 egress*엔 아닙니다. export가 설정되면 `doctor`가 이를 상시 경고로 출력합니다. (단, hatel은 본문이 없는 설계라 프롬프트·도구 본문을 나르지 않으므로, Claude Code의 raw OTel을 사내 컬렉터에 직접 꽂는 것보단 안전합니다.)
 

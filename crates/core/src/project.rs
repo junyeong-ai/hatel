@@ -20,10 +20,18 @@ pub struct ProjectRef {
 /// The project the working directory `cwd` belongs to, or `None` where there is no project to
 /// name — outside a repository, or where `cwd` names no tree this process can resolve.
 pub fn resolve_project(cwd: &str) -> Option<ProjectRef> {
+    // A repository has one location, and a session reaching it through a symlink is in that
+    // repository, not in one named after the link — so the identity is taken from the path the
+    // filesystem resolves, which is also the one every other tool derives from git.
+    let cwd = Path::new(cwd);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let cwd = std::fs::canonicalize(cwd).ok()?;
     // A linked worktree is a checkout of a repository, not a project of its own — work done on a
     // branch in one belongs to the repository's totals, not to a project named after the branch
     // it happened to be checked out for.
-    let tree = git_root(Path::new(cwd))?;
+    let tree = git_root(&cwd)?;
     let root = main_worktree(&tree).unwrap_or(tree);
     let key = root.to_string_lossy().into_owned();
     // A root without a basename (a repository at `/`) falls back to the full path as its label —
@@ -266,6 +274,24 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_reached_through_a_symlink_is_the_repository_it_links_to() {
+        // Otherwise a session started through `~/ws/acme -> workspace/acme-api` is a second
+        // project named after the link, and nothing deriving the label from git can join it.
+        let base = scratch();
+        let repo = base.join("acme-api");
+        write(&repo.join(".git/HEAD"), "ref: refs/heads/main\n");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let alias = base.join("acme");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+
+        let p = project(&alias.join("src"));
+        assert_eq!(p.label, "acme-api");
+        assert_eq!(Path::new(&p.key), std::fs::canonicalize(&repo).unwrap());
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn a_tree_outside_a_repository_has_no_project() {
         // A directory is where a project was found, not one itself. Naming a project after
@@ -400,7 +426,7 @@ mod tests {
         );
 
         let p = project(&checkout);
-        assert_eq!(p.key, checkout.to_string_lossy());
+        assert_eq!(Path::new(&p.key), std::fs::canonicalize(&checkout).unwrap());
         assert_eq!(p.label, "subwt");
         assert_eq!(
             git_branch(checkout.to_str().unwrap()).as_deref(),
@@ -420,7 +446,10 @@ mod tests {
         write(&sup.join("lib/.git"), "gitdir: ../.git/modules/lib\n");
 
         let p = project(&sup.join("lib"));
-        assert_eq!(p.key, sup.join("lib").to_string_lossy());
+        assert_eq!(
+            Path::new(&p.key),
+            std::fs::canonicalize(sup.join("lib")).unwrap()
+        );
         assert_eq!(p.label, "lib");
         assert_eq!(
             git_branch(sup.join("lib").to_str().unwrap()).as_deref(),
@@ -451,7 +480,7 @@ mod tests {
         );
 
         let p = project(&checkout);
-        assert_eq!(p.key, checkout.to_string_lossy());
+        assert_eq!(Path::new(&p.key), std::fs::canonicalize(&checkout).unwrap());
         assert_eq!(p.label, "co");
         std::fs::remove_dir_all(&base).ok();
     }

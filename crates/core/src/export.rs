@@ -48,8 +48,9 @@ impl ExportMode {
 /// "at most one of allow/exclude" invariant: a config setting both is rejected at load.
 ///
 /// An entry matches a project by its display **label** (the git-root basename, e.g. `my-app`)
-/// or its unique **key** (the absolute git-root path) — so two repositories that share a basename
-/// can be told apart by writing the path. Matching on the key never weakens privacy: the key is
+/// or its unique **key** (the absolute git-root path, as the filesystem resolves it) — so two
+/// repositories that share a basename can be told apart by writing the path. Matching on the key
+/// never weakens privacy: the key is
 /// only read here, for the local forward/skip decision, and is never part of an egressed body
 /// (enrichment injects the label alone).
 #[derive(Debug, Clone, PartialEq, Eq)]

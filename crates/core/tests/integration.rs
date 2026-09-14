@@ -234,7 +234,10 @@ fn session_start_is_recorded_in_the_index() {
     let index = SessionIndex::new(cfg.state_dir.clone()).load();
     let row = index.get("S3").expect("session recorded");
     assert_eq!(row.project_label, "myproj");
-    assert_eq!(row.project_key, repo.to_string_lossy());
+    assert_eq!(
+        std::path::Path::new(&row.project_key),
+        std::fs::canonicalize(&repo).unwrap()
+    );
 }
 
 #[test]
