@@ -57,6 +57,17 @@ pub fn read_records(cfg: &Config, kind: &str, since: Option<i64>) -> Vec<Envelop
     }
 }
 
+/// The timestamp of the oldest record of `kind` the backend still holds, or `None` when it holds
+/// none. Retention prunes the store from the back, so this is how far into the past an answer
+/// over it can reach — a reader comparing it with a window's start knows whether the window was
+/// measured whole.
+pub fn oldest_record_ts(cfg: &Config, kind: &str) -> Option<String> {
+    match cfg.sink {
+        SinkKind::Jsonl => jsonl::oldest_ts(&cfg.ledger_dir, kind),
+        SinkKind::Sqlite => sqlite::oldest_ts(&sqlite_db_path(cfg), kind),
+    }
+}
+
 /// Every Kind the backend holds records for, sorted. Each backend answers from what it owns —
 /// the JSONL sink from the file names it chose, the SQLite sink from the column it writes — so
 /// this is an exact statement about storage rather than an inference about it. It is what lets a

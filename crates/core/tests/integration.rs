@@ -1056,6 +1056,77 @@ fn sqlite_sink_round_trips_through_report() {
 }
 
 #[test]
+fn a_kind_section_says_how_far_back_its_store_reaches() {
+    // Retention prunes a store from the back, so a window that starts before the oldest record
+    // still held was not measured whole; the section names that record's time so a reader can
+    // tell an empty early stretch from one nobody recorded. It is read from every file's first
+    // line rather than from the records the window admits — an archive older than the window is
+    // exactly what places the reach before it.
+    let reg = load_core().unwrap();
+    let stamped = |ts: &str, tool: &str| {
+        serde_json::json!({
+            "ts": ts, "kind": "tool", "_schema_version": 1,
+            "payload": {"session_id": "S", "project": "p", "tool_name": tool}
+        })
+        .to_string()
+    };
+    for sink in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let cfg = Config {
+            sink,
+            ..config_in(temp_dir(), vec![])
+        };
+        let section = |cfg: &Config| {
+            report::Report::build(&reg, cfg, "30d", &query(0, 0, None))
+                .kinds
+                .into_iter()
+                .find(|k| k.kind == "tool")
+                .unwrap()
+        };
+        assert_eq!(
+            section(&cfg).retained_since,
+            None,
+            "{sink:?}: an empty store reaches nowhere"
+        );
+        match sink {
+            SinkKind::Jsonl => {
+                std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+                std::fs::write(
+                    cfg.ledger_dir.join("tool.jsonl"),
+                    format!("{}\n", stamped("2026-03-01T00:00:00Z", "Read")),
+                )
+                .unwrap();
+                std::fs::write(
+                    cfg.ledger_dir.join("tool.jsonl.20260101.1"),
+                    format!(
+                        "{}\n{}\n",
+                        stamped("2026-01-01T00:00:00Z", "Bash"),
+                        stamped("2026-01-02T00:00:00Z", "Bash")
+                    ),
+                )
+                .unwrap();
+            }
+            SinkKind::Sqlite => {
+                let mut s = hatel_core::sink::build_sink(&cfg);
+                for (ts, tool) in [
+                    ("2026-03-01T00:00:00Z", "Read"),
+                    ("2026-01-01T00:00:00Z", "Bash"),
+                ] {
+                    s.write_record(
+                        &hatel_core::Envelope::from_json_line(&stamped(ts, tool)).unwrap(),
+                    );
+                }
+                s.flush();
+            }
+        }
+        assert_eq!(
+            section(&cfg).retained_since.as_deref(),
+            Some("2026-01-01T00:00:00Z"),
+            "{sink:?}: the oldest record, wherever it is held"
+        );
+    }
+}
+
+#[test]
 fn top_zero_means_all_groups() {
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();

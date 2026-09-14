@@ -18,6 +18,14 @@ pub fn read_records(dir: &Path, kind: &str) -> Vec<Envelope> {
     rolling::read_parsed(dir, &base(kind), Envelope::from_json_line)
 }
 
+/// The oldest record of `kind` still stored, as its timestamp — how far back the store reaches.
+pub fn oldest_ts(dir: &Path, kind: &str) -> Option<String> {
+    rolling::first_parsed(dir, &base(kind), Envelope::from_json_line)
+        .into_iter()
+        .map(|env| env.ts)
+        .min()
+}
+
 /// Delete rotated ledger archives whose last write predates `cutoff_epoch` — the JSONL half of the
 /// retention sweep. Whole archives only; the active `<kind>.jsonl` is never touched. Returns files
 /// removed.

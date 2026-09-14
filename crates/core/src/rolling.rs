@@ -18,7 +18,7 @@
 //! produce collides with the archive form.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::SystemTime;
@@ -121,6 +121,23 @@ fn parse_lines<'a, R>(
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(parse)
+}
+
+/// The first parsable line of the active file and of every archive of `base`. A file is appended
+/// in time order, so its first line is its oldest record and the set is what a reader needs to
+/// know how far back the store reaches — without reading the store.
+pub fn first_parsed<R>(dir: &Path, base: &str, parse: impl Fn(&str) -> Option<R>) -> Vec<R> {
+    matching_files(dir, base)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let file = fs::File::open(path).ok()?;
+            BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .find_map(|line| parse(line.as_str()))
+        })
+        .collect()
 }
 
 /// The active file and every archive of `base`, sorted by name. The order is used ONLY to make the

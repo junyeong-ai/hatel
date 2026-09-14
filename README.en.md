@@ -187,6 +187,7 @@ hatel report --window 30d --kind tool --format json
       ],
       "kind": "tool",
       "project_scope": "unrestricted",
+      "retained_since": "2026-06-14T09:12:03.4Z",
       "sort_by": "duration_ms"
     }
   ],
@@ -197,7 +198,7 @@ hatel report --window 30d --kind tool --format json
 }
 ```
 
-> Keys serialize in alphabetical order. Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape. A group's `key` is `null` for the records that carry no value for the dimension at all (the `—` row of the text and markdown views), so a reader tells an absent field from any value by shape rather than by a glyph. A non-null `unreadable_kinds` means **the ledger holds Kinds no loaded schema declares** — the rollup answered over less than was collected, and the names and the place to fix it come with it (see [custom metrics](#custom-metrics-plugins)).
+> Keys serialize in alphabetical order. Only the `Bash` group is shown above; a full report continues with `Edit·Grep·Read` in the same shape. A group's `key` is `null` for the records that carry no value for the dimension at all (the `—` row of the text and markdown views), so a reader tells an absent field from any value by shape rather than by a glyph. `retained_since` is the oldest record of that Kind still stored (of any project; `null` when none): retention prunes the store from the back, so a window that starts before it was not measured whole, and a reader should say so rather than read the empty stretch as silence. A non-null `unreadable_kinds` means **the ledger holds Kinds no loaded schema declares** — the rollup answered over less than was collected, and the names and the place to fix it come with it (see [custom metrics](#custom-metrics-plugins)).
 
 In a full report (no `--kind`), each `cost` row serializes three breakdowns alongside its totals — `tokens_by_type` (`input`/`output`/`cacheRead`/`cacheCreation` — the cache-hit accounting), `by_model` (tokens and cost per model — the model mix), and `by_agent` (tokens and cost per subagent). In each breakdown, a series missing the attribute lands in an `(unattributed)` bucket — never guessed. Sessions recorded before the breakdowns existed show empty objects (`{}`) — exactly the fact that nothing was recorded.
 

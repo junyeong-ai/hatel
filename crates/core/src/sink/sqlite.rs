@@ -93,6 +93,21 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
     out
 }
 
+/// The oldest record of `kind` still stored, as its timestamp — how far back the store reaches.
+pub fn oldest_ts(path: &Path, kind: &str) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    conn.query_row(
+        "SELECT MIN(ts) FROM records WHERE kind = ?1",
+        rusqlite::params![kind],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
 /// Rows deleted per DELETE statement during the retention sweep. Batching keeps each writer-lock
 /// window short, so a first sweep over a months-old backlog can't hold the WAL write lock long
 /// enough to starve concurrent hook inserts.

@@ -383,6 +383,7 @@ mod tests {
             sort_by: Some("duration_ms".to_string()),
             identity: None,
             project_scope: ProjectScope::Unrestricted,
+            retained_since: None,
             groups,
         }
     }
