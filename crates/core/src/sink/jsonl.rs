@@ -18,12 +18,17 @@ pub fn read_records(dir: &Path, kind: &str) -> Vec<Envelope> {
     rolling::read_parsed(dir, &base(kind), Envelope::from_json_line)
 }
 
-/// The oldest record of `kind` still stored, as its timestamp — how far back the store reaches.
-pub fn oldest_ts(dir: &Path, kind: &str) -> Option<String> {
-    rolling::first_parsed(dir, &base(kind), Envelope::from_json_line)
-        .into_iter()
-        .map(|env| env.ts)
-        .min()
+/// The oldest record of `kind` — of `project` when named — still stored, as its timestamp: how
+/// far back the store reaches.
+pub fn oldest_ts(dir: &Path, kind: &str, project: Option<&str>) -> Option<String> {
+    rolling::first_parsed(dir, &base(kind), |line| {
+        Envelope::from_json_line(line).filter(|env| {
+            project.is_none_or(|p| env.payload.get("project").and_then(|v| v.as_str()) == Some(p))
+        })
+    })
+    .into_iter()
+    .map(|env| env.ts)
+    .min()
 }
 
 /// Delete rotated ledger archives whose last write predates `cutoff_epoch` — the JSONL half of the

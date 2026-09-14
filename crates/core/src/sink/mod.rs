@@ -57,14 +57,16 @@ pub fn read_records(cfg: &Config, kind: &str, since: Option<i64>) -> Vec<Envelop
     }
 }
 
-/// The timestamp of the oldest record of `kind` the backend still holds, or `None` when it holds
-/// none. Retention prunes the store from the back, so this is how far into the past an answer
-/// over it can reach — a reader comparing it with a window's start knows whether the window was
-/// measured whole.
-pub fn oldest_record_ts(cfg: &Config, kind: &str) -> Option<String> {
+/// The timestamp of the oldest record of `kind` the backend still holds — of `project` when one
+/// is named — or `None` when it holds none. Retention prunes the store from the back, so this is
+/// how far into the past an answer over it can reach; a reader comparing it with a window's start
+/// knows whether the window was measured whole. Scoped to a project it is the later of two
+/// instants the store cannot tell apart — the hook's first write and the project's first session
+/// here — which is the conservative one for a reader about to take an empty stretch as silence.
+pub fn oldest_record_ts(cfg: &Config, kind: &str, project: Option<&str>) -> Option<String> {
     match cfg.sink {
-        SinkKind::Jsonl => jsonl::oldest_ts(&cfg.ledger_dir, kind),
-        SinkKind::Sqlite => sqlite::oldest_ts(&sqlite_db_path(cfg), kind),
+        SinkKind::Jsonl => jsonl::oldest_ts(&cfg.ledger_dir, kind, project),
+        SinkKind::Sqlite => sqlite::oldest_ts(&sqlite_db_path(cfg), kind, project),
     }
 }
 

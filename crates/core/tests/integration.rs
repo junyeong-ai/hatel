@@ -1063,10 +1063,10 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
     // line rather than from the records the window admits — an archive older than the window is
     // exactly what places the reach before it.
     let reg = load_core().unwrap();
-    let stamped = |ts: &str, tool: &str| {
+    let stamped = |ts: &str, project: &str| {
         serde_json::json!({
             "ts": ts, "kind": "tool", "_schema_version": 1,
-            "payload": {"session_id": "S", "project": "p", "tool_name": tool}
+            "payload": {"session_id": "S", "project": project, "tool_name": "Bash"}
         })
         .to_string()
     };
@@ -1075,15 +1075,15 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
             sink,
             ..config_in(temp_dir(), vec![])
         };
-        let section = |cfg: &Config| {
-            report::Report::build(&reg, cfg, "30d", &query(0, 0, None))
+        let section = |cfg: &Config, project: Option<&str>| {
+            report::Report::build(&reg, cfg, "30d", &query(0, 0, project))
                 .kinds
                 .into_iter()
                 .find(|k| k.kind == "tool")
                 .unwrap()
         };
         assert_eq!(
-            section(&cfg).retained_since,
+            section(&cfg, None).retained_since,
             None,
             "{sink:?}: an empty store reaches nowhere"
         );
@@ -1092,36 +1092,46 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
                 std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
                 std::fs::write(
                     cfg.ledger_dir.join("tool.jsonl"),
-                    format!("{}\n", stamped("2026-03-01T00:00:00Z", "Read")),
+                    format!("{}\n", stamped("2026-03-01T00:00:00Z", "p")),
                 )
                 .unwrap();
                 std::fs::write(
                     cfg.ledger_dir.join("tool.jsonl.20260101.1"),
                     format!(
                         "{}\n{}\n",
-                        stamped("2026-01-01T00:00:00Z", "Bash"),
-                        stamped("2026-01-02T00:00:00Z", "Bash")
+                        stamped("2026-01-01T00:00:00Z", "q"),
+                        stamped("2026-01-02T00:00:00Z", "q")
                     ),
                 )
                 .unwrap();
             }
             SinkKind::Sqlite => {
                 let mut s = hatel_core::sink::build_sink(&cfg);
-                for (ts, tool) in [
-                    ("2026-03-01T00:00:00Z", "Read"),
-                    ("2026-01-01T00:00:00Z", "Bash"),
-                ] {
+                for (ts, project) in [("2026-03-01T00:00:00Z", "p"), ("2026-01-01T00:00:00Z", "q")]
+                {
                     s.write_record(
-                        &hatel_core::Envelope::from_json_line(&stamped(ts, tool)).unwrap(),
+                        &hatel_core::Envelope::from_json_line(&stamped(ts, project)).unwrap(),
                     );
                 }
                 s.flush();
             }
         }
         assert_eq!(
-            section(&cfg).retained_since.as_deref(),
+            section(&cfg, None).retained_since.as_deref(),
             Some("2026-01-01T00:00:00Z"),
             "{sink:?}: the oldest record, wherever it is held"
+        );
+        // Scoped to a project, the reach is that project's own oldest record: another project's
+        // archive says nothing about whether this one was being recorded then.
+        assert_eq!(
+            section(&cfg, Some("p")).retained_since.as_deref(),
+            Some("2026-03-01T00:00:00Z"),
+            "{sink:?}: the project's own oldest record"
+        );
+        assert_eq!(
+            section(&cfg, Some("r")).retained_since,
+            None,
+            "{sink:?}: a project the store never saw reaches nowhere"
         );
     }
 }

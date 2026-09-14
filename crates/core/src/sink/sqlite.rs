@@ -93,15 +93,17 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
     out
 }
 
-/// The oldest record of `kind` still stored, as its timestamp — how far back the store reaches.
-pub fn oldest_ts(path: &Path, kind: &str) -> Option<String> {
+/// The oldest record of `kind` — of `project` when named — still stored, as its timestamp: how
+/// far back the store reaches.
+pub fn oldest_ts(path: &Path, kind: &str, project: Option<&str>) -> Option<String> {
     if !path.exists() {
         return None;
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     conn.query_row(
-        "SELECT MIN(ts) FROM records WHERE kind = ?1",
-        rusqlite::params![kind],
+        "SELECT MIN(ts) FROM records
+         WHERE kind = ?1 AND (?2 IS NULL OR json_extract(payload, '$.project') = ?2)",
+        rusqlite::params![kind, project],
         |row| row.get::<_, Option<String>>(0),
     )
     .ok()

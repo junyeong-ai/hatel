@@ -104,9 +104,10 @@ pub enum ProjectScope {
 /// One Kind's answer, self-describing: which dimension it was grouped by, which measure ranked
 /// it (`None` — and so count — when the Kind declares no measures), what each group's count
 /// counts (`identity`: distinct values of that field, else records), how the project scope
-/// applied, and how far back the store reaches (`retained_since`: the oldest record still held,
-/// of any project — `None` when it holds none). A window that starts before it was not measured
-/// whole, and a reader that would take an empty early stretch for a measured silence reads it.
+/// applied, and how far back the store reaches (`retained_since`: the oldest record still held —
+/// of the project the query names, else of any — `None` when it holds none). A window that starts
+/// before it was not measured whole, and a reader that would take an empty early stretch for a
+/// measured silence reads it.
 #[derive(Debug, Clone, Serialize)]
 pub struct KindSection {
     pub kind: String,
@@ -157,7 +158,7 @@ impl Report {
                     sort_by: sort_by.map(str::to_string),
                     identity: spec.identity.clone(),
                     project_scope,
-                    retained_since: sink::oldest_record_ts(cfg, &spec.name),
+                    retained_since: sink::oldest_record_ts(cfg, &spec.name, q.project),
                     groups: match project_scope {
                         ProjectScope::Unsupported => Vec::new(),
                         _ => aggregate(reg, cfg, &spec.name, q),
