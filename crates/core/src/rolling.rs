@@ -190,8 +190,9 @@ fn matching_files(dir: &Path, base: &str) -> Option<Vec<PathBuf>> {
 
 /// A cheap change signature over `base`'s files — `(file count, total bytes, newest mtime)` — for a
 /// reader that caches the folded contents and only re-reads when this changes. Total bytes strictly
-/// increases on append and shifts on rotation/prune, so it catches a change the 1-second mtime
-/// granularity could miss. `None` when the directory can't be listed.
+/// increases on append and falls on a prune, so it catches a change the 1-second mtime granularity
+/// could miss; a rotation only renames, which leaves both the signature and the contents unchanged.
+/// `None` when the directory can't be listed.
 pub fn fingerprint(dir: &Path, base: &str) -> Option<(usize, u64, Option<SystemTime>)> {
     let files = matching_files(dir, base)?;
     let mut total = 0u64;
@@ -247,8 +248,9 @@ fn prune_matching(dir: &Path, cutoff_epoch: i64, matches: impl Fn(&str) -> bool)
 }
 
 /// Archive the active file of `base` once it holds a record from before `cutoff_epoch`. `epoch`
-/// reads a line's timestamp. The file's last write bounds every line in it and its first dated line
-/// is its oldest record (appends arrive in time order), so either one past the cutoff settles it.
+/// reads a line's timestamp. The file's last write bounds every line in it, and its first dated
+/// line is its oldest dated record to within the moment between stamping a record and appending
+/// it, so either one past the cutoff settles it.
 ///
 /// Call it after the same sweep's prune, never before it. The archive keeps the mtime of its last
 /// write, so a prune that followed could delete it while an append that opened the file just

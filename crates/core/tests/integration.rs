@@ -619,22 +619,30 @@ fn retention_archives_an_active_ledger_once_it_reaches_back_a_tenth_of_the_horiz
 }
 
 #[test]
-fn retention_never_prunes_an_active_ledger_for_a_dotted_kind_name() {
+fn retention_never_deletes_an_active_ledger_for_a_dotted_kind_name() {
     // Kind names may contain dots (the charset allows them), so a Kind named `foo.jsonl` has
     // the active file `foo.jsonl.jsonl` — which contains `.jsonl.` but, like every active
-    // ledger, ENDS with `.jsonl`. The sweep must not take it for an archive, while that same
-    // Kind's archives are still prunable.
+    // ledger, ENDS with `.jsonl`. However old, the sweep must archive it rather than take it for
+    // an archive and delete it, while that same Kind's archives are still prunable.
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
     let dotted_active = cfg.ledger_dir.join("foo.jsonl.jsonl");
     let dotted_archive = cfg.ledger_dir.join("foo.jsonl.jsonl.20240101.1");
     std::fs::write(&dotted_active, format!("{}\n", line("A"))).unwrap();
     std::fs::write(&dotted_archive, format!("{}\n", line("B"))).unwrap();
+    age(&dotted_active, 100);
     age(&dotted_archive, 100);
     let retention = cfg.retention(hatel_core::now_epoch());
-    assert_eq!(hatel_core::sink::prune(&cfg, retention), 1);
-    assert!(dotted_active.exists(), "dotted-Kind active ledger spared");
-    assert!(!dotted_archive.exists(), "its aged archive is pruned");
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, retention),
+        1,
+        "its aged archive"
+    );
+    let kept: Vec<String> = hatel_core::sink::read_records(&cfg, "foo.jsonl", None)
+        .iter()
+        .filter_map(|env| env.payload.get("tool_name")?.as_str().map(String::from))
+        .collect();
+    assert_eq!(kept, ["A"], "its active ledger is archived, not deleted");
 }
 
 #[test]

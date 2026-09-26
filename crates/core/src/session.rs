@@ -121,8 +121,8 @@ impl SessionIndex {
 
     /// The newest write time across the index (active file + archives), or `None` when nothing has
     /// been recorded yet — so a caller can tell whether sessions have started recently without
-    /// reaching into the index's storage layout or missing the brief post-rotation window where the
-    /// active file is momentarily absent.
+    /// reaching into the index's storage layout or missing a stretch where the active file is
+    /// absent, as it is after a rotation until the next line is written.
     pub fn newest_mtime(&self) -> Option<SystemTime> {
         rolling::fingerprint(&self.state_dir, INDEX_BASE).and_then(|(_, _, mtime)| mtime)
     }
@@ -164,7 +164,7 @@ fn latest(lines: Vec<IndexLine>) -> BTreeMap<String, (Option<jiff::Timestamp>, S
 }
 
 /// A change-gated cache of the folded session index: it re-folds only when the index files actually
-/// change — an append, a rotation, or a prune — so a hot read path (the receiver's live render,
+/// change — an append or a prune; a rotation only renames them — so a hot read path (the receiver's live render,
 /// each flush, the export forwarder) pays a directory stat rather than re-parsing the whole, and
 /// ever-growing, index on every call.
 pub struct SessionIndexCache {
