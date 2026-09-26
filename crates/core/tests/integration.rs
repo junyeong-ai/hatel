@@ -2,6 +2,7 @@
 //! sanitization, the JSONL sink, the session index, and windowed reads — all driven
 //! through explicit temp-dir configs so they run in parallel without shared state.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -705,13 +706,37 @@ fn cost_snapshot_merges_by_session() {
         ts: "2024-01-01T00:00:00Z".to_string(),
         ..CostRow::default()
     };
-    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 10), row("S2", 5)], 0);
-    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 99)], 0); // update S1, keep S2 (retain all)
+    let none = BTreeSet::new();
+    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 10), row("S2", 5)], &none, 0);
+    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 99)], &none, 0); // update S1, keep S2 (retain all)
     let mut rows = cost::read_snapshot(&cfg.state_dir);
     rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].tokens, 99, "S1 updated");
     assert_eq!(rows[1].tokens, 5, "S2 preserved across merge");
+
+    // Both flushed again with no project: the index lost S1, while it holds S2 as having none.
+    let unattributed = |sid: &str| CostRow {
+        project: String::new(),
+        ..row(sid, 100)
+    };
+    cost::merge_snapshot(
+        &cfg.state_dir,
+        vec![unattributed("S1"), unattributed("S2")],
+        &BTreeSet::from(["S1".to_string()]),
+        0,
+    );
+    let mut rows = cost::read_snapshot(&cfg.state_dir);
+    rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    assert_eq!(
+        rows[0].project, "p",
+        "a session the index lost keeps its project"
+    );
+    assert_eq!(rows[0].tokens, 100);
+    assert_eq!(
+        rows[1].project, "",
+        "one the index holds as having none loses it"
+    );
 }
 
 #[test]
@@ -727,13 +752,14 @@ fn merge_with_no_rows_still_prunes_stale_entries() {
         ts: "2000-01-01T00:00:00Z".to_string(),
         ..CostRow::default()
     };
-    cost::merge_snapshot(&cfg.state_dir, vec![old], 0); // seed (retain all)
+    let none = BTreeSet::new();
+    cost::merge_snapshot(&cfg.state_dir, vec![old], &none, 0); // seed (retain all)
     assert_eq!(cost::read_snapshot(&cfg.state_dir).len(), 1);
     let cutoff = hatel_core::now_iso_utc()
         .parse::<jiff::Timestamp>()
         .unwrap()
         .as_second();
-    cost::merge_snapshot(&cfg.state_dir, vec![], cutoff); // idle flush, but prunes
+    cost::merge_snapshot(&cfg.state_dir, vec![], &none, cutoff); // idle flush, but prunes
     assert!(
         cost::read_snapshot(&cfg.state_dir).is_empty(),
         "stale row pruned on empty merge"
@@ -756,9 +782,11 @@ fn cost_snapshot_prunes_rows_past_retention() {
         ..CostRow::default()
     };
     let now = hatel_core::now_iso_utc();
+    let none = BTreeSet::new();
     cost::merge_snapshot(
         &cfg.state_dir,
         vec![row("old", "2000-01-01T00:00:00Z"), row("recent", &now)],
+        &none,
         0,
     );
     assert_eq!(
@@ -768,7 +796,7 @@ fn cost_snapshot_prunes_rows_past_retention() {
     );
     // A retain_since of "one day ago" drops the year-2000 row, keeps the recent one.
     let cutoff = now.parse::<jiff::Timestamp>().unwrap().as_second() - 86_400;
-    cost::merge_snapshot(&cfg.state_dir, vec![], cutoff);
+    cost::merge_snapshot(&cfg.state_dir, vec![], &none, cutoff);
     let rows = cost::read_snapshot(&cfg.state_dir);
     assert_eq!(rows.len(), 1, "old row pruned");
     assert_eq!(rows[0].session_id, "recent");

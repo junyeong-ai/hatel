@@ -576,8 +576,9 @@ fn truncate(s: &str, n: usize) -> String {
 /// session still sending telemetry, however long ago it started. Once a session goes unheard, its
 /// project lasts the horizon less at most one rotation span; a session unheard that long — ended,
 /// or running while no receiver listened — cannot be told apart from an ended one, and expires.
-/// Historical cost/tool records bake in their project label at write time, so they never
-/// re-consult the index.
+/// Tool records bake in their project label at write time, and a cost row keeps the project it
+/// carries once the index no longer holds its session (`cost::merge_snapshot`), so neither loses
+/// its attribution to this prune.
 fn prune_ledger(cfg: &Config) {
     let retention = cfg.retention(hatel_core::now_epoch());
     let removed = hatel_core::sink::prune(cfg, retention);
@@ -632,6 +633,12 @@ fn persist_cost(st: &AppState) {
     let acc = lock(&st.acc);
     let no_counts = BTreeMap::new();
     let no_spend = BTreeMap::new();
+    let unindexed: BTreeSet<String> = acc
+        .sessions()
+        .keys()
+        .filter(|sid| !index.contains(sid))
+        .cloned()
+        .collect();
     let rows: Vec<CostRow> = acc
         .sessions()
         .iter()
@@ -688,7 +695,7 @@ fn persist_cost(st: &AppState) {
     // Always merge — even with no active sessions this flush — so the retention prune
     // runs on an idle receiver too, and stale prior-run rows can't linger unbounded.
     let retention = st.cfg.retention(hatel_core::now_epoch());
-    cost::merge_snapshot(&st.cfg.state_dir, rows, retention.cutoff);
+    cost::merge_snapshot(&st.cfg.state_dir, rows, &unindexed, retention.cutoff);
 }
 
 #[cfg(test)]
@@ -893,6 +900,44 @@ mod tests {
             Some("live")
         );
         assert!(!map.contains_key("quiet"), "a quiet session expires");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cost_row_keeps_its_project_once_the_index_forgets_its_session() {
+        // Every flush rewrites every session the receiver holds. `kept` loses its index lines
+        // while its cost row is still retained; `moved` resumes outside any repository.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("keep-project");
+        let st = test_state(&dir);
+        let index = SessionIndex::new(dir.clone());
+        let a = hatel_core::ProjectRef {
+            key: "/k/a".into(),
+            label: "a".into(),
+        };
+        index.record("kept", Some(&a), 1 << 20);
+        index.record("moved", Some(&a), 1 << 20);
+        let heard = |sid: &str| MetricPoint {
+            name: "cost.usage".into(),
+            value: 0.5,
+            session_id: sid.into(),
+            series: vec![],
+            delta: true,
+        };
+        lock(&st.acc).update_metrics(vec![heard("kept"), heard("moved")], jiff::Timestamp::now());
+        persist_cost(&st);
+        std::fs::remove_file(dir.join("session_index.jsonl")).unwrap();
+        index.record("moved", None, 1 << 20);
+        persist_cost(&st);
+        let project = |sid: &str| {
+            cost::read_snapshot(&dir)
+                .into_iter()
+                .find(|r| r.session_id == sid)
+                .map(|r| r.project)
+        };
+        assert_eq!(project("kept").as_deref(), Some("a"));
+        assert_eq!(project("moved").as_deref(), Some(""));
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -8,7 +8,7 @@
 //! stays consistent. One line per session means no growth, and `report` reads it
 //! so cost survives offline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -139,16 +139,28 @@ pub fn read_snapshot(state_dir: &Path) -> Vec<CostRow> {
 
 /// Merge current per-session totals into the snapshot by `session_id` and rewrite it
 /// atomically (temp + rename). Existing sessions are preserved across receiver restarts;
-/// current ones are replaced. Rows older than `retain_since` (epoch seconds) are dropped,
-/// so the durable file and the per-flush rewrite stay bounded at the report horizon — a
-/// session past the retention window is beyond any report's reach. Fail-open: a write
-/// error is a stderr note.
-pub fn merge_snapshot(state_dir: &Path, rows: Vec<CostRow>, retain_since: i64) {
+/// current ones are replaced. A session in `unindexed` — one the session index does not hold,
+/// because its start has not landed yet or its lines expired before its cost row — keeps the
+/// project its existing row carries: no longer knowing a session's project is not a change of
+/// it. Rows older than `retain_since` (epoch seconds) are dropped, so the durable file and the
+/// per-flush rewrite stay bounded at the report horizon — a session past the retention window
+/// is beyond any report's reach. Fail-open: a write error is a stderr note.
+pub fn merge_snapshot(
+    state_dir: &Path,
+    rows: Vec<CostRow>,
+    unindexed: &BTreeSet<String>,
+    retain_since: i64,
+) {
     let mut by_session: BTreeMap<String, CostRow> = read_snapshot(state_dir)
         .into_iter()
         .map(|r| (r.session_id.clone(), r))
         .collect();
-    for row in rows {
+    for mut row in rows {
+        if unindexed.contains(&row.session_id)
+            && let Some(existing) = by_session.get(&row.session_id)
+        {
+            row.project.clone_from(&existing.project);
+        }
         by_session.insert(row.session_id.clone(), row);
     }
     let kept: Vec<&CostRow> = by_session
