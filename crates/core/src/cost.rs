@@ -329,6 +329,7 @@ mod tests {
     #[test]
     fn a_temp_a_previous_run_never_renamed_is_swept_and_the_snapshot_is_not() {
         let dir = std::env::temp_dir().join(format!("ht-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let snapshot = snapshot_path(&dir);
         std::fs::write(&snapshot, "{}\n").unwrap();
@@ -350,6 +351,7 @@ mod tests {
     fn a_failed_write_is_retried_by_the_next_record() {
         // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
         let dir = std::env::temp_dir().join(format!("ht-cost-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let changes = dir.join(CHANGES_NAME);
         std::fs::create_dir_all(changes.join("blocker")).unwrap();
         let mut snapshot = Snapshot::load(&dir);

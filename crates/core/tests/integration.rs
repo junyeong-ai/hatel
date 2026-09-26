@@ -11,9 +11,12 @@ use hatel_core::{Config, Payload, SessionIndex, SinkKind, make_envelope, report}
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A fresh directory. A process id recurs across runs, and a failed run leaves its directories
+/// behind, so one found under this name holds an earlier run's records and is cleared first.
 fn temp_dir() -> PathBuf {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("ht-test-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

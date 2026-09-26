@@ -331,6 +331,7 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

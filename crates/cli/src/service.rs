@@ -607,6 +607,7 @@ mod tests {
         let current = launchd_plist("dev.hatel", exe, log);
         let earlier = earlier_launchd_plists("dev.hatel", exe);
         let dir = std::env::temp_dir().join(format!("ht-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dev.hatel.plist");
         let classify = |text: &str| {
@@ -677,6 +678,7 @@ mod tests {
         let current = systemd_unit(exe);
         let earlier = earlier_systemd_units(exe);
         let dir = std::env::temp_dir().join(format!("ht-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("hatel.service");
         let classify = |text: &str| {

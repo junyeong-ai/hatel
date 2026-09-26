@@ -601,7 +601,8 @@ mod tests {
 
     #[test]
     fn cost_rows_honor_window_and_project() {
-        let dir = test_cfg("costwin", vec![]).state_dir;
+        let cfg = test_cfg("costwin", vec![]);
+        let dir = &cfg.state_dir;
         let row = |sid: &str, proj: &str, ts: &str| {
             format!(
                 "{{\"session_id\":\"{sid}\",\"project\":\"{proj}\",\"tokens\":1,\"cost_usd\":0.0,\
@@ -619,7 +620,6 @@ mod tests {
             ),
         )
         .unwrap();
-        let cfg = test_cfg("costwin", vec![]);
         let reg = build_registry(&cfg).unwrap();
         let cost = |project| {
             report::Report::build(
@@ -644,7 +644,7 @@ mod tests {
         let alpha = cost(Some("alpha"));
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].session_id, "recent");
-        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -677,6 +677,7 @@ mod tests {
     /// A config over a scratch state dir unique to this test (pid-scoped, tag-disambiguated).
     fn test_cfg(tag: &str, plugins: Vec<std::path::PathBuf>) -> Config {
         let dir = std::env::temp_dir().join(format!("ht-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Config {
             sink: hatel_core::SinkKind::Jsonl,
