@@ -67,9 +67,14 @@ rejects.
   `HATEL_PLUGINS` and the storage variables override them for a single process only. The receiver
   reads the file when it starts and reports that file and its store on `/healthz`; `doctor` names a
   receiver that reads another file or writes another store, and the splitting variables it can
-  see, in its own environment and in settings.json `env`. The service unit therefore carries nothing to configure, and
-  `service --restart` brings a unit an earlier release wrote up to the running build's while
-  keeping any other. `doctor` names any stored Kind no loaded schema declares.
+  see, in its own environment and in settings.json `env`. The service unit therefore carries
+  nothing to configure. `doctor` names any stored Kind no loaded schema declares.
+- **A unit is hatel's own only while it is byte-equal to a rendering some release wrote.**
+  `service` and `service --restart` replace only such a unit and keep any other as a hand edit,
+  since replacing it would silently drop what it sets. Changing `launchd_plist` or `systemd_unit`
+  therefore moves the rendering it replaces into `earlier_launchd_plists` / `earlier_systemd_units`,
+  with a copy in the classification test: the pinned-rendering tests fail on the change but cannot
+  check the move, and without it every installed unit reads as hand-edited.
 - **Machine outputs are one shape per question**: `--json` / `--format json` serialize
   keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
   the JSON their CLI counterparts print. Changing one means changing both (they share

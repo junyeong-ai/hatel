@@ -58,12 +58,32 @@ mod unreachable_manager {
         }
     }
 
+    /// `unit` with an environment variable set, as a hand edit sets one.
+    fn edited(unit: &str) -> String {
+        if cfg!(target_os = "macos") {
+            unit.replace(
+                "  <key>RunAtLoad</key>",
+                "  <key>EnvironmentVariables</key><dict><key>HATEL_RETENTION_DAYS</key>\
+                 <string>365</string></dict>\n  <key>RunAtLoad</key>",
+            )
+        } else {
+            unit.replace(
+                "[Service]\n",
+                "[Service]\nEnvironment=HATEL_RETENTION_DAYS=365\n",
+            )
+        }
+    }
+
+    /// Install `text` as the unit at `unit`, and return it.
+    fn install(unit: &Path, text: String) -> String {
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(unit, &text).unwrap();
+        text
+    }
+
     /// An installed unit an earlier release wrote.
     fn install_earlier(unit: &Path) -> String {
-        let earlier = earlier_unit(&exe());
-        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
-        std::fs::write(unit, &earlier).unwrap();
-        earlier
+        install(unit, earlier_unit(&exe()))
     }
 
     /// No `launchctl` or `systemctl` on PATH: the command can only answer from what it checks
@@ -114,6 +134,59 @@ mod unreachable_manager {
         let earlier = install_earlier(&unit);
         refused(&service(&home, &["--restart"]));
         assert_eq!(std::fs::read_to_string(&unit).unwrap(), earlier);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_restart_keeps_a_unit_for_another_binary() {
+        let (home, unit) = home("elsewhere", "");
+        let elsewhere = install(&unit, earlier_unit(Path::new("/elsewhere/hatel")));
+        let out = service(&home, &["--restart"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "stdout: {stdout}");
+        assert!(
+            stdout.contains("which runs /elsewhere/hatel rather than this binary"),
+            "stdout: {stdout}"
+        );
+        assert!(
+            stdout.contains("it as it is"),
+            "a stopped unit is started as it is, not repointed: {stdout}"
+        );
+        assert_eq!(std::fs::read_to_string(&unit).unwrap(), elsewhere);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn an_install_points_a_unit_for_another_binary_at_this_one() {
+        let (home, unit) = home("repoint", "");
+        install(&unit, earlier_unit(Path::new("/elsewhere/hatel")));
+        // The unit is written before the manager is asked to load it, which fails here.
+        service(&home, &[]);
+        let print = service(&home, &["--print"]);
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            String::from_utf8(print.stdout).unwrap()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn an_install_keeps_a_unit_edited_by_hand() {
+        let (home, unit) = home("edited", "");
+        let edited = install(&unit, edited(&earlier_unit(&exe())));
+        let out = service(&home, &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "stderr: {stderr}");
+        assert!(
+            stderr.contains("kept the installed unit"),
+            "stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("the receiver service is installed but not"),
+            "the kept unit is restarted, which finds it stopped here: {stdout}"
+        );
+        assert_eq!(std::fs::read_to_string(&unit).unwrap(), edited);
         std::fs::remove_dir_all(&home).ok();
     }
 

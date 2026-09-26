@@ -49,7 +49,11 @@ hatel doctor               # verify and explain any gaps
 - **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
 - **nothing listens at 127.0.0.1:4318** (a warning) → no receiver is running, so native metrics
   and logs are dropped as they are pushed (the hook ledger still accrues); `hatel serve --all`,
-  or `hatel service` for gap-free collection.
+  or `hatel service` for gap-free collection. When `hatel service` or `--restart` answers **kept
+  the installed unit …, which is not one this build or an earlier release wrote**, the unit was
+  edited by hand, and the lines after it say whether the receiver was restarted: show the user
+  what the unit sets and let them move it into `config.toml` before it is replaced — never
+  `--remove` it on your own.
 - **receiver at … is build <version>, not this build** (a warning) → the receiver kept the binary
   it started from across an upgrade; `hatel service --restart` (or restart the `serve` you run).
   **something answers … but not as a hatel receiver** is a build before 0.18.0 or another
