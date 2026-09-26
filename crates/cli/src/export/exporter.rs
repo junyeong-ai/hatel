@@ -5,11 +5,11 @@
 //! `bytes::Bytes` + `OtlpSignal`, never an axum type, so a future ledger→OTLP-logs exporter can
 //! reuse the same `enqueue`.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use hatel_core::{ExportMode, ExportTarget, SessionIndexCache};
 
 use super::transform::{enrich_logs, enrich_metrics, session_ids};
+use crate::throttle::{Tally, Throttle};
 
 /// Queue depth (slot backstop) before new batches are dropped. The memory bound is `MAX_QUEUED_BYTES`
 /// below; this caps slot count so the channel itself stays small.
@@ -40,8 +41,6 @@ const DEFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// Cap on establishing the TCP/TLS connection, so a downstream that accepts the socket but never
 /// responds can't pin the drain task past this.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Re-log the cumulative drop count once per this many drops (throttled, not per-drop spam).
-const DROP_LOG_EVERY: u64 = 100;
 
 /// Which OTLP signal a body is — selects the downstream path and the enrich walker. "Signal" is the
 /// OTel-native term (metrics / logs / traces); kept distinct from the registry's `Kind` vocabulary.
@@ -75,7 +74,7 @@ struct Outbound {
 #[derive(Clone)]
 pub struct Exporter {
     tx: mpsc::Sender<Outbound>,
-    dropped: Arc<AtomicU64>,
+    tallies: Arc<Tallies>,
     /// Bytes currently queued (added on enqueue, subtracted as the drain task consumes), so the
     /// queue is memory-bounded, not just slot-bounded.
     queued_bytes: Arc<AtomicUsize>,
@@ -87,15 +86,15 @@ impl Exporter {
     /// `JoinHandle` so the receiver can await a bounded drain on shutdown.
     pub fn spawn(targets: Vec<ExportTarget>, state_dir: PathBuf) -> (Exporter, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel(EXPORT_QUEUE_CAP);
-        let dropped = Arc::new(AtomicU64::new(0));
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let shutdown = Arc::new(Notify::new());
         let worker = Worker::new(targets, state_dir, queued_bytes.clone());
+        let tallies = worker.tallies.clone();
         let handle = tokio::spawn(worker.run(rx, shutdown.clone()));
         (
             Exporter {
                 tx,
-                dropped,
+                tallies,
                 queued_bytes,
                 shutdown,
             },
@@ -138,12 +137,25 @@ impl Exporter {
     }
 
     fn record_drop(&self) {
-        let before = self.dropped.fetch_add(1, Ordering::Relaxed);
-        if crate::throttle::should_log(before, 1, DROP_LOG_EVERY) {
-            eprintln!(
-                "hatel: export queue full — dropped {} batch(es) so far (downstream slow/unreachable)",
-                before + 1
-            );
+        if let Some(count) = self.tallies.queue_full.occur(Instant::now()) {
+            note_queue_full(count);
+        }
+    }
+
+    /// Report what the export throttles hold back, per `when` — the receiver's to call: on each
+    /// flush, and once the drain has finished or been given up on, when the drain task may be gone.
+    pub fn note_tally(&self, when: Tally) {
+        let tallies = &self.tallies;
+        if let Some(count) = tallies.queue_full.tally(when) {
+            note_queue_full(count);
+        }
+        if let Some(count) = tallies.unresolved.tally(when) {
+            note_unresolved(count);
+        }
+        for (endpoint, failures) in &tallies.failed {
+            if let Some(count) = failures.tally(when) {
+                eprintln!("hatel: export to {endpoint}: {count} failed delivery(ies) so far");
+            }
         }
     }
 
@@ -151,6 +163,32 @@ impl Exporter {
     /// under a timeout so a dead downstream can't hang shutdown.
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
+    }
+}
+
+/// Every repeated export condition, shared by the handle and the drain task, so the receiver can
+/// report what they hold back after a drain it gave up on.
+#[derive(Default)]
+struct Tallies {
+    /// Batches dropped because the queue was full.
+    queue_full: Throttle,
+    /// Batches dropped for the filtered destination(s) because their session never appeared in
+    /// the index.
+    unresolved: Throttle,
+    /// Deliveries each destination has failed, by endpoint — built from the destinations up front,
+    /// so the handle and the drain task share it without another lock.
+    failed: HashMap<String, Throttle>,
+}
+
+impl Tallies {
+    fn new(targets: &[ExportTarget]) -> Self {
+        Tallies {
+            failed: targets
+                .iter()
+                .map(|t| (t.endpoint.clone(), Throttle::default()))
+                .collect(),
+            ..Tallies::default()
+        }
     }
 }
 
@@ -207,9 +245,8 @@ struct Worker {
     /// Bodies awaiting their sessions' index arrival before the filtered targets can have them —
     /// each forwarded once its `missing` set resolves, or dropped at its deadline (see `Deferred`).
     deferred: Vec<Deferred>,
-    /// Batches dropped for the filtered destination(s) because their session never appeared in
-    /// the index — surfaced to stderr like the queue's drop accounting.
-    unresolved_dropped: u64,
+    /// The repeated conditions it meets, shared with the handle.
+    tallies: Arc<Tallies>,
 }
 
 impl Worker {
@@ -224,14 +261,14 @@ impl Worker {
             .iter()
             .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
         Worker {
-            targets,
             client,
             index: SessionIndexCache::new(state_dir),
             queued_bytes,
             index_needed,
             enrich_skip_warned: HashSet::new(),
             deferred: Vec::new(),
-            unresolved_dropped: 0,
+            tallies: Arc::new(Tallies::new(&targets)),
+            targets,
         }
     }
 
@@ -358,16 +395,10 @@ impl Worker {
     }
 
     /// Count a batch the filtered destination(s) never received because its session never made it
-    /// into the index; log the first and then once per `DROP_LOG_EVERY` (mirrors `record_drop`).
-    fn record_unresolved_drop(&mut self) {
-        let before = self.unresolved_dropped;
-        self.unresolved_dropped += 1;
-        if crate::throttle::should_log(before, 1, DROP_LOG_EVERY) {
-            eprintln!(
-                "hatel: {} batch(es) so far had no indexed session — dropped for the \
-                 project-filtered destination(s) (fail closed)",
-                self.unresolved_dropped
-            );
+    /// into the index, noted through [`crate::throttle`] like `record_drop`.
+    fn record_unresolved_drop(&self) {
+        if let Some(count) = self.tallies.unresolved.occur(Instant::now()) {
+            note_unresolved(count);
         }
     }
 
@@ -385,6 +416,7 @@ impl Worker {
         let client = &self.client;
         let targets = &self.targets;
         let warned = &mut self.enrich_skip_warned;
+        let failed = &self.tallies.failed;
         // The enriched body is identical for every enriched target — the project label is resolved
         // from the index, not the target — so it is built at most once per forward and reused.
         let mut enriched: Option<Result<Bytes, String>> = None;
@@ -458,16 +490,16 @@ impl Worker {
             for (k, v) in &target.headers {
                 req = req.header(k, v);
             }
-            match req.send().await {
-                Ok(resp) if resp.status().is_success() => {}
-                Ok(resp) => {
-                    eprintln!(
-                        "hatel: export to {} returned {}",
-                        target.endpoint,
-                        resp.status()
-                    )
-                }
-                Err(e) => eprintln!("hatel: export to {} failed: {e}", target.endpoint),
+            let failure = match req.send().await {
+                Ok(resp) if resp.status().is_success() => continue,
+                Ok(resp) => format!("returned {}", resp.status()),
+                Err(e) => format!("failed: {e}"),
+            };
+            if let Some(count) = failed[&target.endpoint].occur(Instant::now()) {
+                eprintln!(
+                    "hatel: export to {} {failure} ({count} failed delivery(ies) so far)",
+                    target.endpoint
+                );
             }
         }
     }
@@ -509,6 +541,19 @@ impl Worker {
             BatchProjects::Unindexed(missing)
         }
     }
+}
+
+fn note_queue_full(count: u64) {
+    eprintln!(
+        "hatel: export queue full — dropped {count} batch(es) so far (downstream slow/unreachable)"
+    );
+}
+
+fn note_unresolved(count: u64) {
+    eprintln!(
+        "hatel: {count} batch(es) so far had no indexed session — dropped for the \
+         project-filtered destination(s) (fail closed)"
+    );
 }
 
 #[cfg(test)]
@@ -559,7 +604,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<Outbound>(2);
         let exp = Exporter {
             tx,
-            dropped: Arc::new(AtomicU64::new(0)),
+            tallies: Arc::default(),
             queued_bytes: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(Notify::new()),
         };
@@ -567,7 +612,7 @@ mod tests {
             exp.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
         }
         assert!(
-            exp.dropped.load(Ordering::Relaxed) >= 8,
+            exp.tallies.queue_full.count() >= 8,
             "excess beyond capacity is dropped"
         );
     }
@@ -849,7 +894,7 @@ mod tests {
             1,
             "RACER still parked after an unrelated index advance"
         );
-        assert_eq!(worker.unresolved_dropped, 0, "nothing dropped");
+        assert_eq!(worker.tallies.unresolved.count(), 0, "nothing dropped");
 
         // RACER's own append lands — the next batch flushes the parked body.
         std::fs::write(
@@ -914,6 +959,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_handle_reports_what_its_drain_task_counted_after_it_is_given_up_on() {
+        // The receiver reports the export tallies through the handle once the drain has finished
+        // or been given up on, so a count only the drain task held would be lost with it.
+        let dir = scratch("tally");
+        let endpoint = "http://127.0.0.1:9".to_string(); // the discard port refuses at once
+        let target = ExportTarget {
+            endpoint: endpoint.clone(),
+            mode: ExportMode::Raw,
+            filter: hatel_core::ProjectFilter::All,
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(500),
+        };
+        let (exporter, handle) = Exporter::spawn(vec![target], dir.clone());
+        for _ in 0..2 {
+            exporter.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
+        }
+        let failures = &exporter.tallies.failed[&endpoint];
+        for _ in 0..100 {
+            if failures.count() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(failures.count(), 2, "both deliveries failed");
+        handle.abort();
+        exporter.note_tally(Tally::Stopping);
+        assert_eq!(failures.tally(Tally::Stopping), None, "already reported");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn parked_batches_fail_closed_at_shutdown_when_never_indexed() {
         let dir = scratch("parkdrop");
         // The endpoint is never contacted: an unresolved batch is dropped, not forwarded.
@@ -935,7 +1011,7 @@ mod tests {
         worker.index.refresh();
         worker.retry_deferred(true).await;
         assert!(worker.deferred.is_empty(), "nothing stays parked");
-        assert_eq!(worker.unresolved_dropped, 1, "the drop is counted");
+        assert_eq!(worker.tallies.unresolved.count(), 1, "the drop is counted");
         assert_eq!(qb.load(Ordering::Relaxed), 0, "bytes released");
         std::fs::remove_dir_all(&dir).ok();
     }

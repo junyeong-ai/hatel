@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
@@ -18,11 +18,14 @@ use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
-use hatel_core::{Config, ExportConfig, SessionIndex, SessionIndexCache, resolve_project};
+use hatel_core::{
+    Config, ExportConfig, Registry, SessionIndex, SessionIndexCache, resolve_project,
+};
 
 use crate::export::{Exporter, OtlpSignal};
 use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
 use crate::receiver;
+use crate::throttle::{Tally, Throttle};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// The longest the retention sweep waits between runs while serving; it also runs once at startup.
@@ -31,7 +34,7 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const PRUNE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
 /// a dead downstream can't hang the receiver's exit.
-const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// OTLP/HTTP body cap. Far above any real batch (axum's 2 MB default would silently
 /// 413 a large export and lose it), but bounded so a runaway body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -60,6 +63,21 @@ struct AppState {
     /// The egress forwarder, present only when `[[export]]` destinations are configured. Each
     /// received body is queued here (fire-and-forget) before local decode.
     exporter: Option<Exporter>,
+    undecodable: Arc<Undecodable>,
+}
+
+/// Bodies this build could not decode for its own view, per signal. A client on the wrong protocol
+/// sends nothing else, so each signal's are noted through [`crate::throttle`], not per request.
+#[derive(Default)]
+struct Undecodable {
+    metrics: Throttle,
+    logs: Throttle,
+}
+
+fn note_undecodable(bodies: &Throttle, signal: &str, e: &str) {
+    if let Some(count) = bodies.occur(Instant::now()) {
+        eprintln!("hatel: undecodable OTLP {signal} body — {e} ({count} so far)");
+    }
 }
 
 pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
@@ -76,15 +94,43 @@ pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
     runtime.block_on(serve(port, project, show_all))
 }
 
+/// What a receiver needs before it serves: the configuration, the registry of Kinds, and the export
+/// destinations. Each is fatal when broken, so `service` resolves them too before it starts a
+/// receiver, since stopping a running one for one that will not start is an outage.
+pub(crate) struct Startup {
+    cfg: Config,
+    registry: Registry,
+    export: ExportConfig,
+}
+
+pub(crate) fn startup() -> Result<Startup, String> {
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    let registry = build_registry(&cfg).map_err(|e| e.to_string())?;
+    // A misconfigured export file is fatal (like a bad registry) — fail fast rather than silently
+    // drop a destination the operator asked for. Never reached by the hook.
+    let export = ExportConfig::load().map_err(|e| e.to_string())?;
+    Ok(Startup {
+        cfg,
+        registry,
+        export,
+    })
+}
+
 async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
-    let cfg = match Config::load() {
-        Ok(c) => Arc::new(c),
+    let Startup {
+        cfg,
+        registry,
+        export: export_cfg,
+    } = match startup() {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("serve: {e}");
             return 1;
         }
     };
-    // The single-writer lock, taken before any work: the cost snapshot and the tool ledger assume
+    let cfg = Arc::new(cfg);
+    let registry = Arc::new(registry);
+    // The single-writer lock, taken before any write: the cost snapshot and the tool ledger assume
     // one receiver per state dir, so a second one is refused here rather than left to race. Held in
     // `_state_lock` for the whole run; the OS releases it on exit.
     let _state_lock = match acquire_state_lock(&cfg.state_dir) {
@@ -104,22 +150,6 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             return 1;
         }
         LockOutcome::Failed(e) => {
-            eprintln!("serve: {e}");
-            return 1;
-        }
-    };
-    let registry = match build_registry(&cfg) {
-        Ok(r) => Arc::new(r),
-        Err(e) => {
-            eprintln!("serve: {e}");
-            return 1;
-        }
-    };
-    // A misconfigured export file is fatal at startup (like a bad registry) — fail fast rather
-    // than silently drop a destination the operator asked for. Never reached by the hook.
-    let export_cfg = match ExportConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
             eprintln!("serve: {e}");
             return 1;
         }
@@ -150,6 +180,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         show_all,
         live: std::io::stdout().is_terminal(),
         exporter,
+        undecodable: Arc::default(),
     };
 
     let app = Router::new()
@@ -208,6 +239,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             persist_cost(&flush_state);
             renew_index(&flush_state);
             render(&flush_state);
+            note_tallies(&flush_state, Tally::Overdue(Instant::now()));
             let now = hatel_core::now_epoch();
             if sweep_due(now, last_prune, sweep_every) {
                 last_prune = now;
@@ -242,6 +274,8 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             EXPORT_DRAIN_TIMEOUT.as_secs()
         );
     }
+    // After the drain, finished or given up on, so what the export held back is counted too.
+    note_tallies(&state, Tally::Stopping);
     0
 }
 
@@ -277,7 +311,7 @@ async fn ingest_metrics(
             lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
         }
         Ok(_) => {}
-        Err(e) => eprintln!("hatel: undecodable OTLP metrics body — {e}"),
+        Err(e) => note_undecodable(&st.undecodable.metrics, "metrics", &e),
     }
     ok()
 }
@@ -298,7 +332,7 @@ async fn ingest_logs(
                 lock(&st.acc).update_events(decoded, jiff::Timestamp::now());
             }
         }
-        Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
+        Err(e) => note_undecodable(&st.undecodable.logs, "logs", &e),
     }
     ok()
 }
@@ -565,6 +599,22 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Report what this receiver's throttles hold back, per `when`: on each flush, the occurrences that
+/// have waited an interval since their condition's last note; as it stops, all of them.
+fn note_tallies(st: &AppState, when: Tally) {
+    for (bodies, signal) in [
+        (&st.undecodable.metrics, "metrics"),
+        (&st.undecodable.logs, "logs"),
+    ] {
+        if let Some(count) = bodies.tally(when) {
+            eprintln!("hatel: undecodable OTLP {signal} bodies: {count} so far");
+        }
+    }
+    if let Some(exporter) = &st.exporter {
+        exporter.note_tally(when);
+    }
+}
+
 /// Whether the periodic retention sweep is due, `every` seconds after the `last` one. Timed on the
 /// wall clock, as retention itself is: a monotonic clock can stop while the machine sleeps, which on
 /// a laptop would stretch a day between sweeps into several. A clock stepped back sweeps at once
@@ -736,6 +786,7 @@ mod tests {
             show_all: true,
             live: false,
             exporter: None,
+            undecodable: Arc::default(),
         }
     }
 
@@ -758,6 +809,23 @@ mod tests {
                     );
                 }
             }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stopping_receiver_reports_every_tally_its_throttles_hold_back() {
+        let dir = scratch("tallies");
+        let st = test_state(&dir);
+        let now = Instant::now();
+        let throttles = [&st.undecodable.metrics, &st.undecodable.logs];
+        for t in throttles {
+            t.occur(now);
+            t.occur(now);
+        }
+        note_tallies(&st, Tally::Stopping);
+        for t in throttles {
+            assert_eq!(t.tally(Tally::Stopping), None, "already reported");
         }
         std::fs::remove_dir_all(&dir).ok();
     }

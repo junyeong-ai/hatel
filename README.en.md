@@ -544,12 +544,12 @@ Native OTel is push-only — tokens and cost are captured only while the receive
 
 ```sh
 hatel service           # install + start: runs `serve --all`, kept alive across login/failure
-hatel service --restart # restart it so it runs the binary now on disk (nothing to do when none is installed)
+hatel service --restart # restart it so the binary its unit names runs as now on disk (nothing to do when none is installed)
 hatel service --remove  # stop and remove it
 hatel service --print   # print the unit instead of installing — to inspect or hand to MDM
 ```
 
-> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` after replacing the binaries (a no-op when no service is installed), and `hatel doctor` says which build answers on the port.
+> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` after replacing the binaries (a no-op when no service is installed; a unit an earlier build wrote is rewritten), and `hatel doctor` says which build answers on the port. The receiver logs to `~/Library/Logs/hatel/serve.log` on macOS and to the journal on Linux (`journalctl --user -u hatel`).
 
 ---
 

@@ -544,12 +544,12 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 ```sh
 hatel service           # 설치+시작: `serve --all` 실행, 로그인/실패에 무관하게 유지
-hatel service --restart # 재시작해 지금 디스크에 있는 바이너리로 띄움(서비스가 없으면 아무것도 안 함)
+hatel service --restart # 재시작해 유닛이 가리키는 바이너리를 지금 디스크에 있는 대로 띄움(서비스가 없으면 아무것도 안 함)
 hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않음), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다.
+> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 빌드가 쓴 유닛이면 새로 씀), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다.
 
 ---
 
