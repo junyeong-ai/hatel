@@ -5,9 +5,11 @@
 //! idempotent, and `--print`-able for managed or customized setups. `--restart` is what an
 //! upgrade needs: a running receiver keeps the binary it started from, so the installer restarts
 //! the service — and only if one is installed and running, never installing one as a side effect.
-//! A unit an earlier build wrote is rewritten on that restart, so a change to the unit reaches an
-//! upgraded install. Other platforms are reported honestly as unsupported — run `serve --all`
-//! under your own supervisor.
+//! That restart also brings a unit an earlier release wrote for this binary up to this build's, so
+//! a change to the unit reaches an upgraded install; a unit edited by hand or written for another
+//! binary is kept. The unit carries nothing to configure: the receiver reads its settings from
+//! `config.toml`, as every other process does. Other platforms are reported honestly as
+//! unsupported — run `serve --all` under your own supervisor.
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::Write as _;
@@ -490,8 +492,11 @@ fn receiver_would_start() -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn note_kept_unit(path: &Path) {
     println!(
-        "kept the installed unit {}, which differs from the one this build writes; `hatel service \
-         --print` shows this build's, and `hatel service` replaces it",
+        "kept the installed unit {}, which differs from the one this build writes. `hatel service` \
+         replaces it with this build's, which sets no environment, so first move what it sets into \
+         the default config.toml: HATEL_PLUGINS as `plugins`, storage variables under [storage], \
+         and a HATEL_CONFIG file's contents into that file (`hatel service --print` shows this \
+         build's unit)",
         path.display()
     );
 }

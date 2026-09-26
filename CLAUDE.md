@@ -61,9 +61,15 @@ rejects.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
   override those per query. Answering a new question is a query, not a schema edit.
-- **One registry for the write and read paths.** Plugins are registered in `config.toml`,
-  so a Kind the hook can record is one `report` can read; `HATEL_PLUGINS` overrides it for a
-  single process only. `doctor` names any stored Kind no loaded schema declares.
+- **One registry and one store for the write and read paths.** Plugins and `[storage]` live in
+  `config.toml`, which the hook, the service's receiver and `report` all read however each was
+  started, so a Kind the hook can record is one `report` can read, in the store it reads;
+  `HATEL_PLUGINS` and the storage variables override them for a single process only. The receiver
+  reads the file when it starts and reports that file and its store on `/healthz`; `doctor` names a
+  receiver that reads another file or writes another store, and the splitting variables it can
+  see, in its own environment and in settings.json `env`. The service unit therefore carries nothing to configure, and
+  `service --restart` brings a unit an earlier release wrote up to the running build's while
+  keeping any other. `doctor` names any stored Kind no loaded schema declares.
 - **Machine outputs are one shape per question**: `--json` / `--format json` serialize
   keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
   the JSON their CLI counterparts print. Changing one means changing both (they share

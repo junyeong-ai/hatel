@@ -287,7 +287,7 @@ hatel serve --all      # every project sharing this collector
 hatel serve --project acme-api   # one project (by label)
 ```
 
-The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running (`{"service":"hatel","version":"0.18.1"}`) — what `doctor` compares its own against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
+The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running, the configuration file it read and the store it writes (`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.18.1"}`) — what `doctor` compares its own build, file and store against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
 
 ### `init` — wire into Claude Code
 
@@ -364,7 +364,7 @@ export:
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
 
-> The `receiver:` section appears when a signal is routed to a local receiver, and asks it over the wire (`GET /healthz` on the OTLP port) — nothing listening means native metrics and logs are being dropped, and a receiver keeps the binary it started from, so after an upgrade it can answer as an older build. The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
+> The `receiver:` section appears when a signal is routed to a local receiver, and asks it over the wire (`GET /healthz` on the OTLP port) — nothing listening means native metrics and logs are being dropped, and a receiver keeps the binary and the configuration it started with, so after an upgrade it can answer as an older build, and after an edit to `config.toml` it did not restart for, or `HATEL_CONFIG` or a storage variable set on one side only, it is named as reading another configuration file or writing another store than this process. The `export:` section appears only when export is configured. `doctor` also ends with the **same reference settings block** `hatel init` writes (for pasting into managed/org settings) — identical to the [`init`](#init--wire-into-claude-code) block above, so it's elided here.
 
 `hatel doctor --json` renders the same findings as stable JSON — each section's `findings` carry a `status` (`ok`/`fail`/`warn`/`note`) and `message`, and the top-level `ok` plus the exit code semantics (non-zero only on a hard-requirement failure) match the human output.
 
@@ -504,23 +504,32 @@ It is language-agnostic (any project, any language, calls the binary). Unlike a 
 
 ## Storage & configuration
 
-Both halves of storage go through one abstraction (`HATEL_SINK`) — emitters write via the sink, `report` reads via the same backend (a report consumes SQLite exactly as it does JSONL):
+Both halves of storage go through one abstraction (the sink) — emitters write via the sink, `report` reads via the same backend (a report consumes SQLite exactly as it does JSONL):
 
-- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MB (`HATEL_ROTATE_BYTES`) or once its oldest record is older than a tenth of the retention horizon. Git-friendly, greppable, zero dependencies.
+- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MB (`rotate_bytes`) or once its oldest record is older than a tenth of the retention horizon. Git-friendly, greppable, zero dependencies.
 - **`sqlite`** — embedded, WAL, indexed by `(kind, ts)` so windowed reads stay cheap (the window is filtered in SQL).
 
-State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equivalent); override with `HATEL_STATE_DIR`. The session index and the cost snapshot are always written there independent of the sink (the receiver needs the index to attribute project-less OTel data).
+State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equivalent). The session index and the cost snapshot are always written there independent of the sink (the receiver needs the index to attribute project-less OTel data).
+
+Storage is configured under `[storage]` in `config.toml`. The hook, the receiver and `report` all read that file, so however each was started (by Claude Code, a service manager, a shell) they write and read one store. The receiver reads the file when it starts, so restart it after an edit (`hatel service --restart`). A key left out takes its default:
+
+```toml
+[storage]
+sink = "sqlite"            # jsonl (default) / sqlite
+state_dir = "/data/hatel"  # override the state directory; relative paths resolve against config.toml's own directory
+retention_days = 30        # retention horizon (default 90, max 100000)
+rotate_bytes = 20971520    # JSONL rotation threshold (default 10 MB)
+```
+
+`retention_days` is the retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows. The cost snapshot counts from the last time the receiver heard from a session (one heard again after expiring counts only what it reports from then on), and the session index keeps a session's project for as long as the receiver keeps hearing from it. The receiver sweeps at start and then daily (or every tenth of the horizon, when that is under a day); since JSONL files are deleted whole, a record can outlive the horizon by a tenth of it plus two sweep intervals.
 
 ### Environment variables
 
 | Variable | Effect |
 |---|---|
-| `HATEL_SINK` | `jsonl` (default) / `sqlite` |
-| `HATEL_STATE_DIR` | override the state directory |
-| `HATEL_CONFIG` | override the `config.toml` path (the export destinations) |
+| `HATEL_SINK` / `HATEL_STATE_DIR` / `HATEL_RETENTION_DAYS` / `HATEL_ROTATE_BYTES` | replace the same `[storage]` key for one process only. Hooks inherit Claude Code's environment (its shell, settings.json `env`) and the service's receiver does not, so one set on one side only splits the store; `doctor` names overrides in this shell and in settings.json `env`, and a receiver writing a different store |
+| `HATEL_CONFIG` | override the `config.toml` path; set in settings.json `env`, it moves hooks alone to another file, which `doctor` names |
 | `HATEL_PLUGINS` | plugin TOML paths, overriding `config.toml`'s `plugins`; OS path-list separator (`:` Unix, `;` Windows) |
-| `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
-| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows (default 90, max 100000); the cost snapshot counts from the last time the receiver heard from a session (one heard again after expiring counts only what it reports from then on), and the session index keeps a session's project for as long as the receiver keeps hearing from it. The receiver sweeps at start and then daily (or every tenth of the horizon, when that is under a day); since JSONL files are deleted whole, a record can outlive the horizon by a tenth of it plus two sweep intervals |
 | `HATEL_DISABLED=1` | turn the hook into a no-op |
 | `HATEL_STRICT=1` | error (don't silently drop) on a payload key outside the allow-list |
 | `HATEL_TESTING=1` | redirect writes under a `_test/` subdirectory |
@@ -549,7 +558,7 @@ hatel service --remove  # stop and remove it
 hatel service --print   # print the unit instead of installing — to inspect or hand to MDM
 ```
 
-> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` after replacing the binaries (a no-op when no service is installed; a unit an earlier build wrote is rewritten), and `hatel doctor` says which build answers on the port. The receiver logs to `~/Library/Logs/hatel/serve.log` on macOS and to the journal on Linux (`journalctl --user -u hatel`).
+> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` after replacing the binaries (a no-op when no service is installed; a unit an earlier release wrote for this binary is rewritten to this build's, while one edited by hand or pointing at another binary is kept, with a note), and `hatel doctor` says which build answers on the port. `hatel service` rewrites the whole unit, so the receiver's settings belong in `config.toml`, not the unit. On Linux, any other service setting kept in a drop-in made with `systemctl --user edit hatel` survives. The receiver logs to `~/Library/Logs/hatel/serve.log` on macOS and to the journal on Linux (`journalctl --user -u hatel`).
 
 ---
 

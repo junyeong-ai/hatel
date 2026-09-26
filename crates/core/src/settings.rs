@@ -9,10 +9,13 @@
 //! does not manage.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::config::MAX_RETENTION_DAYS;
+use crate::sink::SinkKind;
 use crate::{Error, Result};
 
 /// The parsed configuration file. An absent file is `default()` — running without one is the
@@ -28,6 +31,9 @@ pub struct Settings {
     /// Plugin schema files merged onto the core registry, in listed order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PathBuf>,
+    /// Where and how records are stored.
+    #[serde(default, skip_serializing_if = "Storage::is_default")]
+    pub storage: Storage,
     /// Downstream OTLP destinations the receiver tees to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub export: Vec<ExportTargetRaw>,
@@ -35,6 +41,70 @@ pub struct Settings {
     /// file.
     #[serde(skip)]
     source: PathBuf,
+}
+
+/// The `[storage]` section; a key left out takes its default. Every process reads this file — the
+/// hook Claude Code spawns, the receiver a service manager starts, a report run from a shell — so
+/// the store they write and read is one, however each was started; an environment variable, which
+/// reaches only the processes started with it, cannot promise that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Storage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sink: Option<SinkKind>,
+    /// As the file spells it; [`Settings::state_dir`] anchors it.
+    #[serde(
+        default,
+        deserialize_with = "literal_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub state_dir: Option<PathBuf>,
+    #[serde(
+        default,
+        deserialize_with = "retention_days",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub retention_days: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotate_bytes: Option<NonZeroU64>,
+}
+
+impl Storage {
+    fn is_default(&self) -> bool {
+        *self == Storage::default()
+    }
+}
+
+/// A path the file spells literally. A leading `~` is refused rather than taken as a relative
+/// name: nothing here expands it the way a shell would, so `~/data` would silently become a
+/// directory called `~` under the configuration directory.
+fn literal_path<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<PathBuf>, D::Error> {
+    let path = PathBuf::deserialize(d)?;
+    if path.as_os_str().is_empty() {
+        return Err(serde::de::Error::custom(
+            "an empty path names no directory; leave the key out for the default",
+        ));
+    }
+    if path
+        .components()
+        .next()
+        .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('~'))
+    {
+        return Err(serde::de::Error::custom(
+            "`~` is not expanded here; write the absolute path",
+        ));
+    }
+    Ok(Some(path))
+}
+
+fn retention_days<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
+    let days = i64::deserialize(d)?;
+    if !(1..=MAX_RETENTION_DAYS).contains(&days) {
+        return Err(serde::de::Error::custom(format!(
+            "retention_days must be from 1 to {MAX_RETENTION_DAYS}, not {days}"
+        )));
+    }
+    Ok(Some(days))
 }
 
 /// One `[[export]]` entry exactly as the file spells it, before validation. `Option` on the two
@@ -60,8 +130,12 @@ impl Settings {
     /// The configuration file's path: `$HATEL_CONFIG` (an empty value is treated as unset), else
     /// the XDG config dir. `None` when the platform exposes no config directory.
     pub fn path() -> Option<PathBuf> {
-        if let Some(p) = std::env::var_os("HATEL_CONFIG").filter(|s| !s.is_empty()) {
-            return Some(PathBuf::from(p));
+        Self::path_given(std::env::var_os("HATEL_CONFIG"))
+    }
+
+    fn path_given(hatel_config: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        if let Some(p) = hatel_config.filter(|s| !s.is_empty()) {
+            return Some(absolute(PathBuf::from(p)));
         }
         use etcetera::BaseStrategy as _;
         etcetera::choose_base_strategy()
@@ -84,8 +158,8 @@ impl Settings {
         Self::parse(&text, &path)
     }
 
-    /// Parse configuration text as if it were read from `path`, which anchors any relative
-    /// plugin path.
+    /// Parse configuration text as if it were read from `path`, which anchors any relative path
+    /// in it.
     pub(crate) fn parse(text: &str, path: &Path) -> Result<Settings> {
         let mut settings: Settings = toml::from_str(text).map_err(|e| Error::ConfigParse {
             path: path.display().to_string(),
@@ -95,19 +169,25 @@ impl Settings {
         Ok(settings)
     }
 
-    /// The plugin schema files to load, each anchored to the configuration file's own directory
-    /// when the file spells it relatively. A config is read by the hook, which is spawned in
-    /// whatever project directory Claude Code is working in, so resolving against the working
-    /// directory would make one file mean different things per invocation.
+    /// The plugin schema files to load, each anchored by [`Settings::anchor`].
     pub fn plugin_paths(&self) -> Vec<PathBuf> {
-        let dir = self.source.parent();
-        self.plugins
-            .iter()
-            .map(|plugin| match dir {
-                Some(dir) if plugin.is_relative() => dir.join(plugin),
-                _ => plugin.clone(),
-            })
-            .collect()
+        self.plugins.iter().map(|p| self.anchor(p)).collect()
+    }
+
+    /// The configured state directory, anchored by [`Settings::anchor`].
+    pub fn state_dir(&self) -> Option<PathBuf> {
+        self.storage.state_dir.as_deref().map(|d| self.anchor(d))
+    }
+
+    /// A path from the file, anchored to the file's own directory when it is spelled relatively.
+    /// The file is read by the hook, which is spawned in whatever project directory Claude Code is
+    /// working in, so resolving against the working directory would make one file mean different
+    /// things per invocation.
+    fn anchor(&self, path: &Path) -> PathBuf {
+        match self.source.parent() {
+            Some(dir) if path.is_relative() => dir.join(path),
+            _ => path.to_path_buf(),
+        }
     }
 
     /// Write the file, owner-only (`0o600`) via a temp file and an atomic rename — it may hold a
@@ -120,6 +200,14 @@ impl Settings {
             .map_err(|e| Error::Io(format!("write {}: {e}", path.display())))?;
         Ok(path)
     }
+}
+
+/// `path` resolved against the working directory, once, so every use of it — the file read, the
+/// anchor for paths inside it, what the receiver reports — names one file whatever directory later
+/// work runs in. Kept as given only when the working directory cannot be read, where the file
+/// system resolves it the same way.
+pub(crate) fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 fn write_private_atomic(path: &Path, body: &str) -> std::io::Result<()> {
@@ -161,12 +249,40 @@ mod tests {
         for text in [
             "pluginz = []",
             "[[exports]]\nendpoint = \"x\"\nmode = \"raw\"",
+            "[storage]\nretention = 30",
         ] {
             assert!(
                 Settings::parse(text, Path::new("/c/config.toml")).is_err(),
                 "{text:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_storage_value_that_names_no_usable_store_is_rejected() {
+        for text in [
+            "sink = \"sqllite\"",
+            "state_dir = \"\"",
+            "state_dir = \"~/data\"",
+            "state_dir = \"~you/data\"",
+            "retention_days = 0",
+            "retention_days = 100001",
+            "rotate_bytes = 0",
+        ] {
+            let text = format!("[storage]\n{text}");
+            assert!(
+                Settings::parse(&text, Path::new("/c/config.toml")).is_err(),
+                "{text:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_config_path_names_one_file_whatever_directory_later_work_runs_in() {
+        assert_eq!(
+            Settings::path_given(Some("cfg/config.toml".into())),
+            Some(std::env::current_dir().unwrap().join("cfg/config.toml"))
+        );
     }
 
     #[test]
@@ -191,7 +307,11 @@ mod tests {
         // a config reached by a relative path would gain another directory level on every rewrite
         // until the plugin no longer resolves.
         let config = Path::new("cfg/config.toml");
-        let mut settings = Settings::parse("plugins = [\"schemas/p.toml\"]", config).unwrap();
+        let mut settings = Settings::parse(
+            "plugins = [\"schemas/p.toml\"]\n[storage]\nstate_dir = \"data\"",
+            config,
+        )
+        .unwrap();
         for _ in 0..3 {
             let text = toml::to_string_pretty(&settings).unwrap();
             settings = Settings::parse(&text, config).unwrap();
@@ -200,6 +320,7 @@ mod tests {
                 settings.plugin_paths(),
                 vec![PathBuf::from("cfg/schemas/p.toml")]
             );
+            assert_eq!(settings.state_dir(), Some(PathBuf::from("cfg/data")));
         }
     }
 
@@ -209,6 +330,7 @@ mod tests {
         // manage must come back byte-for-byte in meaning, or the write silently drops config.
         let original = Settings::parse(
             "plugins = [\"/p/a.toml\"]\n\
+             [storage]\nsink = \"sqlite\"\nstate_dir = \"/s\"\nretention_days = 30\nrotate_bytes = 1024\n\
              [[export]]\nendpoint = \"http://h:4318\"\nmode = \"enriched\"\ntimeout_ms = 900\n\
              [export.headers]\nauthorization = \"t\"\n",
             Path::new("/c/config.toml"),
@@ -217,6 +339,8 @@ mod tests {
         let text = toml::to_string_pretty(&original).unwrap();
         let again = Settings::parse(&text, Path::new("/c/config.toml")).unwrap();
         assert_eq!(again.plugins, vec![PathBuf::from("/p/a.toml")]);
+        assert_eq!(again.storage, original.storage);
+        assert_eq!(again.storage.retention_days, Some(30));
         assert_eq!(again.export.len(), 1);
         assert_eq!(again.export[0].mode, "enriched");
         assert_eq!(again.export[0].timeout_ms, Some(900));

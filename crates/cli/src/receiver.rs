@@ -1,13 +1,17 @@
 //! What a running receiver says about itself, and how `doctor` asks. A receiver keeps the binary
-//! it started from, so after an upgrade the build answering on the port is not necessarily the
-//! build diagnosing it; the only way to know is to ask the process. The answer is an HTTP
+//! it started from, and the configuration it read then, so after an upgrade or an edit to
+//! `config.toml` the receiver answering on the port is not necessarily configured like the process
+//! diagnosing it; the only way to know is to ask the process. The answer is an HTTP
 //! `GET /healthz` on the OTLP port — the address Claude Code already pushes to — carrying the
-//! build as JSON, so a shell can read it the same way (`curl localhost:4318/healthz`).
+//! build and the store as JSON, so a shell can read it the same way
+//! (`curl localhost:4318/healthz`).
 
 use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs as _};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use hatel_core::{Config, Settings, SinkKind};
 use serde::{Deserialize, Serialize};
 
 pub const IDENTITY_PATH: &str = "/healthz";
@@ -23,14 +27,44 @@ const MAX_ANSWER_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
+    /// The configuration file the receiver resolved when it started. Absent from builds before
+    /// 0.19.0, and where the platform has no configuration directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<PathBuf>,
     pub service: String,
+    /// The store the receiver writes, as it resolved its configuration when it started. Absent
+    /// from builds before 0.19.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Store>,
     pub version: String,
 }
 
-impl Identity {
-    pub fn this_build() -> Self {
+/// The settings that decide which records a store holds: where it is, which backend, and how long
+/// it keeps them. Two processes that differ in any of these read and write different data.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Store {
+    pub retention_days: i64,
+    pub sink: SinkKind,
+    pub state_dir: PathBuf,
+}
+
+impl Store {
+    pub fn of(cfg: &Config) -> Self {
         Self {
+            retention_days: cfg.retention_days,
+            sink: cfg.sink,
+            state_dir: cfg.state_dir.clone(),
+        }
+    }
+}
+
+impl Identity {
+    /// This build, serving `cfg`.
+    pub fn of(cfg: &Config) -> Self {
+        Self {
+            config: Settings::path(),
             service: "hatel".to_string(),
+            storage: Some(Store::of(cfg)),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -39,8 +73,8 @@ impl Identity {
 /// What answered at an authority (`host:port`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum Probe {
-    /// A hatel receiver, and its build.
-    Build(String),
+    /// A hatel receiver, and what it says about itself.
+    Receiver(Identity),
     /// Something accepted the connection but did not identify as a hatel receiver — a build
     /// from before the identity route, or another collector.
     Foreign,
@@ -107,7 +141,7 @@ fn identify(answer: &[u8]) -> Probe {
         return Probe::Foreign;
     }
     match serde_json::from_str::<Identity>(body.trim()) {
-        Ok(id) if id.service == "hatel" => Probe::Build(id.version),
+        Ok(id) if id.service == "hatel" => Probe::Receiver(id),
         _ => Probe::Foreign,
     }
 }
@@ -156,7 +190,16 @@ mod tests {
             )
             .into_boxed_str(),
         ));
-        assert_eq!(probe(&authority), Probe::Build("9.9.9".to_string()));
+        assert_eq!(
+            probe(&authority),
+            Probe::Receiver(Identity {
+                config: None,
+                service: "hatel".to_string(),
+                storage: None,
+                version: "9.9.9".to_string(),
+            }),
+            "a build from before the store was reported still identifies"
+        );
     }
 
     #[test]

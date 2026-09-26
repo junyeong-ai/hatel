@@ -3,6 +3,8 @@
 //! `settings.json`, which carries only the native `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY`
 //! block the agent reads at startup.
 
+use std::ffi::OsString;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use crate::Result;
@@ -89,7 +91,10 @@ impl Config {
 
     /// Resolve the configuration, degrading to the defaults on a broken file with a note on
     /// stderr. For the hook, whose contract is that telemetry never blocks a tool call — the same
-    /// asymmetry [`crate::schema::build_registry_resilient`] applies to a broken plugin.
+    /// asymmetry [`crate::schema::build_registry_resilient`] applies to a broken plugin. The
+    /// defaults include the store: a file that cannot be read cannot say which store it names, the
+    /// default is that store for every file that names none, and for one that does, records kept
+    /// there can still be found, where records not written cannot.
     pub fn load_resilient() -> Self {
         Self::from_settings(&Settings::load().unwrap_or_else(|e| {
             eprintln!("hatel: {e}");
@@ -100,37 +105,46 @@ impl Config {
     /// Resolve against settings already read, so a command that needs more than one view of the
     /// configuration file reads it once and every view describes the same observation.
     pub fn from_settings(settings: &Settings) -> Self {
-        let testing = env_flag("HATEL_TESTING");
-        let state_dir = resolve_state_dir(testing);
+        Self::resolve(settings, &Env::process())
+    }
+
+    /// A variable in `env` replaces the file's value, and the file's replaces the default.
+    fn resolve(settings: &Settings, env: &Env) -> Self {
+        let state_dir = env
+            .state_dir()
+            .or_else(|| settings.state_dir())
+            .unwrap_or_else(xdg_state_dir);
+        let state_dir = if env.flag("HATEL_TESTING") {
+            state_dir.join("_test")
+        } else {
+            state_dir
+        };
         let ledger_dir = state_dir.join("ledger");
-        let sink = std::env::var("HATEL_SINK")
-            .ok()
-            .and_then(|s| SinkKind::parse(&s))
+        let sink = env
+            .sink()
+            .or(settings.storage.sink)
             .unwrap_or(SinkKind::Jsonl);
         // `HATEL_PLUGINS` replaces the file's list rather than adding to it, so a shell can pin a
         // registry exactly. An empty value is treated as unset — as `HATEL_CONFIG` is — so an
         // exported-but-blank variable cannot silently unregister every Kind. Split on the OS
         // path-list separator (`:` on Unix, `;` on Windows), so a native Windows path like
         // `C:\plugins\x.toml` isn't split on its drive colon.
-        let (plugins, plugin_source) =
-            match std::env::var_os("HATEL_PLUGINS").filter(|s| !s.is_empty()) {
-                Some(s) => (
-                    std::env::split_paths(&s)
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .collect(),
-                    PluginSource::Environment,
-                ),
-                None => (settings.plugin_paths(), PluginSource::ConfigFile),
-            };
-        let rotate_bytes = std::env::var("HATEL_ROTATE_BYTES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|n| *n > 0)
+        let (plugins, plugin_source) = match env.get("HATEL_PLUGINS").filter(|s| !s.is_empty()) {
+            Some(s) => (
+                std::env::split_paths(&s)
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect(),
+                PluginSource::Environment,
+            ),
+            None => (settings.plugin_paths(), PluginSource::ConfigFile),
+        };
+        let rotate_bytes = env
+            .rotate_bytes()
+            .or(settings.storage.rotate_bytes.map(NonZeroU64::get))
             .unwrap_or(DEFAULT_ROTATE_BYTES);
-        let retention_days = std::env::var("HATEL_RETENTION_DAYS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|n| (1..=MAX_RETENTION_DAYS).contains(n))
+        let retention_days = env
+            .retention_days()
+            .or(settings.storage.retention_days)
             .unwrap_or(DEFAULT_RETENTION_DAYS);
         Config {
             sink,
@@ -140,8 +154,8 @@ impl Config {
             plugin_source,
             rotate_bytes,
             retention_days,
-            disabled: env_flag("HATEL_DISABLED"),
-            strict: env_flag("HATEL_STRICT"),
+            disabled: env.flag("HATEL_DISABLED"),
+            strict: env.flag("HATEL_STRICT"),
         }
     }
 
@@ -173,18 +187,70 @@ impl Config {
     }
 }
 
-fn env_flag(key: &str) -> bool {
-    std::env::var(key).map(|v| v == "1").unwrap_or(false)
+/// The storage variables `lookup` answers with a value that takes effect. Each replaces the
+/// configuration file's `[storage]` value only for a process whose environment carries it.
+pub fn storage_overrides(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'static str> {
+    Env(lookup).storage_overrides()
 }
 
-fn resolve_state_dir(testing: bool) -> PathBuf {
-    // An empty value is treated as unset (rather than resolving state under the cwd).
-    let base = std::env::var("HATEL_STATE_DIR")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(xdg_state_dir);
-    if testing { base.join("_test") } else { base }
+/// The environment configuration reads, looked up through one function so a test can answer for
+/// it without changing the process's own.
+struct Env<'a>(&'a dyn Fn(&str) -> Option<OsString>);
+
+impl Env<'static> {
+    fn process() -> Self {
+        Env(&|key| std::env::var_os(key))
+    }
+}
+
+impl Env<'_> {
+    fn get(&self, key: &str) -> Option<OsString> {
+        (self.0)(key)
+    }
+
+    fn text(&self, key: &str) -> Option<String> {
+        self.get(key).and_then(|v| v.into_string().ok())
+    }
+
+    fn flag(&self, key: &str) -> bool {
+        self.text(key).is_some_and(|v| v == "1")
+    }
+
+    fn sink(&self) -> Option<SinkKind> {
+        self.text("HATEL_SINK").and_then(|s| SinkKind::parse(&s))
+    }
+
+    /// An empty value is treated as unset, rather than resolving state under the working
+    /// directory.
+    fn state_dir(&self) -> Option<PathBuf> {
+        self.get("HATEL_STATE_DIR")
+            .filter(|d| !d.is_empty())
+            .map(|d| crate::settings::absolute(PathBuf::from(d)))
+    }
+
+    fn retention_days(&self) -> Option<i64> {
+        self.text("HATEL_RETENTION_DAYS")
+            .and_then(|s| s.parse().ok())
+            .filter(|n| (1..=MAX_RETENTION_DAYS).contains(n))
+    }
+
+    fn rotate_bytes(&self) -> Option<u64> {
+        self.text("HATEL_ROTATE_BYTES")
+            .and_then(|s| s.parse().ok())
+            .filter(|n| *n > 0)
+    }
+
+    fn storage_overrides(&self) -> Vec<&'static str> {
+        [
+            ("HATEL_SINK", self.sink().is_some()),
+            ("HATEL_STATE_DIR", self.state_dir().is_some()),
+            ("HATEL_RETENTION_DAYS", self.retention_days().is_some()),
+            ("HATEL_ROTATE_BYTES", self.rotate_bytes().is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(var, set)| set.then_some(var))
+        .collect()
+    }
 }
 
 fn xdg_state_dir() -> PathBuf {
@@ -192,5 +258,75 @@ fn xdg_state_dir() -> PathBuf {
     match etcetera::choose_base_strategy() {
         Ok(s) => s.state_dir().unwrap_or_else(|| s.data_dir()).join("hatel"),
         Err(_) => PathBuf::from(".hatel"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+
+    fn resolved(file: &str, vars: &[(&str, &str)]) -> Config {
+        let settings =
+            Settings::parse(file, Path::new("/home/u/.config/hatel/config.toml")).unwrap();
+        let lookup = |key: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(v))
+        };
+        Config::resolve(&settings, &Env(&lookup))
+    }
+
+    #[test]
+    fn storage_comes_from_a_variable_then_the_file_then_the_default() {
+        let file = "[storage]\nsink = \"sqlite\"\nstate_dir = \"data\"\nretention_days = 30\nrotate_bytes = 1024";
+        let from_file = resolved(file, &[]);
+        assert_eq!(from_file.sink, SinkKind::Sqlite);
+        assert_eq!(from_file.state_dir, Path::new("/home/u/.config/hatel/data"));
+        assert_eq!(
+            from_file.ledger_dir,
+            Path::new("/home/u/.config/hatel/data/ledger")
+        );
+        assert_eq!(from_file.retention_days, 30);
+        assert_eq!(from_file.rotate_bytes, 1024);
+
+        let vars = [
+            ("HATEL_SINK", "jsonl"),
+            ("HATEL_STATE_DIR", "/elsewhere"),
+            ("HATEL_RETENTION_DAYS", "7"),
+            ("HATEL_ROTATE_BYTES", "2048"),
+        ];
+        let overridden = resolved(file, &vars);
+        assert_eq!(overridden.sink, SinkKind::Jsonl);
+        assert_eq!(overridden.state_dir, Path::new("/elsewhere"));
+        assert_eq!(
+            resolved(file, &[("HATEL_STATE_DIR", "relative")]).state_dir,
+            std::env::current_dir().unwrap().join("relative"),
+            "a relative variable names one directory whatever directory later work runs in"
+        );
+        assert_eq!(overridden.retention_days, 7);
+        assert_eq!(overridden.rotate_bytes, 2048);
+
+        let defaults = resolved("", &[]);
+        assert_eq!(defaults.sink, SinkKind::Jsonl);
+        assert_eq!(defaults.state_dir, xdg_state_dir());
+        assert_eq!(defaults.retention_days, DEFAULT_RETENTION_DAYS);
+        assert_eq!(defaults.rotate_bytes, DEFAULT_ROTATE_BYTES);
+    }
+
+    #[test]
+    fn only_a_variable_that_takes_effect_is_named_as_an_override() {
+        let vars: &[(&str, &str)] = &[
+            ("HATEL_STATE_DIR", "/elsewhere"),
+            ("HATEL_RETENTION_DAYS", "0"),
+            ("HATEL_SINK", ""),
+        ];
+        let lookup = |key: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| OsString::from(v))
+        };
+        assert_eq!(storage_overrides(&lookup), ["HATEL_STATE_DIR"]);
     }
 }

@@ -166,7 +166,7 @@ fn build_report() -> Report {
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
 
-    let receiver = report_receiver(&env);
+    let receiver = report_receiver(&env, &settings, &cfg);
 
     let wiring = cs::event_wiring(&files, &events);
     let mut hooks = Section::new("hooks", "hooks:");
@@ -182,6 +182,7 @@ fn build_report() -> Report {
             cfg.state_dir.display()
         )),
     }
+    advise_split_environment(&mut storage, &|key| std::env::var_os(key), &env);
     report_registry(&mut storage, &settings, &cfg, &registry);
 
     let mut sections = vec![native];
@@ -441,12 +442,18 @@ fn advise_dormant_bindings(
 /// if the endpoint bypasses hatel; that, and an invalid config file, are hard failures. The
 /// egress-privacy and enriched-protocol notes are advisory. Returns `None` when no export is
 /// configured — no section, no failure.
-/// Whether a receiver answers where Claude Code pushes, and which build it is. Native metrics and
-/// logs are push-only, so nothing listening means they are dropped, not deferred; and a receiver
-/// keeps the binary it started from, so after an upgrade the build on the port can lag the one
-/// diagnosing it. Asked over the wire because that is the only witness. Returns `None` when no
-/// signal is routed to a local receiver — a remote collector is not this receiver's to answer for.
-fn report_receiver(env: &cs::Env) -> Option<Section> {
+/// Whether a receiver answers where Claude Code pushes, which build it is, and whether it writes the
+/// store this process reads. Native metrics and logs are push-only, so nothing listening means they
+/// are dropped, not deferred; and a receiver keeps the binary and the configuration it started
+/// with, so after an upgrade, an edit to `config.toml`, or a variable set on one side only, the
+/// receiver on the port can differ from the process diagnosing it. Asked over the wire because
+/// that is the only witness. Returns `None` when no signal is routed to a local receiver — a remote
+/// collector is not this receiver's to answer for.
+fn report_receiver(
+    env: &cs::Env,
+    settings: &hatel_core::Result<Settings>,
+    cfg: &Config,
+) -> Option<Section> {
     let (metrics, logs) = effective_otlp_endpoints(env);
     let mut authorities: Vec<String> = [metrics, logs]
         .into_iter()
@@ -459,16 +466,50 @@ fn report_receiver(env: &cs::Env) -> Option<Section> {
         return None;
     }
     let ours = env!("CARGO_PKG_VERSION");
+    // A configuration file that does not parse names no store to compare; the storage section
+    // reports the fault itself.
+    let store = settings.is_ok().then(|| receiver::Store::of(cfg));
     let mut sec = Section::new("receiver", "receiver:");
     for authority in authorities {
         match receiver::probe(&authority) {
-            receiver::Probe::Build(v) if v == ours => {
-                sec.ok(format!("receiver at {authority} is this build ({ours})"));
+            receiver::Probe::Receiver(id) => {
+                if id.version == ours {
+                    sec.ok(format!("receiver at {authority} is this build ({ours})"));
+                } else {
+                    sec.warn(format!(
+                        "receiver at {authority} is build {}, not this build ({ours}) — it keeps \
+                         the binary it started from; `hatel service --restart`, or restart your \
+                         `serve`",
+                        id.version
+                    ));
+                }
+                if let (Some(theirs), Some(ours)) = (&id.config, Settings::path())
+                    && *theirs != ours
+                {
+                    sec.warn(format!(
+                        "receiver at {authority} read {} when it started, but this process reads {} \
+                         — HATEL_CONFIG or {DEFAULT_CONFIG_VAR} differs between them, so their \
+                         plugins, export destinations and [storage] can differ",
+                        theirs.display(),
+                        ours.display()
+                    ));
+                }
+                if let (Some(theirs), Some(store)) = (id.storage, &store)
+                    && theirs != *store
+                {
+                    sec.warn(format!(
+                        "receiver at {authority} writes {} with {}-day retention, but this process \
+                         reads {} with {}-day retention — the receiver reads config.toml when it \
+                         starts, so restart it after an edit (`hatel service --restart`), and a \
+                         storage or {DEFAULT_STATE_VAR} variable set for only one of them splits \
+                         them too",
+                        describe(&theirs),
+                        theirs.retention_days,
+                        describe(store),
+                        store.retention_days
+                    ));
+                }
             }
-            receiver::Probe::Build(v) => sec.warn(format!(
-                "receiver at {authority} is build {v}, not this build ({ours}) — it keeps the \
-                 binary it started from; `hatel service --restart`, or restart your `serve`"
-            )),
             receiver::Probe::Foreign => sec.note(format!(
                 "something answers at {authority} but not as a hatel receiver — a build from \
                  before {}, or another collector",
@@ -486,6 +527,63 @@ fn report_receiver(env: &cs::Env) -> Option<Section> {
         }
     }
     Some(sec)
+}
+
+/// Name each variable that sets the store for some processes and not others: a storage variable in
+/// this process's environment, and a storage or location variable in a settings.json env, which
+/// hooks inherit and the service's receiver does not. Any of them splits what hooks, `report` and
+/// the receiver write and read.
+fn advise_split_environment(
+    sec: &mut Section,
+    process: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    env: &cs::Env,
+) {
+    for var in hatel_core::config::storage_overrides(process) {
+        sec.note(format!(
+            "{var} replaces config.toml's [storage] value in this process only; the service's \
+             receiver, and hooks unless Claude Code's environment carries it, use the file's \
+             value or the default"
+        ));
+    }
+    let settings_env = |key: &str| env.get(key).map(|(value, _)| value.into());
+    for var in hatel_core::config::storage_overrides(&settings_env) {
+        sec.note(format!(
+            "{var} in the {} settings.json env replaces config.toml's [storage] value for hooks \
+             but not for the service's receiver — set it under [storage] instead",
+            env[var].1
+        ));
+    }
+    let mut location = vec!["HATEL_CONFIG", DEFAULT_CONFIG_VAR, DEFAULT_STATE_VAR];
+    location.dedup();
+    for var in location {
+        if let Some((value, scope)) = env.get(var).filter(|(value, _)| !value.is_empty()) {
+            sec.note(format!(
+                "{var}={value} in the {scope} settings.json env applies to hooks and not to the \
+                 service's receiver, so they can read another config.toml or write another state \
+                 dir — remove it there"
+            ));
+        }
+    }
+}
+
+/// The variables that move the default configuration and state directories, as etcetera resolves
+/// them: the XDG base directories everywhere but Windows, where `APPDATA` places both.
+#[cfg(not(windows))]
+const DEFAULT_CONFIG_VAR: &str = "XDG_CONFIG_HOME";
+#[cfg(not(windows))]
+const DEFAULT_STATE_VAR: &str = "XDG_STATE_HOME";
+#[cfg(windows)]
+const DEFAULT_CONFIG_VAR: &str = "APPDATA";
+#[cfg(windows)]
+const DEFAULT_STATE_VAR: &str = "APPDATA";
+
+/// Which store: its backend and where it lives.
+fn describe(store: &receiver::Store) -> String {
+    let sink = match store.sink {
+        hatel_core::SinkKind::Jsonl => "jsonl",
+        hatel_core::SinkKind::Sqlite => "sqlite",
+    };
+    format!("{sink} at {}", store.state_dir.display())
 }
 
 /// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
@@ -766,13 +864,26 @@ mod tests {
             .into_iter()
             .collect()
         };
+        let cfg = Config::from_settings(&Settings::default());
         // A remote collector is not this receiver's to answer for: no section at all.
-        assert!(report_receiver(&env_with("https://collector.acme.internal:4318")).is_none());
+        assert!(
+            report_receiver(
+                &env_with("https://collector.acme.internal:4318"),
+                &Ok(Settings::default()),
+                &cfg
+            )
+            .is_none()
+        );
         // A local port nothing listens on is a dropped stream, named as such.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let sec = report_receiver(&env_with(&format!("http://127.0.0.1:{port}"))).unwrap();
+        let sec = report_receiver(
+            &env_with(&format!("http://127.0.0.1:{port}")),
+            &Ok(Settings::default()),
+            &cfg,
+        )
+        .unwrap();
         assert_eq!(sec.findings.len(), 1);
         assert_eq!(sec.findings[0].status, Status::Warn);
         assert!(sec.findings[0].message.starts_with("nothing listens at"));
@@ -782,16 +893,21 @@ mod tests {
             "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".to_string(),
             (format!("http://127.0.0.1:{port}/v1/logs"), "user"),
         );
-        assert_eq!(report_receiver(&env).unwrap().findings.len(), 1);
+        assert_eq!(
+            report_receiver(&env, &Ok(Settings::default()), &cfg)
+                .unwrap()
+                .findings
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn a_receiver_build_is_judged_against_this_one() {
         use std::io::{Read as _, Write as _};
-        let answering = |version: &str| -> cs::Env {
+        let answering = |body: String| -> cs::Env {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let body = format!(r#"{{"service":"hatel","version":"{version}"}}"#);
             std::thread::spawn(move || {
                 let (mut s, _) = listener.accept().unwrap();
                 let _ = s.read(&mut [0u8; 1024]);
@@ -810,16 +926,145 @@ mod tests {
             .into_iter()
             .collect()
         };
+        let cfg = Config::from_settings(&Settings::default());
+        let identity = |version: &str, store: Option<receiver::Store>| {
+            serde_json::to_string(&receiver::Identity {
+                config: Settings::path(),
+                service: "hatel".to_string(),
+                storage: store,
+                version: version.to_string(),
+            })
+            .unwrap()
+        };
         let ours = env!("CARGO_PKG_VERSION");
-        let same = report_receiver(&answering(ours)).unwrap();
+        let store = receiver::Store::of(&cfg);
+        let unread_config = Err(hatel_core::Error::Io("config.toml does not parse".into()));
+
+        let same = report_receiver(
+            &answering(identity(ours, Some(store.clone()))),
+            &Ok(Settings::default()),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(same.findings.len(), 1, "one store, nothing to add");
         assert_eq!(same.findings[0].status, Status::Ok);
-        let older = report_receiver(&answering("0.0.1")).unwrap();
+
+        let older = report_receiver(
+            &answering(identity("0.0.1", None)),
+            &Ok(Settings::default()),
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            older.findings.len(),
+            1,
+            "a build that reports no store is judged by build"
+        );
         assert_eq!(older.findings[0].status, Status::Warn);
         assert!(
             older.findings[0]
                 .message
                 .contains("is build 0.0.1, not this build")
         );
+
+        for theirs in [
+            receiver::Store {
+                state_dir: "/elsewhere".into(),
+                ..store.clone()
+            },
+            receiver::Store {
+                retention_days: store.retention_days + 1,
+                ..store.clone()
+            },
+        ] {
+            let split = report_receiver(
+                &answering(identity(ours, Some(theirs.clone()))),
+                &Ok(Settings::default()),
+                &cfg,
+            )
+            .unwrap();
+            assert_eq!(split.findings.len(), 2);
+            assert_eq!(split.findings[1].status, Status::Warn);
+            assert!(
+                split.findings[1]
+                    .message
+                    .contains("restart it after an edit")
+            );
+            let unread = report_receiver(
+                &answering(identity(ours, Some(theirs))),
+                &unread_config,
+                &cfg,
+            )
+            .unwrap();
+            assert_eq!(
+                unread.findings.len(),
+                1,
+                "no store is compared against a configuration that did not parse"
+            );
+        }
+
+        let other_file = serde_json::to_string(&receiver::Identity {
+            config: Some("/elsewhere/config.toml".into()),
+            service: "hatel".to_string(),
+            storage: Some(store.clone()),
+            version: ours.to_string(),
+        })
+        .unwrap();
+        let moved =
+            report_receiver(&answering(other_file), &Ok(Settings::default()), &cfg).unwrap();
+        assert_eq!(moved.findings.len(), 2);
+        assert_eq!(moved.findings[1].status, Status::Warn);
+        assert!(
+            moved.findings[1]
+                .message
+                .contains("read /elsewhere/config.toml when it started")
+        );
+    }
+
+    #[test]
+    fn a_variable_that_splits_the_store_is_named_where_it_is_set() {
+        let notes = |process: &dyn Fn(&str) -> Option<std::ffi::OsString>, env: &cs::Env| {
+            let mut sec = Section::new("storage", "storage:");
+            advise_split_environment(&mut sec, process, env);
+            sec.findings
+                .into_iter()
+                .map(|f| f.message)
+                .collect::<Vec<_>>()
+        };
+        let unset = |_: &str| None;
+        assert!(notes(&unset, &cs::Env::new()).is_empty());
+
+        let shell = |key: &str| (key == "HATEL_SINK").then(|| "sqlite".into());
+        let hooks: cs::Env = [
+            (
+                "HATEL_STATE_DIR".to_string(),
+                ("/elsewhere".to_string(), "user"),
+            ),
+            (
+                "HATEL_CONFIG".to_string(),
+                ("/other/config.toml".to_string(), "project"),
+            ),
+            (
+                DEFAULT_STATE_VAR.to_string(),
+                ("/state".to_string(), "local"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let found = notes(&shell, &hooks);
+        assert_eq!(found.len(), 4);
+        assert!(
+            found[0]
+                .starts_with("HATEL_SINK replaces config.toml's [storage] value in this process")
+        );
+        assert!(found[1].starts_with("HATEL_STATE_DIR in the user settings.json env"));
+        assert!(
+            found[2]
+                .starts_with("HATEL_CONFIG=/other/config.toml in the project settings.json env")
+        );
+        assert!(found[3].starts_with(&format!(
+            "{DEFAULT_STATE_VAR}=/state in the local settings.json env"
+        )));
     }
 
     #[test]

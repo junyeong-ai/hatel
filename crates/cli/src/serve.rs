@@ -317,9 +317,10 @@ fn ok() -> IngestResponse {
     (StatusCode::OK, Json(serde_json::json!({})))
 }
 
-/// Which build is answering here — what `doctor` compares its own against.
-async fn identity() -> Json<receiver::Identity> {
-    Json(receiver::Identity::this_build())
+/// Which build is answering here, and the store it writes — what `doctor` compares its own
+/// against.
+async fn identity(State(st): State<AppState>) -> Json<receiver::Identity> {
+    Json(receiver::Identity::of(&st.cfg))
 }
 
 async fn ingest_metrics(
@@ -653,7 +654,7 @@ fn sweep_due(now: i64, last: i64, every: i64) -> bool {
     now < last || now - last >= every
 }
 
-/// The retention sweep: the horizon (`HATEL_RETENTION_DAYS`, default 90) applied to every record
+/// The retention sweep: the horizon (`retention_days`, default 90) applied to every record
 /// store at once — the ledger and the session index (`prune_ledger`), and the cost snapshot. A
 /// session last heard before the horizon leaves the snapshot and this receiver's memory together,
 /// so one heard again counts only what it reports from then on.

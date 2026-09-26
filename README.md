@@ -287,7 +287,7 @@ hatel serve --all      # 이 컬렉터를 공유하는 모든 프로젝트
 hatel serve --project acme-api   # 특정 프로젝트(라벨)만
 ```
 
-수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드를 답합니다(`{"service":"hatel","version":"0.18.1"}`) — `doctor`가 자기 빌드와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
+수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드와 그 수신기가 읽은 설정 파일, 쓰는 저장소를 답합니다(`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.18.1"}`) — `doctor`가 자기 빌드·설정 파일·저장소와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
 
 ### `init` — Claude Code에 연결
 
@@ -364,7 +364,7 @@ export:
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
 
-> `receiver:` 섹션은 신호가 로컬 수신기로 향할 때 나타나며, 수신기에 직접 물어봅니다(OTLP 포트의 `GET /healthz`) — 아무것도 듣지 않으면 네이티브 메트릭·로그가 버려지고 있는 것이고, 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드 뒤에는 옛 빌드로 답할 수 있습니다. `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
+> `receiver:` 섹션은 신호가 로컬 수신기로 향할 때 나타나며, 수신기에 직접 물어봅니다(OTLP 포트의 `GET /healthz`) — 아무것도 듣지 않으면 네이티브 메트릭·로그가 버려지고 있는 것이고, 수신기는 시작할 때의 바이너리와 설정을 계속 쓰므로 업그레이드 뒤에는 옛 빌드로 답할 수 있고, `config.toml`을 고친 뒤 재시작하지 않았거나 `HATEL_CONFIG`·저장 변수를 한쪽에만 두면 이 프로세스와 다른 설정 파일을 읽거나 다른 저장소에 쓴다고 알립니다. `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
 
 `hatel doctor --json`은 같은 findings를 안정된 JSON으로 출력합니다 — 섹션별 `findings`가 `status`(`ok`/`fail`/`warn`/`note`)와 `message`를 갖고, 최상위 `ok`와 exit code의 의미(하드 요구 실패 시에만 non-zero)는 사람용 출력과 동일합니다.
 
@@ -504,23 +504,32 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 ## 저장소 & 설정
 
-저장의 두 면이 하나의 추상화(`HATEL_SINK`)를 거칩니다 — emitter는 sink로 쓰고, `report`는 같은 백엔드로 읽습니다(리포트는 SQLite든 JSONL이든 동일하게 소비):
+저장의 두 면이 하나의 추상화(sink)를 거칩니다 — emitter는 sink로 쓰고, `report`는 같은 백엔드로 읽습니다(리포트는 SQLite든 JSONL이든 동일하게 소비):
 
-- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`HATEL_ROTATE_BYTES`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
+- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`rotate_bytes`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
 - **`sqlite`** — 임베디드, WAL, `(kind, ts)` 인덱스 — 윈도우 읽기를 SQL에서 필터.
 
-상태는 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장, `HATEL_STATE_DIR`로 재정의. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
+상태는 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장됩니다. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
+
+저장 방식은 `config.toml`의 `[storage]`에 설정합니다. 훅·수신기·`report`가 모두 이 파일을 읽으므로, 각자 어디서 시작됐든(Claude Code, 서비스 관리자, 셸) 같은 저장소에 쓰고 같은 저장소를 읽습니다. 수신기는 이 파일을 시작할 때 읽으므로 고친 뒤에는 `hatel service --restart`로 재시작합니다. 빠진 키는 기본값을 씁니다:
+
+```toml
+[storage]
+sink = "sqlite"            # jsonl(기본) / sqlite
+state_dir = "/data/hatel"  # 상태 디렉터리 재정의. 상대 경로는 config.toml 자신의 디렉터리 기준
+retention_days = 30        # 보존 기간(기본 90, 최대 100000)
+rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
+```
+
+`retention_days`는 저장 전체의 보존 기간입니다 — 비용 스냅샷·원장·세션 인덱스·SQLite 행. 비용 스냅샷은 수신기가 그 세션의 활동을 마지막으로 받은 때부터 세고(만료 뒤 다시 들리는 세션은 그때부터 보고한 것만 합산), 세션 인덱스는 수신기가 활동을 받는 동안 그 세션의 프로젝트를 유지합니다. 수신기는 시작할 때와 그 뒤 하루마다(보존 기간의 1/10이 하루보다 짧으면 그 간격마다) 정리합니다. JSONL은 파일을 통째로 지우므로 기록이 기한을 넘겨 보존 기간의 1/10에 정리 간격 두 번을 더한 만큼 남을 수 있습니다.
 
 ### 환경 변수
 
 | 변수 | 효과 |
 |---|---|
-| `HATEL_SINK` | `jsonl`(기본) / `sqlite` |
-| `HATEL_STATE_DIR` | 상태 디렉터리 재정의 |
-| `HATEL_CONFIG` | `config.toml`(export 목적지) 경로 재정의 |
+| `HATEL_SINK` / `HATEL_STATE_DIR` / `HATEL_RETENTION_DAYS` / `HATEL_ROTATE_BYTES` | 한 프로세스에 한해 `[storage]`의 같은 키를 대체. 훅은 Claude Code의 환경(그 셸, settings.json `env`)을 물려받고 서비스의 수신기는 물려받지 않으므로, 한쪽에만 두면 저장소가 갈라짐. `doctor`가 이 셸과 settings.json `env`의 재정의, 다른 저장소에 쓰는 수신기를 알림 |
+| `HATEL_CONFIG` | `config.toml` 경로 재정의. settings.json `env`에 두면 훅만 다른 파일을 읽으므로 `doctor`가 알림 |
 | `HATEL_PLUGINS` | 플러그인 TOML 경로. `config.toml`의 `plugins`를 대체. OS 경로 구분자(`:` Unix, `;` Windows) |
-| `HATEL_ROTATE_BYTES` | JSONL 회전 임계값(기본 10MB) |
-| `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·원장·세션 인덱스·SQLite 행(기본 90, 최대 100000). 비용 스냅샷은 수신기가 그 세션의 활동을 마지막으로 받은 때부터 세고(만료 뒤 다시 들리는 세션은 그때부터 보고한 것만 합산), 세션 인덱스는 수신기가 활동을 받는 동안 그 세션의 프로젝트를 유지. 수신기가 시작할 때와 그 뒤 하루마다(보존 기간의 1/10이 하루보다 짧으면 그 간격마다) 정리. JSONL은 파일을 통째로 지우므로 기록이 기한을 넘겨 보존 기간의 1/10에 정리 간격 두 번을 더한 만큼 남을 수 있음 |
 | `HATEL_DISABLED=1` | 훅을 no-op으로 |
 | `HATEL_STRICT=1` | allow-list 밖 페이로드 키를 (조용히 드롭하지 않고) 에러 |
 | `HATEL_TESTING=1` | `_test/` 하위로 쓰기 리디렉트 |
@@ -549,7 +558,7 @@ hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 빌드가 쓴 유닛이면 새로 씀), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다.
+> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. `hatel service`는 유닛 전체를 새로 쓰므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다.
 
 ---
 
