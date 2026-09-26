@@ -9,7 +9,7 @@
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
@@ -171,8 +171,8 @@ fn emit_tool(p: EmitParams) -> Result<CallToolResult, McpError> {
 // can show its agent.
 #[tool_handler]
 impl ServerHandler for HatelMcp {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default()
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default()
             .with_server_info(Implementation::new("hatel", env!("CARGO_PKG_VERSION")))
             .with_instructions(
                 "Local Claude Code telemetry. Ask `doctor` first when data looks missing \
