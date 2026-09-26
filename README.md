@@ -558,7 +558,7 @@ hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. `hatel service`는 유닛 전체를 새로 쓰므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다.
+> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션의 MCP 서버(`hatel mcp`)도 시작할 때의 바이너리를 계속 쓰므로, 업그레이드 뒤에는 그 세션을 다시 시작합니다. `hatel service`는 유닛 전체를 새로 쓰므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다.
 
 ---
 

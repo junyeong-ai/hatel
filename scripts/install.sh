@@ -271,5 +271,7 @@ else
 fi
 
 echo
+echo "Claude Code sessions already open keep the MCP server (hatel mcp) they started with;"
+echo "restart them to use this build."
 echo "Check the wiring anytime: hatel doctor"
 exit "$rc"
