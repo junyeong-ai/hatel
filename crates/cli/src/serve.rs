@@ -189,7 +189,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
 
     // Retention sweep — strictly after the bind succeeded: the port is the single-writer lock,
     // and a destructive sweep belongs to the one receiver. Repeats daily from the flush loop.
-    prune_ledger(&state);
+    prune_ledger(&cfg);
     // The same lock is what makes an unrenamed temp collectable: no other writer holds one.
     let orphans = hatel_core::cost::sweep_orphan_temps(&cfg.state_dir);
     if orphans > 0 {
@@ -212,7 +212,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             let now = hatel_core::now_epoch();
             if now - last_prune >= sweep_every {
                 last_prune = now;
-                prune_ledger(&flush_state);
+                prune_ledger(&flush_state.cfg);
             }
         }
     });
@@ -570,13 +570,13 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// Pruning the session index is safe even though it is the project-attribution join table.
 /// Rotation only moves lines between its files, all of which attribution reads, and a file goes
-/// only once its NEWEST line is past the horizon. A session heard from within the rotation horizon
-/// is renewed into the newest file first, so a session still sending telemetry keeps its project
-/// however long ago it started; one silent for the whole horizon has nothing left to attribute.
-/// Historical cost/tool records bake in their project label at write time, so they never
-/// re-consult the index.
-fn prune_ledger(st: &AppState) {
-    let cfg = &st.cfg;
+/// only once its NEWEST line is past the horizon. Each session the cost snapshot heard from within
+/// the horizon is renewed first, so a session still sending telemetry keeps its project however
+/// long ago it started. The snapshot outlives a restart, so the sweep at startup renews as surely
+/// as one a day in. A session unheard for the whole horizon — ended, or running while no receiver
+/// listened — cannot be told apart from an ended one, and expires. Historical cost/tool records
+/// bake in their project label at write time, so they never re-consult the index.
+fn prune_ledger(cfg: &Config) {
     let retention = cfg.retention(hatel_core::now_epoch());
     let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
@@ -591,17 +591,15 @@ fn prune_ledger(st: &AppState) {
     }
     // The session index is sink-independent, so it is pruned on the same horizon regardless of
     // which sink holds the records.
-    let live: Vec<String> = lock(&st.acc)
-        .sessions()
-        .iter()
-        .filter(|(_, t)| t.last_seen().as_second() >= retention.rotate_before)
-        .map(|(sid, _)| sid.clone())
+    let heard: Vec<(String, i64)> = cost::read_snapshot(&cfg.state_dir)
+        .into_iter()
+        .filter_map(|row| Some((row.session_id, hatel_core::ts_epoch(&row.ts)?)))
+        .filter(|(_, at)| *at >= retention.cutoff)
         .collect();
     let index = SessionIndex::new(cfg.state_dir.clone());
     index.renew(
-        live.iter().map(String::as_str),
-        retention.rotate_before,
-        cfg.rotate_bytes,
+        heard.iter().map(|(sid, at)| (sid.as_str(), *at)),
+        cfg.rotation_span_secs(),
     );
     let index_removed = index.prune(retention);
     if index_removed > 0 {
@@ -838,27 +836,30 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_renews_the_sessions_heard_from_within_the_rotation_horizon() {
-        // All three started a hundred days ago. `live` sent telemetry just now; `lapsed` last did
-        // twenty days ago, past the 9-day rotation horizon of a 90-day retention; `quiet` never did.
-        use crate::otlp::decode::MetricPoint;
-
+    fn the_sweep_renews_the_sessions_the_cost_snapshot_heard_from_within_the_horizon() {
+        // All four started past the 90-day horizon. The snapshot last heard from `live` just now and
+        // from `paused` twenty days ago; `gone`, started 120 days ago, last spoke 95 days ago — long
+        // after its start but past the horizon itself, a row a receiver down that long still finds
+        // at startup; `quiet` never sent telemetry. The sweep reads the snapshot, not this process's
+        // memory, so a receiver that has only just started renews the same way.
         let dir = scratch("renew");
         let st = test_state(&dir);
         let now = jiff::Timestamp::now();
         let days = |n: i64| jiff::SignedDuration::from_hours(24 * n);
-        let started = now - days(100);
-        let line = |sid: &str| {
+        let line = |sid: &str, started: jiff::Timestamp| {
             format!(
                 "{{\"session_id\":\"{sid}\",\"project_key\":\"/k/{sid}\",\"project_label\":\"{sid}\",\"ts\":\"{started}\"}}\n"
             )
         };
         let archive = dir.join("session_index.jsonl.20260101.1");
-        std::fs::write(
-            &archive,
-            [line("live"), line("lapsed"), line("quiet")].concat(),
-        )
-        .unwrap();
+        let hundred = now - days(100);
+        let lines = [
+            line("live", hundred),
+            line("paused", hundred),
+            line("gone", now - days(120)),
+            line("quiet", hundred),
+        ];
+        std::fs::write(&archive, lines.concat()).unwrap();
         std::fs::File::options()
             .write(true)
             .open(&archive)
@@ -867,23 +868,25 @@ mod tests {
                 std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400),
             )
             .unwrap();
-        let point = |sid: &str| MetricPoint {
-            name: "cost.usage".into(),
-            value: 0.5,
+        let heard = |sid: &str, at: jiff::Timestamp| CostRow {
             session_id: sid.into(),
-            series: vec![],
-            delta: true,
+            project: sid.into(),
+            ts: at.to_string(),
+            ..CostRow::default()
         };
-        lock(&st.acc).update_metrics(vec![point("live")], now);
-        lock(&st.acc).update_metrics(vec![point("lapsed")], now - days(20));
-        prune_ledger(&st);
+        let rows = vec![
+            heard("live", now),
+            heard("paused", now - days(20)),
+            heard("gone", now - days(95)),
+        ];
+        cost::merge_snapshot(&dir, rows, i64::MIN);
+        prune_ledger(&st.cfg);
         let map = SessionIndex::new(dir.clone()).load();
-        assert_eq!(
-            map.get("live").map(|r| r.project_label.as_str()),
-            Some("live")
-        );
-        assert!(!map.contains_key("lapsed"));
-        assert!(!map.contains_key("quiet"));
+        let project = |sid: &str| map.get(sid).map(|r| r.project_label.clone());
+        assert_eq!(project("live").as_deref(), Some("live"));
+        assert_eq!(project("paused").as_deref(), Some("paused"));
+        assert_eq!(project("gone"), None);
+        assert_eq!(project("quiet"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

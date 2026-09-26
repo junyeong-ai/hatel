@@ -520,7 +520,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 | `HATEL_CONFIG` | override the `config.toml` path (the export destinations) |
 | `HATEL_PLUGINS` | plugin TOML paths, overriding `config.toml`'s `plugins`; OS path-list separator (`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
-| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows (default 90, max 100000); the cost snapshot and the session index count from a session's last activity. The receiver sweeps at start and then daily (or every tenth of the horizon, when that is under a day); since JSONL files are deleted whole, a record can outlive the horizon by a tenth of it plus two sweep intervals |
+| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows (default 90, max 100000); the cost snapshot and the session index count from the last time the receiver heard from a session. The receiver sweeps at start and then daily (or every tenth of the horizon, when that is under a day); since JSONL files are deleted whole, a record can outlive the horizon by a tenth of it plus two sweep intervals |
 | `HATEL_DISABLED=1` | turn the hook into a no-op |
 | `HATEL_STRICT=1` | error (don't silently drop) on a payload key outside the allow-list |
 | `HATEL_TESTING=1` | redirect writes under a `_test/` subdirectory |

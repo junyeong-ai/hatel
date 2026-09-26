@@ -1,8 +1,9 @@
 //! The session index — the generic `session_id → project` join, sink-independent and append-only.
 //! The receiver needs it to attribute project-less OTel datapoints to a project regardless of the
 //! configured sink. One line per session start, and one per renewal of a session the receiver still
-//! hears from; the reader folds last-wins, so concurrent writers never race on a read-modify-write. It is a [`crate::rolling`] log, so the retention sweep rotates
-//! and prunes it like any ledger — bounding the one store that lives outside a Kind's ledger.
+//! hears from; the reader folds them, the newest start winning, so concurrent writers never race on
+//! a read-modify-write. It is a [`crate::rolling`] log, so the retention sweep rotates and prunes it
+//! like any ledger — bounding the one store that lives outside a Kind's ledger.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,11 @@ struct IndexLine {
     /// empty, which parses to no instant and so loses to any dated record.
     #[serde(default)]
     ts: String,
+    /// A copy the receiver wrote to keep a live session's attribution past the files holding its
+    /// start, not a session start. A start outranks any renewal in the fold, so a renewal that raced
+    /// a newer start — the session resumed in another repository — cannot undo it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    renewal: bool,
 }
 
 /// A session's project attribution (keyed by session id in the loaded map).
@@ -53,40 +59,42 @@ impl SessionIndex {
             project_key: project.map_or_else(String::new, |p| p.key.clone()),
             project_label: project.map_or_else(String::new, |p| p.label.clone()),
         };
-        self.append(session_id, &row, rotate_bytes);
+        self.append(session_id, &row, false, rotate_bytes);
     }
 
-    /// Record again, as of now, each session in `live` whose newest line predates `before`. Only a
-    /// session start writes a line, so a session still sending telemetry once the retention horizon
-    /// has passed its last start would lose its project to the sweep; the receiver, which hears from
-    /// live sessions, renews them before each sweep. A session the index does not hold is skipped:
-    /// renewal carries an attribution forward and never makes one up.
-    pub fn renew<'a>(
-        &self,
-        live: impl IntoIterator<Item = &'a str>,
-        before: i64,
-        rotate_bytes: u64,
-    ) {
+    /// Carry forward the attribution of each session in `heard` — its id and when the receiver last
+    /// heard from it — that was heard from more than `span` after its newest line was written. Only
+    /// a session start writes a line otherwise, so a session running long past its start would lose
+    /// its project to the sweep while still sending telemetry. With this, an attribution outlasts
+    /// the session's last activity by at least the horizon less one span. A session the index does
+    /// not hold is skipped: renewal carries an attribution forward and never makes one up.
+    ///
+    /// A renewal never rotates the file by size, so it cannot hand the prune that follows it a file
+    /// a hook is still writing into; the next hook append rotates it instead.
+    pub fn renew<'a>(&self, heard: impl IntoIterator<Item = (&'a str, i64)>, span: i64) {
         let latest = latest(rolling::read_parsed(
             &self.state_dir,
             INDEX_BASE,
             parse_index_line,
         ));
-        for session_id in live {
-            if let Some((ts, row)) = latest.get(session_id)
-                && ts.is_none_or(|t| t.as_second() < before)
+        for (session_id, last_heard) in heard {
+            if let Some(entry) = latest.get(session_id)
+                && entry
+                    .written
+                    .is_none_or(|t| last_heard > t.as_second() + span)
             {
-                self.append(session_id, row, rotate_bytes);
+                self.append(session_id, &entry.row, true, u64::MAX);
             }
         }
     }
 
-    fn append(&self, session_id: &str, row: &SessionRow, rotate_bytes: u64) {
+    fn append(&self, session_id: &str, row: &SessionRow, renewal: bool, rotate_bytes: u64) {
         let line = IndexLine {
             session_id: session_id.to_string(),
             project_key: row.project_key.clone(),
             project_label: row.project_label.clone(),
             ts: crate::now_iso_utc(),
+            renewal,
         };
         let json = serde_json::to_string(&line).unwrap_or_default();
         if let Err(e) = rolling::append(&self.state_dir, INDEX_BASE, &json, rotate_bytes) {
@@ -104,10 +112,11 @@ impl SessionIndex {
     }
 
     /// Apply `retention` to the index — its half of the retention sweep, on the ledger's terms:
-    /// archives go whole once their newest session start has expired, and then an active file
-    /// holding a start from before `retention.rotate_before` becomes an archive. Rotation moves lines
-    /// without dropping any, so a session stays attributable until its start expires, and a session
-    /// past the horizon has no records left to attribute. Returns archives removed.
+    /// archives go whole once their newest line has expired, and then an active file holding a line
+    /// from before `retention.rotate_before` becomes an archive. Rotation moves lines without
+    /// dropping any, so a session stays attributable until its newest line expires — which
+    /// [`Self::renew`], run first, keeps from happening to a session still being heard from.
+    /// Returns archives removed.
     pub fn prune(&self, retention: Retention) -> usize {
         let removed = rolling::prune_archives_of(&self.state_dir, INDEX_BASE, retention.cutoff);
         rolling::rotate_aged(
@@ -133,40 +142,66 @@ fn parse_index_line(line: &str) -> Option<IndexLine> {
     serde_json::from_str(line).ok()
 }
 
-/// Fold index lines into one row per session, the latest write winning — see [`latest`].
+/// Fold index lines into one row per session — see [`latest`].
 fn fold(lines: Vec<IndexLine>) -> BTreeMap<String, SessionRow> {
     latest(lines)
         .into_iter()
-        .map(|(sid, (_, row))| (sid, row))
+        .map(|(sid, entry)| (sid, entry.row))
         .collect()
 }
 
-/// Each session's newest line, as its write instant and row. The winner is decided by
-/// each line's `ts` PARSED to an instant — not by file/read order, and not by string comparison
+/// What the index holds for one session.
+struct Entry {
+    /// The attribution in force.
+    row: SessionRow,
+    /// Which line `row` came from: a start outranks a renewal, then the later instant wins.
+    rank: (bool, Option<jiff::Timestamp>),
+    /// The newest line of either kind — when the attribution was last written down.
+    written: Option<jiff::Timestamp>,
+}
+
+/// Each session's attribution: its newest start's, or once no start line remains, its newest
+/// renewal's. Instants are each line's `ts` PARSED — not file/read order, and not string comparison
 /// (jiff prints variable precision, so `…:05Z` would sort after `…:05.000001Z` lexically). An empty
 /// or unparseable `ts` is `None`, which orders below any real instant, so a pre-`ts` line loses to
 /// any dated record. The fold is thus independent of how archives are ordered or interleaved — a
 /// re-recorded session resolves to its most recent project wherever its lines landed.
-fn latest(lines: Vec<IndexLine>) -> BTreeMap<String, (Option<jiff::Timestamp>, SessionRow)> {
-    let mut best: BTreeMap<String, (Option<jiff::Timestamp>, SessionRow)> = BTreeMap::new();
+fn latest(lines: Vec<IndexLine>) -> BTreeMap<String, Entry> {
+    let mut best: BTreeMap<String, Entry> = BTreeMap::new();
     for il in lines {
         let ts = il.ts.parse::<jiff::Timestamp>().ok();
-        let newer = best.get(&il.session_id).is_none_or(|(prev, _)| ts >= *prev);
-        if newer {
-            let row = SessionRow {
-                project_key: il.project_key,
-                project_label: il.project_label,
-            };
-            best.insert(il.session_id, (ts, row));
+        let rank = (!il.renewal, ts);
+        let row = SessionRow {
+            project_key: il.project_key,
+            project_label: il.project_label,
+        };
+        match best.get_mut(&il.session_id) {
+            Some(entry) => {
+                entry.written = entry.written.max(ts);
+                if rank >= entry.rank {
+                    entry.rank = rank;
+                    entry.row = row;
+                }
+            }
+            None => {
+                best.insert(
+                    il.session_id,
+                    Entry {
+                        row,
+                        rank,
+                        written: ts,
+                    },
+                );
+            }
         }
     }
     best
 }
 
 /// A change-gated cache of the folded session index: it re-folds only when the index files actually
-/// change — an append or a prune; a rotation only renames them — so a hot read path (the receiver's live render,
-/// each flush, the export forwarder) pays a directory stat rather than re-parsing the whole, and
-/// ever-growing, index on every call.
+/// change — an append or a prune; a rotation only renames them — so a hot read path (the receiver's
+/// live render, each flush, the export forwarder) pays a directory stat rather than re-parsing the
+/// whole, and ever-growing, index on every call.
 pub struct SessionIndexCache {
     state_dir: PathBuf,
     fingerprint: Option<(usize, u64, Option<SystemTime>)>,
@@ -476,11 +511,8 @@ mod tests {
             cutoff: now - 90 * 86_400,
             rotate_before: now - 9 * 86_400,
         };
-        idx.renew(
-            ["S1", "S2", "S3", "ghost"],
-            retention.rotate_before,
-            1 << 20,
-        );
+        let heard = ["S1", "S2", "S3", "ghost"].map(|sid| (sid, now));
+        idx.renew(heard, 9 * 86_400);
         idx.prune(retention);
         assert!(!archive.exists(), "the expired starts are gone");
         let map = idx.load();
@@ -504,6 +536,31 @@ mod tests {
             3,
             "S3's recent start needs no renewal"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_renewal_never_outranks_a_start() {
+        // The receiver renewed S1 in project a from what it had read, while the session resumed in
+        // project b and that start landed first: the later renewal must not undo it. Once no start
+        // is left, the newest renewal carries the attribution.
+        let dir = scratch();
+        let path = dir.join(INDEX_BASE);
+        let line = |project: &str, day: u8, renewal: bool| {
+            let flag = if renewal { ",\"renewal\":true" } else { "" };
+            format!(
+                "{{\"session_id\":\"S1\",\"project_key\":\"/k/{project}\",\"project_label\":\"{project}\",\"ts\":\"2026-06-0{day}T00:00:00Z\"{flag}}}\n"
+            )
+        };
+        let idx = SessionIndex::new(dir.clone());
+        std::fs::write(
+            &path,
+            [line("a", 1, false), line("b", 2, false), line("a", 3, true)].concat(),
+        )
+        .unwrap();
+        assert_eq!(idx.load()["S1"].project_label, "b");
+        std::fs::write(&path, [line("a", 3, true), line("b", 4, true)].concat()).unwrap();
+        assert_eq!(idx.load()["S1"].project_label, "b");
         std::fs::remove_dir_all(&dir).ok();
     }
 
