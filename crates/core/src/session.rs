@@ -59,18 +59,33 @@ impl SessionIndex {
             project_key: project.map_or_else(String::new, |p| p.key.clone()),
             project_label: project.map_or_else(String::new, |p| p.label.clone()),
         };
-        self.append(session_id, &row, false, rotate_bytes);
+        if let Err(e) = self.append(session_id, &row, false, rotate_bytes) {
+            eprintln!("hatel: session index append failed: {e}");
+        }
     }
 
     /// Write a session's attribution in force again, as a renewal — for the sessions
     /// [`SessionIndexCache::due_renewal`] names. Only a session start writes a line otherwise, so a
     /// session running long past its start would lose its project to the retention sweep while
     /// still sending telemetry.
-    pub fn renew(&self, session_id: &str, row: &SessionRow, rotate_bytes: u64) {
-        self.append(session_id, row, true, rotate_bytes);
+    /// A failed write is returned, since its caller is a long-running receiver that notes a store
+    /// failing on every flush through its throttle rather than once per attempt.
+    pub fn renew(
+        &self,
+        session_id: &str,
+        row: &SessionRow,
+        rotate_bytes: u64,
+    ) -> std::io::Result<()> {
+        self.append(session_id, row, true, rotate_bytes)
     }
 
-    fn append(&self, session_id: &str, row: &SessionRow, renewal: bool, rotate_bytes: u64) {
+    fn append(
+        &self,
+        session_id: &str,
+        row: &SessionRow,
+        renewal: bool,
+        rotate_bytes: u64,
+    ) -> std::io::Result<()> {
         let line = IndexLine {
             session_id: session_id.to_string(),
             project_key: row.project_key.clone(),
@@ -79,9 +94,7 @@ impl SessionIndex {
             renewal,
         };
         let json = serde_json::to_string(&line).unwrap_or_default();
-        if let Err(e) = rolling::append(&self.state_dir, INDEX_BASE, &json, rotate_bytes) {
-            eprintln!("hatel: session index append failed: {e}");
-        }
+        rolling::append(&self.state_dir, INDEX_BASE, &json, rotate_bytes)
     }
 
     /// Fold the log (active + archives) into one row per session, as [`latest`] ranks its lines.
@@ -556,7 +569,7 @@ mod tests {
              attribution up"
         );
         for (sid, row) in &due {
-            idx.renew(sid, row, 1 << 20);
+            idx.renew(sid, row, 1 << 20).unwrap();
         }
         cache.refresh();
         assert!(
@@ -592,7 +605,7 @@ mod tests {
         let due = cache.due_renewal([("S1", crate::now_epoch() + 10)], 0);
         idx.record("S1", Some(&pref("b")), 1 << 20);
         for (sid, row) in &due {
-            idx.renew(sid, row, 1 << 20);
+            idx.renew(sid, row, 1 << 20).unwrap();
         }
         assert_eq!(idx.load()["S1"].project_label, "b");
         std::fs::remove_dir_all(&dir).ok();

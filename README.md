@@ -520,7 +520,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 | `HATEL_CONFIG` | `config.toml`(export 목적지) 경로 재정의 |
 | `HATEL_PLUGINS` | 플러그인 TOML 경로. `config.toml`의 `plugins`를 대체. OS 경로 구분자(`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL 회전 임계값(기본 10MB) |
-| `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·원장·세션 인덱스·SQLite 행(기본 90, 최대 100000). 비용 스냅샷은 수신기가 그 세션의 활동을 마지막으로 받은 때부터 세고, 세션 인덱스는 수신기가 활동을 받는 동안 그 세션의 프로젝트를 유지. 수신기가 시작할 때와 그 뒤 하루마다(보존 기간의 1/10이 하루보다 짧으면 그 간격마다) 정리. JSONL은 파일을 통째로 지우므로 기록이 기한을 넘겨 보존 기간의 1/10에 정리 간격 두 번을 더한 만큼 남을 수 있음 |
+| `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·원장·세션 인덱스·SQLite 행(기본 90, 최대 100000). 비용 스냅샷은 수신기가 그 세션의 활동을 마지막으로 받은 때부터 세고(만료 뒤 다시 들리는 세션은 그때부터 보고한 것만 합산), 세션 인덱스는 수신기가 활동을 받는 동안 그 세션의 프로젝트를 유지. 수신기가 시작할 때와 그 뒤 하루마다(보존 기간의 1/10이 하루보다 짧으면 그 간격마다) 정리. JSONL은 파일을 통째로 지우므로 기록이 기한을 넘겨 보존 기간의 1/10에 정리 간격 두 번을 더한 만큼 남을 수 있음 |
 | `HATEL_DISABLED=1` | 훅을 no-op으로 |
 | `HATEL_STRICT=1` | allow-list 밖 페이로드 키를 (조용히 드롭하지 않고) 에러 |
 | `HATEL_TESTING=1` | `_test/` 하위로 쓰기 리디렉트 |

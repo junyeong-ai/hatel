@@ -2,7 +2,6 @@
 //! sanitization, the JSONL sink, the session index, and windowed reads — all driven
 //! through explicit temp-dir configs so they run in parallel without shared state.
 
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -697,111 +696,119 @@ fn skill_version_tracks_the_workspace_version() {
     );
 }
 
-#[test]
-fn cost_snapshot_merges_by_session() {
-    use hatel_core::cost::{self, CostRow};
-    let cfg = test_config(vec![]);
-    let row = |sid: &str, tokens: i64| CostRow {
+/// A cost row for `sid` with `tokens`, last heard at `ts`.
+fn cost_row(sid: &str, tokens: i64, ts: &str) -> hatel_core::cost::CostRow {
+    hatel_core::cost::CostRow {
         session_id: sid.to_string(),
         project: "p".to_string(),
         tokens,
-        ts: "2024-01-01T00:00:00Z".to_string(),
-        ..CostRow::default()
-    };
-    let none = BTreeSet::new();
-    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 10), row("S2", 5)], &none, 0);
-    cost::merge_snapshot(&cfg.state_dir, vec![row("S1", 99)], &none, 0); // update S1, keep S2 (retain all)
-    let mut rows = cost::read_snapshot(&cfg.state_dir);
-    rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].tokens, 99, "S1 updated");
-    assert_eq!(rows[1].tokens, 5, "S2 preserved across merge");
-
-    // Both flushed again with no project: the index lost S1, while it holds S2 as having none.
-    let unattributed = |sid: &str| CostRow {
-        project: String::new(),
-        ..row(sid, 100)
-    };
-    cost::merge_snapshot(
-        &cfg.state_dir,
-        vec![unattributed("S1"), unattributed("S2")],
-        &BTreeSet::from(["S1".to_string()]),
-        0,
-    );
-    let mut rows = cost::read_snapshot(&cfg.state_dir);
-    rows.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-    assert_eq!(
-        rows[0].project, "p",
-        "a session the index lost keeps its project"
-    );
-    assert_eq!(rows[0].tokens, 100);
-    assert_eq!(
-        rows[1].project, "",
-        "one the index holds as having none loses it"
-    );
-}
-
-#[test]
-fn merge_with_no_rows_still_prunes_stale_entries() {
-    // An idle flush (no active sessions) must still prune old rows, so a quiet receiver
-    // can't let stale prior-run entries linger forever.
-    use hatel_core::cost::{self, CostRow};
-    let cfg = test_config(vec![]);
-    let old = CostRow {
-        session_id: "old".to_string(),
-        project: "p".to_string(),
-        tokens: 1,
-        ts: "2000-01-01T00:00:00Z".to_string(),
-        ..CostRow::default()
-    };
-    let none = BTreeSet::new();
-    cost::merge_snapshot(&cfg.state_dir, vec![old], &none, 0); // seed (retain all)
-    assert_eq!(cost::read_snapshot(&cfg.state_dir).len(), 1);
-    let cutoff = hatel_core::now_iso_utc()
-        .parse::<jiff::Timestamp>()
-        .unwrap()
-        .as_second();
-    cost::merge_snapshot(&cfg.state_dir, vec![], &none, cutoff); // idle flush, but prunes
-    assert!(
-        cost::read_snapshot(&cfg.state_dir).is_empty(),
-        "stale row pruned on empty merge"
-    );
-    assert!(
-        !cfg.state_dir.join("cost_snapshot.jsonl").exists(),
-        "a fully-aged-out snapshot leaves no file behind"
-    );
-}
-
-#[test]
-fn cost_snapshot_prunes_rows_past_retention() {
-    use hatel_core::cost::{self, CostRow};
-    let cfg = test_config(vec![]);
-    let row = |sid: &str, ts: &str| CostRow {
-        session_id: sid.to_string(),
-        project: "p".to_string(),
-        tokens: 1,
         ts: ts.to_string(),
-        ..CostRow::default()
-    };
-    let now = hatel_core::now_iso_utc();
-    let none = BTreeSet::new();
-    cost::merge_snapshot(
-        &cfg.state_dir,
-        vec![row("old", "2000-01-01T00:00:00Z"), row("recent", &now)],
-        &none,
-        0,
+        ..hatel_core::cost::CostRow::default()
+    }
+}
+
+fn tokens_by_session(dir: &std::path::Path) -> Vec<(String, i64)> {
+    let mut rows: Vec<(String, i64)> = hatel_core::cost::read_snapshot(dir)
+        .into_iter()
+        .map(|r| (r.session_id, r.tokens))
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn the_cost_snapshot_writes_only_what_changed_and_checkpoints_the_rest() {
+    use hatel_core::cost::Snapshot;
+    let cfg = test_config(vec![]);
+    let dir = &cfg.state_dir;
+    let changes = dir.join("cost_changes.jsonl");
+    let at = "2026-01-01T00:00:00Z";
+    let mut snapshot = Snapshot::load(dir);
+    snapshot
+        .record([cost_row("S1", 10, at), cost_row("S2", 5, at)])
+        .unwrap();
+    std::fs::remove_file(&changes).unwrap();
+    snapshot
+        .record([cost_row("S1", 10, at), cost_row("S2", 5, at)])
+        .unwrap();
+    assert!(
+        !changes.exists(),
+        "a flush in which nothing changed writes nothing"
     );
+    snapshot.record([cost_row("S1", 99, at)]).unwrap();
     assert_eq!(
-        cost::read_snapshot(&cfg.state_dir).len(),
-        2,
-        "both retained at retain_since=0"
+        tokens_by_session(dir),
+        [("S1".into(), 99), ("S2".into(), 5)],
+        "the changes hold every session changed since the checkpoint"
     );
-    // A retain_since of "one day ago" drops the year-2000 row, keeps the recent one.
-    let cutoff = now.parse::<jiff::Timestamp>().unwrap().as_second() - 86_400;
-    cost::merge_snapshot(&cfg.state_dir, vec![], &none, cutoff);
-    let rows = cost::read_snapshot(&cfg.state_dir);
-    assert_eq!(rows.len(), 1, "old row pruned");
-    assert_eq!(rows[0].session_id, "recent");
+    snapshot.checkpoint(0).unwrap();
+    assert!(!changes.exists(), "a checkpoint takes the changes");
+    assert_eq!(
+        tokens_by_session(dir),
+        [("S1".into(), 99), ("S2".into(), 5)]
+    );
+}
+
+#[test]
+fn a_checkpoint_drops_rows_past_retention_and_an_empty_snapshot_leaves_no_file() {
+    use hatel_core::cost::Snapshot;
+    let cfg = test_config(vec![]);
+    let dir = &cfg.state_dir;
+    let now = hatel_core::now_iso_utc();
+    let mut snapshot = Snapshot::load(dir);
+    snapshot
+        .record([
+            cost_row("old", 1, "2000-01-01T00:00:00Z"),
+            cost_row("recent", 2, &now),
+        ])
+        .unwrap();
+    let cutoff = hatel_core::ts_epoch(&now).unwrap() - 86_400;
+    snapshot.checkpoint(cutoff).unwrap();
+    assert_eq!(tokens_by_session(dir), [("recent".into(), 2)]);
+    snapshot.checkpoint(i64::MAX).unwrap();
+    assert!(tokens_by_session(dir).is_empty());
+    assert!(!dir.join("cost_snapshot.jsonl").exists());
+    assert!(!dir.join("cost_changes.jsonl").exists());
+}
+
+#[test]
+fn a_restart_keeps_the_changes_no_checkpoint_has_taken() {
+    use hatel_core::cost::Snapshot;
+    let cfg = test_config(vec![]);
+    let dir = &cfg.state_dir;
+    let at = "2026-01-01T00:00:00Z";
+    Snapshot::load(dir)
+        .record([cost_row("S1", 10, at)])
+        .unwrap();
+    Snapshot::load(dir).record([cost_row("S2", 5, at)]).unwrap();
+    assert_eq!(
+        tokens_by_session(dir),
+        [("S1".into(), 10), ("S2".into(), 5)]
+    );
+}
+
+#[test]
+fn each_session_reads_as_its_latest_row_whichever_file_holds_it() {
+    let cfg = test_config(vec![]);
+    let dir = &cfg.state_dir;
+    std::fs::create_dir_all(dir).unwrap();
+    let line = |row: hatel_core::cost::CostRow| serde_json::to_string(&row).unwrap() + "\n";
+    let (earlier, later) = ("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z");
+    std::fs::write(
+        dir.join("cost_snapshot.jsonl"),
+        line(cost_row("S1", 2, later)) + &line(cost_row("S2", 1, earlier)),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("cost_changes.jsonl"),
+        line(cost_row("S1", 1, earlier)) + &line(cost_row("S2", 2, earlier)),
+    )
+    .unwrap();
+    assert_eq!(
+        tokens_by_session(dir),
+        [("S1".into(), 2), ("S2".into(), 2)],
+        "the later row wins, and a tie goes to the changes"
+    );
 }
 
 #[test]

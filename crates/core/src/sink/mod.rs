@@ -89,7 +89,7 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
 /// Remove expired records from the configured backend — the retention sweep, on the horizon the
 /// cost snapshot also honors. JSONL deletes whole files, rotating aged active ledgers so that they
 /// expire too; SQLite deletes rows. Destructive, so it belongs to exactly one caller: the receiver
-/// (whose port bind is the single-writer lock) — never the hook, and never a read path. Returns
+/// (which holds the single-writer state lock) — never the hook, and never a read path. Returns
 /// the units removed (files / rows).
 pub fn prune(cfg: &Config, retention: Retention) -> usize {
     match cfg.sink {

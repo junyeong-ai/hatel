@@ -1,8 +1,8 @@
 //! The local OTLP/HTTP receiver. Decodes native metrics + logs into per-session
 //! totals, joins them to projects through the session index (the only source of
 //! project identity, since OTel carries none on the wire), and renders a live
-//! per-session view filtered to the current project. It also merges a cost snapshot
-//! periodically and on shutdown so reports survive offline.
+//! per-session view filtered to the current project. It also persists the cost snapshot on
+//! every flush and when it stops, so reports survive offline.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal as _, Write as _};
@@ -16,6 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 
+use hatel_core::config::Retention;
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
 use hatel_core::{
@@ -48,10 +49,8 @@ struct AppState {
     /// exporter) egress — re-folded only when the index files change, so a growing index is not
     /// re-parsed on every batch. Taken before `acc` wherever both are held.
     index_cache: Arc<Mutex<SessionIndexCache>>,
-    /// Per-session totals already persisted before this receiver started, so a
-    /// session that spans a receiver restart continues from its prior total rather
-    /// than being overwritten by only the post-restart deltas.
-    baseline: Arc<BTreeMap<String, CostRow>>,
+    /// The persisted side of cost. Taken only by the flush and the sweep, ahead of `index_cache`.
+    costs: Arc<Mutex<Costs>>,
     /// The current project's unique key (git-root path) — the default filter, so
     /// two same-named repositories are never conflated.
     current_key: Option<String>,
@@ -64,6 +63,7 @@ struct AppState {
     /// received body is queued here (fire-and-forget) before local decode.
     exporter: Option<Exporter>,
     undecodable: Arc<Undecodable>,
+    failed_writes: Arc<FailedWrites>,
 }
 
 /// Bodies this build could not decode for its own view, per signal. A client on the wrong protocol
@@ -74,9 +74,43 @@ struct Undecodable {
     logs: Throttle,
 }
 
+/// The cost snapshot this receiver writes, and what it holds from before this receiver started.
+struct Costs {
+    snapshot: cost::Snapshot,
+    /// Per-session totals already persisted before this receiver started, so a session that spans
+    /// a receiver restart continues from its prior total rather than being overwritten by only the
+    /// post-restart deltas. An entry lasts as long as its session's snapshot row, which is dated by
+    /// when the session was last heard, not by when the entry was loaded.
+    baseline: BTreeMap<String, CostRow>,
+}
+
+impl Costs {
+    fn load(state_dir: &Path) -> Self {
+        let snapshot = cost::Snapshot::load(state_dir);
+        let baseline = snapshot.rows().clone();
+        Costs { snapshot, baseline }
+    }
+}
+
 fn note_undecodable(bodies: &Throttle, signal: &str, e: &str) {
     if let Some(count) = bodies.occur(Instant::now()) {
         eprintln!("hatel: undecodable OTLP {signal} body — {e} ({count} so far)");
+    }
+}
+
+/// Local writes that failed, per store. A store that stays unwritable fails on every flush, so
+/// each is noted through [`crate::throttle`]; the write itself is retried by the next flush.
+#[derive(Default)]
+struct FailedWrites {
+    cost: Throttle,
+    index: Throttle,
+}
+
+fn note_failed_write(writes: &Throttle, store: &str, result: std::io::Result<()>) {
+    if let Err(e) = result
+        && let Some(count) = writes.occur(Instant::now())
+    {
+        eprintln!("hatel: {store} write failed — {e} ({count} so far)");
     }
 }
 
@@ -158,10 +192,6 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         .ok()
         .and_then(|d| resolve_project(&d.to_string_lossy()))
         .map(|p| p.key);
-    let baseline = cost::read_snapshot(&cfg.state_dir)
-        .into_iter()
-        .map(|r| (r.session_id.clone(), r))
-        .collect();
     let (exporter, export_handle) = if export_cfg.targets.is_empty() {
         (None, None)
     } else {
@@ -174,13 +204,14 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         counted: Arc::new(registry.counted_events.clone()),
         cfg: cfg.clone(),
         index_cache: Arc::new(Mutex::new(SessionIndexCache::new(cfg.state_dir.clone()))),
-        baseline: Arc::new(baseline),
+        costs: Arc::new(Mutex::new(Costs::load(&cfg.state_dir))),
         current_key,
         project_filter: project,
         show_all,
         live: std::io::stdout().is_terminal(),
         exporter,
         undecodable: Arc::default(),
+        failed_writes: Arc::default(),
     };
 
     let app = Router::new()
@@ -218,14 +249,15 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         );
     }
 
-    // Retention sweep — strictly after the bind succeeded: the port is the single-writer lock,
-    // and a destructive sweep belongs to the one receiver. The flush loop repeats it.
-    prune_ledger(&cfg);
-    // The same lock is what makes an unrenamed temp collectable: no other writer holds one.
+    // The state lock is what makes an unrenamed temp collectable: no other writer holds one, and
+    // this receiver has not written yet.
     let orphans = hatel_core::cost::sweep_orphan_temps(&cfg.state_dir);
     if orphans > 0 {
         eprintln!("hatel: removed {orphans} cost-snapshot temp file(s) a previous run left behind");
     }
+    // Retention sweep, destructive, so under the same lock and once this receiver is serving. The
+    // flush loop repeats it.
+    sweep(&state);
 
     // Keep the persisted cost snapshot fresh while running (a long-lived daemon
     // never reaches the shutdown flush otherwise).
@@ -243,7 +275,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             let now = hatel_core::now_epoch();
             if sweep_due(now, last_prune, sweep_every) {
                 last_prune = now;
-                prune_ledger(&flush_state.cfg);
+                sweep(&flush_state);
             }
         }
     });
@@ -254,8 +286,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     }
     flush_task.abort();
     let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
-    persist_cost(&state);
-    renew_index(&state);
+    flush_on_stop(&state);
     // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
     // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
     if let Some(exporter) = &state.exporter {
@@ -352,14 +383,9 @@ fn body_headers(headers: &HeaderMap) -> (Option<String>, Option<String>) {
     )
 }
 
-/// Recover a poisoned accumulator lock rather than cascading panics through every
-/// handler — a daemon stays up even if one request panicked mid-update.
-fn lock(m: &Mutex<Accumulator>) -> std::sync::MutexGuard<'_, Accumulator> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Same poison-recovery for the session-index cache.
-fn lock_index(m: &Mutex<SessionIndexCache>) -> std::sync::MutexGuard<'_, SessionIndexCache> {
+/// Recover a poisoned lock rather than cascading panics through every handler — a daemon stays up
+/// even if one request panicked mid-update.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -488,7 +514,7 @@ fn render(st: &AppState) {
     // them before any stdout I/O, so a slow/blocked terminal can never stall OTLP ingestion. The
     // index cache is taken before the accumulator — the one lock order this and `persist` share.
     let out = {
-        let mut index = lock_index(&st.index_cache);
+        let mut index = lock(&st.index_cache);
         index.refresh();
         let acc = lock(&st.acc);
         let mut rows = String::new();
@@ -610,6 +636,14 @@ fn note_tallies(st: &AppState, when: Tally) {
             eprintln!("hatel: undecodable OTLP {signal} bodies: {count} so far");
         }
     }
+    for (writes, store) in [
+        (&st.failed_writes.cost, "cost snapshot"),
+        (&st.failed_writes.index, "session index"),
+    ] {
+        if let Some(count) = writes.tally(when) {
+            eprintln!("hatel: {store} writes failed: {count} so far");
+        }
+    }
     if let Some(exporter) = &st.exporter {
         exporter.note_tally(when);
     }
@@ -623,8 +657,22 @@ fn sweep_due(now: i64, last: i64, every: i64) -> bool {
     now < last || now - last >= every
 }
 
-/// Apply the retention horizon (`HATEL_RETENTION_DAYS`, default 90) on ONE horizon to every record
-/// store: the ledger (here), the cost snapshot (`persist_cost`), and the session index (below).
+/// The retention sweep: the horizon (`HATEL_RETENTION_DAYS`, default 90) applied to every record
+/// store at once — the ledger and the session index (`prune_ledger`), and the cost snapshot. A
+/// session last heard before the horizon leaves the snapshot and this receiver's memory together,
+/// so one heard again counts only what it reports from then on.
+fn sweep(st: &AppState) {
+    let retention = st.cfg.retention(hatel_core::now_epoch());
+    prune_ledger(&st.cfg, retention);
+    let mut costs = lock(&st.costs);
+    let Costs { snapshot, baseline } = &mut *costs;
+    let checkpoint = snapshot.checkpoint(retention.cutoff);
+    note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
+    baseline.retain(|sid, _| snapshot.rows().contains_key(sid));
+    lock(&st.acc).forget_unheard_since(retention.cutoff);
+}
+
+/// Apply `retention` to the ledger and the session index.
 ///
 /// Pruning the session index is safe even though it is the project-attribution join table.
 /// Rotation only moves lines between its files, all of which attribution reads, and a file goes
@@ -633,10 +681,9 @@ fn sweep_due(now: i64, last: i64, every: i64) -> bool {
 /// project lasts the horizon less at most one rotation span; a session unheard that long — ended,
 /// or running while no receiver listened — cannot be told apart from an ended one, and expires.
 /// Tool records bake in their project label at write time, and a cost row keeps the project it
-/// carries once the index no longer holds its session (`cost::merge_snapshot`), so neither loses
-/// its attribution to this prune.
-fn prune_ledger(cfg: &Config) {
-    let retention = cfg.retention(hatel_core::now_epoch());
+/// carries once the index no longer holds its session (`persist_cost`), so neither loses its
+/// attribution to this prune.
+fn prune_ledger(cfg: &Config, retention: Retention) {
     let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
         let unit = match cfg.sink {
@@ -659,13 +706,24 @@ fn prune_ledger(cfg: &Config) {
     }
 }
 
+/// The receiver's last write before it exits: the final totals and renewals, then a checkpoint, so
+/// a stopped receiver leaves every cost row in the snapshot file alone — the one file a reader that
+/// predates the changes file reads.
+fn flush_on_stop(st: &AppState) {
+    persist_cost(st);
+    renew_index(st);
+    let cutoff = st.cfg.retention(hatel_core::now_epoch()).cutoff;
+    let checkpoint = lock(&st.costs).snapshot.checkpoint(cutoff);
+    note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
+}
+
 /// Renew the session-index attribution of every session this receiver has heard from long enough
 /// after it was last written down (`SessionIndexCache::due_renewal`). Run on the flush, a renewal
 /// lands within one flush of the activity that made it due, so a restart cannot forget that
 /// activity before it is written down.
 fn renew_index(st: &AppState) {
     let due = {
-        let mut index = lock_index(&st.index_cache);
+        let mut index = lock(&st.index_cache);
         index.refresh();
         let acc = lock(&st.acc);
         index.due_renewal(
@@ -677,24 +735,18 @@ fn renew_index(st: &AppState) {
     };
     let index = SessionIndex::new(st.cfg.state_dir.clone());
     for (sid, row) in &due {
-        index.renew(sid, row, st.cfg.rotate_bytes);
+        let renewal = index.renew(sid, row, st.cfg.rotate_bytes);
+        note_failed_write(&st.failed_writes.index, "session index", renewal);
     }
 }
 
 fn persist_cost(st: &AppState) {
-    // Resolve totals and attribution under the index + accumulator locks, dropping both before the
-    // snapshot write — a flush never holds a lock across I/O.
-    let mut index = lock_index(&st.index_cache);
+    let mut costs = lock(&st.costs);
+    let mut index = lock(&st.index_cache);
     index.refresh();
     let acc = lock(&st.acc);
     let no_counts = BTreeMap::new();
     let no_spend = BTreeMap::new();
-    let unindexed: BTreeSet<String> = acc
-        .sessions()
-        .keys()
-        .filter(|sid| !index.contains(sid))
-        .cloned()
-        .collect();
     let rows: Vec<CostRow> = acc
         .sessions()
         .iter()
@@ -705,7 +757,7 @@ fn persist_cost(st: &AppState) {
             // temporality session correct. The dimensional breakdowns apply the same
             // rule per bucket key (`cost::merge_counts` / `merge_spend`), so a model
             // or subagent used only before the restart keeps its spend.
-            let base = st.baseline.get(sid);
+            let base = costs.baseline.get(sid);
             let add = |is_delta: bool, pick: fn(&CostRow) -> f64| -> f64 {
                 if is_delta {
                     base.map_or(0.0, pick)
@@ -713,13 +765,22 @@ fn persist_cost(st: &AppState) {
                     0.0
                 }
             };
+            // The index decides a session's project. One it does not hold — its start not landed
+            // yet, or its lines expired before this row — keeps the project its row carries, since
+            // no longer knowing a session's project is not a change of it.
+            let project = match index.get(sid) {
+                Some(r) => r.project_label.clone(),
+                None if index.contains(sid) => String::new(),
+                None => costs
+                    .snapshot
+                    .rows()
+                    .get(sid)
+                    .map(|r| r.project.clone())
+                    .unwrap_or_default(),
+            };
             CostRow {
                 session_id: sid.clone(),
-                project: index
-                    .get(sid)
-                    .map(|r| r.project_label.clone())
-                    .filter(|l| !l.is_empty())
-                    .unwrap_or_default(),
+                project,
                 tokens: t.tokens() + add(t.tokens_is_delta(), |b| b.tokens as f64) as i64,
                 cost_usd: t.cost() + add(t.cost_is_delta(), |b| b.cost_usd),
                 active_time_s: t.active_time_s()
@@ -746,12 +807,12 @@ fn persist_cost(st: &AppState) {
             }
         })
         .collect();
+    // Release what ingestion and the live view share before the write; the snapshot's own lock is
+    // the flush's alone.
     drop(acc);
-    drop(index); // release the cache before the snapshot I/O
-    // Always merge — even with no active sessions this flush — so the retention prune
-    // runs on an idle receiver too, and stale prior-run rows can't linger unbounded.
-    let retention = st.cfg.retention(hatel_core::now_epoch());
-    cost::merge_snapshot(&st.cfg.state_dir, rows, &unindexed, retention.cutoff);
+    drop(index);
+    let record = costs.snapshot.record(rows);
+    note_failed_write(&st.failed_writes.cost, "cost snapshot", record);
 }
 
 #[cfg(test)]
@@ -780,13 +841,14 @@ mod tests {
             counted: Arc::new(registry.counted_events.clone()),
             index_cache: Arc::new(Mutex::new(SessionIndexCache::new(dir.to_path_buf()))),
             cfg: Arc::new(cfg),
-            baseline: Arc::new(BTreeMap::new()),
+            costs: Arc::new(Mutex::new(Costs::load(dir))),
             current_key: None,
             project_filter: None,
             show_all: true,
             live: false,
             exporter: None,
             undecodable: Arc::default(),
+            failed_writes: Arc::default(),
         }
     }
 
@@ -813,23 +875,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn a_stopping_receiver_reports_every_tally_its_throttles_hold_back() {
-        let dir = scratch("tallies");
-        let st = test_state(&dir);
-        let now = Instant::now();
-        let throttles = [&st.undecodable.metrics, &st.undecodable.logs];
-        for t in throttles {
-            t.occur(now);
-            t.occur(now);
-        }
-        note_tallies(&st, Tally::Stopping);
-        for t in throttles {
-            assert_eq!(t.tally(Tally::Stopping), None, "already reported");
-        }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ht-serve-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -841,7 +886,7 @@ mod tests {
         use crate::otlp::decode::MetricPoint;
 
         let dir = scratch("dims");
-        let mut st = test_state(&dir);
+        let st = test_state(&dir);
         // A session persisted by the previous receiver run: 100 tokens (90 cacheRead /
         // 10 input), all on opus.
         let base_row = CostRow {
@@ -863,7 +908,7 @@ mod tests {
             ts: hatel_core::now_iso_utc(),
             ..CostRow::default()
         };
-        st.baseline = Arc::new([("S1".to_string(), base_row)].into_iter().collect());
+        lock(&st.costs).baseline = [("S1".to_string(), base_row)].into_iter().collect();
         // Post-restart delta points: more opus cacheRead tokens, and cost on a model
         // the baseline never saw.
         lock(&st.acc).update_metrics(
@@ -966,7 +1011,7 @@ mod tests {
             now,
         );
         renew_index(&st);
-        prune_ledger(&st.cfg);
+        sweep(&st);
         let map = SessionIndex::new(dir.clone()).load();
         assert!(!archive.exists(), "the expired starts are gone");
         assert_eq!(
@@ -989,7 +1034,7 @@ mod tests {
 
     #[test]
     fn a_cost_row_keeps_its_project_once_the_index_forgets_its_session() {
-        // Every flush rewrites every session the receiver holds. `kept` loses its index lines
+        // Every flush recomputes every session the receiver holds. `kept` loses its index lines
         // while its cost row is still retained; `moved` resumes outside any repository.
         use crate::otlp::decode::MetricPoint;
 
@@ -1026,8 +1071,196 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_forgets_a_session_past_retention_so_its_return_counts_anew() {
+        // S1 was persisted by an earlier run and last heard by this one, both past the 90-day
+        // horizon. Once the sweep expires its row, a point it sends again is all it counts: no
+        // earlier total comes back from the baseline, from this run's memory, or from disk.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("forget");
+        let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
+        let mut earlier = cost::Snapshot::load(&dir);
+        earlier
+            .record([CostRow {
+                session_id: "S1".into(),
+                tokens: 500,
+                ts: long_ago.to_string(),
+                ..CostRow::default()
+            }])
+            .unwrap();
+        let st = test_state(&dir);
+        let tokens = |value: f64, at: jiff::Timestamp| {
+            lock(&st.acc).update_metrics(
+                vec![MetricPoint {
+                    name: "token.usage".into(),
+                    value,
+                    session_id: "S1".into(),
+                    series: vec![],
+                    delta: true,
+                }],
+                at,
+            );
+        };
+        tokens(10.0, long_ago);
+        sweep(&st);
+        assert!(
+            cost::read_snapshot(&dir).is_empty(),
+            "the expired row is gone"
+        );
+        tokens(7.0, jiff::Timestamp::now());
+        persist_cost(&st);
+        let rows = cost::read_snapshot(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tokens, 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_session_heard_past_the_horizon_of_its_baseline_keeps_its_earlier_total() {
+        // This receiver loaded S1's row 100 days ago, when it was fresh, and has heard S1 since.
+        // The flush dates the row by that, so the sweep keeps it, and with it what S1 counted
+        // before this receiver started.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("baseline-lives");
+        let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
+        let mut earlier = cost::Snapshot::load(&dir);
+        earlier
+            .record([CostRow {
+                session_id: "S1".into(),
+                tokens: 500,
+                ts: long_ago.to_string(),
+                ..CostRow::default()
+            }])
+            .unwrap();
+        let st = test_state(&dir);
+        let tokens = |value: f64| {
+            lock(&st.acc).update_metrics(
+                vec![MetricPoint {
+                    name: "token.usage".into(),
+                    value,
+                    session_id: "S1".into(),
+                    series: vec![],
+                    delta: true,
+                }],
+                jiff::Timestamp::now(),
+            );
+            persist_cost(&st);
+        };
+        tokens(7.0);
+        sweep(&st);
+        tokens(3.0);
+        let rows = cost::read_snapshot(&dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tokens, 510);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stopped_receiver_leaves_every_row_in_the_snapshot_file() {
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("stop");
+        let st = test_state(&dir);
+        lock(&st.acc).update_metrics(
+            vec![MetricPoint {
+                name: "token.usage".into(),
+                value: 7.0,
+                session_id: "S1".into(),
+                series: vec![],
+                delta: true,
+            }],
+            jiff::Timestamp::now(),
+        );
+        flush_on_stop(&st);
+        assert!(!dir.join("cost_changes.jsonl").exists());
+        let snapshot = std::fs::read_to_string(dir.join("cost_snapshot.jsonl")).unwrap();
+        let rows: Vec<CostRow> = snapshot
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].session_id.as_str(), rows[0].tokens), ("S1", 7));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_store_that_stays_unwritable_is_noted_through_its_throttle_and_retried() {
+        // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("unwritable");
+        let changes = dir.join("cost_changes.jsonl");
+        std::fs::create_dir_all(changes.join("blocker")).unwrap();
+        let st = test_state(&dir);
+        lock(&st.acc).update_metrics(
+            vec![MetricPoint {
+                name: "cost.usage".into(),
+                value: 0.5,
+                session_id: "S1".into(),
+                series: vec![],
+                delta: true,
+            }],
+            jiff::Timestamp::now(),
+        );
+        persist_cost(&st);
+        persist_cost(&st);
+        assert_eq!(st.failed_writes.cost.count(), 2);
+        std::fs::remove_dir_all(&changes).unwrap();
+        persist_cost(&st);
+        assert!(changes.is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stopping_receiver_reports_every_tally_its_throttles_hold_back() {
+        let dir = scratch("tallies");
+        let st = test_state(&dir);
+        let now = Instant::now();
+        let throttles = [
+            &st.undecodable.metrics,
+            &st.undecodable.logs,
+            &st.failed_writes.cost,
+            &st.failed_writes.index,
+        ];
+        for t in throttles {
+            t.occur(now);
+            t.occur(now);
+        }
+        note_tallies(&st, Tally::Stopping);
+        for t in throttles {
+            assert_eq!(t.tally(Tally::Stopping), None, "already reported");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_flush_in_which_no_session_changed_writes_nothing() {
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("quiet-flush");
+        let st = test_state(&dir);
+        lock(&st.acc).update_metrics(
+            vec![MetricPoint {
+                name: "cost.usage".into(),
+                value: 0.5,
+                session_id: "S1".into(),
+                series: vec![],
+                delta: true,
+            }],
+            jiff::Timestamp::now(),
+        );
+        persist_cost(&st);
+        let changes = dir.join("cost_changes.jsonl");
+        std::fs::remove_file(&changes).unwrap();
+        persist_cost(&st);
+        assert!(!changes.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_flush_dates_each_session_by_when_it_was_last_heard_from() {
-        // Every flush rewrites every session the receiver holds. Were a row dated by the flush, a
+        // Every flush recomputes every session the receiver holds. Were a row dated by the flush, a
         // session silent for weeks would sit inside every report window and never expire.
         use crate::otlp::decode::MetricPoint;
 

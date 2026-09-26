@@ -196,6 +196,12 @@ impl Accumulator {
     pub fn sessions(&self) -> &BTreeMap<String, SessionTotals> {
         &self.by_session
     }
+
+    /// Forget the sessions last heard before `since` (epoch seconds).
+    pub fn forget_unheard_since(&mut self, since: i64) {
+        self.by_session
+            .retain(|_, t| t.last_seen.as_second() >= since);
+    }
 }
 
 #[cfg(test)]

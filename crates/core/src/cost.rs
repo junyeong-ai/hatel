@@ -1,12 +1,9 @@
-//! Native-OTel cost snapshot. Cost/tokens are a *snapshot* of current totals, not
-//! an event stream, so they belong in a rewritten file keyed by session — not the
-//! append-only event sink (which would bloat with near-identical rows). The
-//! receiver merges current totals into this file periodically and on shutdown.
-//! Because Claude Code exports to a single OTel endpoint, exactly one receiver is
-//! ever the active writer for a given state dir; each write still goes through a
-//! uniquely-named temp file plus an atomic rename, so even an accidental overlap
-//! stays consistent. One line per session means no growth, and `report` reads it
-//! so cost survives offline.
+//! Native-OTel cost snapshot. Cost/tokens are a *snapshot* of current totals, not an event stream,
+//! so they are kept as one row per session — not in the append-only event sink, which would bloat
+//! with near-identical rows. The receiver is the one writer (its state lock keeps out a second) and holds
+//! the rows in memory ([`Snapshot`]); on disk they are a checkpoint rewritten at each retention
+//! sweep plus the rows changed since, so what a flush writes follows what changed rather than how
+//! many sessions are retained. `report` reads both, so cost survives offline.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -25,7 +22,7 @@ pub struct Spend {
     pub cost_usd: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostRow {
     pub session_id: String,
     pub project: String,
@@ -95,9 +92,10 @@ pub fn merge_spend(
     out
 }
 
-/// The snapshot's file name. The temp a write renames from is this plus a
-/// suffix, so one owner keeps the sweep and the writer naming the same file.
+/// The checkpoint: every retained session's row as of the last retention sweep.
 const SNAPSHOT_NAME: &str = "cost_snapshot.jsonl";
+/// The rows changed since that checkpoint.
+const CHANGES_NAME: &str = "cost_changes.jsonl";
 
 fn snapshot_path(state_dir: &Path) -> PathBuf {
     state_dir.join(SNAPSHOT_NAME)
@@ -105,11 +103,10 @@ fn snapshot_path(state_dir: &Path) -> PathBuf {
 
 /// Remove temp files a write never renamed, and return how many.
 ///
-/// Call only where a single writer is guaranteed — the receiver holds that
-/// guarantee by having bound the port. Under it every temp on disk was left by
-/// a writer that is gone, because the one live writer has not started. The
-/// retention sweep cannot collect these: it deletes whole archives by age, and
-/// a temp is neither.
+/// Call only where a single writer is guaranteed, and before it first writes —
+/// the receiver, holding its state lock, at startup. Every temp on disk was then
+/// left by a writer that is gone. The retention sweep cannot collect these: it
+/// deletes whole archives by age, and a temp is neither.
 pub fn sweep_orphan_temps(state_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(state_dir) else {
         return 0;
@@ -121,14 +118,116 @@ pub fn sweep_orphan_temps(state_dir: &Path) -> usize {
             let Some(name) = name.to_str() else {
                 return false;
             };
-            name.starts_with(&format!("{SNAPSHOT_NAME}.")) && name.ends_with(".tmp")
+            [SNAPSHOT_NAME, CHANGES_NAME]
+                .iter()
+                .any(|file| name.starts_with(&format!("{file}.")))
+                && name.ends_with(".tmp")
         })
         .filter(|e| std::fs::remove_file(e.path()).is_ok())
         .count()
 }
 
+/// Every session's row, for a reader. The changes are read before the snapshot: a checkpoint writes
+/// the snapshot before it removes the changes, so a read that races one finds each row in at least
+/// one of the two.
 pub fn read_snapshot(state_dir: &Path) -> Vec<CostRow> {
-    let Ok(text) = std::fs::read_to_string(snapshot_path(state_dir)) else {
+    fold(
+        read_rows(&state_dir.join(CHANGES_NAME)),
+        read_rows(&snapshot_path(state_dir)),
+    )
+    .into_values()
+    .collect()
+}
+
+/// The cost snapshot as its one writer, the receiver, holds it: every session's latest row in
+/// memory, persisted so that a flush writes what changed rather than every retained session. A
+/// checkpoint rewrites the snapshot file and clears the changes; between checkpoints a flush that
+/// changed a row rewrites the changes file, which holds only the sessions heard since the last one.
+pub struct Snapshot {
+    state_dir: PathBuf,
+    rows: BTreeMap<String, CostRow>,
+    /// The sessions whose rows the changes file holds.
+    changed: BTreeSet<String>,
+    /// Whether the changes file lags `rows` after a failed write, so the next record retries it.
+    unsaved: bool,
+}
+
+impl Snapshot {
+    /// The snapshot as the files hold it. The rows only the changes file holds stay there until the
+    /// next checkpoint, so a restart before it loses none of them.
+    pub fn load(state_dir: &Path) -> Self {
+        let changes = read_rows(&state_dir.join(CHANGES_NAME));
+        let changed = changes.iter().map(|r| r.session_id.clone()).collect();
+        Snapshot {
+            state_dir: state_dir.to_path_buf(),
+            rows: fold(changes, read_rows(&snapshot_path(state_dir))),
+            changed,
+            unsaved: false,
+        }
+    }
+
+    pub fn rows(&self) -> &BTreeMap<String, CostRow> {
+        &self.rows
+    }
+
+    /// Take `rows` as their sessions' current rows and rewrite the changes file when any differs
+    /// from the row held — so a flush in which nothing changed writes nothing. A failed write is
+    /// returned for the caller to note, and the next record retries it.
+    pub fn record(&mut self, rows: impl IntoIterator<Item = CostRow>) -> std::io::Result<()> {
+        for row in rows {
+            if self.rows.get(&row.session_id) != Some(&row) {
+                self.changed.insert(row.session_id.clone());
+                self.rows.insert(row.session_id.clone(), row);
+                self.unsaved = true;
+            }
+        }
+        if !self.unsaved {
+            return Ok(());
+        }
+        let changed = self.changed.iter().filter_map(|sid| self.rows.get(sid));
+        write_rows(&self.state_dir, CHANGES_NAME, changed)?;
+        self.unsaved = false;
+        Ok(())
+    }
+
+    /// Drop the rows last heard before `retain_since` (epoch seconds), rewrite the snapshot file
+    /// from the rest, and clear the changes. The snapshot is written first, so the changes are
+    /// removed only once it holds them. A failed write is returned for the caller to note; the
+    /// changes file keeps what the snapshot lacks.
+    pub fn checkpoint(&mut self, retain_since: i64) -> std::io::Result<()> {
+        self.rows
+            .retain(|_, r| crate::ts_epoch(&r.ts).is_some_and(|t| t >= retain_since));
+        write_rows(&self.state_dir, SNAPSHOT_NAME, self.rows.values())?;
+        self.changed.clear();
+        // The changes file is behind until it is cleared, so a failure here leaves the next record
+        // to clear it.
+        self.unsaved = true;
+        write_rows(&self.state_dir, CHANGES_NAME, std::iter::empty())?;
+        self.unsaved = false;
+        Ok(())
+    }
+}
+
+/// Each session's row from the changes and the snapshot: the later `ts` wins, and a tie goes to
+/// the changes, which never predate the checkpoint they follow. An unparseable `ts` ranks below
+/// any instant.
+fn fold(changes: Vec<CostRow>, snapshot: Vec<CostRow>) -> BTreeMap<String, CostRow> {
+    let mut rows: BTreeMap<String, CostRow> = BTreeMap::new();
+    for row in changes.into_iter().chain(snapshot) {
+        let at = row.ts.parse::<jiff::Timestamp>().ok();
+        match rows.get(&row.session_id) {
+            Some(held) if held.ts.parse::<jiff::Timestamp>().ok() >= at => {}
+            _ => {
+                rows.insert(row.session_id.clone(), row);
+            }
+        }
+    }
+    rows
+}
+
+/// The rows of one file, a malformed line dropped (fail-open on read); a missing file has none.
+fn read_rows(path: &Path) -> Vec<CostRow> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
     text.lines()
@@ -137,66 +236,32 @@ pub fn read_snapshot(state_dir: &Path) -> Vec<CostRow> {
         .collect()
 }
 
-/// Merge current per-session totals into the snapshot by `session_id` and rewrite it
-/// atomically (temp + rename). Existing sessions are preserved across receiver restarts;
-/// current ones are replaced. A session in `unindexed` — one the session index does not hold,
-/// because its start has not landed yet or its lines expired before its cost row — keeps the
-/// project its existing row carries: no longer knowing a session's project is not a change of
-/// it. Rows older than `retain_since` (epoch seconds) are dropped, so the durable file and the
-/// per-flush rewrite stay bounded at the report horizon — a session past the retention window
-/// is beyond any report's reach. Fail-open: a write error is a stderr note.
-pub fn merge_snapshot(
+/// Replace `<state_dir>/<name>` with `rows`, atomically (a uniquely named temp plus a rename, so a
+/// reader never sees a partial file). No rows removes the file, so an empty snapshot leaves no trace.
+fn write_rows<'a>(
     state_dir: &Path,
-    rows: Vec<CostRow>,
-    unindexed: &BTreeSet<String>,
-    retain_since: i64,
-) {
-    let mut by_session: BTreeMap<String, CostRow> = read_snapshot(state_dir)
-        .into_iter()
-        .map(|r| (r.session_id.clone(), r))
-        .collect();
-    for mut row in rows {
-        if unindexed.contains(&row.session_id)
-            && let Some(existing) = by_session.get(&row.session_id)
-        {
-            row.project.clone_from(&existing.project);
-        }
-        by_session.insert(row.session_id.clone(), row);
+    name: &str,
+    rows: impl Iterator<Item = &'a CostRow>,
+) -> std::io::Result<()> {
+    let path = state_dir.join(name);
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&serde_json::to_string(row).map_err(std::io::Error::other)?);
+        body.push('\n');
     }
-    let kept: Vec<&CostRow> = by_session
-        .values()
-        .filter(|r| crate::ts_epoch(&r.ts).is_some_and(|t| t >= retain_since))
-        .collect();
-    // A fully-aged-out snapshot leaves no trace: when nothing survives the retain cutoff,
-    // remove any existing file rather than rewriting it as a lone newline — and skip the write
-    // entirely when there was never a file. Symmetric with the never-create case.
-    if kept.is_empty() {
-        let path = snapshot_path(state_dir);
-        if path.exists() {
-            let _ = std::fs::remove_file(&path);
-        }
-        return;
+    if body.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
     }
-    let body = kept
-        .iter()
-        .map(|r| serde_json::to_string(r).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if let Err(e) = write_atomic(state_dir, &body) {
-        eprintln!("hatel: cost snapshot write failed: {e}");
-    }
-}
-
-fn write_atomic(state_dir: &Path, body: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir)?;
-    let final_path = snapshot_path(state_dir);
-    // A unique temp name (pid + sequence) means two overlapping flushes — e.g. the
-    // periodic task and the shutdown flush — never share a temp path, so neither
-    // rename can fail on the other's file.
+    // A unique temp name (pid + sequence) means two overlapping writes — e.g. the periodic flush
+    // and the shutdown flush — never share a temp path, so neither rename can fail on the other's.
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = final_path.with_extension(format!("jsonl.{}.{seq}.tmp", std::process::id()));
-    std::fs::write(&tmp, format!("{body}\n"))?;
-    std::fs::rename(&tmp, &final_path)
+    let tmp = state_dir.join(format!("{name}.{}.{seq}.tmp", std::process::id()));
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, &path)
 }
 
 #[cfg(test)]
@@ -269,14 +334,70 @@ mod tests {
         std::fs::write(&snapshot, "{}\n").unwrap();
         std::fs::write(dir.join("cost_snapshot.jsonl.4321.0.tmp"), "").unwrap();
         std::fs::write(dir.join("cost_snapshot.jsonl.4321.1.tmp"), "").unwrap();
+        std::fs::write(dir.join("cost_changes.jsonl.4321.2.tmp"), "").unwrap();
         std::fs::write(dir.join("session_index.jsonl"), "").unwrap();
 
-        assert_eq!(sweep_orphan_temps(&dir), 2);
+        assert_eq!(sweep_orphan_temps(&dir), 3);
         assert!(
             snapshot.exists(),
             "the file a rename produced is not a temp"
         );
         assert!(dir.join("session_index.jsonl").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_is_retried_by_the_next_record() {
+        // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
+        let dir = std::env::temp_dir().join(format!("ht-cost-retry-{}", std::process::id()));
+        let changes = dir.join(CHANGES_NAME);
+        std::fs::create_dir_all(changes.join("blocker")).unwrap();
+        let mut snapshot = Snapshot::load(&dir);
+        let failed = snapshot.record([CostRow {
+            session_id: "S1".into(),
+            ts: "2026-01-01T00:00:00Z".into(),
+            ..CostRow::default()
+        }]);
+        assert!(failed.is_err(), "the failure is the caller's to note");
+        std::fs::remove_dir_all(&changes).unwrap();
+        snapshot.record([]).unwrap();
+        assert!(changes.is_file());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_checkpoint_that_could_not_clear_the_changes_is_finished_by_the_next_record() {
+        // A non-empty directory where the changes file goes makes its removal fail. Once the
+        // obstacle is gone, a stale changes file stands in its place, holding a row the checkpoint
+        // expired; the next record, with nothing changed, still clears it.
+        let dir = std::env::temp_dir().join(format!("ht-cost-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let changes = dir.join(CHANGES_NAME);
+        let row = |sid: &str, ts: &str| CostRow {
+            session_id: sid.into(),
+            ts: ts.into(),
+            ..CostRow::default()
+        };
+        let mut snapshot = Snapshot::load(&dir);
+        snapshot
+            .record([row("kept", "2026-01-01T00:00:00Z")])
+            .unwrap();
+        std::fs::remove_file(&changes).unwrap();
+        std::fs::create_dir_all(changes.join("blocker")).unwrap();
+        assert!(snapshot.checkpoint(0).is_err());
+        std::fs::remove_dir_all(&changes).unwrap();
+        std::fs::write(
+            &changes,
+            serde_json::to_string(&row("expired", "2000-01-01T00:00:00Z")).unwrap() + "\n",
+        )
+        .unwrap();
+        snapshot.record([]).unwrap();
+        assert!(!changes.exists());
+        let sessions: Vec<_> = read_snapshot(&dir)
+            .into_iter()
+            .map(|r| r.session_id)
+            .collect();
+        assert_eq!(sessions, ["kept"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
