@@ -30,6 +30,13 @@ const SERVICE_NAME: &str = "hatel";
 const STOP_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(crate::serve::EXPORT_DRAIN_TIMEOUT.as_secs() + 10);
 
+/// How long launchd waits to start the receiver again after a start that exited. launchd measures
+/// it from that start, so a receiver that ran longer is started again at once; one that cannot
+/// start (a broken config.toml, a port already taken) writes a line to its unrotated log per
+/// interval rather than one every 10 s, launchd's default.
+#[cfg(target_os = "macos")]
+const RELAUNCH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Install,
@@ -86,17 +93,18 @@ fn macos(exe: &Path, action: Action) -> i32 {
         return remove_unit(&path);
     }
     if action == Action::Restart {
-        let installed = match installed_unit(&path, &plist, &earlier_launchd_plists(&label, exe)) {
-            Ok(Some(installed)) => installed,
-            Ok(None) => {
-                println!("no receiver service installed");
-                return 0;
-            }
-            Err(e) => {
-                eprintln!("service: {e}");
-                return 1;
-            }
-        };
+        let installed =
+            match installed_unit(&path, &plist, &earlier_launchd_plists(&label, exe, &log)) {
+                Ok(Some(installed)) => installed,
+                Ok(None) => {
+                    println!("no receiver service installed");
+                    return 0;
+                }
+                Err(e) => {
+                    eprintln!("service: {e}");
+                    return 1;
+                }
+            };
         if !receiver_would_start() {
             return 1;
         }
@@ -131,37 +139,21 @@ fn macos(exe: &Path, action: Action) -> i32 {
             }
             return 0;
         }
-        // launchd reads a plist only when it loads the job, so a replaced one takes effect
-        // through a reload, which also restarts the receiver.
-        if installed == Installed::Earlier {
-            return match reload(&path) {
-                Ok(()) => {
-                    println!(
-                        "updated the service unit to this build's and restarted the receiver; \
-                         `hatel doctor` says which build answers"
-                    );
-                    0
-                }
-                Err(e) => {
-                    eprintln!("service: {e}");
-                    1
-                }
-            };
-        }
-        return match Command::new("launchctl")
-            .args(["kickstart", "-k", &target])
-            .status()
-        {
-            Ok(s) if s.success() => {
-                println!("restarted the receiver service; `hatel doctor` says which build answers");
+        // Reloaded: launchd reads a plist only when it loads the job, and holds a `kickstart` of a
+        // job that failed to start until RELAUNCH_THROTTLE has passed, while a job loaded again
+        // starts at once.
+        return match reload(&path) {
+            Ok(()) => {
+                let done = if installed == Installed::Earlier {
+                    "updated the service unit to this build's and restarted the receiver"
+                } else {
+                    "restarted the receiver service"
+                };
+                println!("{done}; `hatel doctor` says which build answers");
                 0
             }
-            Ok(s) => {
-                eprintln!("service: `launchctl kickstart -k {target}` exited {s}");
-                1
-            }
             Err(e) => {
-                eprintln!("service: launchctl not found ({e})");
+                eprintln!("service: {e}");
                 1
             }
         };
@@ -187,14 +179,15 @@ fn macos(exe: &Path, action: Action) -> i32 {
 }
 
 /// The LaunchAgent that runs `serve --all` from `exe`. launchd discards a job's output unless the
-/// plist names a file, so the receiver's stdout and stderr go to `log`; and it waits
-/// [`STOP_TIMEOUT`] after SIGTERM, not its own shorter default, so a
-/// stop can finish draining egress.
+/// plist names a file, so the receiver's stdout and stderr go to `log`; it waits [`STOP_TIMEOUT`]
+/// after SIGTERM, not its own shorter default, so a stop can finish draining egress; and it starts
+/// a receiver that exited early again only after [`RELAUNCH_THROTTLE`].
 #[cfg(target_os = "macos")]
 fn launchd_plist(label: &str, exe: &Path, log: &Path) -> String {
     let exe_xml = xml_escape(&exe.display().to_string());
     let log_xml = xml_escape(&log.display().to_string());
     let stop = STOP_TIMEOUT.as_secs();
+    let throttle = RELAUNCH_THROTTLE.as_secs();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -204,6 +197,7 @@ fn launchd_plist(label: &str, exe: &Path, log: &Path) -> String {
   <array><string>{exe_xml}</string><string>serve</string><string>--all</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>{throttle}</integer>
   <key>ExitTimeOut</key><integer>{stop}</integer>
   <key>StandardOutPath</key><string>{log_xml}</string>
   <key>StandardErrorPath</key><string>{log_xml}</string>
@@ -212,14 +206,16 @@ fn launchd_plist(label: &str, exe: &Path, log: &Path) -> String {
     )
 }
 
-/// The plists earlier releases wrote for `exe` (v0.4.0 to v0.18.1): one still byte-equal to them is
-/// hatel's own and unedited. Changing [`launchd_plist`] adds the rendering it replaces here, which
-/// `the_plist_this_build_writes_is_pinned` enforces.
+/// The plists earlier releases wrote for `exe` (v0.4.0 to v0.18.1, then v0.19.0): one still
+/// byte-equal to them is hatel's own and unedited. Changing [`launchd_plist`] adds the rendering it
+/// replaces here, which `the_plist_this_build_writes_is_pinned` enforces.
 #[cfg(target_os = "macos")]
-fn earlier_launchd_plists(label: &str, exe: &Path) -> Vec<String> {
+fn earlier_launchd_plists(label: &str, exe: &Path, log: &Path) -> Vec<String> {
     let exe_xml = xml_escape(&exe.display().to_string());
-    vec![format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    let log_xml = xml_escape(&log.display().to_string());
+    vec![
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
@@ -229,7 +225,23 @@ fn earlier_launchd_plists(label: &str, exe: &Path) -> Vec<String> {
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
 </dict></plist>
 "#
-    )]
+        ),
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{exe_xml}</string><string>serve</string><string>--all</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>15</integer>
+  <key>StandardOutPath</key><string>{log_xml}</string>
+  <key>StandardErrorPath</key><string>{log_xml}</string>
+</dict></plist>
+"#
+        ),
+    ]
 }
 
 /// Write the plist, and create the directory its log goes to, so the log does not depend on
@@ -243,7 +255,8 @@ fn write_launchd_unit(path: &Path, plist: &str, log: &Path) -> Result<(), String
 }
 
 /// Unload the agent if loaded (a stop, on SIGTERM) and load it again, which starts the receiver
-/// from the plist on disk.
+/// from the plist on disk. `unload` returns once the receiver has exited, so the one loaded next
+/// does not find the lock still held and wait out [`RELAUNCH_THROTTLE`].
 #[cfg(target_os = "macos")]
 fn reload(path: &Path) -> Result<(), String> {
     quiet(Command::new("launchctl").arg("unload").arg(path));
@@ -586,6 +599,20 @@ mod tests {
         assert!(plist.contains("<string>/opt/a&amp;b/hatel</string>"));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_launchd_agent_starts_a_receiver_that_exited_early_only_after_the_throttle() {
+        let plist = launchd_plist(
+            "dev.hatel",
+            Path::new("/opt/hatel"),
+            Path::new("/Users/u/Library/Logs/hatel/serve.log"),
+        );
+        let throttle = RELAUNCH_THROTTLE.as_secs();
+        assert!(plist.contains(&format!(
+            "<key>ThrottleInterval</key><integer>{throttle}</integer>"
+        )));
+    }
+
     /// What v0.18.1 wrote as `/Users/u/.local/bin/hatel`'s agent: an installed plist, copied.
     #[cfg(target_os = "macos")]
     const PLIST_V0_18_1: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -599,13 +626,29 @@ mod tests {
 </dict></plist>
 "#;
 
+    /// What v0.19.0 wrote as `/Users/u/.local/bin/hatel`'s agent.
+    #[cfg(target_os = "macos")]
+    const PLIST_V0_19_0: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.hatel</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/u/.local/bin/hatel</string><string>serve</string><string>--all</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ExitTimeOut</key><integer>15</integer>
+  <key>StandardOutPath</key><string>/Users/u/Library/Logs/hatel/serve.log</string>
+  <key>StandardErrorPath</key><string>/Users/u/Library/Logs/hatel/serve.log</string>
+</dict></plist>
+"#;
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_restart_replaces_only_a_plist_an_earlier_release_wrote_for_this_binary() {
         let exe = Path::new("/Users/u/.local/bin/hatel");
         let log = Path::new("/Users/u/Library/Logs/hatel/serve.log");
         let current = launchd_plist("dev.hatel", exe, log);
-        let earlier = earlier_launchd_plists("dev.hatel", exe);
+        let earlier = earlier_launchd_plists("dev.hatel", exe, log);
         let dir = std::env::temp_dir().join(format!("ht-unit-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -616,6 +659,7 @@ mod tests {
         };
         assert_eq!(classify(&current), Some(Installed::Current));
         assert_eq!(classify(PLIST_V0_18_1), Some(Installed::Earlier));
+        assert_eq!(classify(PLIST_V0_19_0), Some(Installed::Earlier));
         let edited = PLIST_V0_18_1.replace(
             "  <key>RunAtLoad</key>",
             "  <key>EnvironmentVariables</key><dict><key>HATEL_RETENTION_DAYS</key>\
@@ -659,6 +703,7 @@ mod tests {
   <array><string>/Users/u/.local/bin/hatel</string><string>serve</string><string>--all</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>300</integer>
   <key>ExitTimeOut</key><integer>15</integer>
   <key>StandardOutPath</key><string>/Users/u/Library/Logs/hatel/serve.log</string>
   <key>StandardErrorPath</key><string>/Users/u/Library/Logs/hatel/serve.log</string>
