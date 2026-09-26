@@ -192,10 +192,9 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_unreachable() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let authority = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        assert!(matches!(probe(&authority), Probe::Unreachable(_)));
+        // Port 0 is never listened on. A port freed by dropping a listener is not closed for
+        // long: the other tests bind ephemeral ports concurrently and can be handed it.
+        assert!(matches!(probe("127.0.0.1:0"), Probe::Unreachable(_)));
     }
 
     #[test]
