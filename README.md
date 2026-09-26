@@ -287,7 +287,7 @@ hatel serve --all      # 이 컬렉터를 공유하는 모든 프로젝트
 hatel serve --project acme-api   # 특정 프로젝트(라벨)만
 ```
 
-수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드를 답합니다(`{"service":"hatel","version":"0.18.0"}`) — `doctor`가 자기 빌드와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
+수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드를 답합니다(`{"service":"hatel","version":"0.18.1"}`) — `doctor`가 자기 빌드와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
 
 ### `init` — Claude Code에 연결
 
@@ -349,11 +349,11 @@ native telemetry (settings.json env):
   ✓ session.id included in metrics (default on)
 
 receiver:
-  ✓ receiver at 127.0.0.1:4318 is this build (0.18.0)
+  ✓ receiver at 127.0.0.1:4318 is this build (0.18.1)
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.1)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel

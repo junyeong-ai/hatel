@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "hatel-cli"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "axum",
  "bytes",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "hatel-core"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "blake3",
  "etcetera",
@@ -704,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "hatel-hook"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "hatel-core",
 ]

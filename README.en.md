@@ -287,7 +287,7 @@ hatel serve --all      # every project sharing this collector
 hatel serve --project acme-api   # one project (by label)
 ```
 
-The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running (`{"service":"hatel","version":"0.18.0"}`) — what `doctor` compares its own against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
+The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running (`{"service":"hatel","version":"0.18.1"}`) — what `doctor` compares its own against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
 
 ### `init` — wire into Claude Code
 
@@ -349,11 +349,11 @@ native telemetry (settings.json env):
   ✓ session.id included in metrics (default on)
 
 receiver:
-  ✓ receiver at 127.0.0.1:4318 is this build (0.18.0)
+  ✓ receiver at 127.0.0.1:4318 is this build (0.18.1)
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.0)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.18.1)
 
 storage:
   ✓ state dir writable: ~/.local/state/hatel
