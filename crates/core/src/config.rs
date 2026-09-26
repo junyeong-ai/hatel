@@ -291,15 +291,22 @@ mod tests {
         assert_eq!(from_file.retention_days, 30);
         assert_eq!(from_file.rotate_bytes, 1024);
 
+        // Absolute on this platform: Windows resolves a rooted path without a drive against the
+        // current drive.
+        let elsewhere = if cfg!(windows) {
+            r"C:\elsewhere"
+        } else {
+            "/elsewhere"
+        };
         let vars = [
             ("HATEL_SINK", "jsonl"),
-            ("HATEL_STATE_DIR", "/elsewhere"),
+            ("HATEL_STATE_DIR", elsewhere),
             ("HATEL_RETENTION_DAYS", "7"),
             ("HATEL_ROTATE_BYTES", "2048"),
         ];
         let overridden = resolved(file, &vars);
         assert_eq!(overridden.sink, SinkKind::Jsonl);
-        assert_eq!(overridden.state_dir, Path::new("/elsewhere"));
+        assert_eq!(overridden.state_dir, Path::new(elsewhere));
         assert_eq!(
             resolved(file, &[("HATEL_STATE_DIR", "relative")]).state_dir,
             std::env::current_dir().unwrap().join("relative"),
