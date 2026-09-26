@@ -6,11 +6,10 @@
 //! line level. Records are small and bounded (a `~150`-byte index line; an allow-list-bounded ledger
 //! record), so the write completes in a single syscall on a regular file — `PIPE_BUF` bounds atomic
 //! appends to PIPES, not to regular files, where a small write is not split. The only way to leave a
-//! partial line is a short write under disk-full/`EINTR`, which the reader drops as unparseable: an
-//! honest undercount surfaced to stderr, never a crash or a fabricated value. Reads cover the active
-//! file and every archive, retrying against a
-//! fresh listing when a concurrent rotation or prune changes the matching set, so a rotation never
-//! drops a line from a read. Only archives are deleted, whole and by mtime, so the sweep also
+//! partial line is a short write under disk-full/`EINTR`, which the reader drops as unparseable —
+//! that line alone, an undercount of one record, never a crash or a fabricated value. Reads cover
+//! the active file and every archive, retrying against a fresh listing when a concurrent rotation
+//! or prune changes the matching set, so a rotation never drops a line from a read. Only archives are deleted, whole and by mtime, so the sweep also
 //! archives an active file once it holds a record past its rotation horizon — a log that stays
 //! small or stops being written would otherwise keep its first line forever. Both the per-Kind
 //! ledger and the session index are built on this one primitive.
@@ -87,8 +86,8 @@ pub fn read_parsed<R>(dir: &Path, base: &str, parse: impl Fn(&str) -> Option<R>)
 fn read_best_effort<R>(dir: &Path, base: &str, parse: &impl Fn(&str) -> Option<R>) -> Vec<R> {
     let mut out = Vec::new();
     for path in matching_files(dir, base).unwrap_or_default() {
-        if let Ok(text) = fs::read_to_string(&path) {
-            out.extend(parse_lines(&text, parse));
+        if let Ok(bytes) = fs::read(&path) {
+            out.extend(parse_lines(&bytes, parse));
         }
     }
     out
@@ -103,8 +102,8 @@ fn read_pass<R>(dir: &Path, base: &str, parse: &impl Fn(&str) -> Option<R>) -> O
     };
     let mut out = Vec::new();
     for path in &before {
-        match fs::read_to_string(path) {
-            Ok(text) => out.extend(parse_lines(&text, parse)),
+        match fs::read(path) {
+            Ok(bytes) => out.extend(parse_lines(&bytes, parse)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None, // rotated mid-read
             Err(e) => {
                 // Not the rotation race (that is NotFound, handled above) — a genuine read error
@@ -123,12 +122,22 @@ fn read_pass<R>(dir: &Path, base: &str, parse: &impl Fn(&str) -> Option<R>) -> O
 
 /// Apply `parse` to each non-blank line, reading directly from the borrowed slice.
 fn parse_lines<'a, R>(
-    text: &'a str,
+    bytes: &'a [u8],
     parse: &'a impl Fn(&str) -> Option<R>,
 ) -> impl Iterator<Item = R> + 'a {
-    text.lines()
+    text_lines(bytes)
         .filter(|l| !l.trim().is_empty())
         .filter_map(parse)
+}
+
+/// Each line of `bytes` that is valid UTF-8, without its line ending. A line cut inside a
+/// multibyte character is dropped alone, as any unparseable line is, rather than making the whole
+/// file unreadable.
+fn text_lines(bytes: &[u8]) -> impl Iterator<Item = &str> {
+    bytes
+        .split(|b| *b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter_map(|line| std::str::from_utf8(line).ok())
 }
 
 /// The first parsable line of the active file and of every archive of `base`. A file is appended
@@ -146,9 +155,9 @@ pub fn first_parsed<R>(dir: &Path, base: &str, parse: impl Fn(&str) -> Option<R>
 fn first_record<R>(path: &Path, parse: impl Fn(&str) -> Option<R>) -> Option<R> {
     let file = fs::File::open(path).ok()?;
     BufReader::new(file)
-        .lines()
+        .split(b'\n')
         .map_while(Result::ok)
-        .find_map(|line| parse(line.as_str()))
+        .find_map(|line| text_lines(&line).next().and_then(&parse))
 }
 
 /// The active file and every archive of `base`, sorted by name. The order is used ONLY to make the
@@ -440,6 +449,21 @@ mod tests {
         rotate_aged(&dir, "log.jsonl", crate::now_epoch() + 60, epoch);
         assert!(!dir.join("log.jsonl").exists());
         assert_eq!(lines(&dir, "log.jsonl"), vec!["undated"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_hides_only_itself() {
+        // A short write can cut a record inside a multibyte character, and the next append then
+        // follows it on the same line or the next.
+        let dir = scratch();
+        std::fs::write(dir.join("log.jsonl"), b"\xed\x95100\n150\n\xed\x95\n300\n").unwrap();
+        assert_eq!(lines(&dir, "log.jsonl"), vec!["150", "300"]);
+        rotate_aged(&dir, "log.jsonl", 200, epoch);
+        assert!(
+            !dir.join("log.jsonl").exists(),
+            "the first readable dated line is 150"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
