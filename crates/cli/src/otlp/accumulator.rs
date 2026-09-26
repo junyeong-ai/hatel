@@ -41,6 +41,9 @@ pub struct SessionTotals {
     /// metrics that are delta (a cumulative metric already carries its full total) even
     /// in the unusual case of a session mixing temporalities across metrics.
     cumulative_metrics: std::collections::BTreeSet<String>,
+    /// When the receiver last heard from the session. A report window and the retention sweep
+    /// judge a session by this, not by when its totals were last written out.
+    last_seen: jiff::Timestamp,
 }
 
 impl SessionTotals {
@@ -69,6 +72,9 @@ impl SessionTotals {
     }
     pub fn event_count(&self, name: &str) -> i64 {
         self.events.get(name).copied().unwrap_or(0)
+    }
+    pub fn last_seen(&self) -> jiff::Timestamp {
+        self.last_seen
     }
 
     /// Whether `metric` is delta for this session — the only case in which the
@@ -160,9 +166,11 @@ pub struct Accumulator {
 }
 
 impl Accumulator {
-    pub fn update_metrics(&mut self, points: Vec<MetricPoint>) {
+    /// Fold `points` received `at`.
+    pub fn update_metrics(&mut self, points: Vec<MetricPoint>, at: jiff::Timestamp) {
         for p in points {
             let totals = self.by_session.entry(p.session_id).or_default();
+            totals.last_seen = totals.last_seen.max(at);
             if !p.delta {
                 totals.cumulative_metrics.insert(p.name.clone());
             }
@@ -176,15 +184,12 @@ impl Accumulator {
         }
     }
 
-    pub fn update_events(&mut self, pairs: Vec<(String, String)>) {
+    /// Count `(session, event)` pairs received `at`.
+    pub fn update_events(&mut self, pairs: Vec<(String, String)>, at: jiff::Timestamp) {
         for (session, event) in pairs {
-            *self
-                .by_session
-                .entry(session)
-                .or_default()
-                .events
-                .entry(event)
-                .or_insert(0) += 1;
+            let totals = self.by_session.entry(session).or_default();
+            totals.last_seen = totals.last_seen.max(at);
+            *totals.events.entry(event).or_insert(0) += 1;
         }
     }
 
@@ -196,6 +201,8 @@ impl Accumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const T0: jiff::Timestamp = jiff::Timestamp::UNIX_EPOCH;
 
     fn point(name: &str, value: f64, delta: bool, series: Vec<(&str, &str)>) -> MetricPoint {
         MetricPoint {
@@ -213,23 +220,29 @@ mod tests {
     #[test]
     fn delta_accumulates_and_cumulative_replaces() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![point(TOKENS, 10.0, true, vec![("type", "output")])]);
-        acc.update_metrics(vec![point(TOKENS, 5.0, true, vec![("type", "output")])]);
+        acc.update_metrics(
+            vec![point(TOKENS, 10.0, true, vec![("type", "output")])],
+            T0,
+        );
+        acc.update_metrics(vec![point(TOKENS, 5.0, true, vec![("type", "output")])], T0);
         assert_eq!(acc.sessions()["S"].tokens(), 15);
 
         let mut cum = Accumulator::default();
-        cum.update_metrics(vec![point(COST, 1.0, false, vec![])]);
-        cum.update_metrics(vec![point(COST, 3.0, false, vec![])]);
+        cum.update_metrics(vec![point(COST, 1.0, false, vec![])], T0);
+        cum.update_metrics(vec![point(COST, 3.0, false, vec![])], T0);
         assert!((cum.sessions()["S"].cost() - 3.0).abs() < 1e-9);
     }
 
     #[test]
     fn distinct_series_fold_independently() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![
-            point(TOKENS, 10.0, true, vec![("type", "input")]),
-            point(TOKENS, 20.0, true, vec![("type", "output")]),
-        ]);
+        acc.update_metrics(
+            vec![
+                point(TOKENS, 10.0, true, vec![("type", "input")]),
+                point(TOKENS, 20.0, true, vec![("type", "output")]),
+            ],
+            T0,
+        );
         assert_eq!(acc.sessions()["S"].tokens(), 30);
     }
 
@@ -244,19 +257,15 @@ mod tests {
     #[test]
     fn by_agent_labels_honestly() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![point(
-            TOKENS,
-            10.0,
-            true,
-            vec![("agent.name", "Explore")],
-        )]);
-        acc.update_metrics(vec![point(
-            TOKENS,
-            20.0,
-            true,
-            vec![("query_source", "main")],
-        )]);
-        acc.update_metrics(vec![point(COST, 1.0, false, vec![])]); // no attribution
+        acc.update_metrics(
+            vec![point(TOKENS, 10.0, true, vec![("agent.name", "Explore")])],
+            T0,
+        );
+        acc.update_metrics(
+            vec![point(TOKENS, 20.0, true, vec![("query_source", "main")])],
+            T0,
+        );
+        acc.update_metrics(vec![point(COST, 1.0, false, vec![])], T0); // no attribution
         let agents = acc.sessions()["S"].by_agent();
         assert_eq!(agents.get("Explore").map(|s| s.tokens), Some(10));
         assert_eq!(agents.get("main").map(|s| s.tokens), Some(20));
@@ -269,21 +278,24 @@ mod tests {
     #[test]
     fn by_model_buckets_tokens_and_cost_per_model() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![
-            point(
-                TOKENS,
-                10.0,
-                true,
-                vec![("model", "opus"), ("type", "input")],
-            ),
-            point(
-                TOKENS,
-                5.0,
-                true,
-                vec![("model", "opus"), ("type", "output")],
-            ),
-            point(COST, 0.5, true, vec![("model", "haiku")]),
-        ]);
+        acc.update_metrics(
+            vec![
+                point(
+                    TOKENS,
+                    10.0,
+                    true,
+                    vec![("model", "opus"), ("type", "input")],
+                ),
+                point(
+                    TOKENS,
+                    5.0,
+                    true,
+                    vec![("model", "opus"), ("type", "output")],
+                ),
+                point(COST, 0.5, true, vec![("model", "haiku")]),
+            ],
+            T0,
+        );
         let models = acc.sessions()["S"].by_model();
         assert_eq!(models.get("opus").map(|s| s.tokens), Some(15));
         assert_eq!(models.get("haiku").map(|s| s.cost_usd), Some(0.5));
@@ -292,12 +304,15 @@ mod tests {
     #[test]
     fn tokens_by_type_folds_the_cache_split_and_ignores_cost() {
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![
-            point(TOKENS, 100.0, true, vec![("type", "cacheRead")]),
-            point(TOKENS, 7.0, true, vec![("type", "input")]),
-            point(TOKENS, 3.0, true, vec![]), // a typeless series is not guessed
-            point(COST, 1.0, true, vec![]),   // cost carries no type — excluded
-        ]);
+        acc.update_metrics(
+            vec![
+                point(TOKENS, 100.0, true, vec![("type", "cacheRead")]),
+                point(TOKENS, 7.0, true, vec![("type", "input")]),
+                point(TOKENS, 3.0, true, vec![]), // a typeless series is not guessed
+                point(COST, 1.0, true, vec![]),   // cost carries no type — excluded
+            ],
+            T0,
+        );
         let by_type = acc.sessions()["S"].tokens_by_type();
         assert_eq!(by_type.get("cacheRead"), Some(&100));
         assert_eq!(by_type.get("input"), Some(&7));
@@ -310,22 +325,39 @@ mod tests {
         // A session mixing a delta tokens metric with a cumulative cost metric: the
         // baseline applies to tokens (delta) but not cost (already a full total).
         let mut acc = Accumulator::default();
-        acc.update_metrics(vec![
-            point(TOKENS, 10.0, true, vec![]),
-            point(COST, 5.0, false, vec![]),
-        ]);
+        acc.update_metrics(
+            vec![
+                point(TOKENS, 10.0, true, vec![]),
+                point(COST, 5.0, false, vec![]),
+            ],
+            T0,
+        );
         let t = &acc.sessions()["S"];
         assert!(t.tokens_is_delta(), "delta tokens → baseline added");
         assert!(!t.cost_is_delta(), "cumulative cost → baseline NOT added");
     }
 
     #[test]
+    fn a_session_is_last_seen_at_its_latest_update() {
+        // Batches can arrive out of order; the latest receipt wins, whichever signal carried it.
+        let later = jiff::Timestamp::from_second(200).unwrap();
+        let earlier = jiff::Timestamp::from_second(100).unwrap();
+        let mut acc = Accumulator::default();
+        acc.update_events(vec![("S".to_string(), "user_prompt".to_string())], later);
+        acc.update_metrics(vec![point(TOKENS, 1.0, true, vec![])], earlier);
+        assert_eq!(acc.sessions()["S"].last_seen(), later);
+    }
+
+    #[test]
     fn events_count_per_name() {
         let mut acc = Accumulator::default();
-        acc.update_events(vec![
-            ("S".to_string(), "skill_activated".to_string()),
-            ("S".to_string(), "skill_activated".to_string()),
-        ]);
+        acc.update_events(
+            vec![
+                ("S".to_string(), "skill_activated".to_string()),
+                ("S".to_string(), "skill_activated".to_string()),
+            ],
+            T0,
+        );
         assert_eq!(acc.sessions()["S"].event_count("skill_activated"), 2);
     }
 }

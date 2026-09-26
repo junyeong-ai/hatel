@@ -18,9 +18,7 @@ use axum::{Json, Router};
 
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
-use hatel_core::{
-    Config, ExportConfig, SessionIndex, SessionIndexCache, now_iso_utc, resolve_project,
-};
+use hatel_core::{Config, ExportConfig, SessionIndex, SessionIndexCache, resolve_project};
 
 use crate::export::{Exporter, OtlpSignal};
 use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
@@ -271,7 +269,7 @@ async fn ingest_metrics(
     }
     match parse_metrics(body.as_ref(), &st.tracked) {
         Ok(points) if !points.is_empty() => {
-            lock(&st.acc).update_metrics(points);
+            lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
         }
         Ok(_) => {}
         Err(e) => eprintln!("hatel: undecodable OTLP metrics body — {e}"),
@@ -292,7 +290,7 @@ async fn ingest_logs(
     match parse_logs(body.as_ref(), &st.counted) {
         Ok(decoded) => {
             if !decoded.is_empty() {
-                lock(&st.acc).update_events(decoded);
+                lock(&st.acc).update_events(decoded, jiff::Timestamp::now());
             }
         }
         Err(e) => eprintln!("hatel: undecodable OTLP logs body — {e}"),
@@ -596,7 +594,6 @@ fn prune_ledger(cfg: &Config) {
 }
 
 fn persist_cost(st: &AppState) {
-    let now = now_iso_utc();
     // Resolve totals and attribution under the index + accumulator locks, dropping both before the
     // snapshot write — a flush never holds a lock across I/O.
     let mut index = lock_index(&st.index_cache);
@@ -651,7 +648,7 @@ fn persist_cost(st: &AppState) {
                     t.tokens_is_delta(),
                     t.cost_is_delta(),
                 ),
-                ts: now.clone(),
+                ts: t.last_seen().to_string(),
             }
         })
         .collect();
@@ -751,31 +748,34 @@ mod tests {
             )]
             .into_iter()
             .collect(),
-            ts: now_iso_utc(),
+            ts: hatel_core::now_iso_utc(),
             ..CostRow::default()
         };
         st.baseline = Arc::new([("S1".to_string(), base_row)].into_iter().collect());
         // Post-restart delta points: more opus cacheRead tokens, and cost on a model
         // the baseline never saw.
-        lock(&st.acc).update_metrics(vec![
-            MetricPoint {
-                name: "token.usage".into(),
-                value: 50.0,
-                session_id: "S1".into(),
-                series: vec![
-                    ("model".into(), "opus".into()),
-                    ("type".into(), "cacheRead".into()),
-                ],
-                delta: true,
-            },
-            MetricPoint {
-                name: "cost.usage".into(),
-                value: 0.5,
-                session_id: "S1".into(),
-                series: vec![("model".into(), "haiku".into())],
-                delta: true,
-            },
-        ]);
+        lock(&st.acc).update_metrics(
+            vec![
+                MetricPoint {
+                    name: "token.usage".into(),
+                    value: 50.0,
+                    session_id: "S1".into(),
+                    series: vec![
+                        ("model".into(), "opus".into()),
+                        ("type".into(), "cacheRead".into()),
+                    ],
+                    delta: true,
+                },
+                MetricPoint {
+                    name: "cost.usage".into(),
+                    value: 0.5,
+                    session_id: "S1".into(),
+                    series: vec![("model".into(), "haiku".into())],
+                    delta: true,
+                },
+            ],
+            jiff::Timestamp::now(),
+        );
         persist_cost(&st);
         let rows = cost::read_snapshot(&st.cfg.state_dir);
         assert_eq!(rows.len(), 1);
@@ -815,6 +815,33 @@ mod tests {
             }),
             "agentless series are recorded as such, never guessed"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_flush_dates_each_session_by_when_it_was_last_heard_from() {
+        // Every flush rewrites every session the receiver holds. Were a row dated by the flush, a
+        // session silent for weeks would sit inside every report window and never expire.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("last-seen");
+        let st = test_state(&dir);
+        let heard = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 5);
+        lock(&st.acc).update_metrics(
+            vec![MetricPoint {
+                name: "cost.usage".into(),
+                value: 0.5,
+                session_id: "S1".into(),
+                series: vec![],
+                delta: true,
+            }],
+            heard,
+        );
+        persist_cost(&st);
+        persist_cost(&st);
+        let rows = cost::read_snapshot(&st.cfg.state_dir);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts, heard.to_string());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

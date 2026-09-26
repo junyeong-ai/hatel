@@ -107,7 +107,8 @@ hatel kinds --json                          # queryable Kinds + any the ledger h
 Reading a report: each Kind lists groups with a count — of records, or of distinct `identity`
 values when the Kind declares one — and the summed `measures`; the `cost` array is the latest
 snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_time_s`, `lines`,
-`ts`, plus three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
+`ts` — when the receiver last heard from that session, which is what `--window` judges — plus
+three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
 (tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
 one ran, its `agent` label being the declared type for a plain subagent and the given name for
 a teammate; a row with no label is an agent Claude Code ran for itself, which spawns no

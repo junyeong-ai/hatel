@@ -677,6 +677,7 @@ dependencies = [
  "bytes",
  "clap",
  "hatel-core",
+ "jiff",
  "libc",
  "reqwest",
  "rmcp",
