@@ -202,8 +202,6 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let flush_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
         let sweep_every = PRUNE_INTERVAL_SECS.min(flush_state.cfg.rotation_span_secs());
-        // Timed on the wall clock, as retention itself is: a monotonic clock can stop while the
-        // machine sleeps, which on a laptop would stretch a day between sweeps into several.
         let mut last_prune = hatel_core::now_epoch();
         loop {
             tick.tick().await;
@@ -211,7 +209,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             renew_index(&flush_state);
             render(&flush_state);
             let now = hatel_core::now_epoch();
-            if now - last_prune >= sweep_every {
+            if sweep_due(now, last_prune, sweep_every) {
                 last_prune = now;
                 prune_ledger(&flush_state.cfg);
             }
@@ -567,6 +565,14 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Whether the periodic retention sweep is due, `every` seconds after the `last` one. Timed on the
+/// wall clock, as retention itself is: a monotonic clock can stop while the machine sleeps, which on
+/// a laptop would stretch a day between sweeps into several. A clock stepped back sweeps at once
+/// rather than waiting out the step.
+fn sweep_due(now: i64, last: i64, every: i64) -> bool {
+    now < last || now - last >= every
+}
+
 /// Apply the retention horizon (`HATEL_RETENTION_DAYS`, default 90) on ONE horizon to every record
 /// store: the ledger (here), the cost snapshot (`persist_cost`), and the session index (below).
 ///
@@ -901,6 +907,16 @@ mod tests {
         );
         assert!(!map.contains_key("quiet"), "a quiet session expires");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_runs_once_its_interval_has_passed_or_the_clock_stepped_back() {
+        assert!(!sweep_due(1_000, 1_000, 86_400));
+        assert!(sweep_due(1_000 + 86_400, 1_000, 86_400));
+        assert!(
+            sweep_due(1_000, 1_000 + 365 * 86_400, 86_400),
+            "a clock corrected back by a year does not stop the sweep for a year"
+        );
     }
 
     #[test]
