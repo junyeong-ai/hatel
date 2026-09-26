@@ -643,7 +643,8 @@ fn retention_never_deletes_an_active_ledger_for_a_dotted_kind_name() {
         .iter()
         .filter_map(|env| env.payload.get("tool_name")?.as_str().map(String::from))
         .collect();
-    assert_eq!(kept, ["A"], "its active ledger is archived, not deleted");
+    assert!(!dotted_active.exists(), "its active ledger is archived");
+    assert_eq!(kept, ["A"], "and not deleted");
 }
 
 #[test]
