@@ -506,7 +506,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 저장의 두 면이 하나의 추상화(`HATEL_SINK`)를 거칩니다 — emitter는 sink로 쓰고, `report`는 같은 백엔드로 읽습니다(리포트는 SQLite든 JSONL이든 동일하게 소비):
 
-- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`HATEL_ROTATE_BYTES`)에 회전. git 친화·grep 가능·의존성 0.
+- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`HATEL_ROTATE_BYTES`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
 - **`sqlite`** — 임베디드, WAL, `(kind, ts)` 인덱스 — 윈도우 읽기를 SQL에서 필터.
 
 상태는 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장, `HATEL_STATE_DIR`로 재정의. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
@@ -520,7 +520,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 | `HATEL_CONFIG` | `config.toml`(export 목적지) 경로 재정의 |
 | `HATEL_PLUGINS` | 플러그인 TOML 경로. `config.toml`의 `plugins`를 대체. OS 경로 구분자(`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL 회전 임계값(기본 10MB) |
-| `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·회전 원장·SQLite 행(기본 90, 최대 100000). 수신기가 매일 sweep하되 활성 원장 파일은 건드리지 않음 |
+| `HATEL_RETENTION_DAYS` | 저장 전체의 보존 기간 — 비용 스냅샷·원장·세션 인덱스·SQLite 행(기본 90, 최대 100000). 수신기가 매일 정리. JSONL은 파일을 통째로 지우므로 기록이 파일 하나가 담는 기간(보존 기간의 1/10)만큼 기한을 넘겨 남을 수 있음 |
 | `HATEL_DISABLED=1` | 훅을 no-op으로 |
 | `HATEL_STRICT=1` | allow-list 밖 페이로드 키를 (조용히 드롭하지 않고) 에러 |
 | `HATEL_TESTING=1` | `_test/` 하위로 쓰기 리디렉트 |

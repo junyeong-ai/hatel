@@ -1,11 +1,12 @@
-//! Default sink: one append-only JSONL file per Kind in the ledger directory, size-rotated. The
-//! rolling-log mechanics — rotation, race-safe read across active + archives, and archive pruning —
-//! live in [`crate::rolling`]; this is the JSONL-specific layer: the `<kind>.jsonl` base name and
-//! Envelope (de)serialization.
+//! Default sink: one append-only JSONL file per Kind in the ledger directory, rotated by size and
+//! by age. The rolling-log mechanics — rotation, race-safe read across active + archives, and
+//! archive pruning — live in [`crate::rolling`]; this is the JSONL-specific layer: the
+//! `<kind>.jsonl` base name and Envelope (de)serialization.
 
 use std::path::{Path, PathBuf};
 
 use super::Sink;
+use crate::config::Retention;
 use crate::{Envelope, rolling};
 
 fn base(kind: &str) -> String {
@@ -31,11 +32,18 @@ pub fn oldest_ts(dir: &Path, kind: &str, project: Option<&str>) -> Option<String
     .min()
 }
 
-/// Delete rotated ledger archives whose last write predates `cutoff_epoch` — the JSONL half of the
-/// retention sweep. Whole archives only; the active `<kind>.jsonl` is never touched. Returns files
-/// removed.
-pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
-    rolling::prune_archives(dir, cutoff_epoch)
+/// Apply `retention` to the ledger — the JSONL half of the retention sweep. Files go whole: every
+/// archive whose last write has expired, a removed plugin's orphans included, and then each active
+/// ledger holding a record from before `retention.rotate_before` becomes an archive, to expire in
+/// turn. Returns files removed.
+pub fn prune(dir: &Path, retention: Retention) -> usize {
+    let removed = rolling::prune_archives(dir, retention.cutoff);
+    for kind in stored_kinds(dir).unwrap_or_default() {
+        rolling::rotate_aged(dir, &base(&kind), retention.rotate_before, |line| {
+            Envelope::from_json_line(line).and_then(|env| crate::ts_epoch(&env.ts))
+        });
+    }
+    removed
 }
 
 /// Every Kind with records in `dir`, recovered from the file names this sink writes. `base`

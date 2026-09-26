@@ -506,7 +506,7 @@ It is language-agnostic (any project, any language, calls the binary). Unlike a 
 
 Both halves of storage go through one abstraction (`HATEL_SINK`) — emitters write via the sink, `report` reads via the same backend (a report consumes SQLite exactly as it does JSONL):
 
-- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MB (`HATEL_ROTATE_BYTES`). Git-friendly, greppable, zero dependencies.
+- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MB (`HATEL_ROTATE_BYTES`) or once its oldest record is older than a tenth of the retention horizon. Git-friendly, greppable, zero dependencies.
 - **`sqlite`** — embedded, WAL, indexed by `(kind, ts)` so windowed reads stay cheap (the window is filtered in SQL).
 
 State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equivalent); override with `HATEL_STATE_DIR`. The session index and the cost snapshot are always written there independent of the sink (the receiver needs the index to attribute project-less OTel data).
@@ -520,7 +520,7 @@ State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equ
 | `HATEL_CONFIG` | override the `config.toml` path (the export destinations) |
 | `HATEL_PLUGINS` | plugin TOML paths, overriding `config.toml`'s `plugins`; OS path-list separator (`:` Unix, `;` Windows) |
 | `HATEL_ROTATE_BYTES` | JSONL rotation threshold (default 10 MB) |
-| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, rotated ledger archives, SQLite rows (default 90, max 100000); the receiver sweeps daily, never the active ledger file |
+| `HATEL_RETENTION_DAYS` | retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows (default 90, max 100000); the receiver sweeps daily, and since JSONL files are deleted whole, a record can outlive the horizon by the span one file covers, a tenth of it |
 | `HATEL_DISABLED=1` | turn the hook into a no-op |
 | `HATEL_STRICT=1` | error (don't silently drop) on a payload key outside the allow-list |
 | `HATEL_TESTING=1` | redirect writes under a `_test/` subdirectory |

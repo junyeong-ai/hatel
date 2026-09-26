@@ -12,6 +12,7 @@ pub use sqlite::SqliteSink;
 
 use std::path::PathBuf;
 
+use crate::config::Retention;
 use crate::{Config, Envelope};
 
 pub trait Sink {
@@ -85,14 +86,14 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
     }
 }
 
-/// Remove stored records older than `cutoff_epoch` from the configured backend — the retention
-/// sweep, applying the same horizon the cost snapshot already honors. JSONL deletes whole
-/// rotated archives (never the active file); SQLite deletes rows. Destructive, so it belongs to
-/// exactly one caller: the receiver (whose port bind is the single-writer lock) — never the
-/// hook, and never a read path. Returns the units removed (files / rows).
-pub fn prune_before(cfg: &Config, cutoff_epoch: i64) -> usize {
+/// Remove expired records from the configured backend — the retention sweep, on the horizon the
+/// cost snapshot also honors. JSONL deletes whole files, rotating aged active ledgers so that they
+/// expire too; SQLite deletes rows. Destructive, so it belongs to exactly one caller: the receiver
+/// (whose port bind is the single-writer lock) — never the hook, and never a read path. Returns
+/// the units removed (files / rows).
+pub fn prune(cfg: &Config, retention: Retention) -> usize {
     match cfg.sink {
-        SinkKind::Jsonl => jsonl::prune_archives(&cfg.ledger_dir, cutoff_epoch),
-        SinkKind::Sqlite => sqlite::prune_records(&sqlite_db_path(cfg), cutoff_epoch),
+        SinkKind::Jsonl => jsonl::prune(&cfg.ledger_dir, retention),
+        SinkKind::Sqlite => sqlite::prune_records(&sqlite_db_path(cfg), retention.cutoff),
     }
 }

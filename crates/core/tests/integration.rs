@@ -532,8 +532,31 @@ fn a_redacted_field_is_filterable_by_its_stored_form() {
     );
 }
 
+/// Move a file's last write `days` into the past.
+fn age(path: &std::path::Path, days: u64) {
+    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+}
+
+/// The `tool_name` of every stored `tool` record, sorted.
+fn stored_tools(cfg: &Config) -> Vec<String> {
+    let mut tools: Vec<String> = hatel_core::sink::read_records(cfg, "tool", None)
+        .iter()
+        .filter_map(|env| env.payload.get("tool_name")?.as_str().map(String::from))
+        .collect();
+    tools.sort();
+    tools
+}
+
 #[test]
-fn retention_prunes_old_archives_but_never_the_active_ledger() {
+fn retention_expires_a_ledger_that_stopped_being_written() {
+    // A Kind nothing writes any more never reaches the size that rotates it, and only archives
+    // are deleted, so the sweep archives the quiet active ledger and a later sweep deletes it.
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
     let active = cfg.ledger_dir.join("tool.jsonl");
@@ -542,30 +565,64 @@ fn retention_prunes_old_archives_but_never_the_active_ledger() {
     std::fs::write(&active, format!("{}\n", line("A"))).unwrap();
     std::fs::write(&old_archive, format!("{}\n", line("B"))).unwrap();
     std::fs::write(&fresh_archive, format!("{}\n", line("C"))).unwrap();
-    // Age the active ledger AND one archive past the horizon: only the archive may go —
-    // the active file is never pruned, whatever its age.
-    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);
-    for p in [&active, &old_archive] {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(p)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-    }
-    let cutoff = hatel_core::now_epoch() - 90 * 86_400;
-    let removed = hatel_core::sink::prune_before(&cfg, cutoff);
-    assert_eq!(removed, 1, "exactly the aged archive is removed");
-    assert!(active.exists(), "the active ledger is never pruned");
-    assert!(!old_archive.exists(), "the aged archive is gone");
-    assert!(fresh_archive.exists(), "a fresh archive is kept");
+    age(&active, 100);
+    age(&old_archive, 100);
+    let retention = cfg.retention(hatel_core::now_epoch());
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, retention),
+        1,
+        "the aged archive"
+    );
+    assert!(!active.exists(), "the quiet active ledger is archived");
+    assert_eq!(
+        stored_tools(&cfg),
+        ["A", "C"],
+        "a file archived by a sweep is not deleted by the same sweep"
+    );
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, retention),
+        1,
+        "the next sweep"
+    );
+    assert_eq!(stored_tools(&cfg), ["C"], "a fresh archive is kept");
+}
+
+#[test]
+fn retention_archives_an_active_ledger_once_it_reaches_back_a_tenth_of_the_horizon() {
+    // A Kind written slowly but steadily never reaches the size that rotates it, and its last
+    // write is always recent, so its first record is what says how far back it reaches. Archived
+    // at a tenth of the horizon, it expires at most that long after its oldest record should have.
+    let cfg = test_config(vec![]);
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    let active = cfg.ledger_dir.join("tool.jsonl");
+    let now = hatel_core::now_epoch();
+    let retention = cfg.retention(now);
+    let since = |days: i64| format!("{}\n{}\n", line_at("A", now - days * 86_400), line("B"));
+    std::fs::write(&active, since(8)).unwrap();
+    hatel_core::sink::prune(&cfg, retention);
+    assert!(
+        active.exists(),
+        "eight days back on a 90-day horizon stays active"
+    );
+    std::fs::write(&active, since(10)).unwrap();
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, retention),
+        0,
+        "nothing expired"
+    );
+    assert!(!active.exists(), "ten days back is archived");
+    assert_eq!(
+        stored_tools(&cfg),
+        ["A", "B"],
+        "with every record still read"
+    );
 }
 
 #[test]
 fn retention_never_prunes_an_active_ledger_for_a_dotted_kind_name() {
     // Kind names may contain dots (the charset allows them), so a Kind named `foo.jsonl` has
     // the active file `foo.jsonl.jsonl` — which contains `.jsonl.` but, like every active
-    // ledger, ENDS with `.jsonl`. The sweep must spare it however old it is, while that same
+    // ledger, ENDS with `.jsonl`. The sweep must not take it for an archive, while that same
     // Kind's archives are still prunable.
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
@@ -573,17 +630,9 @@ fn retention_never_prunes_an_active_ledger_for_a_dotted_kind_name() {
     let dotted_archive = cfg.ledger_dir.join("foo.jsonl.jsonl.20240101.1");
     std::fs::write(&dotted_active, format!("{}\n", line("A"))).unwrap();
     std::fs::write(&dotted_archive, format!("{}\n", line("B"))).unwrap();
-    let past = std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400);
-    for p in [&dotted_active, &dotted_archive] {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(p)
-            .unwrap()
-            .set_modified(past)
-            .unwrap();
-    }
-    let cutoff = hatel_core::now_epoch() - 90 * 86_400;
-    assert_eq!(hatel_core::sink::prune_before(&cfg, cutoff), 1);
+    age(&dotted_archive, 100);
+    let retention = cfg.retention(hatel_core::now_epoch());
+    assert_eq!(hatel_core::sink::prune(&cfg, retention), 1);
     assert!(dotted_active.exists(), "dotted-Kind active ledger spared");
     assert!(!dotted_archive.exists(), "its aged archive is pruned");
 }
@@ -612,9 +661,8 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
         )
         .unwrap();
     }
-    let cutoff = hatel_core::now_epoch() - 86_400;
     assert_eq!(
-        hatel_core::sink::prune_before(&cfg, cutoff),
+        hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
         1,
         "exactly the ancient row is deleted"
     );
@@ -1199,8 +1247,13 @@ fn records_newer_than_this_schema_version_are_skipped() {
 }
 
 fn line(tool: &str) -> String {
+    line_at(tool, hatel_core::now_epoch())
+}
+
+/// A `tool` record stamped `epoch`.
+fn line_at(tool: &str, epoch: i64) -> String {
     serde_json::json!({
-        "ts": hatel_core::now_iso_utc(),
+        "ts": jiff::Timestamp::from_second(epoch).unwrap().to_string(),
         "kind": "tool",
         "_schema_version": 1,
         "payload": {"session_id": "S", "project": "p", "tool_name": tool}

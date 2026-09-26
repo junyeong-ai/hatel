@@ -24,10 +24,8 @@ pub struct Config {
     pub plugin_source: PluginSource,
     /// JSONL ledger rotation threshold in bytes (high-volume collectors raise this).
     pub rotate_bytes: u64,
-    /// Days of cost-snapshot history to retain. A session whose snapshot is older than
-    /// this is pruned on the next merge — bounding the durable file (and the receiver's
-    /// per-flush rewrite) at the report horizon. Generous so any realistic report window
-    /// is fully covered.
+    /// Days of history every store retains — see [`Config::retention`]. Generous so any
+    /// realistic report window is fully covered.
     pub retention_days: i64,
     pub disabled: bool,
     pub strict: bool,
@@ -56,11 +54,26 @@ impl PluginSource {
 
 /// Default JSONL rotation threshold.
 pub const DEFAULT_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
-/// Default cost-snapshot retention (≫ the default 30-day report window).
+/// Default retention (≫ the default 30-day report window).
 pub const DEFAULT_RETENTION_DAYS: i64 = 90;
 /// Upper bound on `retention_days`, so `retention_days * 86_400` can never overflow
 /// (mirrors `report::MAX_WINDOW_DAYS`); ~273 years, far beyond any real horizon.
 pub const MAX_RETENTION_DAYS: i64 = 100_000;
+/// How many files a store that deletes whole files spreads one horizon across. Such a file goes
+/// only once its newest record expires, so its oldest outlives the horizon by the file's span;
+/// keeping the span near a tenth of the horizon keeps that overshoot there, at about ten files per
+/// slowly filled log.
+const FILES_PER_HORIZON: i64 = 10;
+
+/// The retention horizon at one instant, in epoch seconds.
+#[derive(Debug, Clone, Copy)]
+pub struct Retention {
+    /// Records from before this have expired.
+    pub cutoff: i64,
+    /// A store that deletes whole files rotates each open file holding a record from before this,
+    /// a tenth of the horizon back.
+    pub rotate_before: i64,
+}
 
 impl Config {
     /// Resolve the configuration, failing on an unreadable or malformed file. Every command that
@@ -125,6 +138,16 @@ impl Config {
             retention_days,
             disabled: env_flag("HATEL_DISABLED"),
             strict: env_flag("HATEL_STRICT"),
+        }
+    }
+
+    /// The retention horizon as of `now_epoch`, one for every store. `retention_days` is capped at
+    /// parse time, so the arithmetic cannot overflow.
+    pub fn retention(&self, now_epoch: i64) -> Retention {
+        let horizon = self.retention_days * 86_400;
+        Retention {
+            cutoff: now_epoch - horizon,
+            rotate_before: now_epoch - horizon / FILES_PER_HORIZON,
         }
     }
 }

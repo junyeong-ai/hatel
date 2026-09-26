@@ -1,15 +1,15 @@
 //! The session index — the generic `session_id → project` join, sink-independent and append-only.
 //! The receiver needs it to attribute project-less OTel datapoints to a project regardless of the
 //! configured sink. One line per session start; the reader folds last-wins, so concurrent hooks
-//! never race on a read-modify-write. It is a [`crate::rolling`] log, so it rotates and its archives
-//! are pruned on the retention sweep like any ledger — bounding the one store that lives outside a
-//! Kind's ledger.
+//! never race on a read-modify-write. It is a [`crate::rolling`] log, so the retention sweep rotates
+//! and prunes it like any ledger — bounding the one store that lives outside a Kind's ledger.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+use crate::config::Retention;
 use crate::project::ProjectRef;
 use crate::rolling;
 
@@ -70,12 +70,20 @@ impl SessionIndex {
         ))
     }
 
-    /// Drop index archives older than `cutoff_epoch` — the session index's half of the retention
-    /// sweep. The active file is never touched (a still-recent session must stay attributable);
-    /// only whole archives go, and an archive's mtime is its newest line's write time. A session
-    /// past the retention horizon has no records left to attribute anyway. Returns archives removed.
-    pub fn prune(&self, cutoff_epoch: i64) -> usize {
-        rolling::prune_archives_of(&self.state_dir, INDEX_BASE, cutoff_epoch)
+    /// Apply `retention` to the index — its half of the retention sweep, on the ledger's terms:
+    /// archives go whole once their newest session start has expired, and then an active file
+    /// holding a start from before `retention.rotate_before` becomes an archive. Rotation moves lines
+    /// without dropping any, so a session stays attributable until its start expires, and a session
+    /// past the horizon has no records left to attribute. Returns archives removed.
+    pub fn prune(&self, retention: Retention) -> usize {
+        let removed = rolling::prune_archives_of(&self.state_dir, INDEX_BASE, retention.cutoff);
+        rolling::rotate_aged(
+            &self.state_dir,
+            INDEX_BASE,
+            retention.rotate_before,
+            |line| parse_index_line(line).and_then(|l| crate::ts_epoch(&l.ts)),
+        );
+        removed
     }
 
     /// The newest write time across the index (active file + archives), or `None` when nothing has
@@ -342,13 +350,48 @@ mod tests {
         // Both sessions remain readable across the archive + the active file.
         let map = idx.load();
         assert!(map.contains_key("S1") && map.contains_key("S2"));
-        // A far-future cutoff makes every archive old: archives go, the active file (S2) stays.
-        assert!(idx.prune(i64::MAX) >= 1, "at least one archive pruned");
+        // A far-future cutoff makes every archive old: archives go, then the active file (S2)
+        // is archived rather than deleted.
+        let everything = Retention {
+            cutoff: i64::MAX,
+            rotate_before: i64::MAX,
+        };
+        assert!(idx.prune(everything) >= 1, "at least one archive pruned");
         let after = idx.load();
         assert!(
             after.contains_key("S2"),
             "the active session survives pruning"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_index_reaching_back_past_the_rotation_horizon_is_archived_and_still_attributes() {
+        // A line from before `ts` existed carries no date, so the first dated line places the file.
+        let dir = scratch();
+        let path = dir.join(INDEX_BASE);
+        let legacy = "{\"session_id\":\"S0\",\"project_key\":\"/k/a\",\"project_label\":\"a\"}\n";
+        let dated = "{\"session_id\":\"S1\",\"project_key\":\"/k/b\",\"project_label\":\"b\",\"ts\":\"2026-06-01T00:00:00Z\"}\n";
+        std::fs::write(&path, format!("{legacy}{dated}")).unwrap();
+        let first = crate::ts_epoch("2026-06-01T00:00:00Z").unwrap();
+        let idx = SessionIndex::new(dir.clone());
+        let at = |rotate_before| Retention {
+            cutoff: i64::MIN,
+            rotate_before,
+        };
+        idx.prune(at(first));
+        assert!(
+            path.exists(),
+            "the undated line is not taken for an older one"
+        );
+        idx.prune(at(first + 1));
+        assert!(
+            !path.exists(),
+            "archived once its first dated start is past"
+        );
+        let map = idx.load();
+        assert_eq!(map.get("S0").unwrap().project_label, "a");
+        assert_eq!(map.get("S1").unwrap().project_label, "b");
         std::fs::remove_dir_all(&dir).ok();
     }
 

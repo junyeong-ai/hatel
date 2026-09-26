@@ -563,18 +563,17 @@ fn truncate(s: &str, n: usize) -> String {
 }
 
 /// Apply the retention horizon (`HATEL_RETENTION_DAYS`, default 90) on ONE horizon to every record
-/// store: the ledger (here), the cost snapshot (`persist_cost`), and the session index's archives
-/// (below). `retention_days` is capped at parse time, so the product cannot overflow.
+/// store: the ledger (here), the cost snapshot (`persist_cost`), and the session index (below).
 ///
-/// Pruning the session index is safe even though it is the project-attribution join table. Only
-/// whole ARCHIVES past the horizon go — the active file is never touched — and an index archive is
-/// past the horizon only once its NEWEST session start is, i.e. every session it holds ended long
-/// ago and produces no more data to attribute. Live attribution reads only recent rows (in the
-/// active file), and historical cost/tool records bake in their project label at write time, so they
-/// never re-consult the index. Nothing still needing attribution can be pruned.
+/// Pruning the session index is safe even though it is the project-attribution join table.
+/// Rotation only moves lines between its files, all of which attribution reads, and a file goes
+/// only once its NEWEST session start is past the horizon, i.e. every session it holds began long
+/// ago and produces no more data to attribute. Historical cost/tool records bake in their project
+/// label at write time, so they never re-consult the index. Nothing still needing attribution can
+/// be pruned.
 fn prune_ledger(cfg: &Config) {
-    let cutoff = hatel_core::now_epoch() - cfg.retention_days * 86_400;
-    let removed = hatel_core::sink::prune_before(cfg, cutoff);
+    let retention = cfg.retention(hatel_core::now_epoch());
+    let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
         let unit = match cfg.sink {
             hatel_core::SinkKind::Jsonl => "archived ledger file(s)",
@@ -585,9 +584,9 @@ fn prune_ledger(cfg: &Config) {
             cfg.retention_days
         );
     }
-    // The session index is sink-independent, so its archives are pruned on the same horizon
-    // regardless of which sink holds the records.
-    let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(cutoff);
+    // The session index is sink-independent, so it is pruned on the same horizon regardless of
+    // which sink holds the records.
+    let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(retention);
     if index_removed > 0 {
         eprintln!(
             "hatel: retention — removed {index_removed} archived session-index file(s) older than {} days",
@@ -660,9 +659,8 @@ fn persist_cost(st: &AppState) {
     drop(index); // release the cache before the snapshot I/O
     // Always merge — even with no active sessions this flush — so the retention prune
     // runs on an idle receiver too, and stale prior-run rows can't linger unbounded.
-    // `retention_days` is capped at parse time, so this product cannot overflow.
-    let retain_since = hatel_core::now_epoch() - st.cfg.retention_days * 86_400;
-    cost::merge_snapshot(&st.cfg.state_dir, rows, retain_since);
+    let retention = st.cfg.retention(hatel_core::now_epoch());
+    cost::merge_snapshot(&st.cfg.state_dir, rows, retention.cutoff);
 }
 
 #[cfg(test)]

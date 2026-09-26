@@ -1,4 +1,5 @@
-//! A rolling append-only text log: one active file plus size-rotated archives in a directory.
+//! A rolling append-only text log: one active file plus the archives rotated out of it, in a
+//! directory. An append rotates by size; the retention sweep rotates by age.
 //!
 //! Appends are one `write_all` of a full line through an `O_APPEND` descriptor — the kernel
 //! serializes same-file appends per write call, so concurrent processes interleave cleanly at the
@@ -9,8 +10,10 @@
 //! honest undercount surfaced to stderr, never a crash or a fabricated value. Reads cover the active
 //! file and every archive, retrying against a
 //! fresh listing when a concurrent rotation or prune changes the matching set, so a rotation never
-//! drops a line from a read. Archives are pruned by mtime. Both the per-Kind ledger and the session
-//! index are built on this one primitive.
+//! drops a line from a read. Only archives are deleted, whole and by mtime, so the sweep also
+//! archives an active file once it holds a record past its rotation horizon — a log that stays
+//! small or stops being written would otherwise keep its first line forever. Both the per-Kind
+//! ledger and the session index are built on this one primitive.
 //!
 //! A base name is the active file's full name (e.g. `tool.jsonl` or `session_index.jsonl`); an
 //! archive is that name with a `.YYYYMMDD.<pid>[.N]` suffix. The active file is matched by exact
@@ -47,7 +50,7 @@ static ROTATION: Mutex<()> = Mutex::new(());
 pub fn append(dir: &Path, base: &str, line: &str, rotate_bytes: u64) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let path = dir.join(base);
-    let _ = rotate_if_needed(&path, base, rotate_bytes);
+    let _ = rotate_when(&path, base, |meta| meta.len() >= rotate_bytes);
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
@@ -135,14 +138,17 @@ pub fn first_parsed<R>(dir: &Path, base: &str, parse: impl Fn(&str) -> Option<R>
     matching_files(dir, base)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|path| {
-            let file = fs::File::open(path).ok()?;
-            BufReader::new(file)
-                .lines()
-                .map_while(Result::ok)
-                .find_map(|line| parse(line.as_str()))
-        })
+        .filter_map(|path| first_record(&path, &parse))
         .collect()
+}
+
+/// The first line of the file at `path` that `parse` accepts.
+fn first_record<R>(path: &Path, parse: impl Fn(&str) -> Option<R>) -> Option<R> {
+    let file = fs::File::open(path).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| parse(line.as_str()))
 }
 
 /// The active file and every archive of `base`, sorted by name. The order is used ONLY to make the
@@ -217,10 +223,9 @@ fn prune_matching(dir: &Path, cutoff_epoch: i64, matches: impl Fn(&str) -> bool)
         }
         let old = entry
             .metadata()
-            .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .is_some_and(|d| (d.as_secs() as i64) < cutoff_epoch);
+            .and_then(|meta| mtime_epoch(&meta))
+            .is_some_and(|t| t < cutoff_epoch);
         if old && fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
@@ -228,18 +233,48 @@ fn prune_matching(dir: &Path, cutoff_epoch: i64, matches: impl Fn(&str) -> bool)
     removed
 }
 
-/// Rotate an oversized active file to `<base>.YYYYMMDD.<pid>[.N]`. The pid gives each process its
-/// own targets and [`ROTATION`] keeps one process's threads apart, so a rename never replaces
-/// another rotation's archive, and the `exists()` bump for the `.N` suffix only separates this
-/// process's sequential same-day rotations (or a dead process's leftovers after pid reuse). A
-/// `NotFound` means a peer process rotated first, which is fine — the active file is recreated on
-/// the next open.
-fn rotate_if_needed(path: &Path, base: &str, threshold: u64) -> std::io::Result<()> {
+/// Archive the active file of `base` once it holds a record from before `cutoff_epoch`. `epoch`
+/// reads a line's timestamp. The file's last write bounds every line in it and its first dated line
+/// is its oldest record (appends arrive in time order), so either one past the cutoff settles it.
+///
+/// Call it after the same sweep's prune, never before it. The archive keeps the mtime of its last
+/// write, so a prune that followed could delete it while an append that opened the file just
+/// before the rename is still writing into it.
+pub fn rotate_aged(dir: &Path, base: &str, cutoff_epoch: i64, epoch: impl Fn(&str) -> Option<i64>) {
+    let path = dir.join(base);
+    let aged = |meta: &fs::Metadata| {
+        let before = |t: i64| t < cutoff_epoch;
+        mtime_epoch(meta).is_some_and(before) || first_record(&path, &epoch).is_some_and(before)
+    };
+    if let Err(e) = rotate_when(&path, base, aged) {
+        eprintln!("hatel: cannot archive {}: {e}", path.display());
+    }
+}
+
+/// The last-write time as epoch seconds.
+fn mtime_epoch(meta: &fs::Metadata) -> Option<i64> {
+    let t = meta.modified().ok()?;
+    let d = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(d.as_secs()).ok()
+}
+
+/// Rotate the active file at `path` to `<base>.YYYYMMDD.<pid>[.N]` when `due` holds for it. The pid
+/// gives each process its own targets, and [`ROTATION`] holds one process's threads apart across
+/// the check and the rename, so a thread arriving second judges the fresh active file rather than
+/// the one already moved. A rename therefore never replaces another rotation's archive, and the
+/// `exists()` bump for the `.N` suffix only separates this process's sequential same-day rotations
+/// (or a dead process's leftovers after pid reuse). A `NotFound` means a peer process rotated
+/// first, which is fine — the active file is recreated on the next open.
+fn rotate_when(
+    path: &Path,
+    base: &str,
+    due: impl FnOnce(&fs::Metadata) -> bool,
+) -> std::io::Result<()> {
     let _serial = ROTATION.lock().unwrap_or_else(PoisonError::into_inner);
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
     };
-    if meta.len() < threshold {
+    if !due(&meta) {
         return Ok(());
     }
     let stamp = date_stamp();
@@ -287,6 +322,11 @@ mod tests {
     /// Read raw lines back (identity parse) — the shape the rotation/prune assertions check.
     fn lines(dir: &Path, base: &str) -> Vec<String> {
         read_parsed(dir, base, |l| Some(l.to_string()))
+    }
+
+    /// A line that is an integer is dated at that epoch second; any other line is undated.
+    fn epoch(line: &str) -> Option<i64> {
+        line.parse().ok()
     }
 
     #[test]
@@ -366,6 +406,40 @@ mod tests {
         let removed = prune_archives(&dir, i64::MAX); // cutoff in the far future → all archives old
         assert_eq!(removed, 2, "both archives pruned, active kept");
         assert_eq!(lines(&dir, "log.jsonl"), vec!["c"], "active file survives");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_archives_an_active_file_by_its_oldest_dated_line() {
+        // Written just now, so only the first dated line can place the file; an undated line ahead
+        // of it — one from before a timestamp existed, or a torn write — is passed over.
+        let dir = scratch();
+        for line in ["undated", "100", "300"] {
+            append(&dir, "log.jsonl", line, 1 << 20).unwrap();
+        }
+        rotate_aged(&dir, "log.jsonl", 100, epoch);
+        assert!(dir.join("log.jsonl").exists(), "no line from before 100");
+        rotate_aged(&dir, "log.jsonl", 200, epoch);
+        assert!(
+            !dir.join("log.jsonl").exists(),
+            "the line at 100 is before 200"
+        );
+        let mut got = lines(&dir, "log.jsonl");
+        got.sort();
+        assert_eq!(got, vec!["100", "300", "undated"], "rotation drops nothing");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_archives_an_active_file_last_written_before_the_cutoff() {
+        // No line is dated, so only the last write can place the file, and it bounds every line.
+        let dir = scratch();
+        append(&dir, "log.jsonl", "undated", 1 << 20).unwrap();
+        rotate_aged(&dir, "log.jsonl", crate::now_epoch() - 60, epoch);
+        assert!(dir.join("log.jsonl").exists(), "written within the minute");
+        rotate_aged(&dir, "log.jsonl", crate::now_epoch() + 60, epoch);
+        assert!(!dir.join("log.jsonl").exists());
+        assert_eq!(lines(&dir, "log.jsonl"), vec!["undated"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
