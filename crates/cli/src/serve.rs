@@ -605,8 +605,7 @@ fn prune_ledger(cfg: &Config) {
 /// Renew the session-index attribution of every session this receiver has heard from long enough
 /// after it was last written down (`SessionIndexCache::due_renewal`). Run on the flush, a renewal
 /// lands within one flush of the activity that made it due, so a restart cannot forget that
-/// activity before it is written down, and the renewal expires on that activity's horizon as any
-/// ledger record expires on its own.
+/// activity before it is written down.
 fn renew_index(st: &AppState) {
     let due = {
         let mut index = lock_index(&st.index_cache);

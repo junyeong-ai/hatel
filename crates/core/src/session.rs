@@ -245,22 +245,28 @@ impl SessionIndexCache {
     }
 
     /// The sessions in `heard` — each id with when the receiver last heard from it — heard from
-    /// more than `span` after their attribution was last written down, each with that attribution
-    /// for [`SessionIndex::renew`] to carry forward. Renewing at most once a span bounds what
-    /// renewals add to the index, and leaves a session's newest line at most one span older than
-    /// its last activity. A session the index does not hold is left out: renewal carries an
+    /// within the last `span` and more than `span` after their attribution was last written down,
+    /// each with that attribution for [`SessionIndex::renew`] to carry forward. Renewing at most
+    /// once a span bounds what renewals add to the index, and leaves a session's newest line at
+    /// most one span older than its last activity. Activity older than a span is not renewed: a
+    /// receiver suspended between hearing a session and flushing would otherwise date that
+    /// activity's renewal by when it woke, keeping the attribution alive for as long past the
+    /// activity as it slept. A session the index does not hold is left out: renewal carries an
     /// attribution forward and never makes one up.
     pub fn due_renewal<'a>(
         &self,
         heard: impl IntoIterator<Item = (&'a str, i64)>,
         span: i64,
     ) -> Vec<(String, SessionRow)> {
+        let recent = crate::now_epoch() - span;
         heard
             .into_iter()
             .filter(|(sid, at)| {
-                self.written
-                    .get(*sid)
-                    .is_some_and(|w| w.is_none_or(|t| *at > t.as_second() + span))
+                *at >= recent
+                    && self
+                        .written
+                        .get(*sid)
+                        .is_some_and(|w| w.is_none_or(|t| *at > t.as_second() + span))
             })
             // A held session outside `map` was recorded without a project: its row is empty.
             .map(|(sid, _)| {
@@ -492,7 +498,8 @@ mod tests {
     #[test]
     fn renewal_carries_a_live_sessions_project_past_its_expired_start() {
         // S1 (a project) and S2 (none) started a hundred days ago and are still live; S4 started as
-        // long ago and went quiet; S3 started today; `ghost` was never recorded.
+        // long ago and went quiet; S5 as well, last heard twenty days ago by a receiver that slept
+        // through the flush after it; S3 started today; `ghost` was never recorded.
         let dir = scratch();
         let now = crate::now_epoch();
         let line = |sid: &str, project: &str, days: i64| {
@@ -513,6 +520,7 @@ mod tests {
                 line("S1", "a", 100),
                 line("S2", "", 100),
                 line("S4", "d", 100),
+                line("S5", "e", 100),
             ]
             .concat(),
         )
@@ -531,13 +539,20 @@ mod tests {
         };
         let mut cache = SessionIndexCache::new(dir.clone());
         cache.refresh();
-        let heard = ["S1", "S2", "S3", "ghost"].map(|sid| (sid, now));
+        let heard = [
+            ("S1", now),
+            ("S2", now),
+            ("S3", now),
+            ("ghost", now),
+            ("S5", now - 20 * 86_400),
+        ];
         let due = cache.due_renewal(heard, 9 * 86_400);
         let named: Vec<&str> = due.iter().map(|(sid, _)| sid.as_str()).collect();
         assert_eq!(
             named,
             ["S1", "S2"],
-            "a recent start needs no renewal, and renewal makes no attribution up"
+            "a recent start needs no renewal, old activity is not renewed, and renewal makes no \
+             attribution up"
         );
         for (sid, row) in &due {
             idx.renew(sid, row, 1 << 20);
@@ -555,6 +570,7 @@ mod tests {
         );
         assert_eq!(map["S3"].project_label, "c");
         assert!(!map.contains_key("S4"), "a quiet session expires");
+        assert!(!map.contains_key("S5"), "so does one heard only long ago");
         std::fs::remove_dir_all(&dir).ok();
     }
 
