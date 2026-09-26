@@ -208,6 +208,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         loop {
             tick.tick().await;
             persist_cost(&flush_state);
+            renew_index(&flush_state);
             render(&flush_state);
             let now = hatel_core::now_epoch();
             if now - last_prune >= sweep_every {
@@ -224,6 +225,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     flush_task.abort();
     let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
     persist_cost(&state);
+    renew_index(&state);
     // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
     // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
     if let Some(exporter) = &state.exporter {
@@ -570,12 +572,12 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// Pruning the session index is safe even though it is the project-attribution join table.
 /// Rotation only moves lines between its files, all of which attribution reads, and a file goes
-/// only once its NEWEST line is past the horizon. Each session the cost snapshot heard from within
-/// the horizon is renewed first, so a session still sending telemetry keeps its project however
-/// long ago it started. The snapshot outlives a restart, so the sweep at startup renews as surely
-/// as one a day in. A session unheard for the whole horizon — ended, or running while no receiver
-/// listened — cannot be told apart from an ended one, and expires. Historical cost/tool records
-/// bake in their project label at write time, so they never re-consult the index.
+/// only once its NEWEST line is past the horizon — which `renew_index` keeps from happening to a
+/// session still sending telemetry, however long ago it started. Once a session goes unheard, its
+/// project lasts the horizon less at most one rotation span; a session unheard that long — ended,
+/// or running while no receiver listened — cannot be told apart from an ended one, and expires.
+/// Historical cost/tool records bake in their project label at write time, so they never
+/// re-consult the index.
 fn prune_ledger(cfg: &Config) {
     let retention = cfg.retention(hatel_core::now_epoch());
     let removed = hatel_core::sink::prune(cfg, retention);
@@ -591,22 +593,35 @@ fn prune_ledger(cfg: &Config) {
     }
     // The session index is sink-independent, so it is pruned on the same horizon regardless of
     // which sink holds the records.
-    let heard: Vec<(String, i64)> = cost::read_snapshot(&cfg.state_dir)
-        .into_iter()
-        .filter_map(|row| Some((row.session_id, hatel_core::ts_epoch(&row.ts)?)))
-        .filter(|(_, at)| *at >= retention.cutoff)
-        .collect();
-    let index = SessionIndex::new(cfg.state_dir.clone());
-    index.renew(
-        heard.iter().map(|(sid, at)| (sid.as_str(), *at)),
-        cfg.rotation_span_secs(),
-    );
-    let index_removed = index.prune(retention);
+    let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(retention);
     if index_removed > 0 {
         eprintln!(
             "hatel: retention — removed {index_removed} archived session-index file(s) older than {} days",
             cfg.retention_days
         );
+    }
+}
+
+/// Renew the session-index attribution of every session this receiver has heard from long enough
+/// after it was last written down (`SessionIndexCache::due_renewal`). Run on the flush, a renewal
+/// lands within one flush of the activity that made it due, so a restart cannot forget that
+/// activity before it is written down, and the renewal expires on that activity's horizon as any
+/// ledger record expires on its own.
+fn renew_index(st: &AppState) {
+    let due = {
+        let mut index = lock_index(&st.index_cache);
+        index.refresh();
+        let acc = lock(&st.acc);
+        index.due_renewal(
+            acc.sessions()
+                .iter()
+                .map(|(sid, t)| (sid.as_str(), t.last_seen().as_second())),
+            st.cfg.rotation_span_secs(),
+        )
+    };
+    let index = SessionIndex::new(st.cfg.state_dir.clone());
+    for (sid, row) in &due {
+        index.renew(sid, row, st.cfg.rotate_bytes);
     }
 }
 
@@ -836,30 +851,22 @@ mod tests {
     }
 
     #[test]
-    fn the_sweep_renews_the_sessions_the_cost_snapshot_heard_from_within_the_horizon() {
-        // All four started past the 90-day horizon. The snapshot last heard from `live` just now and
-        // from `paused` twenty days ago; `gone`, started 120 days ago, last spoke 95 days ago — long
-        // after its start but past the horizon itself, a row a receiver down that long still finds
-        // at startup; `quiet` never sent telemetry. The sweep reads the snapshot, not this process's
-        // memory, so a receiver that has only just started renews the same way.
+    fn a_session_still_heard_from_keeps_its_project_past_the_horizon_of_its_start() {
+        // Both started past the 90-day horizon; the receiver hears from `live` now and never from
+        // `quiet`. The flush renews what it heard, so the sweep after it expires only `quiet`.
+        use crate::otlp::decode::MetricPoint;
+
         let dir = scratch("renew");
         let st = test_state(&dir);
         let now = jiff::Timestamp::now();
-        let days = |n: i64| jiff::SignedDuration::from_hours(24 * n);
-        let line = |sid: &str, started: jiff::Timestamp| {
+        let started = now - jiff::SignedDuration::from_hours(24 * 100);
+        let line = |sid: &str| {
             format!(
                 "{{\"session_id\":\"{sid}\",\"project_key\":\"/k/{sid}\",\"project_label\":\"{sid}\",\"ts\":\"{started}\"}}\n"
             )
         };
         let archive = dir.join("session_index.jsonl.20260101.1");
-        let hundred = now - days(100);
-        let lines = [
-            line("live", hundred),
-            line("paused", hundred),
-            line("gone", now - days(120)),
-            line("quiet", hundred),
-        ];
-        std::fs::write(&archive, lines.concat()).unwrap();
+        std::fs::write(&archive, [line("live"), line("quiet")].concat()).unwrap();
         std::fs::File::options()
             .write(true)
             .open(&archive)
@@ -868,25 +875,25 @@ mod tests {
                 std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400),
             )
             .unwrap();
-        let heard = |sid: &str, at: jiff::Timestamp| CostRow {
-            session_id: sid.into(),
-            project: sid.into(),
-            ts: at.to_string(),
-            ..CostRow::default()
-        };
-        let rows = vec![
-            heard("live", now),
-            heard("paused", now - days(20)),
-            heard("gone", now - days(95)),
-        ];
-        cost::merge_snapshot(&dir, rows, i64::MIN);
+        lock(&st.acc).update_metrics(
+            vec![MetricPoint {
+                name: "cost.usage".into(),
+                value: 0.5,
+                session_id: "live".into(),
+                series: vec![],
+                delta: true,
+            }],
+            now,
+        );
+        renew_index(&st);
         prune_ledger(&st.cfg);
         let map = SessionIndex::new(dir.clone()).load();
-        let project = |sid: &str| map.get(sid).map(|r| r.project_label.clone());
-        assert_eq!(project("live").as_deref(), Some("live"));
-        assert_eq!(project("paused").as_deref(), Some("paused"));
-        assert_eq!(project("gone"), None);
-        assert_eq!(project("quiet"), None);
+        assert!(!archive.exists(), "the expired starts are gone");
+        assert_eq!(
+            map.get("live").map(|r| r.project_label.as_str()),
+            Some("live")
+        );
+        assert!(!map.contains_key("quiet"), "a quiet session expires");
         std::fs::remove_dir_all(&dir).ok();
     }
 

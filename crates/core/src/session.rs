@@ -62,30 +62,12 @@ impl SessionIndex {
         self.append(session_id, &row, false, rotate_bytes);
     }
 
-    /// Carry forward the attribution of each session in `heard` — its id and when the receiver last
-    /// heard from it — that was heard from more than `span` after its newest line was written. Only
-    /// a session start writes a line otherwise, so a session running long past its start would lose
-    /// its project to the sweep while still sending telemetry. With this, an attribution outlasts
-    /// the session's last activity by at least the horizon less one span. A session the index does
-    /// not hold is skipped: renewal carries an attribution forward and never makes one up.
-    ///
-    /// A renewal never rotates the file by size, so it cannot hand the prune that follows it a file
-    /// a hook is still writing into; the next hook append rotates it instead.
-    pub fn renew<'a>(&self, heard: impl IntoIterator<Item = (&'a str, i64)>, span: i64) {
-        let latest = latest(rolling::read_parsed(
-            &self.state_dir,
-            INDEX_BASE,
-            parse_index_line,
-        ));
-        for (session_id, last_heard) in heard {
-            if let Some(entry) = latest.get(session_id)
-                && entry
-                    .written
-                    .is_none_or(|t| last_heard > t.as_second() + span)
-            {
-                self.append(session_id, &entry.row, true, u64::MAX);
-            }
-        }
+    /// Write a session's attribution in force again, as a renewal — for the sessions
+    /// [`SessionIndexCache::due_renewal`] names. Only a session start writes a line otherwise, so a
+    /// session running long past its start would lose its project to the retention sweep while
+    /// still sending telemetry.
+    pub fn renew(&self, session_id: &str, row: &SessionRow, rotate_bytes: u64) {
+        self.append(session_id, row, true, rotate_bytes);
     }
 
     fn append(&self, session_id: &str, row: &SessionRow, renewal: bool, rotate_bytes: u64) {
@@ -115,7 +97,7 @@ impl SessionIndex {
     /// archives go whole once their newest line has expired, and then an active file holding a line
     /// from before `retention.rotate_before` becomes an archive. Rotation moves lines without
     /// dropping any, so a session stays attributable until its newest line expires — which
-    /// [`Self::renew`], run first, keeps from happening to a session still being heard from.
+    /// [`Self::renew`] keeps from happening to a session still being heard from.
     /// Returns archives removed.
     pub fn prune(&self, retention: Retention) -> usize {
         let removed = rolling::prune_archives_of(&self.state_dir, INDEX_BASE, retention.cutoff);
@@ -211,6 +193,8 @@ pub struct SessionIndexCache {
     /// though it were a project, while a caller waiting on attribution can still tell a decided
     /// session from one whose start has not been seen.
     unattributed: BTreeSet<String>,
+    /// When each session's attribution was last written down, whichever set holds it.
+    written: BTreeMap<String, Option<jiff::Timestamp>>,
 }
 
 impl SessionIndexCache {
@@ -220,6 +204,7 @@ impl SessionIndexCache {
             fingerprint: None,
             map: BTreeMap::new(),
             unattributed: BTreeSet::new(),
+            written: BTreeMap::new(),
         }
     }
 
@@ -235,7 +220,7 @@ impl SessionIndexCache {
             Some(_) => {}
         }
         let had_bytes = matches!(fp, Some((_, bytes, _)) if bytes > 0);
-        let rows = fold(rolling::read_parsed(
+        let entries = latest(rolling::read_parsed(
             &self.state_dir,
             INDEX_BASE,
             parse_index_line,
@@ -243,15 +228,48 @@ impl SessionIndexCache {
         // Adopt the new revision — and only then advance the fingerprint — when the fold produced
         // rows, or the index is genuinely empty. Otherwise keep the prior state and the prior
         // fingerprint so the next refresh retries instead of stranding stale attribution.
-        if rows.is_empty() && had_bytes {
+        if entries.is_empty() && had_bytes {
             return;
         }
-        let (labelled, unattributed): (BTreeMap<_, _>, BTreeMap<_, _>) = rows
+        self.written = entries
+            .iter()
+            .map(|(sid, entry)| (sid.clone(), entry.written))
+            .collect();
+        let (labelled, unattributed): (BTreeMap<_, _>, BTreeMap<_, _>) = entries
             .into_iter()
+            .map(|(sid, entry)| (sid, entry.row))
             .partition(|(_, r)| !r.project_label.is_empty());
         self.map = labelled;
         self.unattributed = unattributed.into_keys().collect();
         self.fingerprint = fp;
+    }
+
+    /// The sessions in `heard` — each id with when the receiver last heard from it — heard from
+    /// more than `span` after their attribution was last written down, each with that attribution
+    /// for [`SessionIndex::renew`] to carry forward. Renewing at most once a span bounds what
+    /// renewals add to the index, and leaves a session's newest line at most one span older than
+    /// its last activity. A session the index does not hold is left out: renewal carries an
+    /// attribution forward and never makes one up.
+    pub fn due_renewal<'a>(
+        &self,
+        heard: impl IntoIterator<Item = (&'a str, i64)>,
+        span: i64,
+    ) -> Vec<(String, SessionRow)> {
+        heard
+            .into_iter()
+            .filter(|(sid, at)| {
+                self.written
+                    .get(*sid)
+                    .is_some_and(|w| w.is_none_or(|t| *at > t.as_second() + span))
+            })
+            // A held session outside `map` was recorded without a project: its row is empty.
+            .map(|(sid, _)| {
+                (
+                    sid.to_string(),
+                    self.map.get(sid).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 
     pub fn get(&self, session_id: &str) -> Option<&SessionRow> {
@@ -511,8 +529,19 @@ mod tests {
             cutoff: now - 90 * 86_400,
             rotate_before: now - 9 * 86_400,
         };
+        let mut cache = SessionIndexCache::new(dir.clone());
+        cache.refresh();
         let heard = ["S1", "S2", "S3", "ghost"].map(|sid| (sid, now));
-        idx.renew(heard, 9 * 86_400);
+        let due = cache.due_renewal(heard, 9 * 86_400);
+        let named: Vec<&str> = due.iter().map(|(sid, _)| sid.as_str()).collect();
+        assert_eq!(
+            named,
+            ["S1", "S2"],
+            "a recent start needs no renewal, and renewal makes no attribution up"
+        );
+        for (sid, row) in &due {
+            idx.renew(sid, row, 1 << 20);
+        }
         idx.prune(retention);
         assert!(!archive.exists(), "the expired starts are gone");
         let map = idx.load();
@@ -526,16 +555,24 @@ mod tests {
         );
         assert_eq!(map["S3"].project_label, "c");
         assert!(!map.contains_key("S4"), "a quiet session expires");
-        assert!(
-            !map.contains_key("ghost"),
-            "renewal makes no attribution up"
-        );
-        let active = std::fs::read_to_string(dir.join(INDEX_BASE)).unwrap();
-        assert_eq!(
-            active.lines().count(),
-            3,
-            "S3's recent start needs no renewal"
-        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_renewal_that_raced_a_new_start_does_not_undo_it() {
+        // The receiver judged S1 due in project a; before its renewal landed, the session resumed
+        // in project b.
+        let dir = scratch();
+        let idx = SessionIndex::new(dir.clone());
+        idx.record("S1", Some(&pref("a")), 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.clone());
+        cache.refresh();
+        let due = cache.due_renewal([("S1", crate::now_epoch() + 10)], 0);
+        idx.record("S1", Some(&pref("b")), 1 << 20);
+        for (sid, row) in &due {
+            idx.renew(sid, row, 1 << 20);
+        }
+        assert_eq!(idx.load()["S1"].project_label, "b");
         std::fs::remove_dir_all(&dir).ok();
     }
 
