@@ -38,6 +38,14 @@ pub(crate) fn is_archive_name(name: &str) -> bool {
     ARCHIVE_SUFFIX.is_match(name)
 }
 
+/// The base an archive belongs to: its name without the rotation suffix, or `None` for a name that
+/// is not an archive. A base ends in its non-numeric extension, so the suffix never reaches into it
+/// and the split is exact — `foo.jsonl.jsonl.<stamp>.<pid>` belongs to `foo.jsonl.jsonl`, although
+/// it also begins with `foo.jsonl.` like every archive of `foo.jsonl`.
+pub(crate) fn archive_base(name: &str) -> Option<&str> {
+    ARCHIVE_SUFFIX.find(name).map(|m| &name[..m.start()])
+}
+
 /// Serializes rotation within this process. The pid in an archive name keeps processes apart, but
 /// threads of one process share it — the MCP server runs concurrent `emit` calls — and two of them
 /// rotating at once would pick the same target, the later rename replacing the earlier archive.
@@ -166,14 +174,13 @@ fn first_record<R>(path: &Path, parse: impl Fn(&str) -> Option<R>) -> Option<R> 
 /// non-monotone pid in an archive name and a late cross-rotation append are both immaterial. `None`
 /// if the directory can't be listed.
 fn matching_files(dir: &Path, base: &str) -> Option<Vec<PathBuf>> {
-    let archive_prefix = format!("{base}.");
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter(|e| {
             let n = e.file_name();
             let n = n.to_string_lossy();
-            n == base || (n.starts_with(&archive_prefix) && is_archive_name(&n))
+            n == base || archive_base(&n) == Some(base)
         })
         .map(|e| e.path())
         .collect();
@@ -211,10 +218,7 @@ pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
 /// files (the session index alongside the cost snapshot and the db in the state dir). Symmetric with
 /// the base-scoped read, so the prune can only ever touch this log's own archives.
 pub fn prune_archives_of(dir: &Path, base: &str, cutoff_epoch: i64) -> usize {
-    let prefix = format!("{base}.");
-    prune_matching(dir, cutoff_epoch, |name| {
-        name.starts_with(&prefix) && is_archive_name(name)
-    })
+    prune_matching(dir, cutoff_epoch, |name| archive_base(name) == Some(base))
 }
 
 /// Delete every archive `matches` selects whose last write predates the cutoff. An archive's mtime is
