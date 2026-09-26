@@ -592,7 +592,8 @@ fn retention_expires_a_ledger_that_stopped_being_written() {
 fn retention_archives_an_active_ledger_once_it_reaches_back_a_tenth_of_the_horizon() {
     // A Kind written slowly but steadily never reaches the size that rotates it, and its last
     // write is always recent, so its first record is what says how far back it reaches. Archived
-    // at a tenth of the horizon, it expires at most that long after its oldest record should have.
+    // at a tenth of the horizon, it expires at most that span plus two sweep intervals after its
+    // oldest record should have.
     let cfg = test_config(vec![]);
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
     let active = cfg.ledger_dir.join("tool.jsonl");

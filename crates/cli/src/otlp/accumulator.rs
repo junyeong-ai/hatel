@@ -339,7 +339,8 @@ mod tests {
 
     #[test]
     fn a_session_is_last_seen_at_its_latest_update() {
-        // Batches can arrive out of order; the latest receipt wins, whichever signal carried it.
+        // A wall clock stepped back hands a later update an earlier instant; the latest receipt
+        // wins, whichever signal carried it.
         let later = jiff::Timestamp::from_second(200).unwrap();
         let earlier = jiff::Timestamp::from_second(100).unwrap();
         let mut acc = Accumulator::default();
