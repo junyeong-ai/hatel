@@ -155,7 +155,7 @@ error rather than an empty answer.
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly
 as the ledger stored it). A field outside the Kind's allow-list is a loud error, never an empty
 report. Retention is governed by `HATEL_RETENTION_DAYS` (default 90 days): the receiver prunes
-older ledger archives and cost rows, so a `--window` beyond the horizon shows only what is
+ledger records and cost rows past it, so a `--window` beyond the horizon shows only what is
 retained — say so rather than presenting it as low usage. Each Kind section carries
 `retained_since`, the oldest record still stored — of the project `--project` names, when given
 (`null` when none); a window starting before it was not measured whole, which is the check to

@@ -188,7 +188,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     }
 
     // Retention sweep — strictly after the bind succeeded: the port is the single-writer lock,
-    // and a destructive sweep belongs to the one receiver. Repeats daily from the flush loop.
+    // and a destructive sweep belongs to the one receiver. The flush loop repeats it.
     prune_ledger(&cfg);
     // The same lock is what makes an unrenamed temp collectable: no other writer holds one.
     let orphans = hatel_core::cost::sweep_orphan_temps(&cfg.state_dir);
