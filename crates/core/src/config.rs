@@ -60,9 +60,9 @@ pub const DEFAULT_RETENTION_DAYS: i64 = 90;
 /// (mirrors `report::MAX_WINDOW_DAYS`); ~273 years, far beyond any real horizon.
 pub const MAX_RETENTION_DAYS: i64 = 100_000;
 /// How many files a store that deletes whole files spreads one horizon across. Such a file goes
-/// only once its newest record expires, so its oldest outlives the horizon by the file's span;
-/// keeping the span near a tenth of the horizon keeps that overshoot there, at about ten files per
-/// slowly filled log.
+/// only once its newest record expires, so its oldest outlives the horizon by the file's span, plus
+/// the delay of the sweeps that rotate and delete it. Ten keeps the span to a tenth of the horizon,
+/// at about ten files per slowly filled log.
 const FILES_PER_HORIZON: i64 = 10;
 
 /// The retention horizon at one instant, in epoch seconds.
@@ -71,7 +71,7 @@ pub struct Retention {
     /// Records from before this have expired.
     pub cutoff: i64,
     /// A store that deletes whole files rotates each open file holding a record from before this,
-    /// a tenth of the horizon back.
+    /// one rotation span back — see [`Config::rotation_span_secs`].
     pub rotate_before: i64,
 }
 
@@ -144,11 +144,16 @@ impl Config {
     /// The retention horizon as of `now_epoch`, one for every store. `retention_days` is capped at
     /// parse time, so the arithmetic cannot overflow.
     pub fn retention(&self, now_epoch: i64) -> Retention {
-        let horizon = self.retention_days * 86_400;
         Retention {
-            cutoff: now_epoch - horizon,
-            rotate_before: now_epoch - horizon / FILES_PER_HORIZON,
+            cutoff: now_epoch - self.retention_days * 86_400,
+            rotate_before: now_epoch - self.rotation_span_secs(),
         }
+    }
+
+    /// How long a store that deletes whole files lets one file span before the sweep rotates it: a
+    /// tenth of the horizon. A sweep that ran less often would stretch the span to its own interval.
+    pub fn rotation_span_secs(&self) -> i64 {
+        self.retention_days * 86_400 / FILES_PER_HORIZON
     }
 }
 

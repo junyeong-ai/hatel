@@ -25,9 +25,10 @@ use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_me
 use crate::receiver;
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-/// How often the retention sweep repeats while serving (it also runs once at startup). Daily is
-/// plenty — the sweep deletes archives/rows that are already ~`retention_days` old.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest the retention sweep waits between runs while serving; it also runs once at startup.
+/// A record can outlive the horizon by a file's span plus two sweep intervals, so under a horizon
+/// short enough that the rotation span is under a day, the sweep runs once per span instead.
+const PRUNE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
 /// a dead downstream can't hang the receiver's exit.
 const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -200,13 +201,17 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let flush_state = state.clone();
     let flush_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
-        let mut last_prune = std::time::Instant::now();
+        let sweep_every = PRUNE_INTERVAL_SECS.min(flush_state.cfg.rotation_span_secs());
+        // Timed on the wall clock, as retention itself is: a monotonic clock can stop while the
+        // machine sleeps, which on a laptop would stretch a day between sweeps into several.
+        let mut last_prune = hatel_core::now_epoch();
         loop {
             tick.tick().await;
             persist_cost(&flush_state);
             render(&flush_state);
-            if last_prune.elapsed() >= PRUNE_INTERVAL {
-                last_prune = std::time::Instant::now();
+            let now = hatel_core::now_epoch();
+            if now - last_prune >= sweep_every {
+                last_prune = now;
                 prune_ledger(&flush_state);
             }
         }
