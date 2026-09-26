@@ -20,7 +20,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex, PoisonError};
 use std::time::SystemTime;
 
 /// The archive suffix exactly as rotation writes it: a date stamp (`YYYYMMDD`), the rotating
@@ -35,6 +35,11 @@ static ARCHIVE_SUFFIX: LazyLock<regex::Regex> =
 pub(crate) fn is_archive_name(name: &str) -> bool {
     ARCHIVE_SUFFIX.is_match(name)
 }
+
+/// Serializes rotation within this process. The pid in an archive name keeps processes apart, but
+/// threads of one process share it — the MCP server runs concurrent `emit` calls — and two of them
+/// rotating at once would pick the same target, the later rename replacing the earlier archive.
+static ROTATION: Mutex<()> = Mutex::new(());
 
 /// Append `line` (a newline is added) to `<dir>/<base>`, rotating the active file to an archive
 /// first when it has reached `rotate_bytes`. Rotation is best-effort: a failure — including a peer
@@ -223,15 +228,14 @@ fn prune_matching(dir: &Path, cutoff_epoch: i64, matches: impl Fn(&str) -> bool)
     removed
 }
 
-/// Rotate an oversized active file to `<base>.YYYYMMDD.<pid>[.N]`. Including the pid makes
-/// concurrent rotations by different processes pick distinct targets, so a rename can never clobber
-/// another's archive; a `NotFound` means a peer already rotated, which is fine — the active file is
-/// recreated on the next open. Within a single process, appends to a given base are serialized —
-/// hooks are one-shot and single-threaded, and the receiver writes each ledger from its one flush
-/// writer — so the `exists()`-bump for the `.N` suffix only ever disambiguates *sequential*
-/// same-pid same-day rotations (or a dead process's leftovers after pid reuse), never two
-/// concurrent ones; there is no caller that rotates the same base from two threads at once.
+/// Rotate an oversized active file to `<base>.YYYYMMDD.<pid>[.N]`. The pid gives each process its
+/// own targets and [`ROTATION`] keeps one process's threads apart, so a rename never replaces
+/// another rotation's archive, and the `exists()` bump for the `.N` suffix only separates this
+/// process's sequential same-day rotations (or a dead process's leftovers after pid reuse). A
+/// `NotFound` means a peer process rotated first, which is fine — the active file is recreated on
+/// the next open.
 fn rotate_if_needed(path: &Path, base: &str, threshold: u64) -> std::io::Result<()> {
+    let _serial = ROTATION.lock().unwrap_or_else(PoisonError::into_inner);
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
     };
@@ -311,6 +315,26 @@ mod tests {
             .filter(|e| is_archive_name(&e.file_name().to_string_lossy()))
             .count();
         assert_eq!(archives, 1, "exactly one archive after one rotation");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_rotations_in_one_process_lose_no_line() {
+        // Threads of one process share the pid in the archive name, so two rotating at once pick
+        // the same target unless rotation is serialized, and the later rename replaces the earlier
+        // archive. A one-byte threshold makes every append after the first rotate.
+        let dir = scratch();
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let dir = &dir;
+                s.spawn(move || {
+                    for i in 0..100 {
+                        append(dir, "log.jsonl", &format!("{t}-{i}"), 1).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(lines(&dir, "log.jsonl").len(), 400);
         std::fs::remove_dir_all(&dir).ok();
     }
 
