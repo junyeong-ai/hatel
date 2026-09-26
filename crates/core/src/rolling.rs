@@ -6,14 +6,14 @@
 //! line level. Records are small and bounded (a `~150`-byte index line; an allow-list-bounded ledger
 //! record), so the write completes in a single syscall on a regular file — `PIPE_BUF` bounds atomic
 //! appends to PIPES, not to regular files, where a small write is not split. The only way to leave a
-//! partial line is a short write under disk-full/`EINTR`, which the reader drops as unparseable —
-//! that line alone, an undercount of one record, never a crash or a fabricated value. Reads cover
-//! the active file and every archive, retrying against a fresh listing when a concurrent rotation
-//! or prune changes the matching set, so a rotation never drops a line from a read. Only archives
-//! are deleted, whole and by mtime, so the sweep also archives an active file once it holds a
-//! record past its rotation horizon — a log that stays small or stops being written would
-//! otherwise keep its first line forever. Both the per-Kind ledger and the session index are built
-//! on this one primitive.
+//! partial line is a short write under disk-full/`EINTR`, which the reader drops as unparseable
+//! together with the record the next append joins onto it — an undercount, never a crash or a
+//! fabricated value. Reads cover the active file and every archive, retrying against a fresh
+//! listing when a concurrent rotation or prune changes the matching set, so a rotation never drops
+//! a line from a read. Only archives are deleted, whole and by mtime, so the sweep also archives an
+//! active file once it holds a record past its rotation horizon — a log that stays small or stops
+//! being written would otherwise keep its first line forever. Both the per-Kind ledger and the
+//! session index are built on this one primitive.
 //!
 //! A base name is the active file's full name (e.g. `tool.jsonl` or `session_index.jsonl`); an
 //! archive is that name with a `.YYYYMMDD.<pid>[.N]` suffix. The active file is matched by exact

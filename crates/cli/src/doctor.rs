@@ -391,7 +391,7 @@ fn report_registry(
 }
 
 /// Informational only, never a failure: a wired, hook-bound Kind that produced no records in the
-/// recent window, while sessions HAVE been starting (the index advanced). Both readings are
+/// recent window, while sessions HAVE been running (the index advanced). Both readings are
 /// stated because both are real — a rare event (PreCompact can stay quiet for weeks) and a
 /// silently dead binding (Claude Code renamed the event or reshaped its payload) look identical
 /// from here; the point is that the silence is *visible* where an operator already looks.

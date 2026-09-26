@@ -111,9 +111,10 @@ impl SessionIndex {
     }
 
     /// The newest write time across the index (active file + archives), or `None` when nothing has
-    /// been recorded yet — so a caller can tell whether sessions have started recently without
-    /// reaching into the index's storage layout or missing a stretch where the active file is
-    /// absent, as it is after a rotation until the next line is written.
+    /// been recorded yet — so a caller can tell whether sessions have run recently (a start and a
+    /// renewal of a session the receiver heard from both write a line) without reaching into the
+    /// index's storage layout or missing a stretch where the active file is absent, as it is after
+    /// a rotation until the next line is written.
     pub fn newest_mtime(&self) -> Option<SystemTime> {
         rolling::fingerprint(&self.state_dir, INDEX_BASE).and_then(|(_, _, mtime)| mtime)
     }
@@ -146,7 +147,7 @@ struct Entry {
 /// renewal's. Instants are each line's `ts` PARSED — not file/read order, and not string comparison
 /// (jiff prints variable precision, so `…:05Z` would sort after `…:05.000001Z` lexically). An empty
 /// or unparseable `ts` is `None`, which orders below any real instant, so a pre-`ts` line loses to
-/// any dated record. The fold is thus independent of how archives are ordered or interleaved — a
+/// any dated line of its kind. The fold is thus independent of how archives are ordered or interleaved — a
 /// re-recorded session resolves to its most recent project wherever its lines landed.
 fn latest(lines: Vec<IndexLine>) -> BTreeMap<String, Entry> {
     let mut best: BTreeMap<String, Entry> = BTreeMap::new();
