@@ -68,7 +68,7 @@ pub fn append(dir: &Path, base: &str, line: &str, rotate_bytes: u64) -> std::io:
 
 /// Every parsed record from `<base>` and its archives. Cross-file order is deterministic but
 /// carries no meaning — no consumer depends on it (the ledger aggregates; the session index folds
-/// last-wins by a per-line timestamp), so a record landing in an archive vs the active file, or a
+/// by each line's parsed timestamp), so a record landing in an archive vs the active file, or a
 /// late cross-rotation append, never changes a result. `parse` is applied to each non-blank line
 /// directly from the borrowed file slice — no owned `String` per line on the read path. A pass that
 /// observes the matching-file set change mid-read —
@@ -171,7 +171,7 @@ fn first_record<R>(path: &Path, parse: impl Fn(&str) -> Option<R>) -> Option<R> 
 
 /// The active file and every archive of `base`, sorted by name. The order is used ONLY to make the
 /// read-race set comparison stable (filenames don't change once written), never as a semantic
-/// ordering — consumers are order-independent (aggregate, or fold last-wins by timestamp), so the
+/// ordering — consumers are order-independent (aggregate, or fold by per-line timestamp), so the
 /// non-monotone pid in an archive name and a late cross-rotation append are both immaterial. `None`
 /// if the directory can't be listed.
 fn matching_files(dir: &Path, base: &str) -> Option<Vec<PathBuf>> {

@@ -84,7 +84,7 @@ impl SessionIndex {
         }
     }
 
-    /// Fold the log (active + archives) into one row per session, last writer wins.
+    /// Fold the log (active + archives) into one row per session, as [`latest`] ranks its lines.
     pub fn load(&self) -> BTreeMap<String, SessionRow> {
         fold(rolling::read_parsed(
             &self.state_dir,
@@ -249,11 +249,11 @@ impl SessionIndexCache {
     /// within the last `span` and more than `span` after their attribution was last written down,
     /// each with that attribution for [`SessionIndex::renew`] to carry forward. Renewing at most
     /// once a span bounds what renewals add to the index, and leaves a session's newest line at
-    /// most one span older than its last activity. Activity older than a span is not renewed: a
-    /// receiver suspended between hearing a session and flushing would otherwise date that
-    /// activity's renewal by when it woke, keeping the attribution alive for as long past the
-    /// activity as it slept. A session the index does not hold is left out: renewal carries an
-    /// attribution forward and never makes one up.
+    /// most one span older than its last activity. A renewal is dated when it is written, so one a
+    /// receiver writes after waking from a suspension dates its activity late by the time slept;
+    /// renewing only activity from the last span keeps that lateness under a span. A session the
+    /// index does not hold is left out: renewal carries an attribution forward and never makes one
+    /// up.
     pub fn due_renewal<'a>(
         &self,
         heard: impl IntoIterator<Item = (&'a str, i64)>,
@@ -558,6 +558,11 @@ mod tests {
         for (sid, row) in &due {
             idx.renew(sid, row, 1 << 20);
         }
+        cache.refresh();
+        assert!(
+            cache.due_renewal(heard, 9 * 86_400).is_empty(),
+            "a renewal is the session's newest line, so the next flush has nothing to renew"
+        );
         idx.prune(retention);
         assert!(!archive.exists(), "the expired starts are gone");
         let map = idx.load();
