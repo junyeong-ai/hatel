@@ -46,6 +46,14 @@ pub fn prune(dir: &Path, retention: Retention) -> usize {
     removed
 }
 
+/// The newest write to any file of `kind`'s ledger: its last record's write time, which a
+/// rotation (a rename) keeps.
+pub fn last_written(dir: &Path, kind: &str) -> Option<i64> {
+    let (_, _, newest) = rolling::fingerprint(dir, &base(kind))?;
+    let since_epoch = newest?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    i64::try_from(since_epoch.as_secs()).ok()
+}
+
 /// Every Kind with records in `dir`, recovered from the file names this sink writes. `base`
 /// appends one fixed extension to a Kind name, so the text before that extension is the Kind —
 /// for the active ledger and equally for an archive (`<kind>.jsonl.<stamp>.<pid>`), which the

@@ -71,6 +71,16 @@ pub fn oldest_record_ts(cfg: &Config, kind: &str, project: Option<&str>) -> Opti
     }
 }
 
+/// When the backend last wrote a record of `kind`, in epoch seconds, or `None` when it holds none
+/// or cannot say. How long a kind nothing writes any more is kept follows from it
+/// ([`Config::stored_until`]).
+pub fn last_written(cfg: &Config, kind: &str) -> Option<i64> {
+    match cfg.sink {
+        SinkKind::Jsonl => jsonl::last_written(&cfg.ledger_dir, kind),
+        SinkKind::Sqlite => sqlite::last_written(&sqlite_db_path(cfg), kind),
+    }
+}
+
 /// Every Kind the backend holds records for, sorted. Each backend answers from what it owns —
 /// the JSONL sink from the file names it chose, the SQLite sink from the column it writes — so
 /// this is an exact statement about storage rather than an inference about it. It is what lets a

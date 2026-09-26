@@ -26,6 +26,23 @@ pub fn stored_kinds(path: &Path) -> std::io::Result<Vec<String>> {
     rows.collect::<rusqlite::Result<Vec<String>>>().map_err(io)
 }
 
+/// The newest `ts` of `kind`. `MAX` compares the RFC 3339 text, which can misorder records within
+/// one second (a fraction sorts before `Z`); no caller needs that precision.
+pub fn last_written(path: &Path, kind: &str) -> Option<i64> {
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let ts: Option<String> = conn
+        .query_row(
+            "SELECT MAX(ts) FROM records WHERE kind = ?1",
+            [kind],
+            |row| row.get(0),
+        )
+        .ok()?;
+    crate::ts_epoch(&ts?)
+}
+
 /// Read records for `kind` back as envelopes — the read half of the storage
 /// abstraction, so a report consumes the SQLite sink exactly as it does JSONL. The
 /// time window is pushed into SQL (`ts >= since`) so the indexed backend isn't forced

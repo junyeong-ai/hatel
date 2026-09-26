@@ -681,6 +681,67 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
 }
 
 #[test]
+fn an_undeclared_kind_says_when_retention_removes_it() {
+    // A Kind retired on purpose needs no plugin: nothing writes it, and a running receiver's
+    // retention removes it — by the date that follows from when the store last wrote it, under
+    // either sink.
+    let at = |ts: &str| hatel_core::ts_epoch(ts).unwrap();
+    let expires_by = |cfg: &Config| {
+        let reg = build_registry(cfg).unwrap();
+        let gap = hatel_core::schema::UnreadableKinds::detect(&reg, cfg)
+            .unwrap()
+            .unwrap();
+        assert!(gap.to_string().ends_with(&format!(
+            "a running receiver removes the last of them by {}",
+            gap.expires_by.clone().unwrap()
+        )));
+        gap.expires_by
+    };
+    // 2026-03-01 plus the 90-day horizon plus one sweep interval (a day at that horizon).
+    let removed_by = Some("2026-05-31".to_string());
+
+    let cfg = test_config(vec![]);
+    std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
+    for (name, written) in [
+        ("retired.jsonl.20260101.1", "2026-01-01T00:00:00Z"),
+        ("retired.jsonl", "2026-03-01T00:00:00Z"),
+        ("gone.jsonl", "2026-02-01T00:00:00Z"),
+    ] {
+        let path = cfg.ledger_dir.join(name);
+        std::fs::write(&path, "").unwrap();
+        let written = u64::try_from(at(written)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(written))
+            .unwrap();
+    }
+    assert_eq!(expires_by(&cfg), removed_by);
+
+    let dir = temp_dir();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.clone(), vec![])
+    };
+    let mut sink = hatel_core::build_sink(&cfg);
+    sink.flush();
+    let conn = rusqlite::Connection::open(dir.join("telemetry.db")).unwrap();
+    for (kind, ts) in [
+        ("retired", "2026-01-01T00:00:00Z"),
+        ("retired", "2026-03-01T00:00:00Z"),
+        ("gone", "2026-02-01T00:00:00Z"),
+    ] {
+        conn.execute(
+            "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1,?2,1,'{}')",
+            [ts, kind],
+        )
+        .unwrap();
+    }
+    assert_eq!(expires_by(&cfg), removed_by);
+}
+
+#[test]
 fn skill_version_tracks_the_workspace_version() {
     // SKILL.md ships version-locked with the binaries in every release archive; its
     // frontmatter `version` (kept for install-time tracking — not an official skill

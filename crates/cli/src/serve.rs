@@ -29,10 +29,6 @@ use crate::receiver;
 use crate::throttle::{Tally, Throttle};
 
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-/// The longest the retention sweep waits between runs while serving; it also runs once at startup.
-/// A record can outlive the horizon by a file's span plus two sweep intervals, so under a horizon
-/// short enough that the rotation span is under a day, the sweep runs once per span instead.
-const PRUNE_INTERVAL_SECS: i64 = 24 * 60 * 60;
 /// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
 /// a dead downstream can't hang the receiver's exit.
 pub(crate) const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -264,7 +260,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
     let flush_state = state.clone();
     let flush_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(FLUSH_INTERVAL);
-        let sweep_every = PRUNE_INTERVAL_SECS.min(flush_state.cfg.rotation_span_secs());
+        let sweep_every = flush_state.cfg.sweep_interval_secs();
         let mut last_prune = hatel_core::now_epoch();
         loop {
             tick.tick().await;

@@ -388,14 +388,14 @@ subagent       group_key=agent        fields=[agent, agent_id, project, prompt_i
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 ```
 
-When the ledger holds a Kind no loaded schema declares, one more line follows the list — the other half of an honest answer to what was asked ("what can I query"). `--json` carries the same fact as `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`, and `unreadable_kinds` is `null` when there is no gap:
+When the ledger holds a Kind no loaded schema declares, one more line follows the list — the other half of an honest answer to what was asked ("what can I query"). `--json` carries the same fact as `{ "kinds": [...], "unreadable_kinds": { "expires_by": "...", "names": [...], "plugin_source": "..." } }`, and `unreadable_kinds` is `null` when there is no gap:
 
 ```text
 $ hatel kinds
 ...
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 
-the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
+the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml; if nothing writes them again, a running receiver removes the last of them by 2026-12-26
 ```
 
 ---

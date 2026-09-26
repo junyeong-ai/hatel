@@ -90,6 +90,10 @@ pub struct UnreadableKinds {
     pub names: Vec<String>,
     /// The surface that would have to list their schema, from [`crate::config::PluginSource`].
     pub plugin_source: String,
+    /// The date (UTC) by which a running receiver's retention sweep removes the last of them if
+    /// nothing writes them again — the answer for a Kind retired on purpose, which needs no plugin. `None` when the store
+    /// cannot say when one of them was last written.
+    pub expires_by: Option<String>,
 }
 
 impl UnreadableKinds {
@@ -101,9 +105,20 @@ impl UnreadableKinds {
             .into_iter()
             .filter(|k| reg.kind(k).is_none())
             .collect();
-        Ok((!names.is_empty()).then(|| Self {
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let expires_by = names
+            .iter()
+            .map(|kind| sink::last_written(cfg, kind))
+            .collect::<Option<Vec<i64>>>()
+            .and_then(|written| written.into_iter().max())
+            .and_then(|last| jiff::Timestamp::from_second(cfg.stored_until(last)).ok())
+            .map(|t| t.strftime("%Y-%m-%d").to_string());
+        Ok(Some(Self {
             names,
             plugin_source: cfg.plugin_source.label(),
+            expires_by,
         }))
     }
 
@@ -131,7 +146,14 @@ impl std::fmt::Display for UnreadableKinds {
              uncountable until a plugin that declares them is listed in {}",
             self.names.join(", "),
             self.plugin_source
-        )
+        )?;
+        if let Some(date) = &self.expires_by {
+            write!(
+                f,
+                "; if nothing writes them again, a running receiver removes the last of them by {date}"
+            )?;
+        }
+        Ok(())
     }
 }
 

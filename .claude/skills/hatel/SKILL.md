@@ -129,7 +129,9 @@ rather than a zero, so it contributes nothing instead of diluting the average.
 never as zero usage. `unreadable_kinds` — on every report, and on `kinds --json`, whose payload
 is `{"kinds": [...], "unreadable_kinds": …}` — is non-null when the ledger holds Kinds no loaded
 schema declares: the answer covered less than was collected. Report that gap with the names and
-the surface it carries, never the totals alone.
+the surface it carries, never the totals alone. Its `expires_by` is the date a running receiver's
+retention sweep removes the last of them if nothing writes them again — for a Kind retired on
+purpose, waiting with the receiver running is the fix and no plugin is needed.
 
 Each Kind section names the axes it was computed on (`group_by`, `sort_by` — `null` means groups
 rank by count — and `identity`, naming what that count counts when it is not records).

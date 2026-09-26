@@ -388,14 +388,14 @@ subagent       group_key=agent        fields=[agent, agent_id, project, prompt_i
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 ```
 
-원장에 있으나 어떤 로드된 스키마도 선언하지 않는 Kind가 있으면 목록 뒤에 한 줄이 더 붙습니다 — 질문한 것("무엇을 조회할 수 있나")에 대한 정직한 답의 나머지 절반입니다. `--json`은 같은 사실을 `{ "kinds": [...], "unreadable_kinds": { "names": [...], "plugin_source": "..." } }`로 내고, 공백이 없으면 `unreadable_kinds`는 `null`입니다:
+원장에 있으나 어떤 로드된 스키마도 선언하지 않는 Kind가 있으면 목록 뒤에 한 줄이 더 붙습니다 — 질문한 것("무엇을 조회할 수 있나")에 대한 정직한 답의 나머지 절반입니다. `--json`은 같은 사실을 `{ "kinds": [...], "unreadable_kinds": { "expires_by": "...", "names": [...], "plugin_source": "..." } }`로 내고, 공백이 없으면 `unreadable_kinds`는 `null`입니다:
 
 ```text
 $ hatel kinds
 ...
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 
-the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml
+the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml; if nothing writes them again, a running receiver removes the last of them by 2026-12-26
 ```
 
 ---

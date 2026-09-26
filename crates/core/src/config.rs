@@ -64,6 +64,10 @@ pub const MAX_RETENTION_DAYS: i64 = 100_000;
 /// the delay of the sweeps that rotate and delete it. Ten keeps the span to a tenth of the horizon,
 /// at about ten files per slowly filled log.
 const FILES_PER_HORIZON: i64 = 10;
+/// The longest the receiver's retention sweep waits between runs; it also runs once at startup. A
+/// record can outlive the horizon by a file's span plus two sweep intervals, so under a horizon
+/// short enough that the rotation span is under a day, the sweep runs once per span instead.
+const MAX_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// The retention horizon at one instant, in epoch seconds.
 #[derive(Debug, Clone, Copy)]
@@ -154,6 +158,18 @@ impl Config {
     /// tenth of the horizon. A sweep that ran less often would stretch the span to its own interval.
     pub fn rotation_span_secs(&self) -> i64 {
         self.retention_days * 86_400 / FILES_PER_HORIZON
+    }
+
+    /// How often the receiver's retention sweep runs.
+    pub fn sweep_interval_secs(&self) -> i64 {
+        MAX_SWEEP_INTERVAL_SECS.min(self.rotation_span_secs())
+    }
+
+    /// The latest a store still holds a record kind whose newest record was written at `written`
+    /// (epoch seconds), when nothing writes that kind again and a receiver keeps sweeping: that
+    /// record's file is rotated well within the horizon and removed by the first sweep after it.
+    pub fn stored_until(&self, written: i64) -> i64 {
+        written + self.retention_days * 86_400 + self.sweep_interval_secs()
     }
 }
 
