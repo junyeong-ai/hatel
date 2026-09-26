@@ -188,7 +188,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
 
     // Retention sweep — strictly after the bind succeeded: the port is the single-writer lock,
     // and a destructive sweep belongs to the one receiver. Repeats daily from the flush loop.
-    prune_ledger(&cfg);
+    prune_ledger(&state);
     // The same lock is what makes an unrenamed temp collectable: no other writer holds one.
     let orphans = hatel_core::cost::sweep_orphan_temps(&cfg.state_dir);
     if orphans > 0 {
@@ -207,7 +207,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
             render(&flush_state);
             if last_prune.elapsed() >= PRUNE_INTERVAL {
                 last_prune = std::time::Instant::now();
-                prune_ledger(&flush_state.cfg);
+                prune_ledger(&flush_state);
             }
         }
     });
@@ -565,11 +565,13 @@ fn truncate(s: &str, n: usize) -> String {
 ///
 /// Pruning the session index is safe even though it is the project-attribution join table.
 /// Rotation only moves lines between its files, all of which attribution reads, and a file goes
-/// only once its NEWEST session start is past the horizon, i.e. every session it holds began long
-/// ago and produces no more data to attribute. Historical cost/tool records bake in their project
-/// label at write time, so they never re-consult the index. Nothing still needing attribution can
-/// be pruned.
-fn prune_ledger(cfg: &Config) {
+/// only once its NEWEST line is past the horizon. A session heard from within the rotation horizon
+/// is renewed into the newest file first, so a session still sending telemetry keeps its project
+/// however long ago it started; one silent for the whole horizon has nothing left to attribute.
+/// Historical cost/tool records bake in their project label at write time, so they never
+/// re-consult the index.
+fn prune_ledger(st: &AppState) {
+    let cfg = &st.cfg;
     let retention = cfg.retention(hatel_core::now_epoch());
     let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
@@ -584,7 +586,19 @@ fn prune_ledger(cfg: &Config) {
     }
     // The session index is sink-independent, so it is pruned on the same horizon regardless of
     // which sink holds the records.
-    let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(retention);
+    let live: Vec<String> = lock(&st.acc)
+        .sessions()
+        .iter()
+        .filter(|(_, t)| t.last_seen().as_second() >= retention.rotate_before)
+        .map(|(sid, _)| sid.clone())
+        .collect();
+    let index = SessionIndex::new(cfg.state_dir.clone());
+    index.renew(
+        live.iter().map(String::as_str),
+        retention.rotate_before,
+        cfg.rotate_bytes,
+    );
+    let index_removed = index.prune(retention);
     if index_removed > 0 {
         eprintln!(
             "hatel: retention — removed {index_removed} archived session-index file(s) older than {} days",
@@ -815,6 +829,56 @@ mod tests {
             }),
             "agentless series are recorded as such, never guessed"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sweep_renews_the_sessions_heard_from_within_the_rotation_horizon() {
+        // All three started a hundred days ago. `live` sent telemetry just now; `lapsed` last did
+        // twenty days ago, past the 9-day rotation horizon of a 90-day retention; `quiet` never did.
+        use crate::otlp::decode::MetricPoint;
+
+        let dir = scratch("renew");
+        let st = test_state(&dir);
+        let now = jiff::Timestamp::now();
+        let days = |n: i64| jiff::SignedDuration::from_hours(24 * n);
+        let started = now - days(100);
+        let line = |sid: &str| {
+            format!(
+                "{{\"session_id\":\"{sid}\",\"project_key\":\"/k/{sid}\",\"project_label\":\"{sid}\",\"ts\":\"{started}\"}}\n"
+            )
+        };
+        let archive = dir.join("session_index.jsonl.20260101.1");
+        std::fs::write(
+            &archive,
+            [line("live"), line("lapsed"), line("quiet")].concat(),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(100 * 86_400),
+            )
+            .unwrap();
+        let point = |sid: &str| MetricPoint {
+            name: "cost.usage".into(),
+            value: 0.5,
+            session_id: sid.into(),
+            series: vec![],
+            delta: true,
+        };
+        lock(&st.acc).update_metrics(vec![point("live")], now);
+        lock(&st.acc).update_metrics(vec![point("lapsed")], now - days(20));
+        prune_ledger(&st);
+        let map = SessionIndex::new(dir.clone()).load();
+        assert_eq!(
+            map.get("live").map(|r| r.project_label.as_str()),
+            Some("live")
+        );
+        assert!(!map.contains_key("lapsed"));
+        assert!(!map.contains_key("quiet"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

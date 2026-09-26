@@ -1,7 +1,7 @@
 //! The session index — the generic `session_id → project` join, sink-independent and append-only.
 //! The receiver needs it to attribute project-less OTel datapoints to a project regardless of the
-//! configured sink. One line per session start; the reader folds last-wins, so concurrent hooks
-//! never race on a read-modify-write. It is a [`crate::rolling`] log, so the retention sweep rotates
+//! configured sink. One line per session start, and one per renewal of a session the receiver still
+//! hears from; the reader folds last-wins, so concurrent writers never race on a read-modify-write. It is a [`crate::rolling`] log, so the retention sweep rotates
 //! and prunes it like any ledger — bounding the one store that lives outside a Kind's ledger.
 
 use serde::{Deserialize, Serialize};
@@ -49,10 +49,43 @@ impl SessionIndex {
     /// with no project is recorded too — the index is what separates a session that has none from
     /// one whose start has not been seen, and only the second becomes attributable by waiting.
     pub fn record(&self, session_id: &str, project: Option<&ProjectRef>, rotate_bytes: u64) {
-        let line = IndexLine {
-            session_id: session_id.to_string(),
+        let row = SessionRow {
             project_key: project.map_or_else(String::new, |p| p.key.clone()),
             project_label: project.map_or_else(String::new, |p| p.label.clone()),
+        };
+        self.append(session_id, &row, rotate_bytes);
+    }
+
+    /// Record again, as of now, each session in `live` whose newest line predates `before`. Only a
+    /// session start writes a line, so a session still sending telemetry once the retention horizon
+    /// has passed its last start would lose its project to the sweep; the receiver, which hears from
+    /// live sessions, renews them before each sweep. A session the index does not hold is skipped:
+    /// renewal carries an attribution forward and never makes one up.
+    pub fn renew<'a>(
+        &self,
+        live: impl IntoIterator<Item = &'a str>,
+        before: i64,
+        rotate_bytes: u64,
+    ) {
+        let latest = latest(rolling::read_parsed(
+            &self.state_dir,
+            INDEX_BASE,
+            parse_index_line,
+        ));
+        for session_id in live {
+            if let Some((ts, row)) = latest.get(session_id)
+                && ts.is_none_or(|t| t.as_second() < before)
+            {
+                self.append(session_id, row, rotate_bytes);
+            }
+        }
+    }
+
+    fn append(&self, session_id: &str, row: &SessionRow, rotate_bytes: u64) {
+        let line = IndexLine {
+            session_id: session_id.to_string(),
+            project_key: row.project_key.clone(),
+            project_label: row.project_label.clone(),
             ts: crate::now_iso_utc(),
         };
         let json = serde_json::to_string(&line).unwrap_or_default();
@@ -100,13 +133,21 @@ fn parse_index_line(line: &str) -> Option<IndexLine> {
     serde_json::from_str(line).ok()
 }
 
-/// Fold index lines into one row per session, the latest write winning. The winner is decided by
+/// Fold index lines into one row per session, the latest write winning — see [`latest`].
+fn fold(lines: Vec<IndexLine>) -> BTreeMap<String, SessionRow> {
+    latest(lines)
+        .into_iter()
+        .map(|(sid, (_, row))| (sid, row))
+        .collect()
+}
+
+/// Each session's newest line, as its write instant and row. The winner is decided by
 /// each line's `ts` PARSED to an instant — not by file/read order, and not by string comparison
 /// (jiff prints variable precision, so `…:05Z` would sort after `…:05.000001Z` lexically). An empty
 /// or unparseable `ts` is `None`, which orders below any real instant, so a pre-`ts` line loses to
 /// any dated record. The fold is thus independent of how archives are ordered or interleaved — a
 /// re-recorded session resolves to its most recent project wherever its lines landed.
-fn fold(lines: Vec<IndexLine>) -> BTreeMap<String, SessionRow> {
+fn latest(lines: Vec<IndexLine>) -> BTreeMap<String, (Option<jiff::Timestamp>, SessionRow)> {
     let mut best: BTreeMap<String, (Option<jiff::Timestamp>, SessionRow)> = BTreeMap::new();
     for il in lines {
         let ts = il.ts.parse::<jiff::Timestamp>().ok();
@@ -119,7 +160,7 @@ fn fold(lines: Vec<IndexLine>) -> BTreeMap<String, SessionRow> {
             best.insert(il.session_id, (ts, row));
         }
     }
-    best.into_iter().map(|(sid, (_, row))| (sid, row)).collect()
+    best
 }
 
 /// A change-gated cache of the folded session index: it re-folds only when the index files actually
@@ -392,6 +433,77 @@ mod tests {
         let map = idx.load();
         assert_eq!(map.get("S0").unwrap().project_label, "a");
         assert_eq!(map.get("S1").unwrap().project_label, "b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn renewal_carries_a_live_sessions_project_past_its_expired_start() {
+        // S1 (a project) and S2 (none) started a hundred days ago and are still live; S4 started as
+        // long ago and went quiet; S3 started today; `ghost` was never recorded.
+        let dir = scratch();
+        let now = crate::now_epoch();
+        let line = |sid: &str, project: &str, days: i64| {
+            let ts = jiff::Timestamp::from_second(now - days * 86_400).unwrap();
+            let key = if project.is_empty() {
+                String::new()
+            } else {
+                format!("/k/{project}")
+            };
+            format!(
+                "{{\"session_id\":\"{sid}\",\"project_key\":\"{key}\",\"project_label\":\"{project}\",\"ts\":\"{ts}\"}}\n"
+            )
+        };
+        let archive = dir.join(format!("{INDEX_BASE}.20260101.1"));
+        std::fs::write(
+            &archive,
+            [
+                line("S1", "a", 100),
+                line("S2", "", 100),
+                line("S4", "d", 100),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&archive)
+            .unwrap()
+            .set_modified(SystemTime::now() - std::time::Duration::from_secs(100 * 86_400))
+            .unwrap();
+        std::fs::write(dir.join(INDEX_BASE), line("S3", "c", 0)).unwrap();
+        let idx = SessionIndex::new(dir.clone());
+        let retention = Retention {
+            cutoff: now - 90 * 86_400,
+            rotate_before: now - 9 * 86_400,
+        };
+        idx.renew(
+            ["S1", "S2", "S3", "ghost"],
+            retention.rotate_before,
+            1 << 20,
+        );
+        idx.prune(retention);
+        assert!(!archive.exists(), "the expired starts are gone");
+        let map = idx.load();
+        assert_eq!(
+            map["S1"].project_label, "a",
+            "a live session keeps its project"
+        );
+        assert!(
+            map["S2"].project_key.is_empty(),
+            "a live session without one stays recorded as having none"
+        );
+        assert_eq!(map["S3"].project_label, "c");
+        assert!(!map.contains_key("S4"), "a quiet session expires");
+        assert!(
+            !map.contains_key("ghost"),
+            "renewal makes no attribution up"
+        );
+        let active = std::fs::read_to_string(dir.join(INDEX_BASE)).unwrap();
+        assert_eq!(
+            active.lines().count(),
+            3,
+            "S3's recent start needs no renewal"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
