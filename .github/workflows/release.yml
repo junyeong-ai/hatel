@@ -44,25 +44,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      # Every target builds natively on its own runner (Linux arm64 included), so the
-      # binaries carry the current runner images' baselines — supporting recent distros
-      # only is the explicit policy.
+      # Every build runs on a pinned image, so a shipped binary's baseline (the glibc a
+      # Linux gnu build requires, the SDK and toolchain elsewhere) moves only when this
+      # matrix does, and both Linux architectures share one. Recent distros only is the
+      # policy for gnu; the static musl builds, which the installer uses, run on any.
+      # x86_64-apple-darwin cross-compiles on the arm64 image.
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
-            os: macos-latest
+            os: macos-26
           - target: x86_64-apple-darwin
-            os: macos-latest
+            os: macos-26
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
+            os: windows-2025
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -105,14 +107,13 @@ jobs:
         shell: bash
         env:
           MATRIX_TARGET: ${{ matrix.target }}
-          MATRIX_OS: ${{ matrix.os }}
         run: |
           set -euo pipefail
           target="$MATRIX_TARGET"
           stem="hatel-${target}"
           mkdir -p staging/skill
           cp .claude/skills/hatel/SKILL.md staging/skill/SKILL.md
-          if [ "$MATRIX_OS" = "windows-latest" ]; then
+          if [[ "$target" == *-windows-* ]]; then
             cp "target/${target}/release/hatel.exe" staging/
             cp "target/${target}/release/hatel-hook.exe" staging/
             archive="${stem}.zip"
