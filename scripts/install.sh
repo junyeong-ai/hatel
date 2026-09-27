@@ -235,11 +235,8 @@ if [ "$SERVICE" = true ]; then
     "$BIN_DIR/hatel" service || rc=$?
 else
     # A running receiver keeps the binary it started from; a service installed earlier is
-    # restarted onto this one (a no-op when none is installed).
+    # restarted onto this one, and with none installed this says how to install one.
     "$BIN_DIR/hatel" service --restart || rc=$?
-    echo "For gap-free collection, install the background service (launchd/systemd):"
-    echo "  hatel service     # or re-run this installer with --service"
-    echo "Or run it in the foreground when you want it:  hatel serve --all"
 fi
 
 echo

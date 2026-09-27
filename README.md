@@ -579,7 +579,7 @@ hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> - **업그레이드.** 실행 중인 수신기는 시작할 때의 바이너리를 계속 쓰므로, `scripts/install.sh`는 바이너리를 바꾼 뒤 서비스를 재시작하고(`hatel service --restart`, `--service`를 주면 `hatel service`. 서비스가 없으면 아무것도 하지 않음), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션도 시작할 때의 `hatel mcp`를 계속 쓰므로 그 세션을 다시 시작합니다.
+> - **업그레이드.** 실행 중인 수신기는 시작할 때의 바이너리를 계속 쓰므로, `scripts/install.sh`는 바이너리를 바꾼 뒤 서비스를 재시작하고(`hatel service --restart`, `--service`를 주면 `hatel service`. 서비스가 없으면 설치 방법을 알려 줌), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션도 시작할 때의 `hatel mcp`를 계속 쓰므로 그 세션을 다시 시작합니다.
 > - **어느 유닛을 바꾸는가.** 유닛은 자신을 설치한 바로 그 바이너리를 실행하고 `serve --all --wait` 말고는 아무것도 설정하지 않으므로, 수신기의 설정은 `config.toml`에 둡니다. 재시작은 이전 릴리스가 이 바이너리를 위해 쓴 유닛을 이 빌드의 것으로 새로 쓰고, 손으로 고쳤거나 다른 바이너리를 위해 쓴 유닛은 알림과 함께 그대로 둡니다. `hatel service`는 hatel이 다른 바이너리를 위해 쓴 유닛도 새로 써서, `cargo install`이나 경로 이동 뒤에 이 바이너리를 가리키게 합니다. 손으로 고친 유닛은 그 설정을 조용히 잃지 않도록 그대로 두고 지금 디스크에 있는 바이너리로 재시작한 뒤, 알림과 함께 실패합니다. Linux에서 `systemctl --user edit hatel`로 만든 drop-in의 설정은 어느 경우에도 유지됩니다.
 > - **로그와 재시작.** 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다. 서비스의 수신기는 다른 수신기가 쥔 포트나 저장소 락을 기다렸다가 곧바로 이어받습니다. macOS에서 시작하자마자 끝나는 수신기(예: 깨진 `config.toml`)는 5분 뒤에 다시 시작되므로, 원인을 고친 뒤 `hatel service --restart`로 바로 시작합니다. 손으로 고친 유닛은 launchd가 적재한 그대로 재시작하므로 그 유닛의 재시작 간격을 기다립니다.
 

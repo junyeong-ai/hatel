@@ -24,6 +24,11 @@ use std::process::{Command, Stdio};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_NAME: &str = "hatel";
 
+/// What a restart with no service to restart says, and how to get one.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const NOT_INSTALLED: &str = "no receiver service installed: `hatel service` installs one for \
+                             gap-free collection, or run `hatel serve --all` when you want it";
+
 /// How long the service manager waits after SIGTERM before killing the receiver: the export drain's
 /// bound plus room for the requests in flight and the final flush ahead of it. The units declare
 /// it because a manager's own default can be shorter than the drain (launchd gives a user agent
@@ -64,7 +69,11 @@ pub fn run(action: Action) -> i32 {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         if action == Action::Restart {
-            println!("no receiver service to restart on this platform");
+            println!(
+                "no receiver service to restart on this platform: run `{} serve --all` under its \
+                 service manager, or when you want it",
+                exe.display()
+            );
             return 0;
         }
         eprintln!(
@@ -111,7 +120,7 @@ fn macos(exe: &Path, action: Action) -> i32 {
     let target = format!("gui/{}/{label}", unsafe { libc::getuid() });
     if action == Action::Restart {
         let Some(installed) = installed else {
-            println!("no receiver service installed");
+            println!("{NOT_INSTALLED}");
             return 0;
         };
         if !receiver_would_start() {
@@ -377,7 +386,7 @@ fn linux(exe: &Path, action: Action) -> i32 {
     };
     if action == Action::Restart {
         let Some(installed) = installed else {
-            println!("no receiver service installed");
+            println!("{NOT_INSTALLED}");
             return 0;
         };
         if !receiver_would_start() {
