@@ -498,7 +498,7 @@ $ hatel emit ci_check check=lint runs:=14000 failurez:=3
 emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor, check, date, failures, project, runs
 ```
 
-It is language-agnostic (any project, any language, calls the binary). Unlike a hook, `emit` does **not** infer the project from its working directory (a scheduler or CI job may run anywhere — guessing would mis-attribute), so include the attribution you want as payload fields. `plugins/example.toml` is a worked example.
+It is language-agnostic (any project, any language, calls the binary). Unlike a hook, `emit` does **not** infer the project from its working directory (a scheduler or CI job may run anywhere — guessing would mis-attribute), so for cross-project analysis include the attribution you want (`project`, a slug, an org) as payload fields. `plugins/example.toml` is a worked example.
 
 ---
 
@@ -580,7 +580,7 @@ The collector never fights managed policy; it adapts:
 | **Hook Kinds show up but `cost`/`tokens` are empty** | Cost and tokens are native OTel metrics, so they come **through the receiver**. The hook ledger accrues without it, but those two need it running *at that moment*. Run `hatel service` for always-on. |
 | **A hook Kind's numbers look doubled** | `hatel-hook` is reached twice for one event — bound in both the user `settings.json` and a project `.claude/settings.json`, or the project one calls a wrapper script that runs `hatel-hook` again. Hook envelopes carry no event-unique identifier, so hatel cannot tell a duplicate delivery from a genuine repeat; remove one of the two bindings. `subagent` and `tool` are unaffected — they count entities by `agent_id` and `tool_use_id`. |
 | **`doctor` shows `⚠ wired hook … names no version` / `… did not name its build` / `… is <version> while this hatel is …`** | The hook Claude Code runs is a different build from `hatel`, or could not say which build it is, so its records can differ from the fields `hatel kinds` lists. Reinstall so both come from one release, or check the wrapper that answers for it. |
-| **`doctor` shows `⚠ nothing listens at 127.0.0.1:4318`** | No receiver is running, so native metrics and logs are dropped as Claude Code pushes them (the hook ledger still accrues). `hatel serve --all` now, or `hatel service` for gap-free collection. |
+| **`doctor` shows `⚠ nothing listens at 127.0.0.1:4318`** | No receiver is running, so native metrics and logs are dropped as Claude Code pushes them (the hook ledger still accrues). `hatel serve --all` now, or `hatel service` for gap-free collection. With the service installed, its log (`~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux) says why the receiver exits; fix that, then `hatel service --restart`. |
 | **`doctor` shows `⚠ receiver at … is build <version>, not this build`** | The receiver kept the binary it started from across an upgrade. `hatel service --restart` (or restart your own `serve`). `• something answers … but not as a hatel receiver` is a build before 0.18.0 or another collector on that port. |
 | **`doctor` shows `⚠ … wired synchronously`** | Wiring written before 0.12. Every record still arrives, but Claude Code waits for the hook each time the event fires. Re-run `hatel init` to rewrite it asynchronously. |
 | **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
