@@ -161,10 +161,11 @@ error rather than an empty answer.
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly as
 the ledger stored it). A field outside the Kind's allow-list is a loud error, never an empty
 report. Retention is governed by `retention_days` under `[storage]` in `config.toml` (default 90
-days; `HATEL_RETENTION_DAYS` overrides it for one process only; the receiver reads it when it
-starts, and `doctor` warns when the receiver reads another config.toml or writes a different
-store): the receiver prunes ledger records and cost rows past it, so a `--window` beyond the
-horizon shows only what is retained — say so rather than presenting it as low usage. Each Kind
+days; `HATEL_RETENTION_DAYS` overrides it for one process only). The receiver reads it when it
+starts and rereads the file before it deletes anything, keeping whatever the file now keeps, so a
+raised horizon holds at once; `doctor` warns when the receiver reads another config.toml or writes
+a different store. The receiver prunes ledger records and cost rows past the horizon, so a
+`--window` beyond it shows only what is retained — say so rather than presenting it as low usage. Each Kind
 section carries `retained_since`, the oldest record still stored — of the project `--project`
 names, when given (`null` when none); a window starting before it was not measured whole, which is
 the check to make before reading a zero as an absence.

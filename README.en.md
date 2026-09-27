@@ -511,7 +511,7 @@ Both halves of storage go through one abstraction (the sink) — emitters write 
 
 State lives under the XDG state dir (`~/.local/state/hatel`, or the platform equivalent). The session index and the cost snapshot are always written there independent of the sink (the receiver needs the index to attribute project-less OTel data).
 
-Storage is configured under `[storage]` in `config.toml`. The hook, the receiver and `report` all read that file, so however each was started (by Claude Code, a service manager, a shell) they write and read one store. The receiver reads the file when it starts, so restart it after an edit (`hatel service --restart`). A key left out takes its default:
+Storage is configured under `[storage]` in `config.toml`. The hook, the receiver and `report` all read that file, so however each was started (by Claude Code, a service manager, a shell) they write and read one store. The receiver reads the file when it starts, so restart it after an edit (`hatel service --restart`). Deletion is the exception: the receiver reads the file again before it deletes anything, keeps whatever the file now keeps, and deletes nothing while the file cannot be read, so a raised `retention_days` protects records before that restart. A key left out takes its default:
 
 ```toml
 [storage]

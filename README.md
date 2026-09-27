@@ -511,7 +511,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 상태는 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장됩니다. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
 
-저장 방식은 `config.toml`의 `[storage]`에 설정합니다. 훅·수신기·`report`가 모두 이 파일을 읽으므로, 각자 어디서 시작됐든(Claude Code, 서비스 관리자, 셸) 같은 저장소에 쓰고 같은 저장소를 읽습니다. 수신기는 이 파일을 시작할 때 읽으므로 고친 뒤에는 `hatel service --restart`로 재시작합니다. 빠진 키는 기본값을 씁니다:
+저장 방식은 `config.toml`의 `[storage]`에 설정합니다. 훅·수신기·`report`가 모두 이 파일을 읽으므로, 각자 어디서 시작됐든(Claude Code, 서비스 관리자, 셸) 같은 저장소에 쓰고 같은 저장소를 읽습니다. 수신기는 이 파일을 시작할 때 읽으므로 고친 뒤에는 `hatel service --restart`로 재시작합니다. 삭제만은 예외입니다: 수신기는 무엇이든 지우기 전에 파일을 다시 읽어 파일이 지금 보존하는 기록을 남기고, 파일을 읽을 수 없는 동안에는 아무것도 지우지 않으므로, 늘린 `retention_days`는 재시작 전에도 기록을 지킵니다. 빠진 키는 기본값을 씁니다:
 
 ```toml
 [storage]

@@ -65,10 +65,12 @@ rejects.
   `config.toml`, which the hook, the service's receiver and `report` all read however each was
   started, so a Kind the hook can record is one `report` can read, in the store it reads;
   `HATEL_PLUGINS` and the storage variables override them for a single process only. The receiver
-  reads the file when it starts and reports that file and its store on `/healthz`; `doctor` names a
-  receiver that reads another file or writes another store, and the splitting variables it can
-  see, in its own environment and in settings.json `env`. The service unit therefore carries
-  nothing to configure. `doctor` names any stored Kind no loaded schema declares.
+  reads the file when it starts, and again before it deletes anything, keeping the longer retention
+  and deleting nothing while the file cannot be read. It reports that file and its store on
+  `/healthz`; `doctor` names a receiver that reads another file or writes another store, and the
+  splitting variables it can see, in its own environment and in settings.json `env`. The service
+  unit therefore carries nothing to configure. `doctor` names any stored Kind no loaded schema
+  declares.
 - **A unit is hatel's own only while it is byte-equal to a rendering some release wrote.**
   `service` and `service --restart` replace only such a unit and keep any other as a hand edit,
   since replacing it would silently drop what it sets. Changing `launchd_plist` or `systemd_unit`

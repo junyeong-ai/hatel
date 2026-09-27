@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use hatel_core::config::Retention;
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
 use hatel_core::{
-    Config, ExportConfig, Registry, SessionIndex, SessionIndexCache, resolve_project,
+    Config, ExportConfig, Registry, SessionIndex, SessionIndexCache, Settings, resolve_project,
 };
 
 use crate::export::{Exporter, OtlpSignal};
@@ -41,6 +41,11 @@ struct AppState {
     tracked: Arc<BTreeSet<String>>,
     counted: Arc<BTreeSet<String>>,
     cfg: Arc<Config>,
+    /// The configuration file this receiver read when it started, read again by a step that
+    /// deletes records ([`horizon`]), and the environment it resolves that file against: the
+    /// process's own, which a test replaces.
+    config_file: Option<PathBuf>,
+    env: fn(&str) -> Option<std::ffi::OsString>,
     /// The change-gated session→project map, shared by the live render, each flush, and (via the
     /// exporter) egress — re-folded only when the index files change, so a growing index is not
     /// re-parsed on every batch. Taken before `acc` wherever both are held.
@@ -199,6 +204,8 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         tracked: Arc::new(registry.tracked_metrics.clone()),
         counted: Arc::new(registry.counted_events.clone()),
         cfg: cfg.clone(),
+        config_file: Settings::path(),
+        env: |key| std::env::var_os(key),
         index_cache: Arc::new(Mutex::new(SessionIndexCache::new(cfg.state_dir.clone()))),
         costs: Arc::new(Mutex::new(Costs::load(&cfg.state_dir))),
         current_key,
@@ -654,13 +661,38 @@ fn sweep_due(now: i64, last: i64, every: i64) -> bool {
     now < last || now - last >= every
 }
 
-/// The retention sweep: the horizon (`retention_days`, default 90) applied to every record
-/// store at once — the ledger and the session index (`prune_ledger`), and the cost snapshot. A
-/// session last heard before the horizon leaves the snapshot and this receiver's memory together,
-/// so one heard again counts only what it reports from then on.
+/// The configuration a step that deletes records applies: the receiver's own, with the longer of
+/// its retention and the one `file` sets now. Raising `retention_days` therefore keeps records from
+/// the next sweep on, and through the stop of the restart that applies every other setting;
+/// lowering it waits for that restart, as every other setting does. `Err` when the file cannot be
+/// read now, since a horizon the file cannot confirm deletes nothing.
+fn horizon(
+    running: &Config,
+    file: Option<&Path>,
+    env: fn(&str) -> Option<std::ffi::OsString>,
+) -> hatel_core::Result<Config> {
+    let settings = file.map_or_else(|| Ok(Settings::default()), Settings::read)?;
+    let mut cfg = running.clone();
+    cfg.retention_days = cfg
+        .retention_days
+        .max(Config::from_settings_in(&settings, &env).retention_days);
+    Ok(cfg)
+}
+
+/// The retention sweep: the [`horizon`] applied to every record store at once — the ledger and the
+/// session index (`prune_ledger`), and the cost snapshot. A session last heard before the horizon
+/// leaves the snapshot and this receiver's memory together, so one heard again counts only what it
+/// reports from then on.
 fn sweep(st: &AppState) {
-    let retention = st.cfg.retention(hatel_core::now_epoch());
-    prune_ledger(&st.cfg, retention);
+    let cfg = match horizon(&st.cfg, st.config_file.as_deref(), st.env) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("hatel: retention sweep skipped, the configuration file cannot be read: {e}");
+            return;
+        }
+    };
+    let retention = cfg.retention(hatel_core::now_epoch());
+    prune_ledger(&cfg, retention);
     let mut costs = lock(&st.costs);
     let Costs { snapshot, baseline } = &mut *costs;
     let checkpoint = snapshot.checkpoint(retention.cutoff);
@@ -709,8 +741,12 @@ fn prune_ledger(cfg: &Config, retention: Retention) {
 fn flush_on_stop(st: &AppState) {
     persist_cost(st);
     renew_index(st);
-    let cutoff = st.cfg.retention(hatel_core::now_epoch()).cutoff;
-    let checkpoint = lock(&st.costs).snapshot.checkpoint(cutoff);
+    // A file that cannot be read now leaves the rows past the horizon to the next sweep.
+    let retain_since = horizon(&st.cfg, st.config_file.as_deref(), st.env)
+        .map_or(i64::MIN, |cfg| {
+            cfg.retention(hatel_core::now_epoch()).cutoff
+        });
+    let checkpoint = lock(&st.costs).snapshot.checkpoint(retain_since);
     note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
 }
 
@@ -833,6 +869,8 @@ mod tests {
         };
         let registry = Arc::new(build_registry(&cfg).unwrap());
         AppState {
+            config_file: Some(dir.join("config.toml")),
+            env: |_| None,
             acc: Arc::new(Mutex::new(Accumulator::default())),
             tracked: Arc::new(registry.tracked_metrics.clone()),
             counted: Arc::new(registry.counted_events.clone()),
@@ -1151,6 +1189,69 @@ mod tests {
         let rows = cost::read_snapshot(&dir);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 510);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_horizon_is_the_longer_of_the_running_retention_and_the_files_now() {
+        let dir = scratch("horizon");
+        let running = test_state(&dir).cfg;
+        let file = dir.join("config.toml");
+        let days = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            horizon(&running, Some(&file), |_| None).map(|cfg| cfg.retention_days)
+        };
+        assert_eq!(days("[storage]\nretention_days = 365\n").unwrap(), 365);
+        assert_eq!(
+            days("[storage]\nretention_days = 30\n").unwrap(),
+            90,
+            "a shorter retention waits for the restart"
+        );
+        assert!(days("[storage\n").is_err());
+        std::fs::write(
+            &file,
+            "[storage]\nstate_dir = \"/elsewhere\"\nretention_days = 365\n",
+        )
+        .unwrap();
+        let moved = horizon(&running, Some(&file), |_| None).unwrap();
+        assert_eq!(
+            moved.state_dir, running.state_dir,
+            "the store stays the receiver's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sweep_or_a_stop_deletes_nothing_the_file_now_keeps_or_cannot_say() {
+        let dir = scratch("keeps");
+        let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
+        cost::Snapshot::load(&dir)
+            .record([CostRow {
+                session_id: "S1".into(),
+                tokens: 500,
+                ts: long_ago.to_string(),
+                ..CostRow::default()
+            }])
+            .unwrap();
+        let st = test_state(&dir);
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "[storage]\nretention_days = 365\n").unwrap();
+        sweep(&st);
+        assert_eq!(cost::read_snapshot(&dir).len(), 1, "the file keeps a year");
+        std::fs::write(&config, "[storage\n").unwrap();
+        sweep(&st);
+        flush_on_stop(&st);
+        assert_eq!(
+            cost::read_snapshot(&dir).len(),
+            1,
+            "a file that cannot be read deletes nothing"
+        );
+        std::fs::remove_file(&config).unwrap();
+        sweep(&st);
+        assert!(
+            cost::read_snapshot(&dir).is_empty(),
+            "the running 90 days apply once the file keeps no longer"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

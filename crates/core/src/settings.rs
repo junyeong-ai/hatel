@@ -143,19 +143,21 @@ impl Settings {
             .map(|s| s.config_dir().join("hatel").join("config.toml"))
     }
 
-    /// Read and parse the file. A missing file yields the default; a present-but-broken one is a
-    /// hard error, so a misconfiguration fails fast rather than silently dropping a section the
-    /// operator wrote.
+    /// Read and parse the file at [`Settings::path`]. A missing file yields the default; a
+    /// present-but-broken one is a hard error, so a misconfiguration fails fast rather than silently
+    /// dropping a section the operator wrote.
     pub fn load() -> Result<Settings> {
-        let Some(path) = Self::path() else {
-            return Ok(Settings::default());
-        };
-        let text = match std::fs::read_to_string(&path) {
+        Self::path().map_or_else(|| Ok(Settings::default()), |path| Self::read(&path))
+    }
+
+    /// Read and parse the file at `path`, as [`Settings::load`] does.
+    pub fn read(path: &Path) -> Result<Settings> {
+        let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
             Err(e) => return Err(Error::Io(format!("read config {}: {e}", path.display()))),
         };
-        Self::parse(&text, &path)
+        Self::parse(&text, path)
     }
 
     /// Parse configuration text as if it were read from `path`, which anchors any relative path

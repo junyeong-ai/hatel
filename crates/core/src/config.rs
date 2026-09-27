@@ -108,6 +108,15 @@ impl Config {
         Self::resolve(settings, &Env::process())
     }
 
+    /// Resolve against settings already read and the variables `lookup` answers for, in place of
+    /// this process's environment.
+    pub fn from_settings_in(
+        settings: &Settings,
+        lookup: &dyn Fn(&str) -> Option<OsString>,
+    ) -> Self {
+        Self::resolve(settings, &Env(lookup))
+    }
+
     /// A variable in `env` replaces the file's value, and the file's replaces the default.
     fn resolve(settings: &Settings, env: &Env) -> Self {
         let state_dir = env
