@@ -2,37 +2,32 @@
 //! sanitization, the JSONL sink, the session index, and windowed reads — all driven
 //! through explicit temp-dir configs so they run in parallel without shared state.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
 
 use hatel_core::registry::FieldMap;
 use hatel_core::schema::{build_registry, load_core};
 use hatel_core::{Config, Payload, SessionIndex, SinkKind, make_envelope, report};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A fresh directory. A process id recurs across runs, and a failed run leaves its directories
-/// behind, so one found under this name holds an earlier run's records and is cleared first.
-fn temp_dir() -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("ht-test-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A config over a fresh store, which is removed when this is dropped: use the config through
+/// this value, not a clone of it.
+struct TestConfig {
+    cfg: Config,
+    _dir: tempfile::TempDir,
 }
 
-fn test_config(plugins: Vec<PathBuf>) -> Config {
-    let dir = temp_dir();
-    Config {
-        sink: SinkKind::Jsonl,
-        ledger_dir: dir.join("ledger"),
-        state_dir: dir,
-        plugins,
-        plugin_source: hatel_core::config::PluginSource::ConfigFile,
-        rotate_bytes: 10 * 1024 * 1024,
-        retention_days: 90,
-        disabled: false,
-        strict: true,
+impl std::ops::Deref for TestConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.cfg
+    }
+}
+
+fn test_config(plugins: Vec<PathBuf>) -> TestConfig {
+    let dir = tempfile::tempdir().unwrap();
+    TestConfig {
+        cfg: config_in(dir.path(), plugins),
+        _dir: dir,
     }
 }
 
@@ -54,11 +49,11 @@ fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
 }
 
 /// A config rooted at an explicit dir, so a test can write a plugin file into it.
-fn config_in(dir: PathBuf, plugins: Vec<PathBuf>) -> Config {
+fn config_in(dir: &Path, plugins: Vec<PathBuf>) -> Config {
     Config {
         sink: SinkKind::Jsonl,
         ledger_dir: dir.join("ledger"),
-        state_dir: dir,
+        state_dir: dir.to_path_buf(),
         plugins,
         plugin_source: hatel_core::config::PluginSource::ConfigFile,
         rotate_bytes: 10 * 1024 * 1024,
@@ -156,15 +151,15 @@ fn bound_events_surfaces_an_out_of_vocabulary_binding() {
     // Core accepts a binding to any event string (it doesn't own the wiring vocabulary); the
     // registry surfaces every bound event so the CLI can flag one it can't wire, rather than let
     // a binding to e.g. `PreToolUse` load cleanly and then silently never fire.
-    let dir = temp_dir();
-    let plugin = dir.join("oov.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("oov.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname = \"team.pre\"\nfields = [\"session_id\"]\ngroup_key = \"session_id\"\n\
          [[binding]]\nevent = \"PreToolUse\"\nkind = \"team.pre\"\nmap.session_id = { from = \"session_id\" }\n",
     )
     .unwrap();
-    let reg = build_registry(&config_in(dir, vec![plugin])).unwrap();
+    let reg = build_registry(&config_in(dir.path(), vec![plugin])).unwrap();
     let bound: Vec<&str> = reg.bound_events().collect();
     assert!(
         bound.contains(&"PreToolUse"),
@@ -227,7 +222,8 @@ fn prompt_stores_length_not_text() {
 fn session_start_is_recorded_in_the_index() {
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
-    let repo = temp_dir().join("myproj");
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("myproj");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let mut event = serde_json::json!({
         "hook_event_name": "SessionStart",
@@ -251,8 +247,8 @@ fn an_unattributable_session_start_is_recorded_without_a_project() {
     // is the only kind worth holding an egress batch back for.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
-    let outside = temp_dir();
-    for (session_id, cwd) in [("S4", ""), ("S5", outside.to_str().unwrap())] {
+    let outside = tempfile::tempdir().unwrap();
+    for (session_id, cwd) in [("S4", ""), ("S5", outside.path().to_str().unwrap())] {
         let mut event = serde_json::json!({
             "hook_event_name": "SessionStart",
             "session_id": session_id, "cwd": cwd
@@ -283,10 +279,10 @@ fn an_unattributable_session_records_the_empty_project_label() {
     // the record naming the directory the work happened to run in.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
-    let outside = temp_dir();
+    let outside = tempfile::tempdir().unwrap();
     let mut event = serde_json::json!({
         "hook_event_name": "UserPromptSubmit",
-        "session_id": "S6", "cwd": outside.to_str().unwrap(), "prompt": "hello"
+        "session_id": "S6", "cwd": outside.path().to_str().unwrap(), "prompt": "hello"
     });
     hatel_core::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
@@ -349,8 +345,8 @@ fn compaction_records_trigger_with_either_field_name() {
 
 #[test]
 fn git_branch_is_injected_only_when_a_binding_uses_it() {
-    let dir = temp_dir();
-    let plugin = dir.join("branch.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("branch.toml");
     std::fs::write(
         &plugin,
         r#"
@@ -366,7 +362,7 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
 "#,
     )
     .unwrap();
-    let repo = dir.join("repo");
+    let repo = dir.path().join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::write(
         repo.join(".git").join("HEAD"),
@@ -375,8 +371,8 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
     .unwrap();
     let cfg = Config {
         sink: SinkKind::Jsonl,
-        ledger_dir: dir.join("ledger"),
-        state_dir: dir.clone(),
+        ledger_dir: dir.path().join("ledger"),
+        state_dir: dir.path().to_path_buf(),
         plugins: vec![plugin],
         plugin_source: hatel_core::config::PluginSource::ConfigFile,
         rotate_bytes: 10 * 1024 * 1024,
@@ -652,10 +648,10 @@ fn retention_never_deletes_an_active_ledger_for_a_dotted_kind_name() {
 
 #[test]
 fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
-    let dir = temp_dir();
+    let dir = tempfile::tempdir().unwrap();
     let cfg = Config {
         sink: SinkKind::Sqlite,
-        ..config_in(dir.clone(), vec![])
+        ..config_in(dir.path(), vec![])
     };
     // A current row through the real write path…
     let reg = load_core().unwrap();
@@ -667,7 +663,7 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
     sink.flush();
     // …and an ancient row inserted directly.
     {
-        let conn = rusqlite::Connection::open(dir.join("telemetry.db")).unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
         conn.execute(
             "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1,'tool',1,'{}')",
             ["2000-01-01T00:00:00Z"],
@@ -722,14 +718,14 @@ fn an_undeclared_kind_says_when_retention_removes_it() {
     }
     assert_eq!(expires_by(&cfg), removed_by);
 
-    let dir = temp_dir();
+    let dir = tempfile::tempdir().unwrap();
     let cfg = Config {
         sink: SinkKind::Sqlite,
-        ..config_in(dir.clone(), vec![])
+        ..config_in(dir.path(), vec![])
     };
     let mut sink = hatel_core::build_sink(&cfg);
     sink.flush();
-    let conn = rusqlite::Connection::open(dir.join("telemetry.db")).unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
     for (kind, ts) in [
         ("retired", "2026-01-01T00:00:00Z"),
         ("retired", "2026-03-01T00:00:00Z"),
@@ -895,15 +891,15 @@ fn compaction_writes_one_record_per_compaction() {
 
 #[test]
 fn binding_writing_a_non_allowlisted_field_is_rejected_at_build() {
-    let dir = temp_dir();
-    let plugin = dir.join("bad.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.typo={ from=\"session_id\" }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(
         format!("{err}").contains("not in the kind's fields"),
         "got: {err}"
@@ -912,8 +908,8 @@ fn binding_writing_a_non_allowlisted_field_is_rejected_at_build() {
 
 #[test]
 fn invalid_capture_regex_is_rejected_at_build() {
-    let dir = temp_dir();
-    let plugin = dir.join("bad.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
@@ -921,7 +917,7 @@ fn invalid_capture_regex_is_rejected_at_build() {
          map.spec={ from=\"git_branch\", capture=\"([\" }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(
         format!("{err}").contains("invalid capture regex"),
         "got: {err}"
@@ -930,14 +926,14 @@ fn invalid_capture_regex_is_rejected_at_build() {
 
 #[test]
 fn unsafe_kind_name_is_rejected() {
-    let dir = temp_dir();
-    let plugin = dir.join("bad.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"../escape\"\nfields=[\"a\"]\ngroup_key=\"a\"\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(format!("{err}").contains("[A-Za-z0-9._-]"), "got: {err}");
 }
 
@@ -1016,15 +1012,15 @@ fn report_filters_by_project() {
 
 #[test]
 fn binding_mapping_project_is_rejected() {
-    let dir = temp_dir();
-    let plugin = dir.join("p.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"project\"]\ngroup_key=\"session_id\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.project={ from=\"session_id\" }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(
         format!("{err}").contains("may not map 'project'"),
         "got: {err}"
@@ -1033,8 +1029,8 @@ fn binding_mapping_project_is_rejected() {
 
 #[test]
 fn field_map_with_two_transforms_is_rejected() {
-    let dir = temp_dir();
-    let plugin = dir.join("p.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"n\"]\ngroup_key=\"session_id\"\n\
@@ -1042,14 +1038,14 @@ fn field_map_with_two_transforms_is_rejected() {
          map.session_id={ from=\"session_id\" }\nmap.n={ from=\"p\", len=true, basename=true }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(format!("{err}").contains("at most one"), "got: {err}");
 }
 
 #[test]
 fn field_map_transform_without_source_is_rejected() {
-    let dir = temp_dir();
-    let plugin = dir.join("p.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"n\"]\ngroup_key=\"session_id\"\n\
@@ -1057,14 +1053,14 @@ fn field_map_transform_without_source_is_rejected() {
          map.session_id={ from=\"session_id\" }\nmap.n={ len=true }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(format!("{err}").contains("non-empty `from`"), "got: {err}");
 }
 
 #[test]
 fn capture_regex_without_a_group_is_rejected() {
-    let dir = temp_dir();
-    let plugin = dir.join("p.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
@@ -1072,7 +1068,7 @@ fn capture_regex_without_a_group_is_rejected() {
          map.spec={ from=\"git_branch\", capture=\"spec/.+\" }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(format!("{err}").contains("needs a group"), "got: {err}");
 }
 
@@ -1105,8 +1101,8 @@ fn measures_reject_non_finite_values() {
 #[test]
 fn duplicate_event_kind_binding_is_rejected() {
     // Two bindings for the same (event, kind) would write two records per fire.
-    let dir = temp_dir();
-    let plugin = dir.join("p.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
         "[[kind]]\nname=\"x\"\nfields=[\"session_id\"]\ngroup_key=\"session_id\"\n\
@@ -1114,7 +1110,7 @@ fn duplicate_event_kind_binding_is_rejected() {
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.session_id={ from=\"session_id\" }\n",
     )
     .unwrap();
-    let err = build_registry(&config_in(dir, vec![plugin])).unwrap_err();
+    let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
     assert!(
         format!("{err}").contains("already has a binding for kind"),
         "got: {err}"
@@ -1124,11 +1120,11 @@ fn duplicate_event_kind_binding_is_rejected() {
 #[test]
 fn sqlite_window_filter_excludes_old_records() {
     // The SQLite reader pushes the time window into SQL; an out-of-window row is excluded.
-    let dir = temp_dir();
-    let db = dir.join("telemetry.db");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("telemetry.db");
     let cfg = Config {
         sink: SinkKind::Sqlite,
-        ..config_in(dir, vec![])
+        ..config_in(dir.path(), vec![])
     };
     let reg = load_core().unwrap();
     // recent record via the real write path
@@ -1160,11 +1156,11 @@ fn sqlite_window_filter_excludes_old_records() {
 fn sqlite_window_keeps_records_in_the_cutoff_second() {
     // A stored ts carries a fraction (`...:20.5Z`); a whole-second cutoff in the SAME
     // second must NOT drop it (the SQL pre-filter must be a safe superset).
-    let dir = temp_dir();
-    let db = dir.join("telemetry.db");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("telemetry.db");
     let cfg = Config {
         sink: SinkKind::Sqlite,
-        ..config_in(dir, vec![])
+        ..config_in(dir.path(), vec![])
     };
     let reg = load_core().unwrap();
     let mut event = serde_json::json!({
@@ -1187,10 +1183,10 @@ fn sqlite_window_keeps_records_in_the_cutoff_second() {
 fn sqlite_sink_round_trips_through_report() {
     // The storage abstraction is honest: a report reads the SQLite sink exactly as it
     // does JSONL, so the SQLite backend is fully usable (not write-only).
-    let dir = temp_dir();
+    let dir = tempfile::tempdir().unwrap();
     let cfg = Config {
         sink: SinkKind::Sqlite,
-        ..config_in(dir, vec![])
+        ..config_in(dir.path(), vec![])
     };
     let reg = load_core().unwrap();
     let mut event = serde_json::json!({
@@ -1231,9 +1227,10 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
             .to_string()
     };
     for sink in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let dir = tempfile::tempdir().unwrap();
         let cfg = Config {
             sink,
-            ..config_in(temp_dir(), vec![])
+            ..config_in(dir.path(), vec![])
         };
         let section = |cfg: &Config, project: Option<&str>| {
             report::Report::build(&reg, cfg, "30d", &query(0, 0, project))
@@ -1394,7 +1391,7 @@ fn a_report_names_the_stored_kinds_no_loaded_schema_declares() {
 
     // Loading the plugin that declares it closes the gap — the report is then answering over
     // everything the store holds, which is the state the message asks the operator to reach.
-    let with_plugin = config_in(cfg.state_dir.clone(), vec![example_plugin()]);
+    let with_plugin = config_in(&cfg.state_dir, vec![example_plugin()]);
     let reg = build_registry(&with_plugin).unwrap();
     assert!(build(&with_plugin, &reg).unreadable_kinds.is_none());
 }
@@ -1561,8 +1558,8 @@ fn both_backends_represent_an_entity_by_its_earliest_record() {
     // its older archives, so a rotation puts the newest record first. The two backends are compared
     // against one another, with a rotation forced between the records, so an answer that depends on
     // storage layout cannot pass.
-    let dir = temp_dir();
-    let plugin = dir.join("ordered.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("ordered.toml");
     std::fs::write(
         &plugin,
         r#"
@@ -1583,7 +1580,8 @@ measures = ["ms"]
         ("j1", "build", 99.0),
     ];
     let answer = |sink: SinkKind| {
-        let mut cfg = config_in(temp_dir(), vec![plugin.clone()]);
+        let store = tempfile::tempdir().unwrap();
+        let mut cfg = config_in(store.path(), vec![plugin.clone()]);
         cfg.sink = sink;
         // One record per file, so the active file holds the newest and the archives the older.
         cfg.rotate_bytes = 1;
@@ -1809,7 +1807,8 @@ fn memory_files_are_told_apart_by_their_path_in_the_repository() {
     // the root file with each nested one and says nothing about which rule was loaded.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
-    let repo = temp_dir().join("acme");
+    let base = tempfile::tempdir().unwrap();
+    let repo = base.path().join("acme");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let cwd = repo.join("crates/api");
     std::fs::create_dir_all(&cwd).unwrap();

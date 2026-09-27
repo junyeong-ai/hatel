@@ -38,6 +38,8 @@ bytes = "1"
 # `flock` for the receiver's single-writer lock on the state dir — the OS releases it on exit
 # (even a crash), so a second receiver over the same state dir is refused, not silently racing.
 libc = "0.2"
+# Test scratch directories, removed when their owner drops, whether the test passes or panics.
+tempfile = "3.27"
 
 # The hook binary is spawned on every lifecycle event; a fat, single-codegen-unit,
 # abort-on-panic, stripped build minimises both size and cold-start.

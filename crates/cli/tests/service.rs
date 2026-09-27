@@ -13,16 +13,13 @@ mod unreachable_manager {
     }
 
     /// A home holding `config`, and where the receiver's unit would be.
-    fn home(tag: &str, config: &str) -> (PathBuf, PathBuf) {
-        let home =
-            std::env::temp_dir().join(format!("ht-cli-service-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::write(home.join("config.toml"), config).unwrap();
+    fn home(config: &str) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
         let unit = if cfg!(target_os = "macos") {
-            home.join("Library/LaunchAgents/dev.hatel.plist")
+            home.path().join("Library/LaunchAgents/dev.hatel.plist")
         } else {
-            home.join(".config/systemd/user/hatel.service")
+            home.path().join(".config/systemd/user/hatel.service")
         };
         (home, unit)
     }
@@ -112,36 +109,34 @@ mod unreachable_manager {
 
     #[test]
     fn a_restart_brings_a_unit_an_earlier_release_wrote_up_to_this_builds() {
-        let (home, unit) = home("upgrade", "");
+        let (home, unit) = home("");
         install_earlier(&unit);
-        let out = service(&home, &["--restart"]);
+        let out = service(home.path(), &["--restart"]);
         assert!(
             out.status.success(),
             "stderr: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let print = service(&home, &["--print"]);
+        let print = service(home.path(), &["--print"]);
         assert_eq!(
             std::fs::read_to_string(&unit).unwrap(),
             String::from_utf8(print.stdout).unwrap()
         );
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn a_restart_into_a_configuration_the_receiver_rejects_changes_nothing() {
-        let (home, unit) = home("restart", "pluginz = []\n");
+        let (home, unit) = home("pluginz = []\n");
         let earlier = install_earlier(&unit);
-        refused(&service(&home, &["--restart"]));
+        refused(&service(home.path(), &["--restart"]));
         assert_eq!(std::fs::read_to_string(&unit).unwrap(), earlier);
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn a_restart_keeps_a_unit_for_another_binary() {
-        let (home, unit) = home("elsewhere", "");
+        let (home, unit) = home("");
         let elsewhere = install(&unit, earlier_unit(Path::new("/elsewhere/hatel")));
-        let out = service(&home, &["--restart"]);
+        let out = service(home.path(), &["--restart"]);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "stdout: {stdout}");
         assert!(
@@ -153,28 +148,26 @@ mod unreachable_manager {
             "a stopped unit is started as it is, not repointed: {stdout}"
         );
         assert_eq!(std::fs::read_to_string(&unit).unwrap(), elsewhere);
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn an_install_points_a_unit_for_another_binary_at_this_one() {
-        let (home, unit) = home("repoint", "");
+        let (home, unit) = home("");
         install(&unit, earlier_unit(Path::new("/elsewhere/hatel")));
         // The unit is written before the manager is asked to load it, which fails here.
-        service(&home, &[]);
-        let print = service(&home, &["--print"]);
+        service(home.path(), &[]);
+        let print = service(home.path(), &["--print"]);
         assert_eq!(
             std::fs::read_to_string(&unit).unwrap(),
             String::from_utf8(print.stdout).unwrap()
         );
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn an_install_keeps_a_unit_edited_by_hand() {
-        let (home, unit) = home("edited", "");
+        let (home, unit) = home("");
         let edited = install(&unit, edited(&earlier_unit(&exe())));
-        let out = service(&home, &[]);
+        let out = service(home.path(), &[]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!out.status.success(), "stderr: {stderr}");
@@ -187,14 +180,12 @@ mod unreachable_manager {
             "the kept unit is restarted, which finds it stopped here: {stdout}"
         );
         assert_eq!(std::fs::read_to_string(&unit).unwrap(), edited);
-        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
     fn an_install_with_a_configuration_the_receiver_rejects_writes_no_unit() {
-        let (home, unit) = home("install", "pluginz = []\n");
-        refused(&service(&home, &[]));
+        let (home, unit) = home("pluginz = []\n");
+        refused(&service(home.path(), &[]));
         assert!(!unit.exists());
-        std::fs::remove_dir_all(&home).ok();
     }
 }

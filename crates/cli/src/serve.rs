@@ -891,7 +891,7 @@ fn persist_cost(st: &AppState) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::*;
 
@@ -932,11 +932,11 @@ mod tests {
     fn the_announced_scope_is_the_one_applied() {
         // Whatever combination the flags and the current directory produce, the banner claims a
         // wide scope exactly when the filter admits a project it knows nothing about.
-        let dir = scratch("scope");
+        let dir = tempfile::tempdir().unwrap();
         for show_all in [false, true] {
             for project_filter in [None, Some("acme".to_string())] {
                 for current_key in [None, Some("/k/acme".to_string())] {
-                    let mut st = test_state(&dir);
+                    let mut st = test_state(dir.path());
                     st.show_all = show_all;
                     st.project_filter = project_filter.clone();
                     st.current_key = current_key.clone();
@@ -948,22 +948,14 @@ mod tests {
                 }
             }
         }
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ht-serve-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
     fn persist_cost_merges_dimensional_baselines_across_restart() {
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("dims");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         // A session persisted by the previous receiver run: 100 tokens (90 cacheRead /
         // 10 input), all on opus.
         let base_row = CostRow {
@@ -1049,7 +1041,6 @@ mod tests {
             }),
             "agentless series are recorded as such, never guessed"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1058,8 +1049,8 @@ mod tests {
         // `quiet`. The flush renews what it heard, so the sweep after it expires only `quiet`.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("renew");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         let now = jiff::Timestamp::now();
         let started = now - jiff::SignedDuration::from_hours(24 * 100);
         let line = |sid: &str| {
@@ -1067,7 +1058,7 @@ mod tests {
                 "{{\"session_id\":\"{sid}\",\"project_key\":\"/k/{sid}\",\"project_label\":\"{sid}\",\"ts\":\"{started}\"}}\n"
             )
         };
-        let archive = dir.join("session_index.jsonl.20260101.1");
+        let archive = dir.path().join("session_index.jsonl.20260101.1");
         std::fs::write(&archive, [line("live"), line("quiet")].concat()).unwrap();
         std::fs::File::options()
             .write(true)
@@ -1089,14 +1080,13 @@ mod tests {
         );
         renew_index(&st);
         sweep(&st);
-        let map = SessionIndex::new(dir.clone()).load();
+        let map = SessionIndex::new(dir.path().to_path_buf()).load();
         assert!(!archive.exists(), "the expired starts are gone");
         assert_eq!(
             map.get("live").map(|r| r.project_label.as_str()),
             Some("live")
         );
         assert!(!map.contains_key("quiet"), "a quiet session expires");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1115,9 +1105,9 @@ mod tests {
         // while its cost row is still retained; `moved` resumes outside any repository.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("keep-project");
-        let st = test_state(&dir);
-        let index = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let index = SessionIndex::new(dir.path().to_path_buf());
         let a = hatel_core::ProjectRef {
             key: "/k/a".into(),
             label: "a".into(),
@@ -1133,18 +1123,17 @@ mod tests {
         };
         lock(&st.acc).update_metrics(vec![heard("kept"), heard("moved")], jiff::Timestamp::now());
         persist_cost(&st);
-        std::fs::remove_file(dir.join("session_index.jsonl")).unwrap();
+        std::fs::remove_file(dir.path().join("session_index.jsonl")).unwrap();
         index.record("moved", None, 1 << 20);
         persist_cost(&st);
         let project = |sid: &str| {
-            cost::read_snapshot(&dir)
+            cost::read_snapshot(dir.path())
                 .into_iter()
                 .find(|r| r.session_id == sid)
                 .map(|r| r.project)
         };
         assert_eq!(project("kept").as_deref(), Some("a"));
         assert_eq!(project("moved").as_deref(), Some(""));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1154,9 +1143,9 @@ mod tests {
         // earlier total comes back from the baseline, from this run's memory, or from disk.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("forget");
+        let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
-        let mut earlier = cost::Snapshot::load(&dir);
+        let mut earlier = cost::Snapshot::load(dir.path());
         earlier
             .record([CostRow {
                 session_id: "S1".into(),
@@ -1165,7 +1154,7 @@ mod tests {
                 ..CostRow::default()
             }])
             .unwrap();
-        let st = test_state(&dir);
+        let st = test_state(dir.path());
         let tokens = |value: f64, at: jiff::Timestamp| {
             lock(&st.acc).update_metrics(
                 vec![MetricPoint {
@@ -1181,15 +1170,14 @@ mod tests {
         tokens(10.0, long_ago);
         sweep(&st);
         assert!(
-            cost::read_snapshot(&dir).is_empty(),
+            cost::read_snapshot(dir.path()).is_empty(),
             "the expired row is gone"
         );
         tokens(7.0, jiff::Timestamp::now());
         persist_cost(&st);
-        let rows = cost::read_snapshot(&dir);
+        let rows = cost::read_snapshot(dir.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 7);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1199,9 +1187,9 @@ mod tests {
         // before this receiver started.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("baseline-lives");
+        let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
-        let mut earlier = cost::Snapshot::load(&dir);
+        let mut earlier = cost::Snapshot::load(dir.path());
         earlier
             .record([CostRow {
                 session_id: "S1".into(),
@@ -1210,7 +1198,7 @@ mod tests {
                 ..CostRow::default()
             }])
             .unwrap();
-        let st = test_state(&dir);
+        let st = test_state(dir.path());
         let tokens = |value: f64| {
             lock(&st.acc).update_metrics(
                 vec![MetricPoint {
@@ -1227,17 +1215,16 @@ mod tests {
         tokens(7.0);
         sweep(&st);
         tokens(3.0);
-        let rows = cost::read_snapshot(&dir);
+        let rows = cost::read_snapshot(dir.path());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 510);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_horizon_is_the_longer_of_the_running_retention_and_the_files_now() {
-        let dir = scratch("horizon");
-        let running = test_state(&dir).cfg;
-        let file = dir.join("config.toml");
+        let dir = tempfile::tempdir().unwrap();
+        let running = test_state(dir.path()).cfg;
+        let file = dir.path().join("config.toml");
         let days = |text: &str| {
             std::fs::write(&file, text).unwrap();
             horizon(&running, Some(&file), |_| None).map(|cfg| cfg.retention_days)
@@ -1259,14 +1246,13 @@ mod tests {
             moved.state_dir, running.state_dir,
             "the store stays the receiver's"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_sweep_or_a_stop_deletes_nothing_the_file_now_keeps_or_cannot_say() {
-        let dir = scratch("keeps");
+        let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
-        cost::Snapshot::load(&dir)
+        cost::Snapshot::load(dir.path())
             .record([CostRow {
                 session_id: "S1".into(),
                 tokens: 500,
@@ -1274,34 +1260,37 @@ mod tests {
                 ..CostRow::default()
             }])
             .unwrap();
-        let st = test_state(&dir);
-        let config = dir.join("config.toml");
+        let st = test_state(dir.path());
+        let config = dir.path().join("config.toml");
         std::fs::write(&config, "[storage]\nretention_days = 365\n").unwrap();
         sweep(&st);
-        assert_eq!(cost::read_snapshot(&dir).len(), 1, "the file keeps a year");
+        assert_eq!(
+            cost::read_snapshot(dir.path()).len(),
+            1,
+            "the file keeps a year"
+        );
         std::fs::write(&config, "[storage\n").unwrap();
         sweep(&st);
         flush_on_stop(&st);
         assert_eq!(
-            cost::read_snapshot(&dir).len(),
+            cost::read_snapshot(dir.path()).len(),
             1,
             "a file that cannot be read deletes nothing"
         );
         std::fs::remove_file(&config).unwrap();
         sweep(&st);
         assert!(
-            cost::read_snapshot(&dir).is_empty(),
+            cost::read_snapshot(dir.path()).is_empty(),
             "the running 90 days apply once the file keeps no longer"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_stopped_receiver_leaves_every_row_in_the_snapshot_file() {
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("stop");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
                 name: "token.usage".into(),
@@ -1313,15 +1302,14 @@ mod tests {
             jiff::Timestamp::now(),
         );
         flush_on_stop(&st);
-        assert!(!dir.join("cost_changes.jsonl").exists());
-        let snapshot = std::fs::read_to_string(dir.join("cost_snapshot.jsonl")).unwrap();
+        assert!(!dir.path().join("cost_changes.jsonl").exists());
+        let snapshot = std::fs::read_to_string(dir.path().join("cost_snapshot.jsonl")).unwrap();
         let rows: Vec<CostRow> = snapshot
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].session_id.as_str(), rows[0].tokens), ("S1", 7));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1329,10 +1317,10 @@ mod tests {
         // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("unwritable");
-        let changes = dir.join("cost_changes.jsonl");
+        let dir = tempfile::tempdir().unwrap();
+        let changes = dir.path().join("cost_changes.jsonl");
         std::fs::create_dir_all(changes.join("blocker")).unwrap();
-        let st = test_state(&dir);
+        let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
                 name: "cost.usage".into(),
@@ -1349,13 +1337,12 @@ mod tests {
         std::fs::remove_dir_all(&changes).unwrap();
         persist_cost(&st);
         assert!(changes.is_file());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_stopping_receiver_reports_every_tally_its_throttles_hold_back() {
-        let dir = scratch("tallies");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         let now = Instant::now();
         let throttles = [
             &st.undecodable.metrics,
@@ -1371,15 +1358,14 @@ mod tests {
         for t in throttles {
             assert_eq!(t.tally(Tally::Stopping), None, "already reported");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_flush_in_which_no_session_changed_writes_nothing() {
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("quiet-flush");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
                 name: "cost.usage".into(),
@@ -1391,11 +1377,10 @@ mod tests {
             jiff::Timestamp::now(),
         );
         persist_cost(&st);
-        let changes = dir.join("cost_changes.jsonl");
+        let changes = dir.path().join("cost_changes.jsonl");
         std::fs::remove_file(&changes).unwrap();
         persist_cost(&st);
         assert!(!changes.exists());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1404,8 +1389,8 @@ mod tests {
         // session silent for weeks would sit inside every report window and never expire.
         use crate::otlp::decode::MetricPoint;
 
-        let dir = scratch("last-seen");
-        let st = test_state(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
         let heard = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 5);
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
@@ -1422,6 +1407,5 @@ mod tests {
         let rows = cost::read_snapshot(&st.cfg.state_dir);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, heard.to_string());
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

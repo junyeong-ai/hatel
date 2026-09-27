@@ -1255,20 +1255,11 @@ mod tests {
     #[cfg(unix)]
     fn probe_script(body: &str, deadline: std::time::Duration) -> HookBuild {
         use std::os::unix::fs::PermissionsExt;
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "ht-probe-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(HOOK_BIN);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(HOOK_BIN);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let build = probe_hook_build(path.to_str().unwrap(), deadline);
-        std::fs::remove_dir_all(&dir).ok();
-        build
+        probe_hook_build(path.to_str().unwrap(), deadline)
     }
 
     #[cfg(unix)]

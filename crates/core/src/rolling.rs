@@ -321,20 +321,6 @@ fn date_stamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static N: AtomicU32 = AtomicU32::new(0);
-
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ht-rolling-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     /// Read raw lines back (identity parse) — the shape the rotation/prune assertions check.
     fn lines(dir: &Path, base: &str) -> Vec<String> {
@@ -348,31 +334,29 @@ mod tests {
 
     #[test]
     fn append_then_read_round_trips_in_order() {
-        let dir = scratch();
-        append(&dir, "log.jsonl", "a", 1 << 20).unwrap();
-        append(&dir, "log.jsonl", "b", 1 << 20).unwrap();
-        assert_eq!(lines(&dir, "log.jsonl"), vec!["a", "b"]);
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), "log.jsonl", "a", 1 << 20).unwrap();
+        append(dir.path(), "log.jsonl", "b", 1 << 20).unwrap();
+        assert_eq!(lines(dir.path(), "log.jsonl"), vec!["a", "b"]);
     }
 
     #[test]
     fn rotation_preserves_all_lines() {
-        let dir = scratch();
+        let dir = tempfile::tempdir().unwrap();
         // The first append creates the file; the second, with a tiny threshold, sees it
         // over-threshold, archives it, and writes `new` to a fresh active file. Both lines survive
         // the rotation — read order across files is unspecified, so compare as a set.
-        append(&dir, "log.jsonl", "old", 1 << 20).unwrap();
-        append(&dir, "log.jsonl", "new", 1).unwrap();
-        let mut got = lines(&dir, "log.jsonl");
+        append(dir.path(), "log.jsonl", "old", 1 << 20).unwrap();
+        append(dir.path(), "log.jsonl", "new", 1).unwrap();
+        let mut got = lines(dir.path(), "log.jsonl");
         got.sort();
         assert_eq!(got, vec!["new", "old"]);
-        let archives = std::fs::read_dir(&dir)
+        let archives = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
             .filter(|e| is_archive_name(&e.file_name().to_string_lossy()))
             .count();
         assert_eq!(archives, 1, "exactly one archive after one rotation");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -380,10 +364,10 @@ mod tests {
         // Threads of one process share the pid in the archive name, so two rotating at once pick
         // the same target unless rotation is serialized, and the later rename replaces the earlier
         // archive. A one-byte threshold makes every append after the first rotate.
-        let dir = scratch();
+        let dir = tempfile::tempdir().unwrap();
         std::thread::scope(|s| {
             for t in 0..4 {
-                let dir = &dir;
+                let dir = dir.path();
                 s.spawn(move || {
                     for i in 0..100 {
                         append(dir, "log.jsonl", &format!("{t}-{i}"), 1).unwrap();
@@ -391,8 +375,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(lines(&dir, "log.jsonl").len(), 400);
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(lines(dir.path(), "log.jsonl").len(), 400);
     }
 
     #[test]
@@ -411,78 +394,87 @@ mod tests {
 
     #[test]
     fn prune_removes_old_archives_only() {
-        let dir = scratch();
+        let dir = tempfile::tempdir().unwrap();
         // Create the file, then two tiny-threshold appends each roll the active file into an
         // archive — two archives, the newest line in the active file.
-        append(&dir, "log.jsonl", "a", 1 << 20).unwrap();
-        append(&dir, "log.jsonl", "b", 1).unwrap();
-        append(&dir, "log.jsonl", "c", 1).unwrap();
-        let mut before = lines(&dir, "log.jsonl");
+        append(dir.path(), "log.jsonl", "a", 1 << 20).unwrap();
+        append(dir.path(), "log.jsonl", "b", 1).unwrap();
+        append(dir.path(), "log.jsonl", "c", 1).unwrap();
+        let mut before = lines(dir.path(), "log.jsonl");
         before.sort();
         assert_eq!(before, vec!["a", "b", "c"]);
-        let removed = prune_archives(&dir, i64::MAX); // cutoff in the far future → all archives old
+        let removed = prune_archives(dir.path(), i64::MAX); // cutoff in the far future → all archives old
         assert_eq!(removed, 2, "both archives pruned, active kept");
-        assert_eq!(lines(&dir, "log.jsonl"), vec!["c"], "active file survives");
-        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            lines(dir.path(), "log.jsonl"),
+            vec!["c"],
+            "active file survives"
+        );
     }
 
     #[test]
     fn the_sweep_archives_an_active_file_by_its_oldest_dated_line() {
         // Written just now, so only the first dated line can place the file; an undated line ahead
         // of it — one from before a timestamp existed, or a torn write — is passed over.
-        let dir = scratch();
+        let dir = tempfile::tempdir().unwrap();
         for line in ["undated", "100", "300"] {
-            append(&dir, "log.jsonl", line, 1 << 20).unwrap();
+            append(dir.path(), "log.jsonl", line, 1 << 20).unwrap();
         }
-        rotate_aged(&dir, "log.jsonl", 100, epoch);
-        assert!(dir.join("log.jsonl").exists(), "no line from before 100");
-        rotate_aged(&dir, "log.jsonl", 200, epoch);
+        rotate_aged(dir.path(), "log.jsonl", 100, epoch);
         assert!(
-            !dir.join("log.jsonl").exists(),
+            dir.path().join("log.jsonl").exists(),
+            "no line from before 100"
+        );
+        rotate_aged(dir.path(), "log.jsonl", 200, epoch);
+        assert!(
+            !dir.path().join("log.jsonl").exists(),
             "the line at 100 is before 200"
         );
-        let mut got = lines(&dir, "log.jsonl");
+        let mut got = lines(dir.path(), "log.jsonl");
         got.sort();
         assert_eq!(got, vec!["100", "300", "undated"], "rotation drops nothing");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn the_sweep_archives_an_active_file_last_written_before_the_cutoff() {
         // No line is dated, so only the last write can place the file, and it bounds every line.
-        let dir = scratch();
-        append(&dir, "log.jsonl", "undated", 1 << 20).unwrap();
-        rotate_aged(&dir, "log.jsonl", crate::now_epoch() - 60, epoch);
-        assert!(dir.join("log.jsonl").exists(), "written within the minute");
-        rotate_aged(&dir, "log.jsonl", crate::now_epoch() + 60, epoch);
-        assert!(!dir.join("log.jsonl").exists());
-        assert_eq!(lines(&dir, "log.jsonl"), vec!["undated"]);
-        std::fs::remove_dir_all(&dir).ok();
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), "log.jsonl", "undated", 1 << 20).unwrap();
+        rotate_aged(dir.path(), "log.jsonl", crate::now_epoch() - 60, epoch);
+        assert!(
+            dir.path().join("log.jsonl").exists(),
+            "written within the minute"
+        );
+        rotate_aged(dir.path(), "log.jsonl", crate::now_epoch() + 60, epoch);
+        assert!(!dir.path().join("log.jsonl").exists());
+        assert_eq!(lines(dir.path(), "log.jsonl"), vec!["undated"]);
     }
 
     #[test]
     fn a_line_that_is_not_utf8_hides_only_itself() {
         // A short write can cut a record inside a multibyte character, and the next append then
         // follows it on the same line or the next.
-        let dir = scratch();
-        std::fs::write(dir.join("log.jsonl"), b"\xed\x95100\n150\n\xed\x95\n300\n").unwrap();
-        assert_eq!(lines(&dir, "log.jsonl"), vec!["150", "300"]);
-        rotate_aged(&dir, "log.jsonl", 200, epoch);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("log.jsonl"),
+            b"\xed\x95100\n150\n\xed\x95\n300\n",
+        )
+        .unwrap();
+        assert_eq!(lines(dir.path(), "log.jsonl"), vec!["150", "300"]);
+        rotate_aged(dir.path(), "log.jsonl", 200, epoch);
         assert!(
-            !dir.join("log.jsonl").exists(),
+            !dir.path().join("log.jsonl").exists(),
             "the first readable dated line is 150"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn fingerprint_changes_on_append() {
-        let dir = scratch();
-        append(&dir, "log.jsonl", "a", 1 << 20).unwrap();
-        let f1 = fingerprint(&dir, "log.jsonl").unwrap();
-        append(&dir, "log.jsonl", "bb", 1 << 20).unwrap();
-        let f2 = fingerprint(&dir, "log.jsonl").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), "log.jsonl", "a", 1 << 20).unwrap();
+        let f1 = fingerprint(dir.path(), "log.jsonl").unwrap();
+        append(dir.path(), "log.jsonl", "bb", 1 << 20).unwrap();
+        let f2 = fingerprint(dir.path(), "log.jsonl").unwrap();
         assert_ne!(f1.1, f2.1, "total bytes grew, so the fingerprint changed");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

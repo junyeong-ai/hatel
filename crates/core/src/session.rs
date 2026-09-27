@@ -326,21 +326,9 @@ impl SessionIndexCache {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static N: AtomicU32 = AtomicU32::new(0);
-
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ht-sessidx-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn pref(label: &str) -> ProjectRef {
         ProjectRef {
@@ -370,11 +358,11 @@ mod tests {
 
     #[test]
     fn a_session_recorded_without_a_project_is_decided_but_not_attributable() {
-        let dir = scratch();
-        let idx = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         idx.record("S1", Some(&pref("alpha")), 1 << 20);
         idx.record("S2", None, 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
 
         assert_eq!(cache.project("S1"), Some(("alpha", "/k/alpha")));
@@ -391,46 +379,43 @@ mod tests {
         );
         assert!(!cache.contains("ghost"));
         assert!(!cache.is_unattributed("ghost"));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn record_then_load_folds_per_session() {
-        let dir = scratch();
-        let idx = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         idx.record("S1", Some(&pref("alpha")), 1 << 20);
         idx.record("S2", Some(&pref("beta")), 1 << 20);
         let map = idx.load();
         assert_eq!(map.get("S1").unwrap().project_label, "alpha");
         assert_eq!(map.get("S2").unwrap().project_key, "/k/beta");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn fold_keeps_the_latest_record_per_session_regardless_of_order() {
-        let dir = scratch();
-        let path = dir.join(INDEX_BASE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_BASE);
         let old = "{\"session_id\":\"S1\",\"project_key\":\"/k/old\",\"project_label\":\"old\",\"ts\":\"2026-01-01T00:00:00Z\"}\n";
         let new = "{\"session_id\":\"S1\",\"project_key\":\"/k/new\",\"project_label\":\"new\",\"ts\":\"2026-06-01T00:00:00Z\"}\n";
         // The later timestamp wins whichever line order the two records appear in — the fold does
         // not depend on file or read order.
         std::fs::write(&path, format!("{old}{new}")).unwrap();
-        let label = |dir: &PathBuf| {
-            SessionIndex::new(dir.clone())
+        let label = |dir: &Path| {
+            SessionIndex::new(dir.to_path_buf())
                 .load()
                 .get("S1")
                 .unwrap()
                 .project_label
                 .clone()
         };
-        assert_eq!(label(&dir), "new");
+        assert_eq!(label(dir.path()), "new");
         std::fs::write(&path, format!("{new}{old}")).unwrap();
         assert_eq!(
-            label(&dir),
+            label(dir.path()),
             "new",
             "order-independent: latest ts still wins"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -438,13 +423,13 @@ mod tests {
         // jiff prints variable precision: a whole second as `…:05Z`, a sub-second as `…:05.000001Z`.
         // Lexically `Z` (0x5A) > `.` (0x2E), so a naive string compare would pick the earlier
         // whole-second record; comparing parsed instants correctly picks the later sub-second one.
-        let dir = scratch();
-        let path = dir.join(INDEX_BASE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_BASE);
         let whole = "{\"session_id\":\"S1\",\"project_key\":\"/k/old\",\"project_label\":\"old\",\"ts\":\"2026-06-01T00:00:05Z\"}\n";
         let frac = "{\"session_id\":\"S1\",\"project_key\":\"/k/new\",\"project_label\":\"new\",\"ts\":\"2026-06-01T00:00:05.000001Z\"}\n";
         std::fs::write(&path, format!("{whole}{frac}")).unwrap();
         assert_eq!(
-            SessionIndex::new(dir.clone())
+            SessionIndex::new(dir.path().to_path_buf())
                 .load()
                 .get("S1")
                 .unwrap()
@@ -452,13 +437,12 @@ mod tests {
             "new",
             "the later sub-second instant wins, not the lexically-greater whole-second string"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn rotation_and_prune_bound_the_index_without_losing_the_active_session() {
-        let dir = scratch();
-        let idx = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         // A tiny rotate threshold rolls the active file into an archive before the second append.
         idx.record("S1", Some(&pref("alpha")), 1);
         idx.record("S2", Some(&pref("beta")), 1);
@@ -477,19 +461,18 @@ mod tests {
             after.contains_key("S2"),
             "the active session survives pruning"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn an_index_reaching_back_past_the_rotation_horizon_is_archived_and_still_attributes() {
         // A line from before `ts` existed carries no date, so the first dated line places the file.
-        let dir = scratch();
-        let path = dir.join(INDEX_BASE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_BASE);
         let legacy = "{\"session_id\":\"S0\",\"project_key\":\"/k/a\",\"project_label\":\"a\"}\n";
         let dated = "{\"session_id\":\"S1\",\"project_key\":\"/k/b\",\"project_label\":\"b\",\"ts\":\"2026-06-01T00:00:00Z\"}\n";
         std::fs::write(&path, format!("{legacy}{dated}")).unwrap();
         let first = crate::ts_epoch("2026-06-01T00:00:00Z").unwrap();
-        let idx = SessionIndex::new(dir.clone());
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         let at = |rotate_before| Retention {
             cutoff: i64::MIN,
             rotate_before,
@@ -507,7 +490,6 @@ mod tests {
         let map = idx.load();
         assert_eq!(map.get("S0").unwrap().project_label, "a");
         assert_eq!(map.get("S1").unwrap().project_label, "b");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -515,7 +497,7 @@ mod tests {
         // S1 (a project) and S2 (none) started a hundred days ago and are still live; S4 started as
         // long ago and went quiet; S5 as well, last heard twenty days ago by a receiver that slept
         // through the flush after it; S3 started today; `ghost` was never recorded.
-        let dir = scratch();
+        let dir = tempfile::tempdir().unwrap();
         let now = crate::now_epoch();
         let line = |sid: &str, project: &str, days: i64| {
             let ts = jiff::Timestamp::from_second(now - days * 86_400).unwrap();
@@ -528,7 +510,7 @@ mod tests {
                 "{{\"session_id\":\"{sid}\",\"project_key\":\"{key}\",\"project_label\":\"{project}\",\"ts\":\"{ts}\"}}\n"
             )
         };
-        let archive = dir.join(format!("{INDEX_BASE}.20260101.1"));
+        let archive = dir.path().join(format!("{INDEX_BASE}.20260101.1"));
         std::fs::write(
             &archive,
             [
@@ -546,13 +528,13 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - std::time::Duration::from_secs(100 * 86_400))
             .unwrap();
-        std::fs::write(dir.join(INDEX_BASE), line("S3", "c", 0)).unwrap();
-        let idx = SessionIndex::new(dir.clone());
+        std::fs::write(dir.path().join(INDEX_BASE), line("S3", "c", 0)).unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         let retention = Retention {
             cutoff: now - 90 * 86_400,
             rotate_before: now - 9 * 86_400,
         };
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         let heard = [
             ("S1", now),
@@ -591,17 +573,16 @@ mod tests {
         assert_eq!(map["S3"].project_label, "c");
         assert!(!map.contains_key("S4"), "a quiet session expires");
         assert!(!map.contains_key("S5"), "so does one heard only long ago");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_renewal_that_raced_a_new_start_does_not_undo_it() {
         // The receiver judged S1 due in project a; before its renewal landed, the session resumed
         // in project b.
-        let dir = scratch();
-        let idx = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         idx.record("S1", Some(&pref("a")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         let due = cache.due_renewal([("S1", crate::now_epoch() + 10)], 0);
         idx.record("S1", Some(&pref("b")), 1 << 20);
@@ -609,7 +590,6 @@ mod tests {
             idx.renew(sid, row, 1 << 20).unwrap();
         }
         assert_eq!(idx.load()["S1"].project_label, "b");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -617,15 +597,15 @@ mod tests {
         // The receiver renewed S1 in project a from what it had read, while the session resumed in
         // project b and that start landed first: the later renewal must not undo it. Once no start
         // is left, the newest renewal carries the attribution.
-        let dir = scratch();
-        let path = dir.join(INDEX_BASE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_BASE);
         let line = |project: &str, day: u8, renewal: bool| {
             let flag = if renewal { ",\"renewal\":true" } else { "" };
             format!(
                 "{{\"session_id\":\"S1\",\"project_key\":\"/k/{project}\",\"project_label\":\"{project}\",\"ts\":\"2026-06-0{day}T00:00:00Z\"{flag}}}\n"
             )
         };
-        let idx = SessionIndex::new(dir.clone());
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         std::fs::write(
             &path,
             [line("a", 1, false), line("b", 2, false), line("a", 3, true)].concat(),
@@ -634,14 +614,13 @@ mod tests {
         assert_eq!(idx.load()["S1"].project_label, "b");
         std::fs::write(&path, [line("a", 3, true), line("b", 4, true)].concat()).unwrap();
         assert_eq!(idx.load()["S1"].project_label, "b");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cache_serves_known_and_never_fabricates_unknown() {
-        let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        SessionIndex::new(dir.path().to_path_buf()).record("S1", Some(&pref("alpha")), 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
         assert_eq!(cache.project("S1"), Some(("alpha", "/k/alpha")));
@@ -651,15 +630,14 @@ mod tests {
             None,
             "an unknown session is never fabricated"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cache_reloads_when_a_new_session_is_appended() {
-        let dir = scratch();
-        let idx = SessionIndex::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let idx = SessionIndex::new(dir.path().to_path_buf());
         idx.record("S1", Some(&pref("alpha")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         assert!(cache.contains("S1") && !cache.contains("S2"));
         idx.record("S2", Some(&pref("beta")), 1 << 20);
@@ -668,57 +646,54 @@ mod tests {
             cache.contains("S2"),
             "a freshly recorded session is picked up"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cache_drops_labels_when_the_index_is_reset() {
-        let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        SessionIndex::new(dir.path().to_path_buf()).record("S1", Some(&pref("alpha")), 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         assert!(cache.contains("S1"));
         // A state reset removes the index file; the cache must not keep serving the stale label.
-        std::fs::remove_file(dir.join(INDEX_BASE)).unwrap();
+        std::fs::remove_file(dir.path().join(INDEX_BASE)).unwrap();
         cache.refresh();
         assert!(
             !cache.contains("S1"),
             "stale label dropped after the index is removed"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cache_keeps_prior_labels_when_a_nonempty_index_folds_empty() {
-        let dir = scratch();
-        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        let dir = tempfile::tempdir().unwrap();
+        SessionIndex::new(dir.path().to_path_buf()).record("S1", Some(&pref("alpha")), 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         assert_eq!(cache.label("S1").as_deref(), Some("alpha"));
         // Overwrite with a torn line: the file holds bytes but nothing parses, so the fold is
         // empty — a transient read race, and the prior good label is kept.
-        std::fs::write(dir.join(INDEX_BASE), torn(GOOD_LINE)).unwrap();
+        std::fs::write(dir.path().join(INDEX_BASE), torn(GOOD_LINE)).unwrap();
         cache.refresh();
         assert_eq!(
             cache.label("S1").as_deref(),
             Some("alpha"),
             "prior labels kept on an empty fold"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn cache_recovers_after_a_transient_empty_fold_at_a_colliding_fingerprint() {
-        let dir = scratch();
-        let path = dir.join(INDEX_BASE);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(INDEX_BASE);
         // A torn line and its intact original share a byte length by construction, so written with
         // an equal mtime they share a fingerprint.
         let good = GOOD_LINE;
         let empty = torn(good);
 
         // A different good session seeds the cache so it starts non-empty (its own fingerprint).
-        SessionIndex::new(dir.clone()).record("S1", Some(&pref("alpha")), 1 << 20);
-        let mut cache = SessionIndexCache::new(dir.clone());
+        SessionIndex::new(dir.path().to_path_buf()).record("S1", Some(&pref("alpha")), 1 << 20);
+        let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
         assert!(cache.contains("S1"));
 
@@ -742,6 +717,5 @@ mod tests {
             cache.contains("S2"),
             "good data after a colliding empty fold is not stranded"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

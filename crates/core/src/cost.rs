@@ -328,33 +328,29 @@ mod tests {
 
     #[test]
     fn a_temp_a_previous_run_never_renamed_is_swept_and_the_snapshot_is_not() {
-        let dir = std::env::temp_dir().join(format!("ht-cost-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let snapshot = snapshot_path(&dir);
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = snapshot_path(dir.path());
         std::fs::write(&snapshot, "{}\n").unwrap();
-        std::fs::write(dir.join("cost_snapshot.jsonl.4321.0.tmp"), "").unwrap();
-        std::fs::write(dir.join("cost_snapshot.jsonl.4321.1.tmp"), "").unwrap();
-        std::fs::write(dir.join("cost_changes.jsonl.4321.2.tmp"), "").unwrap();
-        std::fs::write(dir.join("session_index.jsonl"), "").unwrap();
+        std::fs::write(dir.path().join("cost_snapshot.jsonl.4321.0.tmp"), "").unwrap();
+        std::fs::write(dir.path().join("cost_snapshot.jsonl.4321.1.tmp"), "").unwrap();
+        std::fs::write(dir.path().join("cost_changes.jsonl.4321.2.tmp"), "").unwrap();
+        std::fs::write(dir.path().join("session_index.jsonl"), "").unwrap();
 
-        assert_eq!(sweep_orphan_temps(&dir), 3);
+        assert_eq!(sweep_orphan_temps(dir.path()), 3);
         assert!(
             snapshot.exists(),
             "the file a rename produced is not a temp"
         );
-        assert!(dir.join("session_index.jsonl").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(dir.path().join("session_index.jsonl").exists());
     }
 
     #[test]
     fn a_failed_write_is_retried_by_the_next_record() {
         // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
-        let dir = std::env::temp_dir().join(format!("ht-cost-retry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let changes = dir.join(CHANGES_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let changes = dir.path().join(CHANGES_NAME);
         std::fs::create_dir_all(changes.join("blocker")).unwrap();
-        let mut snapshot = Snapshot::load(&dir);
+        let mut snapshot = Snapshot::load(dir.path());
         let failed = snapshot.record([CostRow {
             session_id: "S1".into(),
             ts: "2026-01-01T00:00:00Z".into(),
@@ -364,7 +360,6 @@ mod tests {
         std::fs::remove_dir_all(&changes).unwrap();
         snapshot.record([]).unwrap();
         assert!(changes.is_file());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -372,15 +367,14 @@ mod tests {
         // A non-empty directory where the changes file goes makes its removal fail. Once the
         // obstacle is gone, a stale changes file stands in its place, holding a row the checkpoint
         // expired; the next record, with nothing changed, still clears it.
-        let dir = std::env::temp_dir().join(format!("ht-cost-clear-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let changes = dir.join(CHANGES_NAME);
+        let dir = tempfile::tempdir().unwrap();
+        let changes = dir.path().join(CHANGES_NAME);
         let row = |sid: &str, ts: &str| CostRow {
             session_id: sid.into(),
             ts: ts.into(),
             ..CostRow::default()
         };
-        let mut snapshot = Snapshot::load(&dir);
+        let mut snapshot = Snapshot::load(dir.path());
         snapshot
             .record([row("kept", "2026-01-01T00:00:00Z")])
             .unwrap();
@@ -395,12 +389,11 @@ mod tests {
         .unwrap();
         snapshot.record([]).unwrap();
         assert!(!changes.exists());
-        let sessions: Vec<_> = read_snapshot(&dir)
+        let sessions: Vec<_> = read_snapshot(dir.path())
             .into_iter()
             .map(|r| r.session_id)
             .collect();
         assert_eq!(sessions, ["kept"]);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

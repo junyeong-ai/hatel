@@ -560,14 +560,6 @@ fn note_unresolved(count: u64) {
 mod tests {
     use super::*;
 
-    /// A scratch state dir unique to this test (pid-scoped, tag-disambiguated).
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("ht-export-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     /// A stub downstream OTLP collector on a loopback port, recording every body it receives.
     async fn stub_collector() -> (
         std::net::SocketAddr,
@@ -629,13 +621,17 @@ mod tests {
 
     #[test]
     fn batch_projects_resolves_known_and_fails_closed_on_unknown() {
-        let dir = scratch("filter");
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("session_index.jsonl"),
+            dir.path().join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
         )
         .unwrap();
-        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        let mut worker = Worker::new(
+            vec![],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicUsize::new(0)),
+        );
         worker.index.refresh();
         let body = |sid: &str| {
             serde_json::to_vec(&serde_json::json!({
@@ -671,7 +667,6 @@ mod tests {
             ),
             "non-JSON is unattributable (never retried)"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -679,14 +674,18 @@ mod tests {
         // A batch spanning two sessions resolves to both projects; an allow-list missing one of
         // them rejects the whole batch (fail closed), so a disallowed session can never ride along
         // with an allowed one.
-        let dir = scratch("mixed");
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("session_index.jsonl"),
+            dir.path().join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n\
              {\"session_id\":\"S2\",\"project_key\":\"/k/beta\",\"project_label\":\"beta\"}\n",
         )
         .unwrap();
-        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        let mut worker = Worker::new(
+            vec![],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicUsize::new(0)),
+        );
         worker.index.refresh();
         let body = serde_json::to_vec(&serde_json::json!({
             "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{ "sum": { "dataPoints": [
@@ -709,7 +708,6 @@ mod tests {
             !passes,
             "a batch with a disallowed project (beta) is rejected as a whole"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A metrics body carrying one datapoint for `sid`.
@@ -740,13 +738,17 @@ mod tests {
         // Waiting only helps a session the index has not seen yet. One recorded as having no
         // project is already answered, so parking it would hold a slot for the full timeout to
         // arrive at the same fail-closed end.
-        let dir = scratch("decided");
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("session_index.jsonl"),
+            dir.path().join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"\",\"project_label\":\"\"}\n",
         )
         .unwrap();
-        let mut worker = Worker::new(vec![], dir.clone(), Arc::new(AtomicUsize::new(0)));
+        let mut worker = Worker::new(
+            vec![],
+            dir.path().to_path_buf(),
+            Arc::new(AtomicUsize::new(0)),
+        );
         worker.index.refresh();
         assert!(
             matches!(
@@ -762,13 +764,12 @@ mod tests {
             ),
             "a session never seen is still worth waiting for"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn a_batch_from_a_session_with_no_project_takes_no_park_slot() {
         let (addr, received, server) = stub_collector().await;
-        let dir = scratch("decided-park");
+        let dir = tempfile::tempdir().unwrap();
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Raw,
@@ -777,9 +778,9 @@ mod tests {
             timeout_ms: Some(2_000),
         };
         let qb = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let mut worker = Worker::new(vec![target], dir.path().to_path_buf(), qb.clone());
         std::fs::write(
-            dir.join("session_index.jsonl"),
+            dir.path().join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"\",\"project_label\":\"\"}\n",
         )
         .unwrap();
@@ -802,13 +803,12 @@ mod tests {
             "bytes released at disposition"
         );
         server.abort();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn an_unindexed_batch_is_parked_then_forwarded_after_the_index_catches_up() {
         let (addr, received, server) = stub_collector().await;
-        let dir = scratch("park");
+        let dir = tempfile::tempdir().unwrap();
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Raw,
@@ -817,7 +817,7 @@ mod tests {
             timeout_ms: Some(2_000),
         };
         let qb = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let mut worker = Worker::new(vec![target], dir.path().to_path_buf(), qb.clone());
 
         // The batch arrives before the SessionStart hook indexed S1 — it must be parked for the
         // filtered destination, not dropped.
@@ -831,7 +831,7 @@ mod tests {
         );
 
         // The SessionStart hook lands; the next batch triggers the parked retry.
-        let path = dir.join("session_index.jsonl");
+        let path = dir.path().join("session_index.jsonl");
         std::fs::write(
             &path,
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
@@ -854,13 +854,12 @@ mod tests {
             "all bytes released at disposition"
         );
         server.abort();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn an_unrelated_session_append_does_not_burn_a_parked_body() {
         let (addr, received, server) = stub_collector().await;
-        let dir = scratch("unrelated");
+        let dir = tempfile::tempdir().unwrap();
         let allow: std::collections::BTreeSet<String> =
             ["alpha".to_string(), "beta".to_string()].into();
         let target = ExportTarget {
@@ -871,7 +870,7 @@ mod tests {
             timeout_ms: Some(2_000),
         };
         let qb = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let mut worker = Worker::new(vec![target], dir.path().to_path_buf(), qb.clone());
         let reserve = |body: Vec<u8>| {
             qb.fetch_add(body.len(), Ordering::Relaxed);
             outbound(body)
@@ -883,7 +882,7 @@ mod tests {
 
         // An UNRELATED session (OTHER) reaches the index first. Its batch forwards, but the
         // parked RACER body must STAY parked — an unrelated append must not burn its chance.
-        let path = dir.join("session_index.jsonl");
+        let path = dir.path().join("session_index.jsonl");
         let other =
             "{\"session_id\":\"OTHER\",\"project_key\":\"/k/beta\",\"project_label\":\"beta\"}\n";
         std::fs::write(&path, other).unwrap();
@@ -916,7 +915,6 @@ mod tests {
         );
         assert_eq!(qb.load(Ordering::Relaxed), 0, "all bytes released");
         server.abort();
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test(start_paused = true)]
@@ -924,7 +922,7 @@ mod tests {
         // No traffic after the park and no shutdown: the run loop's deadline arm alone must
         // wake, fail the body closed, and release its reserved bytes — parked bodies can never
         // hold the queue budget hostage on an idle stream. (Paused clock: sleeps auto-advance.)
-        let dir = scratch("idle");
+        let dir = tempfile::tempdir().unwrap();
         let target = ExportTarget {
             endpoint: "http://127.0.0.1:9".to_string(), // never contacted
             mode: ExportMode::Raw,
@@ -932,7 +930,7 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
         };
-        let (exporter, handle) = Exporter::spawn(vec![target], dir.clone());
+        let (exporter, handle) = Exporter::spawn(vec![target], dir.path().to_path_buf());
         exporter.enqueue(
             OtlpSignal::Metrics,
             Bytes::from(metrics_body("GHOST")),
@@ -956,14 +954,13 @@ mod tests {
         assert!(released, "idle worker released the timed-out parked bytes");
         exporter.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn the_handle_reports_what_its_drain_task_counted_after_it_is_given_up_on() {
         // The receiver reports the export tallies through the handle once the drain has finished
         // or been given up on, so a count only the drain task held would be lost with it.
-        let dir = scratch("tally");
+        let dir = tempfile::tempdir().unwrap();
         let endpoint = "http://127.0.0.1:9".to_string(); // the discard port refuses at once
         let target = ExportTarget {
             endpoint: endpoint.clone(),
@@ -972,7 +969,7 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
         };
-        let (exporter, handle) = Exporter::spawn(vec![target], dir.clone());
+        let (exporter, handle) = Exporter::spawn(vec![target], dir.path().to_path_buf());
         for _ in 0..2 {
             exporter.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
         }
@@ -987,12 +984,11 @@ mod tests {
         handle.abort();
         exporter.note_tally(Tally::Stopping);
         assert_eq!(failures.tally(Tally::Stopping), None, "already reported");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
     async fn parked_batches_fail_closed_at_shutdown_when_never_indexed() {
-        let dir = scratch("parkdrop");
+        let dir = tempfile::tempdir().unwrap();
         // The endpoint is never contacted: an unresolved batch is dropped, not forwarded.
         let target = ExportTarget {
             endpoint: "http://127.0.0.1:9".to_string(),
@@ -1002,7 +998,7 @@ mod tests {
             timeout_ms: Some(500),
         };
         let qb = Arc::new(AtomicUsize::new(0));
-        let mut worker = Worker::new(vec![target], dir.clone(), qb.clone());
+        let mut worker = Worker::new(vec![target], dir.path().to_path_buf(), qb.clone());
         let body = metrics_body("GHOST");
         qb.fetch_add(body.len(), Ordering::Relaxed);
         worker.handle(outbound(body)).await;
@@ -1014,7 +1010,6 @@ mod tests {
         assert!(worker.deferred.is_empty(), "nothing stays parked");
         assert_eq!(worker.tallies.unresolved.count(), 1, "the drop is counted");
         assert_eq!(qb.load(Ordering::Relaxed), 0, "bytes released");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     // End-to-end: a real receiver→exporter→downstream hop. Spins a stub OTLP collector on a
@@ -1026,9 +1021,9 @@ mod tests {
         use axum::routing::post;
         use tokio::sync::oneshot;
 
-        let dir = scratch("e2e");
+        let dir = tempfile::tempdir().unwrap();
         std::fs::write(
-            dir.join("session_index.jsonl"),
+            dir.path().join("session_index.jsonl"),
             "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
         )
         .unwrap();
@@ -1061,7 +1056,7 @@ mod tests {
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };
-        let (exporter, handle) = Exporter::spawn(vec![target], dir.clone());
+        let (exporter, handle) = Exporter::spawn(vec![target], dir.path().to_path_buf());
 
         let body = serde_json::to_vec(&serde_json::json!({
             "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
@@ -1087,7 +1082,6 @@ mod tests {
         exporter.shutdown();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         server.abort();
-        std::fs::remove_dir_all(&dir).ok();
 
         let v: serde_json::Value = serde_json::from_slice(&received).unwrap();
         let dp = &v["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0];

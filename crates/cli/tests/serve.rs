@@ -2,16 +2,14 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 /// A home whose config.toml keeps the store in it.
-fn home(tag: &str) -> PathBuf {
-    let home = std::env::temp_dir().join(format!("ht-cli-serve-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
-    configure(&home, "");
+fn home() -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    configure(home.path(), "");
     home
 }
 
@@ -153,87 +151,81 @@ const LIMIT: Duration = Duration::from_secs(10);
 
 #[test]
 fn a_receiver_without_wait_exits_when_the_port_is_taken() {
-    let home = home("taken");
+    let home = home();
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut receiver = serve(&home, held.local_addr().unwrap().port(), false);
+    let mut receiver = serve(home.path(), held.local_addr().unwrap().port(), false);
     let status = exit_within(&mut receiver, LIMIT);
     drop(receiver);
     assert!(status.is_some_and(|s| !s.success()), "{status:?}");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[cfg(unix)]
 #[test]
 fn a_waiting_receiver_stops_at_once_when_asked() {
-    let home = home("stop");
+    let home = home();
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut receiver = waiting(&home, held.local_addr().unwrap().port(), PORT_HELD);
+    let mut receiver = waiting(home.path(), held.local_addr().unwrap().port(), PORT_HELD);
     let pid = libc::pid_t::try_from(receiver.0.id()).unwrap();
     // SAFETY: `kill` on the pid of a child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let status = exit_within(&mut receiver, LIMIT);
     drop(receiver);
     assert!(status.is_some_and(|s| s.success()), "{status:?}");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
 fn a_waiting_receiver_serves_once_the_port_is_freed() {
-    let home = home("port");
+    let home = home();
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port();
-    let receiver = waiting(&home, port, PORT_HELD);
+    let receiver = waiting(home.path(), port, PORT_HELD);
     drop(held);
     let served = within(LIMIT, || answers(port));
     drop(receiver);
     assert!(served, "it serves once the port is free");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
 fn a_receiver_waiting_for_the_port_leaves_the_store_to_another() {
-    let home = home("share");
+    let home = home();
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let first = waiting(&home, held.local_addr().unwrap().port(), PORT_HELD);
+    let first = waiting(home.path(), held.local_addr().unwrap().port(), PORT_HELD);
     // `--wait`, so the instant the first holds the lock on each of its attempts cannot fail it.
     let port = free_port();
-    let second = serve(&home, port, true);
+    let second = serve(home.path(), port, true);
     let served = within(LIMIT, || answers(port));
     drop(second);
     drop(first);
     assert!(served, "the store is free for a receiver on another port");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
 fn a_waiting_receiver_takes_over_the_store_once_its_holder_exits() {
-    let home = home("lock");
+    let home = home();
     let first_port = free_port();
-    let first = serve(&home, first_port, false);
+    let first = serve(home.path(), first_port, false);
     assert!(within(LIMIT, || answers(first_port)));
     let second_port = free_port();
-    let second = waiting(&home, second_port, LOCK_HELD);
+    let second = waiting(home.path(), second_port, LOCK_HELD);
     drop(first);
     let served = within(LIMIT, || answers(second_port));
     drop(second);
     assert!(served, "it takes over once the holder exits");
-    std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
 fn a_waiting_receiver_serves_the_configuration_it_finds_when_it_takes_over() {
-    let home = home("config");
+    let home = home();
     let first_port = free_port();
-    let first = serve(&home, first_port, false);
+    let first = serve(home.path(), first_port, false);
     assert!(within(LIMIT, || answers(first_port)));
     let second_port = free_port();
-    let second = waiting(&home, second_port, LOCK_HELD);
-    configure(&home, "retention_days = 45\n");
+    let second = waiting(home.path(), second_port, LOCK_HELD);
+    configure(home.path(), "retention_days = 45\n");
     drop(first);
     let current = within(LIMIT, || {
         healthz(second_port).is_some_and(|body| body.contains("\"retention_days\":45"))
     });
     drop(second);
     assert!(current, "it reads config.toml again when it takes over");
-    std::fs::remove_dir_all(&home).ok();
 }

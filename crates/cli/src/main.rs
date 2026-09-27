@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn cost_rows_honor_window_and_project() {
-        let cfg = test_cfg("costwin", vec![]);
+        let cfg = test_cfg(vec![]);
         let dir = &cfg.state_dir;
         let row = |sid: &str, proj: &str, ts: &str| {
             format!(
@@ -653,7 +653,6 @@ mod tests {
         let alpha = cost(Some("alpha"));
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].session_id, "recent");
-        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -683,21 +682,36 @@ mod tests {
         assert!(parse_pairs(&["n:=not-json".into()]).is_err());
     }
 
-    /// A config over a scratch state dir unique to this test (pid-scoped, tag-disambiguated).
-    fn test_cfg(tag: &str, plugins: Vec<std::path::PathBuf>) -> Config {
-        let dir = std::env::temp_dir().join(format!("ht-cli-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Config {
-            sink: hatel_core::SinkKind::Jsonl,
-            ledger_dir: dir.join("ledger"),
-            state_dir: dir,
-            plugins,
-            plugin_source: hatel_core::config::PluginSource::ConfigFile,
-            rotate_bytes: 10 * 1024 * 1024,
-            retention_days: 90,
-            disabled: false,
-            strict: false,
+    /// A config over a fresh store, which is removed when this is dropped: use the config through
+    /// this value, not a clone of it.
+    struct TestConfig {
+        cfg: Config,
+        _dir: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestConfig {
+        type Target = Config;
+
+        fn deref(&self) -> &Config {
+            &self.cfg
+        }
+    }
+
+    fn test_cfg(plugins: Vec<std::path::PathBuf>) -> TestConfig {
+        let dir = tempfile::tempdir().unwrap();
+        TestConfig {
+            cfg: Config {
+                sink: hatel_core::SinkKind::Jsonl,
+                ledger_dir: dir.path().join("ledger"),
+                state_dir: dir.path().to_path_buf(),
+                plugins,
+                plugin_source: hatel_core::config::PluginSource::ConfigFile,
+                rotate_bytes: 10 * 1024 * 1024,
+                retention_days: 90,
+                disabled: false,
+                strict: false,
+            },
+            _dir: dir,
         }
     }
 
@@ -715,7 +729,7 @@ mod tests {
 
     #[test]
     fn parse_filters_validates_fields_against_the_allow_list() {
-        let reg = build_registry(&test_cfg("filters", vec![])).unwrap();
+        let reg = build_registry(&test_cfg(vec![])).unwrap();
         assert_eq!(
             parse_filters(&["tool_name=Bash".into()], Some("tool"), &reg).unwrap(),
             vec![("tool_name".to_string(), "Bash".to_string())]
@@ -735,7 +749,7 @@ mod tests {
         // would silently match nothing.
         let plugin =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/example.toml");
-        let reg = build_registry(&test_cfg("redacted", vec![plugin])).unwrap();
+        let reg = build_registry(&test_cfg(vec![plugin])).unwrap();
         let parsed =
             parse_filters(&["actor=alice@example.com".into()], Some("ci_check"), &reg).unwrap();
         assert_eq!(parsed[0].0, "actor");
@@ -748,7 +762,7 @@ mod tests {
 
     #[test]
     fn report_json_kind_filter_scopes_to_one_kind() {
-        let cfg = test_cfg("kindfilter", vec![]);
+        let cfg = test_cfg(vec![]);
         let reg = build_registry(&cfg).unwrap();
         let q = |kind: Option<&'static str>| report::Query {
             since: 0,
@@ -800,7 +814,6 @@ mod tests {
         );
         // the native cost section is not a Kind, so a scoped report drops it
         assert_eq!(scoped["cost"].as_array().unwrap().len(), 0);
-        std::fs::remove_dir_all(&cfg.state_dir).ok();
     }
 
     #[test]
@@ -808,7 +821,7 @@ mod tests {
         // A name the ledger already has records for is an unloaded schema, not a typo. The
         // registered list alone sends whoever reads the error to `kinds`, which knows no more
         // than that list does — the loop closes only where the schema would be listed.
-        let cfg = test_cfg("unknownkind", vec![]);
+        let cfg = test_cfg(vec![]);
         std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
         std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
         let reg = build_registry(&cfg).unwrap();
@@ -823,14 +836,13 @@ mod tests {
             "a name nothing stored is a typo, not an unloaded schema: {typo}"
         );
         assert!(typo.contains("registered: "), "got: {typo}");
-        std::fs::remove_dir_all(&cfg.state_dir).ok();
     }
 
     #[test]
     fn kinds_json_reports_the_gap_between_the_registry_and_the_store() {
         // `kinds` answers "what can I query"; a registry missing a schema the store has records
         // for would answer it as if the partial list were the whole one.
-        let cfg = test_cfg("kindsgap", vec![]);
+        let cfg = test_cfg(vec![]);
         std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
         std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
         let reg = build_registry(&cfg).unwrap();
@@ -850,6 +862,5 @@ mod tests {
         );
         // One shape either way: no gap is `null`, never an absent key.
         assert!(kinds_value(&reg, None)["unreadable_kinds"].is_null());
-        std::fs::remove_dir_all(&cfg.state_dir).ok();
     }
 }

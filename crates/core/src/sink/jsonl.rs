@@ -118,9 +118,7 @@ mod tests {
         // The reader takes the active ledger and its archives, so enumeration must see a Kind
         // whose active file a prune has already removed — and must not invent one from a
         // neighbouring file.
-        let dir = std::env::temp_dir().join(format!("ht-enum-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         for name in [
             "tool.jsonl",
             "tool.jsonl.20260804.1",
@@ -128,46 +126,46 @@ mod tests {
             "cost_snapshot.jsonl.1.2.tmp",
             "notes.txt",
         ] {
-            std::fs::write(dir.join(name), "").unwrap();
+            std::fs::write(dir.path().join(name), "").unwrap();
         }
         assert_eq!(
-            stored_kinds(&dir).unwrap(),
+            stored_kinds(dir.path()).unwrap(),
             vec!["global.rules".to_string(), "tool".to_string()]
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn an_archive_belongs_to_the_one_kind_its_name_ends_with() {
         // A Kind may be named `foo.jsonl`. Its archive then begins with `foo.jsonl.`, as every
         // archive of the Kind `foo` does, and must still be read and listed as `foo.jsonl`'s alone.
-        let dir = std::env::temp_dir().join(format!("ht-owner-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let record = |kind: &str| {
             format!("{{\"ts\":\"2026-09-26T00:00:00Z\",\"kind\":\"{kind}\",\"payload\":{{}}}}\n")
         };
-        std::fs::write(dir.join("foo.jsonl"), record("foo")).unwrap();
-        std::fs::write(dir.join("foo.jsonl.jsonl.20260926.1"), record("foo.jsonl")).unwrap();
+        std::fs::write(dir.path().join("foo.jsonl"), record("foo")).unwrap();
+        std::fs::write(
+            dir.path().join("foo.jsonl.jsonl.20260926.1"),
+            record("foo.jsonl"),
+        )
+        .unwrap();
         assert_eq!(
-            stored_kinds(&dir).unwrap(),
+            stored_kinds(dir.path()).unwrap(),
             vec!["foo".to_string(), "foo.jsonl".to_string()]
         );
         let kinds_read = |kind: &str| -> Vec<String> {
-            read_records(&dir, kind)
+            read_records(dir.path(), kind)
                 .into_iter()
                 .map(|env| env.kind)
                 .collect()
         };
         assert_eq!(kinds_read("foo"), vec!["foo"]);
         assert_eq!(kinds_read("foo.jsonl"), vec!["foo.jsonl"]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_directory_that_was_never_written_is_empty_not_an_error() {
-        let dir = std::env::temp_dir().join(format!("ht-enum-absent-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("ledger");
         assert_eq!(stored_kinds(&dir).unwrap(), Vec::<String>::new());
     }
 }

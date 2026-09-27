@@ -1069,12 +1069,10 @@ mod tests {
 
     #[test]
     fn unattributed_sessions_are_named_only_when_some_exist() {
-        let dir = std::env::temp_dir().join(format!("ht-doctor-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::from_settings(&Settings::default());
-        cfg.state_dir = dir.clone();
-        let index = SessionIndex::new(dir.clone());
+        cfg.state_dir = dir.path().to_path_buf();
+        let index = SessionIndex::new(dir.path().to_path_buf());
         let acme = hatel_core::ProjectRef {
             key: "/k/acme".into(),
             label: "acme".into(),
@@ -1100,7 +1098,6 @@ mod tests {
             "counted against every recorded session: {}",
             findings[0].message
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Complete coverage says nothing about what the coverage costs: a hook wired before

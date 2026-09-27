@@ -160,20 +160,6 @@ fn recorded_path(base: &Path, recorded: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static N: AtomicU32 = AtomicU32::new(0);
-
-    fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "ht-proj-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -206,26 +192,35 @@ mod tests {
 
     #[test]
     fn branch_from_a_normal_git_dir_with_crlf() {
-        let repo = scratch();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/feature/x\r\n").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            repo.path().join(".git/HEAD"),
+            "ref: refs/heads/feature/x\r\n",
+        )
+        .unwrap();
         assert_eq!(
-            git_branch(repo.to_str().unwrap()).as_deref(),
+            git_branch(repo.path().to_str().unwrap()).as_deref(),
             Some("feature/x")
         );
-        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
     fn branch_from_a_worktree_git_file_redirect() {
         // A worktree's `.git` is a FILE redirecting to the real git dir via `gitdir:`.
-        let repo = scratch();
-        let real = repo.join("realgit");
+        let repo = tempfile::tempdir().unwrap();
+        let real = repo.path().join("realgit");
         std::fs::create_dir_all(&real).unwrap();
         std::fs::write(real.join("HEAD"), "ref: refs/heads/wt\n").unwrap();
-        std::fs::write(repo.join(".git"), format!("gitdir: {}\n", real.display())).unwrap();
-        assert_eq!(git_branch(repo.to_str().unwrap()).as_deref(), Some("wt"));
-        std::fs::remove_dir_all(&repo).ok();
+        std::fs::write(
+            repo.path().join(".git"),
+            format!("gitdir: {}\n", real.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            git_branch(repo.path().to_str().unwrap()).as_deref(),
+            Some("wt")
+        );
     }
 
     #[test]
@@ -263,8 +258,8 @@ mod tests {
 
     #[test]
     fn a_path_is_named_relative_to_the_checkout_it_sits_in() {
-        let base = scratch();
-        let (_, checkout) = repo_with_worktree(&base);
+        let base = tempfile::tempdir().unwrap();
+        let (_, checkout) = repo_with_worktree(base.path());
         let cwd = checkout.join("crates/core");
         std::fs::create_dir_all(&cwd).unwrap();
         let rule = checkout.join(".claude/rules/testing.md");
@@ -272,7 +267,6 @@ mod tests {
             repo_path(rule.to_str().unwrap(), cwd.to_str().unwrap()),
             ".claude/rules/testing.md"
         );
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
@@ -280,17 +274,16 @@ mod tests {
     fn a_checkout_reached_through_a_symlink_is_the_repository_it_links_to() {
         // Otherwise a session started through `~/ws/acme -> workspace/acme-api` is a second
         // project named after the link, and nothing deriving the label from git can join it.
-        let base = scratch();
-        let repo = base.join("acme-api");
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("acme-api");
         write(&repo.join(".git/HEAD"), "ref: refs/heads/main\n");
         std::fs::create_dir_all(repo.join("src")).unwrap();
-        let alias = base.join("acme");
+        let alias = base.path().join("acme");
         std::os::unix::fs::symlink(&repo, &alias).unwrap();
 
         let p = project(&alias.join("src"));
         assert_eq!(p.label, "acme-api");
         assert_eq!(Path::new(&p.key), std::fs::canonicalize(&repo).unwrap());
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -298,10 +291,9 @@ mod tests {
         // A directory is where a project was found, not one itself. Naming a project after
         // whatever directory the work ran in invents a home directory, a container of
         // repositories, and every scratch directory as projects of their own.
-        let dir = scratch();
-        assert!(resolve_project(dir.to_str().unwrap()).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_project(dir.path().to_str().unwrap()).is_none());
         assert!(resolve_project("/").is_none());
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -318,11 +310,10 @@ mod tests {
 
     #[test]
     fn detached_head_and_non_repo_yield_none() {
-        let repo = scratch();
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join(".git/HEAD"), "a1b2c3d4e5f6\n").unwrap(); // detached
-        assert_eq!(git_branch(repo.to_str().unwrap()), None);
-        std::fs::remove_dir_all(&repo).ok();
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "a1b2c3d4e5f6\n").unwrap(); // detached
+        assert_eq!(git_branch(repo.path().to_str().unwrap()), None);
         assert_eq!(git_branch("/tmp/definitely-not-a-repo-xyz"), None);
     }
 
@@ -330,8 +321,8 @@ mod tests {
     fn a_linked_worktree_attributes_to_its_repository() {
         // Otherwise every spec branch checked out into its own tree becomes a project named
         // after that branch, and the repository's own totals silently lose that work.
-        let base = scratch();
-        let (repo, checkout) = repo_with_worktree(&base);
+        let base = tempfile::tempdir().unwrap();
+        let (repo, checkout) = repo_with_worktree(base.path());
         let deep = checkout.join("crates/core/src");
         std::fs::create_dir_all(&deep).unwrap();
 
@@ -341,21 +332,19 @@ mod tests {
             assert_eq!(Path::new(&p.key), repo, "from {}", from.display());
             assert_eq!(p.label, "acme-api", "from {}", from.display());
         }
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn a_worktree_reports_the_branch_it_is_on_not_the_repositorys() {
         // Project attribution collapses a worktree into its repository; the branch must not,
         // or a `spec/<slug>` binding would capture the main checkout's branch instead.
-        let base = scratch();
-        let (repo, checkout) = repo_with_worktree(&base);
+        let base = tempfile::tempdir().unwrap();
+        let (repo, checkout) = repo_with_worktree(base.path());
         assert_eq!(
             git_branch(checkout.to_str().unwrap()).as_deref(),
             Some("spec/x")
         );
         assert_eq!(git_branch(repo.to_str().unwrap()).as_deref(), Some("main"));
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
@@ -364,15 +353,14 @@ mod tests {
         // Git writes a submodule's redirect relative to the checkout, so where the checkout is
         // reached through a symlink only the kernel can say what `..` leaves. Folding it away in
         // process would name a directory that does not exist and lose the branch entirely.
-        let base = scratch();
-        let sup = base.join("super");
+        let base = tempfile::tempdir().unwrap();
+        let sup = base.path().join("super");
         write(&sup.join(".git/modules/lib/HEAD"), "ref: refs/heads/dev\n");
         write(&sup.join("lib/.git"), "gitdir: ../.git/modules/lib\n");
-        let alias = base.join("lib-alias");
+        let alias = base.path().join("lib-alias");
         std::os::unix::fs::symlink(sup.join("lib"), &alias).unwrap();
 
         assert_eq!(git_branch(alias.to_str().unwrap()).as_deref(), Some("dev"));
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[cfg(unix)]
@@ -380,9 +368,9 @@ mod tests {
     fn a_symlinked_worktree_recorded_relatively_still_attributes_to_its_repository() {
         // `worktree.useRelativePaths` records the redirect relative to the checkout too, so the
         // repository is only reachable by letting the filesystem cross the symlink.
-        let base = scratch();
-        let repo = base.join("repo");
-        let checkout = base.join("trees/wt");
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("repo");
+        let checkout = base.path().join("trees/wt");
         write(&repo.join(".git/HEAD"), "ref: refs/heads/main\n");
         write(
             &repo.join(".git/worktrees/wt/HEAD"),
@@ -393,7 +381,7 @@ mod tests {
             &checkout.join(".git"),
             "gitdir: ../../repo/.git/worktrees/wt\n",
         );
-        let alias = base.join("wt-alias");
+        let alias = base.path().join("wt-alias");
         std::os::unix::fs::symlink(&checkout, &alias).unwrap();
 
         let p = project(&alias);
@@ -407,7 +395,6 @@ mod tests {
             git_branch(alias.to_str().unwrap()).as_deref(),
             Some("spec/y")
         );
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -415,9 +402,9 @@ mod tests {
         // Its shared directory is the submodule's `.git/modules/<name>`, which names no checkout;
         // the repository is recorded only in that directory's config, so the tree keeps its own
         // identity rather than being attributed by a guess.
-        let base = scratch();
-        let module = base.join("super/.git/modules/lib");
-        let checkout = base.join("subwt");
+        let base = tempfile::tempdir().unwrap();
+        let module = base.path().join("super/.git/modules/lib");
+        let checkout = base.path().join("subwt");
         write(&module.join("HEAD"), "ref: refs/heads/main\n");
         write(&module.join("worktrees/w/HEAD"), "ref: refs/heads/sub-wt\n");
         write(&module.join("worktrees/w/commondir"), "../..\n");
@@ -433,15 +420,14 @@ mod tests {
             git_branch(checkout.to_str().unwrap()).as_deref(),
             Some("sub-wt")
         );
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
     fn a_submodule_is_its_own_project() {
         // A submodule also reaches its git directory through a `.git` file — a relative one —
         // but it is a repository in its own right, not a checkout of its superproject.
-        let base = scratch();
-        let sup = base.join("super");
+        let base = tempfile::tempdir().unwrap();
+        let sup = base.path().join("super");
         write(&sup.join(".git/HEAD"), "ref: refs/heads/main\n");
         write(&sup.join(".git/modules/lib/HEAD"), "ref: refs/heads/dev\n");
         write(&sup.join("lib/.git"), "gitdir: ../.git/modules/lib\n");
@@ -457,7 +443,6 @@ mod tests {
             Some("dev"),
             "a relative gitdir still resolves"
         );
-        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -465,24 +450,26 @@ mod tests {
         // A bare repository's worktree (and equally a submodule's) shares a directory that is
         // not some checkout's `.git`, so there is no repository root to attribute to; the tree
         // keeps its own identity rather than borrowing the shared directory's name.
-        let base = scratch();
-        let checkout = base.join("co");
+        let base = tempfile::tempdir().unwrap();
+        let checkout = base.path().join("co");
         write(
-            &base.join("bare.git/worktrees/wt/HEAD"),
+            &base.path().join("bare.git/worktrees/wt/HEAD"),
             "ref: refs/heads/wt\n",
         );
         write(
-            &base.join("bare.git/worktrees/wt/commondir"),
-            &format!("{}\n", base.join("bare.git").display()),
+            &base.path().join("bare.git/worktrees/wt/commondir"),
+            &format!("{}\n", base.path().join("bare.git").display()),
         );
         write(
             &checkout.join(".git"),
-            &format!("gitdir: {}\n", base.join("bare.git/worktrees/wt").display()),
+            &format!(
+                "gitdir: {}\n",
+                base.path().join("bare.git/worktrees/wt").display()
+            ),
         );
 
         let p = project(&checkout);
         assert_eq!(Path::new(&p.key), std::fs::canonicalize(&checkout).unwrap());
         assert_eq!(p.label, "co");
-        std::fs::remove_dir_all(&base).ok();
     }
 }

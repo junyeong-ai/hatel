@@ -834,10 +834,8 @@ mod tests {
     fn a_plist_is_classified_by_what_wrote_it_and_for_which_binary() {
         let exe = Path::new("/Users/u/.local/bin/hatel");
         let log = Path::new("/Users/u/Library/Logs/hatel/serve.log");
-        let dir = std::env::temp_dir().join(format!("ht-unit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("dev.hatel.plist");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev.hatel.plist");
         let classify = |text: &str| {
             std::fs::write(&path, text).unwrap();
             installed_unit(
@@ -893,7 +891,6 @@ mod tests {
             .unwrap(),
             None
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(target_os = "macos")]
@@ -942,10 +939,8 @@ mod tests {
     #[test]
     fn a_unit_is_classified_by_what_wrote_it_and_for_which_binary() {
         let exe = Path::new("/home/u/.local/bin/hatel");
-        let dir = std::env::temp_dir().join(format!("ht-unit-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("hatel.service");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hatel.service");
         let classify = |text: &str| {
             std::fs::write(&path, text).unwrap();
             installed_unit(&path, exe, systemd_units, systemd_unescape).unwrap()
@@ -973,7 +968,6 @@ mod tests {
             Some(Installed::Other),
             "an edit next to the binary's path is no rendering of another path"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(target_os = "linux")]
