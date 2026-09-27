@@ -51,7 +51,9 @@ rejects.
   fail loudly, never silently disable a feature. `config.toml` therefore has exactly one
   typed shape (`settings.rs`) covering every section: a second parser over the same file
   would have to tolerate the sections it doesn't own, and a writer that rebuilt the file
-  from its own section alone would drop the rest.
+  from its own section alone would drop the rest. A storage variable's or a `HATEL_*` flag's
+  value is held to the same bar: `Config` resolves one it cannot read as unset and returns it
+  beside the config, for `Config::load` to refuse and the hook to note.
 - **A lifecycle event marks a turn boundary, not an entity.** `SubagentStart`, `SubagentStop` and
   `SessionStart` all fire again when their subject is resumed. Before binding a Kind that claims to
   count something, check how often its event fires per one of that thing. `identity` names the

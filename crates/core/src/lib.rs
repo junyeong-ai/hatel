@@ -57,6 +57,8 @@ pub enum Error {
     },
     #[error("invalid export config: {0}")]
     InvalidExport(String),
+    #[error("invalid environment: {0}")]
+    InvalidEnvironment(String),
     #[error("io error: {0}")]
     Io(String),
 }

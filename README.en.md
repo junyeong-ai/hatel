@@ -553,6 +553,8 @@ rotate_bytes = 20971520    # JSONL rotation threshold (default 10 MB)
 | `HATEL_STRICT=1` | error (don't silently drop) on a payload key outside the allow-list |
 | `HATEL_TESTING=1` | redirect writes under a `_test/` subdirectory |
 
+A storage variable or `HATEL_DISABLED` / `HATEL_STRICT` / `HATEL_TESTING` set to a value it cannot take (`HATEL_SINK=sqllite`, `HATEL_DISABLED=true`) makes `serve`, `report`, `kinds` and `emit` fail with an error naming it, as do the MCP server's `report`, `kinds` and `emit` tools, and `service` refuse to install or restart; a hook or `init` ignores it with a note on stderr, and `doctor` names it in this shell and in settings.json `env`.
+
 > These configure the *collector itself* and are unrelated to Claude Code's `OTEL_*` telemetry settings, which live in `settings.json`.
 
 ---
@@ -606,7 +608,7 @@ The collector never fights managed policy; it adapts:
 | **`doctor` shows `⚠ … wired synchronously`** | Wiring written before 0.12. Every record still arrives, but Claude Code waits for the hook each time the event fires. Re-run `hatel init` to rewrite it asynchronously. |
 | **`doctor` shows a `✗`** | It names exactly what's missing. A `✗` on an env line → re-run `hatel init`. A `✗` on the hooks line → `settings.json` `hooks` is empty or points elsewhere; `hatel init` restores it idempotently. |
 | **`emit` drops a field** | The field isn't in the Kind's allow-list. stderr prints the accepted fields (`accepted fields: …`) — fix the typo. |
-| **Receiver won't start / exits immediately** | The service log (`~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux) or the terminal says why: `config.toml` does not parse, or, for a `serve` run without `--wait`, another receiver holds the state dir's lock (single-writer) or the port is taken. Fix the file or use the receiver already running; after a fix, `hatel service --restart`. |
+| **Receiver won't start / exits immediately** | The service log (`~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux) or the terminal says why: `config.toml` does not parse or a `HATEL_*` variable holds a value it cannot take, or, for a `serve` run without `--wait`, another receiver holds the state dir's lock (single-writer) or the port is taken. Fix the file or the variable, or use the receiver already running; after a fix, `hatel service --restart`. |
 | **Corporate policy locks the endpoint/hooks** | See [Enterprise / managed settings](#enterprise--managed-settings) — `doctor` reports honestly what's possible. |
 
 > The fastest diagnosis is always **`hatel doctor`** — it reports the missing signal as-is, no guessing.

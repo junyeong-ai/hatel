@@ -54,6 +54,10 @@ does not, since that splits the store.
 
 `doctor` gaps and what they mean:
 - **no hook invokes …** → run `init`.
+- **HATEL_… in this process / in the … settings.json env: must be …** → a variable holds a value
+  hatel cannot read: `serve`, `report`, `kinds` and `emit` fail on it, as do the MCP `report` /
+  `kinds` / `emit` tools (the `doctor` tool still answers); `service` refuses to install or
+  restart, and hooks ignore it. Fix it where doctor says it is set.
 - **BLOCKED by allowManagedHooksOnly** → IT must deploy the hook as a *managed* hook (MDM).
 - **OTEL_METRICS_INCLUDE_SESSION_ID=false** → per-session/project attribution is impossible;
   hatel drops session-less metrics rather than guess (org/user aggregation only survives at a

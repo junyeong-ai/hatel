@@ -714,9 +714,9 @@ fn horizon(
 ) -> hatel_core::Result<Config> {
     let settings = file.map_or_else(|| Ok(Settings::default()), Settings::read)?;
     let mut cfg = running.clone();
-    cfg.retention_days = cfg
-        .retention_days
-        .max(Config::from_settings_in(&settings, &env).retention_days);
+    // The environment is the one `startup` accepted, so every variable in it resolves.
+    let (now, _) = Config::from_settings_in(&settings, &env);
+    cfg.retention_days = cfg.retention_days.max(now.retention_days);
     Ok(cfg)
 }
 

@@ -3,13 +3,13 @@
 //! `settings.json`, which carries only the native `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY`
 //! block the agent reads at startup.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-use crate::Result;
 use crate::settings::Settings;
 use crate::sink::SinkKind;
+use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -82,55 +82,67 @@ pub struct Retention {
 }
 
 impl Config {
-    /// Resolve the configuration, failing on an unreadable or malformed file. Every command that
-    /// reads or reports data takes this path: a settings file that cannot be parsed would
-    /// otherwise silently yield no plugins, and so an under-reported answer that looks complete.
+    /// Resolve the configuration, failing on an unreadable or malformed file or a variable set to a
+    /// value it cannot read. Every command that reads or reports data takes this path: a settings
+    /// file that cannot be parsed would otherwise silently yield no plugins, and so an
+    /// under-reported answer that looks complete.
     pub fn load() -> Result<Self> {
-        Ok(Self::from_settings(&Settings::load()?))
+        let (cfg, invalid) = Self::from_settings(&Settings::load()?);
+        if invalid.is_empty() {
+            Ok(cfg)
+        } else {
+            let invalid: Vec<String> = invalid.iter().map(ToString::to_string).collect();
+            Err(Error::InvalidEnvironment(invalid.join("; ")))
+        }
     }
 
-    /// Resolve the configuration, degrading to the defaults on a broken file with a note on
-    /// stderr. For the hook, whose contract is that telemetry never blocks a tool call — the same
-    /// asymmetry [`crate::schema::build_registry_resilient`] applies to a broken plugin. The
-    /// defaults include the store: a file that cannot be read cannot say which store it names, the
-    /// default is that store for every file that names none, and for one that does, records kept
-    /// there can still be found, where records not written cannot.
+    /// Resolve the configuration, degrading to the defaults on a broken file, and reading a
+    /// variable it cannot read as unset, each with a note on stderr. For the hook, whose contract
+    /// is that telemetry never blocks a tool call — the same asymmetry
+    /// [`crate::schema::build_registry_resilient`] applies to a broken plugin. The defaults include
+    /// the store: a file that cannot be read cannot say which store it names, the default is that
+    /// store for every file that names none, and for one that does, records kept there can still
+    /// be found, where records not written cannot.
     pub fn load_resilient() -> Self {
-        Self::from_settings(&Settings::load().unwrap_or_else(|e| {
+        let (cfg, invalid) = Self::from_settings(&Settings::load().unwrap_or_else(|e| {
             eprintln!("hatel: {e}");
             Settings::default()
-        }))
+        }));
+        for var in invalid {
+            eprintln!("hatel: ignoring {var}");
+        }
+        cfg
     }
 
     /// Resolve against settings already read, so a command that needs more than one view of the
-    /// configuration file reads it once and every view describes the same observation.
-    pub fn from_settings(settings: &Settings) -> Self {
+    /// configuration file reads it once and every view describes the same observation. A variable
+    /// set to a value it cannot read resolves as unset, and is returned beside the configuration.
+    pub fn from_settings(settings: &Settings) -> (Self, Vec<InvalidVariable>) {
         Self::resolve(settings, &Env::process())
     }
 
     /// Resolve against settings already read and the variables `lookup` answers for, in place of
-    /// this process's environment.
+    /// this process's environment, as [`Config::from_settings`] does.
     pub fn from_settings_in(
         settings: &Settings,
         lookup: &dyn Fn(&str) -> Option<OsString>,
-    ) -> Self {
+    ) -> (Self, Vec<InvalidVariable>) {
         Self::resolve(settings, &Env(lookup))
     }
 
     /// A variable in `env` replaces the file's value, and the file's replaces the default.
-    fn resolve(settings: &Settings, env: &Env) -> Self {
-        let state_dir = env
-            .state_dir()
+    fn resolve(settings: &Settings, env: &Env) -> (Self, Vec<InvalidVariable>) {
+        let mut invalid = Vec::new();
+        let state_dir = valid(env.state_dir(), &mut invalid)
             .or_else(|| settings.state_dir())
             .unwrap_or_else(xdg_state_dir);
-        let state_dir = if env.flag("HATEL_TESTING") {
+        let state_dir = if valid(env.flag("HATEL_TESTING"), &mut invalid).unwrap_or(false) {
             state_dir.join("_test")
         } else {
             state_dir
         };
         let ledger_dir = state_dir.join("ledger");
-        let sink = env
-            .sink()
+        let sink = valid(env.sink(), &mut invalid)
             .or(settings.storage.sink)
             .unwrap_or(SinkKind::Jsonl);
         // `HATEL_PLUGINS` replaces the file's list rather than adding to it, so a shell can pin a
@@ -147,15 +159,15 @@ impl Config {
             ),
             None => (settings.plugin_paths(), PluginSource::ConfigFile),
         };
-        let rotate_bytes = env
-            .rotate_bytes()
+        let rotate_bytes = valid(env.rotate_bytes(), &mut invalid)
             .or(settings.storage.rotate_bytes.map(NonZeroU64::get))
             .unwrap_or(DEFAULT_ROTATE_BYTES);
-        let retention_days = env
-            .retention_days()
+        let retention_days = valid(env.retention_days(), &mut invalid)
             .or(settings.storage.retention_days)
             .unwrap_or(DEFAULT_RETENTION_DAYS);
-        Config {
+        let disabled = valid(env.flag("HATEL_DISABLED"), &mut invalid).unwrap_or(false);
+        let strict = valid(env.flag("HATEL_STRICT"), &mut invalid).unwrap_or(false);
+        let cfg = Config {
             sink,
             state_dir,
             ledger_dir,
@@ -163,9 +175,10 @@ impl Config {
             plugin_source,
             rotate_bytes,
             retention_days,
-            disabled: env.flag("HATEL_DISABLED"),
-            strict: env.flag("HATEL_STRICT"),
-        }
+            disabled,
+            strict,
+        };
+        (cfg, invalid)
     }
 
     /// The retention horizon as of `now_epoch`, one for every store. `retention_days` is capped at
@@ -202,6 +215,37 @@ pub fn storage_overrides(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<&'sta
     Env(lookup).storage_overrides()
 }
 
+/// The variables `lookup` answers with a value configuration cannot read.
+pub fn invalid_variables(lookup: &dyn Fn(&str) -> Option<OsString>) -> Vec<InvalidVariable> {
+    Config::resolve(&Settings::default(), &Env(lookup)).1
+}
+
+/// An environment variable set to a value configuration cannot read, which it resolves as unset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidVariable {
+    pub name: &'static str,
+    pub value: OsString,
+    /// What the value should be instead.
+    pub reason: String,
+}
+
+impl std::fmt::Display for InvalidVariable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={:?}: {}", self.name, self.value, self.reason)
+    }
+}
+
+/// `read`'s value, or `None` once the variable it could not read is recorded in `invalid`.
+fn valid<T>(
+    read: std::result::Result<Option<T>, InvalidVariable>,
+    invalid: &mut Vec<InvalidVariable>,
+) -> Option<T> {
+    read.unwrap_or_else(|var| {
+        invalid.push(var);
+        None
+    })
+}
+
 /// The environment configuration reads, looked up through one function so a test can answer for
 /// it without changing the process's own.
 struct Env<'a>(&'a dyn Fn(&str) -> Option<OsString>);
@@ -217,44 +261,93 @@ impl Env<'_> {
         (self.0)(key)
     }
 
-    fn text(&self, key: &str) -> Option<String> {
-        self.get(key).and_then(|v| v.into_string().ok())
+    /// The variable `name` as `parse` reads it. An empty value is treated as unset, as
+    /// `HATEL_CONFIG`'s is, so an exported-but-blank variable changes nothing.
+    fn parsed<T>(
+        &self,
+        name: &'static str,
+        parse: impl FnOnce(&OsStr) -> std::result::Result<T, String>,
+    ) -> std::result::Result<Option<T>, InvalidVariable> {
+        let Some(value) = self.get(name).filter(|v| !v.is_empty()) else {
+            return Ok(None);
+        };
+        parse(&value).map(Some).map_err(|reason| InvalidVariable {
+            name,
+            value,
+            reason,
+        })
     }
 
-    fn flag(&self, key: &str) -> bool {
-        self.text(key).is_some_and(|v| v == "1")
+    fn text<T>(
+        &self,
+        name: &'static str,
+        expected: &str,
+        parse: impl FnOnce(&str) -> Option<T>,
+    ) -> std::result::Result<Option<T>, InvalidVariable> {
+        self.parsed(name, |v| {
+            v.to_str()
+                .and_then(parse)
+                .ok_or_else(|| format!("must be {expected}"))
+        })
     }
 
-    fn sink(&self) -> Option<SinkKind> {
-        self.text("HATEL_SINK").and_then(|s| SinkKind::parse(&s))
+    fn flag(&self, name: &'static str) -> std::result::Result<Option<bool>, InvalidVariable> {
+        self.text(name, "1 or 0", |v| match v {
+            "1" => Some(true),
+            "0" => Some(false),
+            _ => None,
+        })
     }
 
-    /// An empty value is treated as unset, rather than resolving state under the working
-    /// directory.
-    fn state_dir(&self) -> Option<PathBuf> {
-        self.get("HATEL_STATE_DIR")
-            .filter(|d| !d.is_empty())
-            .map(|d| crate::settings::absolute(PathBuf::from(d)))
+    fn sink(&self) -> std::result::Result<Option<SinkKind>, InvalidVariable> {
+        self.text("HATEL_SINK", "jsonl or sqlite", SinkKind::parse)
     }
 
-    fn retention_days(&self) -> Option<i64> {
-        self.text("HATEL_RETENTION_DAYS")
-            .and_then(|s| s.parse().ok())
-            .filter(|n| (1..=MAX_RETENTION_DAYS).contains(n))
+    /// A leading `~` is refused, as the configuration file's `state_dir` refuses it: a shell
+    /// expands one before this process starts, so one that arrives here never will be.
+    fn state_dir(&self) -> std::result::Result<Option<PathBuf>, InvalidVariable> {
+        self.parsed("HATEL_STATE_DIR", |d| {
+            let dir = PathBuf::from(d);
+            crate::settings::refuse_tilde(&dir)?;
+            Ok(crate::settings::absolute(dir))
+        })
     }
 
-    fn rotate_bytes(&self) -> Option<u64> {
-        self.text("HATEL_ROTATE_BYTES")
-            .and_then(|s| s.parse().ok())
-            .filter(|n| *n > 0)
+    fn retention_days(&self) -> std::result::Result<Option<i64>, InvalidVariable> {
+        self.text(
+            "HATEL_RETENTION_DAYS",
+            &format!("a whole number of days from 1 to {MAX_RETENTION_DAYS}"),
+            |s| {
+                s.parse()
+                    .ok()
+                    .filter(|n| (1..=MAX_RETENTION_DAYS).contains(n))
+            },
+        )
+    }
+
+    fn rotate_bytes(&self) -> std::result::Result<Option<u64>, InvalidVariable> {
+        self.text(
+            "HATEL_ROTATE_BYTES",
+            "a whole number of bytes above 0",
+            |s| s.parse().ok().filter(|n| *n > 0),
+        )
     }
 
     fn storage_overrides(&self) -> Vec<&'static str> {
         [
-            ("HATEL_SINK", self.sink().is_some()),
-            ("HATEL_STATE_DIR", self.state_dir().is_some()),
-            ("HATEL_RETENTION_DAYS", self.retention_days().is_some()),
-            ("HATEL_ROTATE_BYTES", self.rotate_bytes().is_some()),
+            ("HATEL_SINK", self.sink().is_ok_and(|v| v.is_some())),
+            (
+                "HATEL_STATE_DIR",
+                self.state_dir().is_ok_and(|v| v.is_some()),
+            ),
+            (
+                "HATEL_RETENTION_DAYS",
+                self.retention_days().is_ok_and(|v| v.is_some()),
+            ),
+            (
+                "HATEL_ROTATE_BYTES",
+                self.rotate_bytes().is_ok_and(|v| v.is_some()),
+            ),
         ]
         .into_iter()
         .filter_map(|(var, set)| set.then_some(var))
@@ -276,7 +369,7 @@ mod tests {
 
     use super::*;
 
-    fn resolved(file: &str, vars: &[(&str, &str)]) -> Config {
+    fn resolution(file: &str, vars: &[(&str, &str)]) -> (Config, Vec<InvalidVariable>) {
         let settings =
             Settings::parse(file, Path::new("/home/u/.config/hatel/config.toml")).unwrap();
         let lookup = |key: &str| {
@@ -285,6 +378,12 @@ mod tests {
                 .map(|(_, v)| OsString::from(v))
         };
         Config::resolve(&settings, &Env(&lookup))
+    }
+
+    fn resolved(file: &str, vars: &[(&str, &str)]) -> Config {
+        let (cfg, invalid) = resolution(file, vars);
+        assert_eq!(invalid, []);
+        cfg
     }
 
     #[test]
@@ -344,5 +443,54 @@ mod tests {
                 .map(|(_, v)| OsString::from(v))
         };
         assert_eq!(storage_overrides(&lookup), ["HATEL_STATE_DIR"]);
+        let invalid = invalid_variables(&lookup);
+        assert_eq!(invalid.len(), 1);
+        assert_eq!(invalid[0].name, "HATEL_RETENTION_DAYS");
+    }
+
+    #[test]
+    fn a_variable_set_to_a_value_it_cannot_read_is_named_and_leaves_the_file_in_force() {
+        let file = "[storage]\nsink = \"sqlite\"\nretention_days = 30\nrotate_bytes = 1024";
+        for days in ["365d", "0", "100001"] {
+            let (cfg, invalid) = resolution(
+                file,
+                &[
+                    ("HATEL_SINK", "sqllite"),
+                    ("HATEL_STATE_DIR", "~/data"),
+                    ("HATEL_RETENTION_DAYS", days),
+                    ("HATEL_ROTATE_BYTES", "10MB"),
+                    ("HATEL_DISABLED", "true"),
+                ],
+            );
+            assert_eq!(cfg.sink, SinkKind::Sqlite);
+            assert_eq!(cfg.state_dir, xdg_state_dir());
+            assert_eq!(cfg.retention_days, 30);
+            assert_eq!(cfg.rotate_bytes, 1024);
+            assert!(!cfg.disabled);
+            let mut named: Vec<_> = invalid.iter().map(|v| v.name).collect();
+            named.sort_unstable();
+            assert_eq!(
+                named,
+                [
+                    "HATEL_DISABLED",
+                    "HATEL_RETENTION_DAYS",
+                    "HATEL_ROTATE_BYTES",
+                    "HATEL_SINK",
+                    "HATEL_STATE_DIR"
+                ]
+            );
+        }
+        let (_, invalid) = resolution("", &[("HATEL_SINK", "sqllite")]);
+        assert_eq!(
+            invalid[0].to_string(),
+            r#"HATEL_SINK="sqllite": must be jsonl or sqlite"#
+        );
+    }
+
+    #[test]
+    fn a_flag_is_set_by_1_and_cleared_by_0_or_an_empty_value() {
+        for (value, set) in [("1", true), ("0", false), ("", false)] {
+            assert_eq!(resolved("", &[("HATEL_DISABLED", value)]).disabled, set);
+        }
     }
 }

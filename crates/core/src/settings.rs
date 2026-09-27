@@ -85,16 +85,19 @@ fn literal_path<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<P
             "an empty path names no directory; leave the key out for the default",
         ));
     }
+    refuse_tilde(&path).map_err(serde::de::Error::custom)?;
+    Ok(Some(path))
+}
+
+pub(crate) fn refuse_tilde(path: &Path) -> std::result::Result<(), String> {
     if path
         .components()
         .next()
         .is_some_and(|first| first.as_os_str().to_string_lossy().starts_with('~'))
     {
-        return Err(serde::de::Error::custom(
-            "`~` is not expanded here; write the absolute path",
-        ));
+        return Err("`~` is not expanded here; write the absolute path".to_string());
     }
-    Ok(Some(path))
+    Ok(())
 }
 
 fn retention_days<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {

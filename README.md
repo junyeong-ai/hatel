@@ -553,6 +553,8 @@ rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
 | `HATEL_STRICT=1` | allow-list 밖 페이로드 키를 (조용히 드롭하지 않고) 에러 |
 | `HATEL_TESTING=1` | `_test/` 하위로 쓰기 리디렉트 |
 
+저장 변수나 `HATEL_DISABLED` / `HATEL_STRICT` / `HATEL_TESTING`에 받을 수 없는 값(`HATEL_SINK=sqllite`, `HATEL_DISABLED=true`)이 있으면 `serve`, `report`, `kinds`, `emit`은 그 변수를 밝히는 에러로 실패하고, MCP 서버의 `report`, `kinds`, `emit` 도구도 같은 에러로 실패하며, `service`는 설치와 재시작을 거부합니다. 훅과 `init`은 stderr에 알린 뒤 그 값을 무시하고, `doctor`가 이 셸과 settings.json `env`의 그런 값을 알립니다.
+
 > 이 변수들은 *수집기 자신*을 설정하며, `settings.json`에 사는 Claude Code의 `OTEL_*` 텔레메트리 설정과는 무관합니다.
 
 ---
@@ -606,7 +608,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | **`doctor`에 `⚠ … wired synchronously`** | 0.12 이전에 배선된 설정입니다. 기록은 전부 남지만 이벤트마다 Claude Code가 훅을 기다립니다. `hatel init`을 다시 실행하면 비동기로 다시 씁니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |
-| **수신기가 안 뜸 / 곧바로 종료** | 서비스 로그(macOS `~/Library/Logs/hatel/serve.log`, Linux `journalctl --user -u hatel`)나 터미널이 이유를 말합니다: `config.toml`을 파싱할 수 없거나, `--wait` 없이 실행한 `serve`라면 같은 state 디렉터리의 락을 다른 수신기가 잡고 있거나(단일-writer) 포트가 이미 쓰이고 있습니다. 파일을 고치거나 이미 도는 수신기를 쓰고, 고친 뒤에는 `hatel service --restart`. |
+| **수신기가 안 뜸 / 곧바로 종료** | 서비스 로그(macOS `~/Library/Logs/hatel/serve.log`, Linux `journalctl --user -u hatel`)나 터미널이 이유를 말합니다: `config.toml`을 파싱할 수 없거나 `HATEL_*` 변수에 받을 수 없는 값이 있거나, `--wait` 없이 실행한 `serve`라면 같은 state 디렉터리의 락을 다른 수신기가 잡고 있거나(단일-writer) 포트가 이미 쓰이고 있습니다. 파일이나 변수를 고치거나 이미 도는 수신기를 쓰고, 고친 뒤에는 `hatel service --restart`. |
 | **사내 정책으로 endpoint·훅이 잠김** | [엔터프라이즈 / managed 설정](#엔터프라이즈--managed-설정) 참고 — `doctor`가 무엇이 가능한지 정직하게 보고합니다. |
 
 > 무엇이 잘못됐는지 가장 빠른 진단은 항상 **`hatel doctor`** 입니다 — 추측 없이 빠진 신호를 그대로 보고합니다.

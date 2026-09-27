@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use hatel_core::config::InvalidVariable;
 use hatel_core::schema::UnreadableKinds;
 use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings};
 
@@ -143,7 +144,7 @@ fn build_report() -> Report {
     // is one fault, reported once, by the section that owns it.
     let settings = Settings::load();
     let resolved = settings.as_ref().cloned().unwrap_or_default();
-    let cfg = Config::from_settings(&resolved);
+    let (cfg, invalid) = Config::from_settings(&resolved);
     let registry = cs::registry_for_wiring(&cfg);
     let events = cs::active_events(&registry);
 
@@ -182,6 +183,7 @@ fn build_report() -> Report {
             cfg.state_dir.display()
         )),
     }
+    report_invalid_variables(&mut storage, &invalid, &env);
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &env);
     report_registry(&mut storage, &settings, &cfg, &registry);
 
@@ -529,6 +531,27 @@ fn report_receiver(
     Some(sec)
 }
 
+/// Name each variable set to a value configuration cannot read: in this process's environment
+/// (`here`), where a command that reads or writes the store fails on it, and in a settings.json
+/// env, where hooks ignore it with a note on stderr.
+fn report_invalid_variables(sec: &mut Section, here: &[InvalidVariable], env: &cs::Env) {
+    for var in here {
+        sec.fail(format!(
+            "{}={:?} in this process: {}; `serve`, `report`, `kinds` and `emit` fail here, and \
+             `service` refuses to install or restart, until it is fixed or unset",
+            var.name, var.value, var.reason
+        ));
+    }
+    let settings_env = |key: &str| env.get(key).map(|(value, _)| value.into());
+    for var in hatel_core::config::invalid_variables(&settings_env) {
+        sec.fail(format!(
+            "{}={:?} in the {} settings.json env: {}; hooks ignore it until it is fixed or \
+             removed there",
+            var.name, var.value, env[var.name].1, var.reason
+        ));
+    }
+}
+
 /// Name each variable that sets the store for some processes and not others: a storage variable in
 /// this process's environment, and a storage or location variable in a settings.json env, which
 /// hooks inherit and the service's receiver does not. Any of them splits what hooks, `report` and
@@ -864,7 +887,7 @@ mod tests {
             .into_iter()
             .collect()
         };
-        let cfg = Config::from_settings(&Settings::default());
+        let cfg = Config::from_settings(&Settings::default()).0;
         // A remote collector is not this receiver's to answer for: no section at all.
         assert!(
             report_receiver(
@@ -926,7 +949,7 @@ mod tests {
             .into_iter()
             .collect()
         };
-        let cfg = Config::from_settings(&Settings::default());
+        let cfg = Config::from_settings(&Settings::default()).0;
         let identity = |version: &str, store: Option<receiver::Store>| {
             serde_json::to_string(&receiver::Identity {
                 config: Settings::path(),
@@ -1022,6 +1045,28 @@ mod tests {
     }
 
     #[test]
+    fn a_variable_set_to_a_value_it_cannot_read_is_named_where_it_is_set() {
+        let here = hatel_core::config::invalid_variables(&|key: &str| {
+            (key == "HATEL_SINK").then(|| "sqllite".into())
+        });
+        let hooks: cs::Env = [("HATEL_DISABLED".to_string(), ("true".to_string(), "user"))]
+            .into_iter()
+            .collect();
+        let mut sec = Section::new("storage", "storage:");
+        report_invalid_variables(&mut sec, &here, &hooks);
+        assert_eq!(sec.findings.len(), 2);
+        assert!(sec.findings.iter().all(|f| f.status == Status::Fail));
+        assert!(
+            sec.findings[0]
+                .message
+                .starts_with(r#"HATEL_SINK="sqllite" in this process: must be jsonl or sqlite;"#)
+        );
+        assert!(sec.findings[1].message.starts_with(
+            r#"HATEL_DISABLED="true" in the user settings.json env: must be 1 or 0;"#
+        ));
+    }
+
+    #[test]
     fn a_variable_that_splits_the_store_is_named_where_it_is_set() {
         let notes = |process: &dyn Fn(&str) -> Option<std::ffi::OsString>, env: &cs::Env| {
             let mut sec = Section::new("storage", "storage:");
@@ -1070,7 +1115,7 @@ mod tests {
     #[test]
     fn unattributed_sessions_are_named_only_when_some_exist() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = Config::from_settings(&Settings::default());
+        let mut cfg = Config::from_settings(&Settings::default()).0;
         cfg.state_dir = dir.path().to_path_buf();
         let index = SessionIndex::new(dir.path().to_path_buf());
         let acme = hatel_core::ProjectRef {
