@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// A home whose config.toml keeps the store in it.
@@ -29,12 +30,24 @@ fn configure(home: &Path, storage: &str) {
     std::fs::rename(&staged, home.join("config.toml")).unwrap();
 }
 
+/// Held while this process creates a listener or spawns a receiver. On macOS a socket is marked
+/// close-on-exec in a second call after it is created, so a receiver spawned in between inherits a
+/// listener and keeps its port bound for as long as it runs. A connection it inherits binds no port
+/// a test waits on.
+static SOCKETS: Mutex<()> = Mutex::new(());
+
+fn exclusive<T>(f: impl FnOnce() -> T) -> T {
+    let _held = SOCKETS.lock().unwrap_or_else(PoisonError::into_inner);
+    f()
+}
+
+/// A loopback listener on a port the OS picks.
+fn listener() -> TcpListener {
+    exclusive(|| TcpListener::bind("127.0.0.1:0")).unwrap()
+}
+
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    listener().local_addr().unwrap().port()
 }
 
 /// A receiver this test started, killed when dropped so a failed assertion leaves no process
@@ -72,12 +85,7 @@ fn command(home: &Path, port: u16, wait: bool) -> Command {
 }
 
 fn serve(home: &Path, port: u16, wait: bool) -> Receiver {
-    Receiver(
-        command(home, port, wait)
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    )
+    Receiver(exclusive(|| command(home, port, wait).stderr(Stdio::null()).spawn()).unwrap())
 }
 
 /// The line a receiver started with `--wait` prints when another process holds the port.
@@ -88,10 +96,7 @@ const LOCK_HELD: &str = "— waiting for it to exit";
 /// A receiver started with `--wait`, returned once it prints the line ending in `held`. By then it
 /// listens for a stop request, and holds neither the lock nor the port while it waits.
 fn waiting(home: &Path, port: u16, held: &str) -> Receiver {
-    let mut child = command(home, port, true)
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = exclusive(|| command(home, port, true).stderr(Stdio::piped()).spawn()).unwrap();
     let stderr = child.stderr.take().unwrap();
     let receiver = Receiver(child);
     let (said, heard) = std::sync::mpsc::channel();
@@ -152,7 +157,7 @@ const LIMIT: Duration = Duration::from_secs(10);
 #[test]
 fn a_receiver_without_wait_exits_when_the_port_is_taken() {
     let home = home();
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = listener();
     let mut receiver = serve(home.path(), held.local_addr().unwrap().port(), false);
     let status = exit_within(&mut receiver, LIMIT);
     drop(receiver);
@@ -163,7 +168,7 @@ fn a_receiver_without_wait_exits_when_the_port_is_taken() {
 #[test]
 fn a_waiting_receiver_stops_at_once_when_asked() {
     let home = home();
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = listener();
     let mut receiver = waiting(home.path(), held.local_addr().unwrap().port(), PORT_HELD);
     let pid = libc::pid_t::try_from(receiver.0.id()).unwrap();
     // SAFETY: `kill` on the pid of a child this test spawned and has not reaped.
@@ -176,7 +181,7 @@ fn a_waiting_receiver_stops_at_once_when_asked() {
 #[test]
 fn a_waiting_receiver_serves_once_the_port_is_freed() {
     let home = home();
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = listener();
     let port = held.local_addr().unwrap().port();
     let receiver = waiting(home.path(), port, PORT_HELD);
     drop(held);
@@ -188,7 +193,7 @@ fn a_waiting_receiver_serves_once_the_port_is_freed() {
 #[test]
 fn a_receiver_waiting_for_the_port_leaves_the_store_to_another() {
     let home = home();
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
+    let held = listener();
     let first = waiting(home.path(), held.local_addr().unwrap().port(), PORT_HELD);
     // `--wait`, so the instant the first holds the lock on each of its attempts cannot fail it.
     let port = free_port();
