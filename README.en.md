@@ -81,7 +81,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> 💡 Wire while installing with `... | bash -s -- --wire` — or do the service and MCP registration in one go with `--wire --service --mcp`. Pin a release with `HATEL_VERSION=0.4.3`. Uninstall later with `scripts/uninstall.sh` (collected data and `config.toml` stay in place).
+> 💡 Wire while installing with `... | bash -s -- --wire` — or do the service and MCP registration in one go with `--wire --service --mcp`. Pin a release with `HATEL_VERSION=<version>`. Uninstall later with `scripts/uninstall.sh` (collected data and `config.toml` stay in place).
 
 > ⚠️ **Cost and tokens are captured only while the receiver is running** (native OTel is push-only). So you don't have to remember to start it, run it as a background service with `hatel service` ([Always-on collection](#always-on-collection-no-gaps)).
 

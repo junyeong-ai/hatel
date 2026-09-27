@@ -138,7 +138,8 @@ three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
 (tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
 one ran, its `agent` label being the declared type for a plain subagent and the given name for
 a teammate; a row with no label is an agent Claude Code ran for itself, which spawns no
-transcript and calls no tools — report it as such, not as a subagent that went unnamed), `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
+transcript and calls no tools — report it as such, not as a subagent that went unnamed),
+`by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
 (`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
 `cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
 such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
@@ -149,7 +150,10 @@ rebuilding the prompt cache cost each time a context was re-established, which n
 `cache_likely_expired` say how long the gap was and whether the cache had gone cold. Add that sum
 when asked what a project or a period actually cost. A fresh `startup` carries no such field at all
 rather than a zero, so it contributes nothing instead of diluting the average.
-`report --project <label>` matches by the project's basename label. A project is a repository: work done in a linked worktree rolls up to the repository it checks out, and a session run outside any repository has no project and groups under `(empty)` — report that as unattributed, never as a project of its own. A Kind that carries no
+`report --project <label>` matches by the project's basename label. A project is a repository:
+work done in a linked worktree rolls up to the repository it checks out, and a session run
+outside any repository has no project and groups under `(empty)` — report that as unattributed,
+never as a project of its own. A Kind that carries no
 `project` field records none, so a project scope cannot select it: its `project_scope` reads
 `unsupported` and it renders as a note, not an empty table — read that as "not applicable",
 never as zero usage. `unreadable_kinds` — on every report, and on `kinds --json`, whose payload
@@ -168,7 +172,8 @@ memory loads), and on `tool`, `--group-by agent_id` separates a subagent's calls
 agent's — the row with no value (`—` in text, `key: null` in JSON) is the main agent, which never
 carries one. The `memory` Kind answers which instruction files (CLAUDE.md, rules) entered context:
 `file_path` is the path in the repository, else `~/…` under home, else absolute (add `--group-by
-project` across repositories), and `load_reason` says why. A context rebuild (`session_start`, `compact`) announces every file
+project` across repositories), and `load_reason` says why. A context rebuild (`session_start`,
+`compact`) announces every file
 again, an @-import as `include` with `parent_file_path`; a load a file access set off carries
 `trigger_file_path` and skips a file the context already holds — so report a missing load as "not
 announced", never as "not in context". `prompt_id` is the latest prompt submitted at load time, not
