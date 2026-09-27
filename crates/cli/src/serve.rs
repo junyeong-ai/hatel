@@ -152,9 +152,15 @@ pub(crate) fn startup() -> Result<Startup, String> {
 }
 
 async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -> i32 {
-    // One stop request for the whole run, listened for from the first wait on, so one sent while
-    // this receiver waits is not lost before the server listens for it.
-    let mut stop = Box::pin(stop_requested());
+    // One stop request for the whole run, listened for from here on, so one sent while this
+    // receiver waits or starts takes the graceful path as one sent while it serves does.
+    let mut stop = match stop_requested() {
+        Ok(stop) => Box::pin(stop),
+        Err(e) => {
+            eprintln!("serve: cannot listen for a stop request: {e}");
+            return 1;
+        }
+    };
     let addr = format!("127.0.0.1:{port}");
     // Each attempt starts afresh: it reads the configuration, takes the single-writer lock on the
     // state dir that configuration names, and binds the port. The cost snapshot and the tool ledger
@@ -515,26 +521,30 @@ async fn stopped_while_waiting<F: Future<Output = ()>>(stop: &mut std::pin::Pin<
     }
 }
 
-async fn stop_requested() {
-    // A service manager (launchd/systemd) stops the daemon with SIGTERM, an interactive run with
-    // Ctrl-C (SIGINT) — wait on both so the graceful path (and the final cost flush) runs either way.
+/// Listen for a stop request: SIGTERM, with which a service manager (launchd/systemd) stops the
+/// daemon, or Ctrl-C (SIGINT) in an interactive run, so the graceful path and its final cost flush
+/// run either way. The handlers are installed by this call, not when the future is first polled:
+/// until they are, either signal ends the process by its default action.
+fn stop_requested() -> std::io::Result<impl Future<Output = ()>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = term.recv() => {}
-                }
+        let mut terminate = signal(SignalKind::terminate())?;
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = terminate.recv() => {}
+                _ = interrupt.recv() => {}
             }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
-        }
+        })
     }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
+    #[cfg(windows)]
+    {
+        let mut ctrl_c = tokio::signal::windows::ctrl_c()?;
+        Ok(async move {
+            ctrl_c.recv().await;
+        })
+    }
 }
 
 /// Draw the live per-session rollup. Called on the flush tick, not on ingest: a frame is a human

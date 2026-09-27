@@ -1,6 +1,6 @@
 //! `serve` against a port or a state dir another process holds, as the service runs it.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -50,11 +50,11 @@ impl Drop for Receiver {
     }
 }
 
-fn serve(home: &Path, port: u16, wait: bool) -> Receiver {
+/// `hatel serve --all` on `port`. No `HATEL_*` variable of the environment the tests run in
+/// reaches it, so it configures itself from the home's config.toml alone; the names are compared
+/// without case, as Windows reads them.
+fn command(home: &Path, port: u16, wait: bool) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hatel"));
-    // No `HATEL_*` variable of the environment the tests run in reaches the receiver, which
-    // configures itself from the home's config.toml alone. Compared without case, as Windows reads
-    // the names.
     for (key, _) in std::env::vars_os() {
         if key
             .to_str()
@@ -69,9 +69,46 @@ fn serve(home: &Path, port: u16, wait: bool) -> Receiver {
     }
     cmd.env("HOME", home)
         .env("HATEL_CONFIG", home.join("config.toml"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    Receiver(cmd.spawn().unwrap())
+        .stdout(Stdio::null());
+    cmd
+}
+
+fn serve(home: &Path, port: u16, wait: bool) -> Receiver {
+    Receiver(
+        command(home, port, wait)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// The line a receiver started with `--wait` prints when another process holds the port.
+const PORT_HELD: &str = "is in use — waiting for it to be freed";
+/// The line it prints when another receiver holds the store's lock.
+const LOCK_HELD: &str = "— waiting for it to exit";
+
+/// A receiver started with `--wait`, returned once it prints the line ending in `held`. By then it
+/// listens for a stop request, and holds neither the lock nor the port while it waits.
+fn waiting(home: &Path, port: u16, held: &str) -> Receiver {
+    let mut child = command(home, port, true)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let receiver = Receiver(child);
+    let (said, heard) = std::sync::mpsc::channel();
+    let held = held.to_owned();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.ends_with(&held) {
+                said.send(()).ok();
+            }
+        }
+    });
+    heard
+        .recv_timeout(LIMIT)
+        .expect("it says what it waits for");
+    receiver
 }
 
 /// The `/healthz` body a hatel receiver answers on `port`, if one does.
@@ -112,10 +149,6 @@ fn exit_within(receiver: &mut Receiver, limit: Duration) -> Option<ExitStatus> {
     None
 }
 
-fn still_running(receiver: &mut Receiver) -> bool {
-    receiver.0.try_wait().unwrap().is_none()
-}
-
 const LIMIT: Duration = Duration::from_secs(10);
 
 #[test]
@@ -134,12 +167,11 @@ fn a_receiver_without_wait_exits_when_the_port_is_taken() {
 fn a_waiting_receiver_stops_at_once_when_asked() {
     let home = home("stop");
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut receiver = serve(&home, held.local_addr().unwrap().port(), true);
-    std::thread::sleep(Duration::from_millis(1500));
+    let mut receiver = waiting(&home, held.local_addr().unwrap().port(), PORT_HELD);
     let pid = libc::pid_t::try_from(receiver.0.id()).unwrap();
     // SAFETY: `kill` on the pid of a child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    let status = exit_within(&mut receiver, Duration::from_secs(3));
+    let status = exit_within(&mut receiver, LIMIT);
     drop(receiver);
     assert!(status.is_some_and(|s| s.success()), "{status:?}");
     std::fs::remove_dir_all(&home).ok();
@@ -150,9 +182,7 @@ fn a_waiting_receiver_serves_once_the_port_is_freed() {
     let home = home("port");
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = held.local_addr().unwrap().port();
-    let mut receiver = serve(&home, port, true);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(still_running(&mut receiver), "it waits rather than exits");
+    let receiver = waiting(&home, port, PORT_HELD);
     drop(held);
     let served = within(LIMIT, || answers(port));
     drop(receiver);
@@ -164,9 +194,7 @@ fn a_waiting_receiver_serves_once_the_port_is_freed() {
 fn a_receiver_waiting_for_the_port_leaves_the_store_to_another() {
     let home = home("share");
     let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut first = serve(&home, held.local_addr().unwrap().port(), true);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(still_running(&mut first), "it waits for the port");
+    let first = waiting(&home, held.local_addr().unwrap().port(), PORT_HELD);
     // `--wait`, so the instant the first holds the lock on each of its attempts cannot fail it.
     let port = free_port();
     let second = serve(&home, port, true);
@@ -184,12 +212,7 @@ fn a_waiting_receiver_takes_over_the_store_once_its_holder_exits() {
     let first = serve(&home, first_port, false);
     assert!(within(LIMIT, || answers(first_port)));
     let second_port = free_port();
-    let mut second = serve(&home, second_port, true);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(
-        still_running(&mut second) && !answers(second_port),
-        "it waits for the store's lock"
-    );
+    let second = waiting(&home, second_port, LOCK_HELD);
     drop(first);
     let served = within(LIMIT, || answers(second_port));
     drop(second);
@@ -204,9 +227,7 @@ fn a_waiting_receiver_serves_the_configuration_it_finds_when_it_takes_over() {
     let first = serve(&home, first_port, false);
     assert!(within(LIMIT, || answers(first_port)));
     let second_port = free_port();
-    let mut second = serve(&home, second_port, true);
-    std::thread::sleep(Duration::from_millis(1500));
-    assert!(still_running(&mut second), "it waits for the store's lock");
+    let second = waiting(&home, second_port, LOCK_HELD);
     configure(&home, "retention_days = 45\n");
     drop(first);
     let current = within(LIMIT, || {
