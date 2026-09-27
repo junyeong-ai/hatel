@@ -41,6 +41,17 @@ hatel init --insert        # keep a corporate endpoint AND route through hatel (
 hatel doctor               # verify and explain any gaps
 ```
 
+hatel's own settings live in `config.toml`: `$HATEL_CONFIG`, else
+`~/.config/hatel/config.toml` (under `$XDG_CONFIG_HOME` when set, `%APPDATA%\hatel` on Windows;
+`doctor` prints the path). The hook, the receiver and `report` all read it. Storage goes under
+`[storage]`: `sink`, `state_dir`, `retention_days` (default 90) and `rotate_bytes`. `state_dir` is
+absolute or relative to that file's directory, and `~` is refused rather than expanded. The
+receiver reads the file when it starts, so restart it after an edit (`hatel service --restart`),
+except that it rereads the file before deleting anything and keeps whatever the file now keeps.
+A `HATEL_*` storage variable overrides a key for one process only: never put one, `HATEL_CONFIG`
+or an `XDG_*` directory in settings.json `env`, which hooks inherit and the service's receiver
+does not, since that splits the store.
+
 `doctor` gaps and what they mean:
 - **no hook invokes …** → run `init`.
 - **BLOCKED by allowManagedHooksOnly** → IT must deploy the hook as a *managed* hook (MDM).
@@ -61,6 +72,11 @@ hatel doctor               # verify and explain any gaps
   it started from across an upgrade; `hatel service --restart` (or restart the `serve` you run).
   **something answers … but not as a hatel receiver** is a build before 0.18.0 or another
   collector on that port — say which is unknown rather than assume.
+- **receiver at … read … but this process reads …** / **receiver at … writes … but this process
+  reads …** (warnings) → the receiver started before a `config.toml` edit (`hatel service
+  --restart`), or `HATEL_CONFIG`, an `XDG_*` directory or a storage variable is set on one side
+  only, which splits the store: cost can look empty while a receiver runs. Move the setting into
+  `config.toml` and out of settings.json `env`; doctor's notes name where it is set.
 - **wired hook … is <version> while this hatel is …** (a warning) → the hook writing records is a
   different build from the `hatel` reading them, so its fields can differ from what `kinds` lists.
 - **wired hook … names no version / did not name its build** (a warning) → which build writes the
@@ -76,8 +92,7 @@ hatel doctor               # verify and explain any gaps
 ## Forward to other collectors (export)
 
 The receiver can tee what it ingests to downstream OTLP/HTTP collectors, so you keep a corporate
-collector *and* gain hatel. Destinations live in `config.toml` (`$HATEL_CONFIG`, else
-`<config-dir>/hatel/config.toml`), one `[[export]]` per destination:
+collector *and* gain hatel. Destinations live in `config.toml`, one `[[export]]` per destination:
 
 ```toml
 [[export]]
@@ -162,27 +177,22 @@ error rather than an empty answer.
 
 `--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
 column shows; a redacted field is matched by its *original* value (the query is hashed exactly as
-the ledger stored it). A field outside the Kind's allow-list is a loud error, never an empty
-report. Retention is governed by `retention_days` under `[storage]` in `config.toml` (default 90
-days; `HATEL_RETENTION_DAYS` overrides it for one process only). The receiver reads it when it
-starts and rereads the file before it deletes anything, keeping whatever the file now keeps, so a
-raised horizon holds at once; `doctor` warns when the receiver reads another config.toml or writes
-a different store. The receiver prunes ledger records and cost rows past the horizon, so a
-`--window` beyond it shows only what is retained — say so rather than presenting it as low usage. Each Kind
-section carries `retained_since`, the oldest record still stored — of the project `--project`
-names, when given (`null` when none); a window starting before it was not measured whole, which is
-the check to make before reading a zero as an absence.
+the ledger stored it). The receiver prunes ledger records and cost rows past `retention_days`, so
+a `--window` beyond the horizon shows only what is retained — say so rather than presenting it as
+low usage. Each Kind section carries `retained_since`, the oldest record still stored — of the
+project `--project` names, when given (`null` when none); a window starting before it was not
+measured whole, which is the check to make before reading a zero as an absence.
 
 ## Add a custom per-project metric
 
 A plugin is a TOML schema file (no code, no recompile). List it under `plugins` in
-`config.toml` (`$HATEL_CONFIG`, else `<config-dir>/hatel/config.toml`; relative paths resolve
-against that file's directory), then confirm with `hatel kinds`. Configuring it there is what
-makes the write and read paths agree — `HATEL_PLUGINS` overrides the list for one process only,
-so a Kind registered that way is invisible to any command run without it. `doctor`, `kinds`,
-`report`, and the error from `--kind <that name>` all name such a Kind and the surface where its
-schema would be listed — listing it there is the fix. **Choose the path by where the signal
-originates, and keep one writer per Kind** — a Kind written by both paths double-counts:
+`config.toml` (relative paths resolve against that file's directory), then confirm with
+`hatel kinds`. Configuring it there is what makes the write and read paths agree —
+`HATEL_PLUGINS` overrides the list for one process only, so a Kind registered that way is
+invisible to any command run without it. `doctor`, `kinds`, `report`, and the error from
+`--kind <that name>` all name such a Kind and the surface where its schema would be listed —
+listing it there is the fix. **Choose the path by where the signal originates, and keep one
+writer per Kind** — a Kind written by both paths double-counts:
 
 - A signal the Claude Code lifecycle can observe → a **hook binding** (zero code,
   auto-attributed to the session's project).

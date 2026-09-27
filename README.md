@@ -7,11 +7,15 @@
 
 **Claude Code가 쓴 토큰·비용·시간을 내 노트북에서 본다.** 토큰·비용·활성 시간·도구 사용을 **프로젝트·세션·서브에이전트별로** 모읍니다 — 띄워둘 대시보드도, 가입할 SaaS도 없이. 기본적으로 데이터는 당신의 머신을 떠나지 않습니다.
 
-```text
-| tool | Bash [count=4, duration_ms=5730, ok=3], Edit [count=4, duration_ms=1360, ok=4], … |
+```md
+| tool_name | count | duration_ms | ok |
+|---|---:|---:|---:|
+| Bash | 4 | 5,730 | 3 |
 
-| session  | project  | tokens | cost$  | active_s | lines |
-| a1b2c3d4 | acme-api | 248913 | 1.8423 |   1284.6 |   342 |
+| project | sessions | tokens | cost_usd | active_time_s | lines |
+|---|---:|---:|---:|---:|---:|
+| acme-api | 2 | 346,453 | 2.56 | 1,896.90 | 460 |
+| acme-web | 1 | 53,201 | 0.41 | 401.70 | 76 |
 ```
 
 ---
@@ -77,7 +81,7 @@ hatel serve --all
 hatel report --window 30d
 ```
 
-> 💡 설치하면서 바로 연결하려면 `... | bash -s -- --wire` — 서비스·MCP 등록까지 한 번에 하려면 `--wire --service --mcp`. 특정 버전 고정은 `HATEL_VERSION=0.4.3`. 나중에 깔끔히 제거는 `scripts/uninstall.sh`.
+> 💡 설치하면서 바로 연결하려면 `... | bash -s -- --wire` — 서비스·MCP 등록까지 한 번에 하려면 `--wire --service --mcp`. 특정 버전 고정은 `HATEL_VERSION=0.4.3`. 나중에 제거는 `scripts/uninstall.sh`(모은 데이터와 `config.toml`은 그대로 남음).
 
 > ⚠️ **비용·토큰은 수신기가 켜져 있을 때만** 잡힙니다(네이티브 OTel은 push 전용). 끄고 켜는 걸 잊지 않으려면 `hatel service`로 백그라운드 상시 실행하세요([항상 켜두기](#항상-켜두기-무중단-수집)).
 
@@ -140,7 +144,7 @@ hatel report --window 30d
 - **`command`** 섹션은 명시적으로 호출한 슬래시 명령과 스킬입니다. 모델이 스스로 불러온 스킬은 확장을 일으키지 않으므로 여기 없고, `--kind tool --filter tool_name=Skill --group-by skill`이 그 이름을 보여주며, 실패한 호출도 함께 셉니다.
 - **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다. 라벨이 없는 `(empty)` 행은 Claude Code가 스스로 돌린 에이전트입니다 — 대화가 띄운 것이 아니어서 유형도 대화 기록도 없고 도구도 쓰지 않습니다.
 
-> 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적습니다. 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
+> 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적고, 기록이 아예 없는 Kind도 같은 방식으로 나열됩니다(위에서는 줄였습니다). 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
 ### 라이브 뷰 — `hatel serve`
 
@@ -165,7 +169,7 @@ e5f6a7b8 acme-api                 97540    0.7218    612.3    118       1      0
 대시보드·스크립트·AI 에이전트가 그대로 파싱:
 
 ```sh
-hatel report --window 30d --kind tool --format json
+hatel report --window 30d --kind tool --top 1 --format json
 ```
 
 ```json
@@ -180,25 +184,32 @@ hatel report --window 30d --kind tool --format json
           "count": 4,
           "key": "Bash",
           "sums": [
-            { "name": "duration_ms", "sum": 5730.0 },
-            { "name": "ok", "sum": 3.0 }
+            {
+              "name": "duration_ms",
+              "sum": 5730.0
+            },
+            {
+              "name": "ok",
+              "sum": 3.0
+            }
           ]
         }
       ],
+      "identity": "tool_use_id",
       "kind": "tool",
       "project_scope": "unrestricted",
-      "retained_since": "2026-06-14T09:12:03.4Z",
+      "retained_since": "2026-09-27T01:00:27.289564Z",
       "sort_by": "duration_ms"
     }
   ],
   "project": null,
-  "top_n": 5,
+  "top_n": 1,
   "unreadable_kinds": null,
   "window": "30d"
 }
 ```
 
-> 키는 알파벳 순으로 직렬화됩니다. 위는 `Bash` 그룹만 보였고, 실제 리포트엔 `Edit·Grep·Read`가 같은 형태로 이어집니다. 그 차원의 값을 아예 싣지 않은 기록의 그룹은 `key`가 `null`입니다(텍스트·마크다운 뷰의 `—` 행). 필드가 없는 것과 어떤 값이 있는 것을 글자가 아니라 모양으로 구분할 수 있습니다. `retained_since`는 그 Kind에서 아직 보관 중인 가장 오래된 기록의 시각입니다(`--project`를 주면 그 프로젝트의 기록 중에서, 없으면 `null`). 보존 기간이 저장소를 뒤에서부터 잘라 내므로, 그보다 앞서 시작하는 구간은 전부 측정된 것이 아니며 읽는 쪽은 그 빈 앞부분을 침묵으로 읽지 말고 그렇게 말해야 합니다. `unreadable_kinds`가 `null`이 아니면 **로드된 스키마가 선언하지 않는 Kind가 원장에 있다**는 뜻입니다 — 이 집계는 수집된 것보다 적게 답한 것이고, 이름과 고칠 위치가 거기 실려 옵니다([커스텀 지표](#커스텀-지표-플러그인) 참조).
+> 키는 알파벳 순으로 직렬화됩니다. 위는 `--top 1`로 `Bash` 그룹만 남겼고, 기본값(상위 5)이면 `Edit·Grep·Read`가 같은 형태로 이어집니다. 그 차원의 값을 아예 싣지 않은 기록의 그룹은 `key`가 `null`입니다(텍스트·마크다운 뷰의 `—` 행). 필드가 없는 것과 어떤 값이 있는 것을 글자가 아니라 모양으로 구분할 수 있습니다. `retained_since`는 그 Kind에서 아직 보관 중인 가장 오래된 기록의 시각입니다(`--project`를 주면 그 프로젝트의 기록 중에서, 없으면 `null`). 보존 기간이 저장소를 뒤에서부터 잘라 내므로, 그보다 앞서 시작하는 구간은 전부 측정된 것이 아니며 읽는 쪽은 그 빈 앞부분을 침묵으로 읽지 말고 그렇게 말해야 합니다. `unreadable_kinds`가 `null`이 아니면 **로드된 스키마가 선언하지 않는 Kind가 원장에 있다**는 뜻입니다 — 이 집계는 수집된 것보다 적게 답한 것이고, 이름과 고칠 위치가 거기 실려 옵니다([커스텀 지표](#커스텀-지표-플러그인) 참조).
 
 전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로).
 
@@ -219,7 +230,7 @@ claude mcp add hatel -- hatel mcp
 | `serve [--port 4318] [--all] [--project N] [--wait]` | OTLP/HTTP 수신기 + 세션별 라이브 롤업(서브에이전트가 돌면 토큰·비용 분해 포함). `--wait`는 다른 프로세스가 포트나 저장소의 락을 쥐고 있으면 끝나지 않고 풀릴 때까지 기다림(서비스가 이렇게 실행). |
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--group-by F] [--sort-by M] [--filter f=v]` | 롤링 윈도우 집계 — 그룹별 레코드 수와 각 Kind `measures`의 합, 그리고 비용 스냅샷. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | `settings.json`에 텔레메트리 env + 훅을 연결/해제 — 멱등·비파괴·원자적. |
-| `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all --wait` 실행, 무중단 수집). |
+| `service [--restart] [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치·재시작·제거(`serve --all --wait` 실행, 무중단 수집). |
 | `doctor [--json]` | 연결을 검증하고 정책 공백을 정직하게 보고 — `--json`은 같은 findings를 기계 판독용으로. |
 | `kinds [--json]` | 등록된 Kind(코어+플러그인) 목록 — 그리고 원장에 있으나 어떤 스키마도 선언하지 않는 Kind. |
 | `emit <kind> [key=value...] [--json OBJ]` | 등록된 Kind에 도메인 신호 하나 기록 — 커스텀 지표의 프로그래밍 경로. |
@@ -245,6 +256,9 @@ hatel report --window 30d --format json            # 대시보드/스크립트�
 $ hatel report --window 30d --project acme-api --format text
 === hatel — rolling 30d — project acme-api ===
 
+command — by command_name, ranked by count
+  (no records in this window)
+
 compaction — by session_id, ranked by count
   (no records in this window)
 
@@ -255,6 +269,9 @@ prompt — by session_id, ranked by count
                       session_id  count
   ██████████████████  a1b2c3d4        2
   █████████░░░░░░░░░  e5f6a7b8        1
+
+session — by source, ranked by estimated_cache_write_usd
+  (no records in this window)
 
 subagent — by agent, ranked by count
                       agent          count
@@ -335,10 +352,10 @@ $ hatel doctor
 hatel doctor
 
 settings files:
-  user     found    ~/.claude/settings.json
-  project  absent   ./.claude/settings.json
-  local    absent   ./.claude/settings.local.json
-  managed  absent   /Library/Application Support/ClaudeCode/managed-settings.json
+  user     found                  /home/you/.claude/settings.json
+  project  absent                 /home/you/src/acme-api/.claude/settings.json
+  local    absent                 /home/you/src/acme-api/.claude/settings.local.json
+  managed  absent                 /etc/claude-code/managed-settings.json
 
 native telemetry (settings.json env):
   ✓ CLAUDE_CODE_ENABLE_TELEMETRY=1 (from user)
@@ -356,7 +373,8 @@ hooks:
   ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.19.0)
 
 storage:
-  ✓ state dir writable: ~/.local/state/hatel
+  ✓ state dir writable: /home/you/.local/state/hatel
+  • no plugin schemas configured (/home/you/.config/hatel/config.toml)
 
 export:
   • http://collector.acme.internal:4318 (enriched, only: acme-api, acme-web, 1 header(s))
@@ -364,7 +382,7 @@ export:
   ✓ OTel is routed through this receiver — export has a stream to forward
 ```
 
-> `receiver:` 섹션은 신호가 로컬 수신기로 향할 때 나타나며, 수신기에 직접 물어봅니다(OTLP 포트의 `GET /healthz`) — 아무것도 듣지 않으면 네이티브 메트릭·로그가 버려지고 있는 것이고, 수신기는 시작할 때의 바이너리와 설정을 계속 쓰므로 업그레이드 뒤에는 옛 빌드로 답할 수 있고, `config.toml`을 고친 뒤 재시작하지 않았거나 `HATEL_CONFIG`·저장 변수를 한쪽에만 두면 이 프로세스와 다른 설정 파일을 읽거나 다른 저장소에 쓴다고 알립니다. `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
+> `receiver:` 섹션은 신호가 로컬 수신기로 향할 때 나타나며, 수신기에 직접 물어봅니다(OTLP 포트의 `GET /healthz`). 아무것도 듣지 않으면 네이티브 메트릭·로그가 버려지고 있는 것입니다. 수신기는 시작할 때의 바이너리와 설정을 계속 쓰므로, 업그레이드 뒤, 재시작하지 않은 `config.toml` 편집 뒤, 또는 `HATEL_CONFIG`·`XDG_*` 디렉터리·저장 변수를 한쪽에만 둔 경우에 다른 빌드로 답하거나 이 프로세스와 다른 설정 파일을 읽거나 다른 저장소에 쓰는 수신기를 알립니다. `export:` 섹션은 export가 설정됐을 때만 나타납니다. 그리고 `doctor`는 마지막에 `hatel init`이 쓰는 것과 **동일한 참조 설정 블록**(managed/org 설정에 붙여넣기용)도 출력하는데, 위 [`init`](#init--claude-code에-연결) 블록과 같아 여기선 줄였습니다.
 
 `hatel doctor --json`은 같은 findings를 안정된 JSON으로 출력합니다 — 섹션별 `findings`가 `status`(`ok`/`fail`/`warn`/`note`)와 `message`를 갖고, 최상위 `ok`와 exit code의 의미(하드 요구 실패 시에만 non-zero)는 사람용 출력과 동일합니다.
 
@@ -395,7 +413,7 @@ $ hatel kinds
 ...
 tool           group_key=tool_name    fields=[agent_id, duration_ms, ok, project, prompt_id, session_id, skill, tool_name, tool_use_id] identity=tool_use_id
 
-the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in ~/.config/hatel/config.toml; if nothing writes them again, a running receiver removes the last of them by 2026-12-26
+the ledger holds team.deploy, which no loaded schema declares — those records stay uncountable until a plugin that declares them is listed in /home/you/.config/hatel/config.toml; if nothing writes them again, a running receiver removes the last of them by 2026-12-27
 ```
 
 ---
@@ -412,7 +430,7 @@ flowchart LR
   R -->|"raw: 바이트 그대로"| ARC["아카이브 백엔드"]
 ```
 
-`config.toml`(`$HATEL_CONFIG`, 없으면 `<config-dir>/hatel/config.toml`)에 목적지를 설정합니다. `[[export]]` 하나가 한 목적지 + 거기로 갈 때 적용할 변환입니다:
+`config.toml`(`$HATEL_CONFIG`, 없으면 `~/.config/hatel/config.toml` 또는 플랫폼 등가)에 목적지를 설정합니다. `[[export]]` 하나가 한 목적지 + 거기로 갈 때 적용할 변환입니다:
 
 ```toml
 [[export]]
@@ -457,7 +475,7 @@ plugins = ["schemas/aix.toml"]   # 상대 경로는 config.toml 자신의 디렉
 
 ```text
 $ hatel report --kind team.deploy
-report: unknown kind "team.deploy" (registered: command, compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in ~/.config/hatel/config.toml
+report: unknown kind "team.deploy" (registered: command, compaction, memory, prompt, session, subagent, tool) — it has records in the ledger, but no loaded schema declares it; list its plugin in /home/you/.config/hatel/config.toml
 ```
 
 Kind당: `fields`(단일 allow-list), `group_key`(리포트가 묶는 필드), `measures`(리포트가 **합산**하는 숫자 필드 — 첫 번째가 정렬 기준), `redact`(저장 전 해싱), `identity`(여러 기록이 한 실체를 가리킬 때 그 실체를 식별하는 필드 — 리포트가 기록이 아니라 실체를 셉니다).
@@ -509,14 +527,14 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 - **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`rotate_bytes`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
 - **`sqlite`** — 임베디드, WAL, `(kind, ts)` 인덱스 — 윈도우 읽기를 SQL에서 필터.
 
-상태는 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장됩니다. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
+상태는 기본적으로 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장되고, `[storage]`의 `state_dir`로 옮길 수 있습니다. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
 
 저장 방식은 `config.toml`의 `[storage]`에 설정합니다. 훅·수신기·`report`가 모두 이 파일을 읽으므로, 각자 어디서 시작됐든(Claude Code, 서비스 관리자, 셸) 같은 저장소에 쓰고 같은 저장소를 읽습니다. 수신기는 이 파일을 시작할 때 읽으므로 고친 뒤에는 `hatel service --restart`로 재시작합니다. 삭제만은 예외입니다: 수신기는 무엇이든 지우기 전에 파일을 다시 읽어 파일이 지금 보존하는 기록을 남기고, 파일을 읽을 수 없는 동안에는 아무것도 지우지 않으므로, 늘린 `retention_days`는 재시작 전에도 기록을 지킵니다. 빠진 키는 기본값을 씁니다:
 
 ```toml
 [storage]
 sink = "sqlite"            # jsonl(기본) / sqlite
-state_dir = "/data/hatel"  # 상태 디렉터리 재정의. 상대 경로는 config.toml 자신의 디렉터리 기준
+state_dir = "/data/hatel"  # 상태 디렉터리 재정의: 절대 경로, 또는 config.toml 자신의 디렉터리 기준 상대 경로(~는 확장하지 않음)
 retention_days = 30        # 보존 기간(기본 90, 최대 100000)
 rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
 ```
@@ -529,6 +547,7 @@ rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
 |---|---|
 | `HATEL_SINK` / `HATEL_STATE_DIR` / `HATEL_RETENTION_DAYS` / `HATEL_ROTATE_BYTES` | 한 프로세스에 한해 `[storage]`의 같은 키를 대체. 훅은 Claude Code의 환경(그 셸, settings.json `env`)을 물려받고 서비스의 수신기는 물려받지 않으므로, 한쪽에만 두면 저장소가 갈라짐. `doctor`가 이 셸과 settings.json `env`의 재정의, 다른 저장소에 쓰는 수신기를 알림 |
 | `HATEL_CONFIG` | `config.toml` 경로 재정의. settings.json `env`에 두면 훅만 다른 파일을 읽으므로 `doctor`가 알림 |
+| `XDG_CONFIG_HOME` / `XDG_STATE_HOME` (Windows는 `APPDATA`) | 기본 `config.toml`과 state 디렉터리의 위치. 서비스 관리자가 읽지 않는 셸 프로필이나 settings.json `env`처럼 한쪽에만 두면 저장 변수처럼 저장소가 갈라짐. `doctor`가 settings.json `env`의 값과, 다른 파일을 읽거나 다른 저장소에 쓰는 수신기를 알림 |
 | `HATEL_PLUGINS` | 플러그인 TOML 경로. `config.toml`의 `plugins`를 대체. OS 경로 구분자(`:` Unix, `;` Windows) |
 | `HATEL_DISABLED=1` | 훅을 no-op으로 |
 | `HATEL_STRICT=1` | allow-list 밖 페이로드 키를 (조용히 드롭하지 않고) 에러 |
@@ -553,12 +572,14 @@ rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
 
 ```sh
 hatel service           # 설치+시작: `serve --all --wait` 실행, 로그인/실패에 무관하게 유지
-hatel service --restart # 재시작해 유닛이 가리키는 바이너리를 지금 디스크에 있는 대로 띄움(서비스가 없으면 아무것도 안 함)
+hatel service --restart # 재시작해 유닛이 가리키는 바이너리를 지금 디스크에 있는 대로 띄움(없거나 멈춰 있는 서비스는 시작하지 않음)
 hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`(`--service`를 주면 `hatel service`)를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션의 MCP 서버(`hatel mcp`)도 시작할 때의 바이너리를 계속 쓰므로, 업그레이드 뒤에는 그 세션을 다시 시작합니다. `hatel service`는 hatel이 쓴 유닛을 이 빌드의 것으로 새로 씁니다. 손으로 고친 유닛은 그 설정을 조용히 잃지 않도록 그대로 두고 지금 디스크에 있는 바이너리로 재시작한 뒤, 알림과 함께 실패합니다. 이 빌드의 유닛은 `serve --all --wait` 말고는 아무것도 설정하지 않으므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다. 서비스의 수신기는 다른 수신기가 쥔 포트나 저장소 락을 기다렸다가 곧바로 이어받습니다. macOS에서 시작하자마자 끝나는 수신기(예: 깨진 `config.toml`)는 5분 뒤에 다시 시작되므로, 원인을 고친 뒤 `hatel service --restart`로 바로 시작합니다.
+> - **업그레이드.** 실행 중인 수신기는 시작할 때의 바이너리를 계속 쓰므로, `scripts/install.sh`는 바이너리를 바꾼 뒤 서비스를 재시작하고(`hatel service --restart`, `--service`를 주면 `hatel service`. 서비스가 없으면 아무것도 하지 않음), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션도 시작할 때의 `hatel mcp`를 계속 쓰므로 그 세션을 다시 시작합니다.
+> - **어느 유닛을 바꾸는가.** 유닛은 자신을 설치한 바로 그 바이너리를 실행하고 `serve --all --wait` 말고는 아무것도 설정하지 않으므로, 수신기의 설정은 `config.toml`에 둡니다. 재시작은 이전 릴리스가 이 바이너리를 위해 쓴 유닛을 이 빌드의 것으로 새로 쓰고, 손으로 고쳤거나 다른 바이너리를 위해 쓴 유닛은 알림과 함께 그대로 둡니다. `hatel service`는 hatel이 다른 바이너리를 위해 쓴 유닛도 새로 써서, `cargo install`이나 경로 이동 뒤에 이 바이너리를 가리키게 합니다. 손으로 고친 유닛은 그 설정을 조용히 잃지 않도록 그대로 두고 지금 디스크에 있는 바이너리로 재시작한 뒤, 알림과 함께 실패합니다. Linux에서 `systemctl --user edit hatel`로 만든 drop-in의 설정은 어느 경우에도 유지됩니다.
+> - **로그와 재시작.** 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다. 서비스의 수신기는 다른 수신기가 쥔 포트나 저장소 락을 기다렸다가 곧바로 이어받습니다. macOS에서 시작하자마자 끝나는 수신기(예: 깨진 `config.toml`)는 5분 뒤에 다시 시작되므로, 원인을 고친 뒤 `hatel service --restart`로 바로 시작합니다. 손으로 고친 유닛은 launchd가 적재한 그대로 재시작하므로 그 유닛의 재시작 간격을 기다립니다.
 
 ---
 
@@ -585,7 +606,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 | **`doctor`에 `⚠ … wired synchronously`** | 0.12 이전에 배선된 설정입니다. 기록은 전부 남지만 이벤트마다 Claude Code가 훅을 기다립니다. `hatel init`을 다시 실행하면 비동기로 다시 씁니다. |
 | **`doctor`에 `✗` 가 보임** | 빠진 항목을 그대로 짚어줍니다. env 줄이 `✗`면 `hatel init` 재실행. 훅 줄이 `✗`면 `settings.json`의 `hooks`가 비었거나 다른 경로 — `hatel init`이 멱등 복구. |
 | **`emit`이 필드를 드롭** | Kind의 allow-list에 없는 필드입니다. stderr가 허용 필드 목록을 출력하니(`accepted fields: …`) 오타를 맞춰주세요. |
-| **수신기가 안 뜸 / 곧바로 종료** | 같은 state 디렉터리에 다른 수신기가 이미 락을 잡고 있습니다(단일-writer). 기존 것을 쓰거나 `hatel service`로 관리하세요. |
+| **수신기가 안 뜸 / 곧바로 종료** | 서비스 로그(macOS `~/Library/Logs/hatel/serve.log`, Linux `journalctl --user -u hatel`)나 터미널이 이유를 말합니다: `config.toml`을 파싱할 수 없거나, `--wait` 없이 실행한 `serve`라면 같은 state 디렉터리의 락을 다른 수신기가 잡고 있거나(단일-writer) 포트가 이미 쓰이고 있습니다. 파일을 고치거나 이미 도는 수신기를 쓰고, 고친 뒤에는 `hatel service --restart`. |
 | **사내 정책으로 endpoint·훅이 잠김** | [엔터프라이즈 / managed 설정](#엔터프라이즈--managed-설정) 참고 — `doctor`가 무엇이 가능한지 정직하게 보고합니다. |
 
 > 무엇이 잘못됐는지 가장 빠른 진단은 항상 **`hatel doctor`** 입니다 — 추측 없이 빠진 신호를 그대로 보고합니다.

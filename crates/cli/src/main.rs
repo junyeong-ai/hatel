@@ -105,7 +105,7 @@ enum Command {
         #[arg(long, value_enum, default_value_t = init::InsertMode::Enriched, requires = "insert")]
         mode: init::InsertMode,
     },
-    /// Install or remove the receiver as a background user service (launchd on macOS,
+    /// Install, restart or remove the receiver as a background user service (launchd on macOS,
     /// systemd --user on Linux) for gap-free collection — the unit runs `serve --all --wait`.
     Service {
         /// Remove the service instead of installing it.
@@ -114,8 +114,8 @@ enum Command {
         /// Print the unit file instead of installing it.
         #[arg(long, conflicts_with = "restart")]
         print: bool,
-        /// Restart the installed service so it runs the binary now on disk; nothing to do when
-        /// none is installed or loaded.
+        /// Restart the installed service so it runs the binary now on disk, first rewriting a unit
+        /// an earlier release wrote; a service that is missing or stopped is not started.
         #[arg(long)]
         restart: bool,
     },
