@@ -1,6 +1,6 @@
 //! `service` — install or remove the receiver as a per-user background service so native OTel is
 //! captured gap-free, not only while `serve` runs in a terminal. macOS uses a launchd LaunchAgent,
-//! Linux a systemd `--user` unit; the unit runs `serve --all` from this exact binary. Like `init`,
+//! Linux a systemd `--user` unit; the unit runs `serve --all --wait` from this exact binary. Like `init`,
 //! the binary owns this OS integration (rather than a copy-pasted plist/unit), so it is consistent,
 //! idempotent, and `--print`-able for managed or customized setups. `--restart` is what an
 //! upgrade needs: a running receiver keeps the binary it started from, so the installer restarts
@@ -34,8 +34,9 @@ const STOP_TIMEOUT: std::time::Duration =
 
 /// How long launchd waits to start the receiver again after a start that exited. launchd measures
 /// it from that start, so a receiver that ran longer is started again at once; one that cannot
-/// start (a broken config.toml, a port already taken) writes a line to its unrotated log per
-/// interval rather than one every 10 s, launchd's default.
+/// start (a broken config.toml) writes a line to its unrotated log per interval rather than one
+/// every 10 s, launchd's default. A port or lock another receiver holds is waited for instead
+/// (`serve --wait`), so taking over from it does not wait out this interval.
 #[cfg(target_os = "macos")]
 const RELAUNCH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -156,7 +157,7 @@ fn macos(exe: &Path, action: Action) -> i32 {
     }
 }
 
-/// The LaunchAgent that runs `serve --all` from `exe`. launchd discards a job's output unless the
+/// The LaunchAgent that runs `serve --all --wait` from `exe`. launchd discards a job's output unless the
 /// plist names a file, so the receiver's stdout and stderr go to `log`; it waits [`STOP_TIMEOUT`]
 /// after SIGTERM, not its own shorter default, so a stop can finish draining egress; and it starts
 /// a receiver that exited early again only after [`RELAUNCH_THROTTLE`].
@@ -172,7 +173,7 @@ fn launchd_plist(label: &str, exe: &Path, log: &Path) -> String {
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key>
-  <array><string>{exe_xml}</string><string>serve</string><string>--all</string></array>
+  <array><string>{exe_xml}</string><string>serve</string><string>--all</string><string>--wait</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>{throttle}</integer>
@@ -453,14 +454,14 @@ fn linux(exe: &Path, action: Action) -> i32 {
     0
 }
 
-/// The systemd user unit that runs `serve --all` from `exe`, waiting
+/// The systemd user unit that runs `serve --all --wait` from `exe`, waiting
 /// [`STOP_TIMEOUT`] after SIGTERM so a stop can finish draining egress.
 #[cfg(target_os = "linux")]
 fn systemd_unit(exe: &Path) -> String {
     let exec = systemd_exec_arg(&exe.display().to_string());
     let stop = STOP_TIMEOUT.as_secs();
     format!(
-        "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec={stop}\n\n[Install]\nWantedBy=default.target\n"
+        "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all --wait\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec={stop}\n\n[Install]\nWantedBy=default.target\n"
     )
 }
 
@@ -472,8 +473,8 @@ fn systemd_units(exe: &Path) -> Vec<String> {
     units
 }
 
-/// The units earlier releases wrote for `exe` (v0.1.0 to v0.3.0, then v0.4.0 to v0.18.1): one still
-/// byte-equal to them is hatel's own and unedited. Changing [`systemd_unit`] adds the rendering it
+/// The units earlier releases wrote for `exe` (v0.1.0 to v0.3.0, v0.4.0 to v0.18.1, then v0.19.0):
+/// one still byte-equal to them is hatel's own and unedited. Changing [`systemd_unit`] adds the rendering it
 /// replaces here, which `the_systemd_unit_this_build_writes_is_pinned` enforces.
 #[cfg(target_os = "linux")]
 fn earlier_systemd_units(exe: &Path) -> Vec<String> {
@@ -484,6 +485,9 @@ fn earlier_systemd_units(exe: &Path) -> Vec<String> {
         ),
         format!(
             "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+        ),
+        format!(
+            "[Unit]\nDescription={SERVICE_NAME} receiver\n\n[Service]\nExecStart={exec} serve --all\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n"
         ),
     ]
 }
@@ -910,7 +914,7 @@ mod tests {
 <plist version="1.0"><dict>
   <key>Label</key><string>dev.hatel</string>
   <key>ProgramArguments</key>
-  <array><string>/Users/u/.local/bin/hatel</string><string>serve</string><string>--all</string></array>
+  <array><string>/Users/u/.local/bin/hatel</string><string>serve</string><string>--all</string><string>--wait</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>300</integer>
@@ -925,6 +929,10 @@ mod tests {
     /// What v0.1.0 to v0.3.0 wrote as `/home/u/.local/bin/hatel`'s unit.
     #[cfg(target_os = "linux")]
     const UNIT_V0_3_0: &str = "[Unit]\nDescription=hatel receiver\n\n[Service]\nExecStart=\"/home/u/.local/bin/hatel\" serve --all\nRestart=always\n\n[Install]\nWantedBy=default.target\n";
+
+    /// What v0.19.0 wrote as `/home/u/.local/bin/hatel`'s unit.
+    #[cfg(target_os = "linux")]
+    const UNIT_V0_19_0: &str = "[Unit]\nDescription=hatel receiver\n\n[Service]\nExecStart=\"/home/u/.local/bin/hatel\" serve --all\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n";
 
     /// What v0.18.1 wrote as `/home/u/.local/bin/hatel`'s unit.
     #[cfg(target_os = "linux")]
@@ -945,6 +953,7 @@ mod tests {
         assert_eq!(classify(&systemd_unit(exe)), Some(Installed::Current));
         assert_eq!(classify(UNIT_V0_3_0), Some(Installed::Earlier));
         assert_eq!(classify(UNIT_V0_18_1), Some(Installed::Earlier));
+        assert_eq!(classify(UNIT_V0_19_0), Some(Installed::Earlier));
         assert_eq!(
             classify(&UNIT_V0_18_1.replace(exe.to_str().unwrap(), "/src/target/debug/hatel")),
             Some(Installed::AnotherBinary("/src/target/debug/hatel".into())),
@@ -975,7 +984,7 @@ mod tests {
         // installed unit as it is.
         assert_eq!(
             systemd_unit(Path::new("/home/u/.local/bin/hatel")),
-            "[Unit]\nDescription=hatel receiver\n\n[Service]\nExecStart=\"/home/u/.local/bin/hatel\" serve --all\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=hatel receiver\n\n[Service]\nExecStart=\"/home/u/.local/bin/hatel\" serve --all --wait\nRestart=on-failure\nRestartSec=5\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n"
         );
     }
 

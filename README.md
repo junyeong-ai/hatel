@@ -216,10 +216,10 @@ claude mcp add hatel -- hatel mcp
 
 | 명령 | 용도 |
 |---|---|
-| `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP 수신기 + 세션별 라이브 롤업(서브에이전트가 돌면 토큰·비용 분해 포함). |
+| `serve [--port 4318] [--all] [--project N] [--wait]` | OTLP/HTTP 수신기 + 세션별 라이브 롤업(서브에이전트가 돌면 토큰·비용 분해 포함). `--wait`는 다른 프로세스가 포트나 저장소의 락을 쥐고 있으면 끝나지 않고 풀릴 때까지 기다림(서비스가 이렇게 실행). |
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--group-by F] [--sort-by M] [--filter f=v]` | 롤링 윈도우 집계 — 그룹별 레코드 수와 각 Kind `measures`의 합, 그리고 비용 스냅샷. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | `settings.json`에 텔레메트리 env + 훅을 연결/해제 — 멱등·비파괴·원자적. |
-| `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all` 실행, 무중단 수집). |
+| `service [--remove] [--print]` | 수신기를 launchd/systemd 사용자 서비스로 설치/제거(`serve --all --wait` 실행, 무중단 수집). |
 | `doctor [--json]` | 연결을 검증하고 정책 공백을 정직하게 보고 — `--json`은 같은 findings를 기계 판독용으로. |
 | `kinds [--json]` | 등록된 Kind(코어+플러그인) 목록 — 그리고 원장에 있으나 어떤 스키마도 선언하지 않는 Kind. |
 | `emit <kind> [key=value...] [--json OBJ]` | 등록된 Kind에 도메인 신호 하나 기록 — 커스텀 지표의 프로그래밍 경로. |
@@ -287,7 +287,7 @@ hatel serve --all      # 이 컬렉터를 공유하는 모든 프로젝트
 hatel serve --project acme-api   # 특정 프로젝트(라벨)만
 ```
 
-수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러납니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드와 그 수신기가 읽은 설정 파일, 쓰는 저장소를 답합니다(`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.19.0"}`) — `doctor`가 자기 빌드·설정 파일·저장소와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
+수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러나고, `--wait`로 실행한 것은 락이 풀릴 때까지 기다립니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드와 그 수신기가 읽은 설정 파일, 쓰는 저장소를 답합니다(`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.19.0"}`) — `doctor`가 자기 빌드·설정 파일·저장소와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
 
 ### `init` — Claude Code에 연결
 
@@ -552,13 +552,13 @@ rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
 네이티브 OTel은 push 전용이라 수신기가 켜져 있을 때만 토큰·비용이 잡힙니다. 무중단 사용자-레벨 수집은 백그라운드 서비스로 설치하세요 — `hatel`이 유닛을 직접 쓰고 로드합니다(macOS launchd, Linux systemd `--user`):
 
 ```sh
-hatel service           # 설치+시작: `serve --all` 실행, 로그인/실패에 무관하게 유지
+hatel service           # 설치+시작: `serve --all --wait` 실행, 로그인/실패에 무관하게 유지
 hatel service --restart # 재시작해 유닛이 가리키는 바이너리를 지금 디스크에 있는 대로 띄움(서비스가 없으면 아무것도 안 함)
 hatel service --remove  # 중지·제거
 hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 ```
 
-> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`(`--service`를 주면 `hatel service`)를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션의 MCP 서버(`hatel mcp`)도 시작할 때의 바이너리를 계속 쓰므로, 업그레이드 뒤에는 그 세션을 다시 시작합니다. `hatel service`는 hatel이 쓴 유닛을 이 빌드의 것으로 새로 씁니다. 손으로 고친 유닛은 그 설정을 조용히 잃지 않도록 그대로 두고 지금 디스크에 있는 바이너리로 재시작한 뒤, 알림과 함께 실패합니다. 이 빌드의 유닛은 `serve --all` 말고는 아무것도 설정하지 않으므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다. macOS에서 시작하자마자 끝나는 수신기(깨진 `config.toml`, 이미 쓰이는 포트)는 5분 뒤에 다시 시작되므로, 원인을 고친 뒤 `hatel service --restart`로 바로 시작합니다.
+> 유닛은 자신을 설치한 바로 그 바이너리를 실행하므로, `cargo install`이나 경로 이동 후 `hatel service`를 다시 돌리면 재지정됩니다. 실행 중인 수신기는 시작할 때의 바이너리를 계속 실행하므로 업그레이드에는 재시작이 필요합니다: `scripts/install.sh`는 바이너리를 바꾼 뒤 `hatel service --restart`(`--service`를 주면 `hatel service`)를 실행하고(서비스가 없으면 아무것도 하지 않고, 이전 릴리스가 이 바이너리를 위해 쓴 유닛은 이 빌드의 것으로 새로 쓰며, 손으로 고쳤거나 다른 바이너리를 가리키는 유닛은 알림과 함께 그대로 둠), `hatel doctor`는 포트에서 어느 빌드가 답하는지 말합니다. 이미 열린 Claude Code 세션의 MCP 서버(`hatel mcp`)도 시작할 때의 바이너리를 계속 쓰므로, 업그레이드 뒤에는 그 세션을 다시 시작합니다. `hatel service`는 hatel이 쓴 유닛을 이 빌드의 것으로 새로 씁니다. 손으로 고친 유닛은 그 설정을 조용히 잃지 않도록 그대로 두고 지금 디스크에 있는 바이너리로 재시작한 뒤, 알림과 함께 실패합니다. 이 빌드의 유닛은 `serve --all --wait` 말고는 아무것도 설정하지 않으므로 수신기의 설정은 유닛이 아니라 `config.toml`에 둡니다. Linux에서 그 밖의 서비스 설정은 `systemctl --user edit hatel`로 만드는 drop-in에 두면 유지됩니다. 수신기의 로그는 macOS에서 `~/Library/Logs/hatel/serve.log`, Linux에서 `journalctl --user -u hatel`로 봅니다. 서비스의 수신기는 다른 수신기가 쥔 포트나 저장소 락을 기다렸다가 곧바로 이어받습니다. macOS에서 시작하자마자 끝나는 수신기(예: 깨진 `config.toml`)는 5분 뒤에 다시 시작되므로, 원인을 고친 뒤 `hatel service --restart`로 바로 시작합니다.
 
 ---
 

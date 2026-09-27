@@ -115,7 +115,7 @@ fn note_failed_write(writes: &Throttle, store: &str, result: std::io::Result<()>
     }
 }
 
-pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
+pub fn run(port: u16, project: Option<String>, show_all: bool, wait: bool) -> i32 {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -126,7 +126,7 @@ pub fn run(port: u16, project: Option<String>, show_all: bool) -> i32 {
             return 1;
         }
     };
-    runtime.block_on(serve(port, project, show_all))
+    runtime.block_on(serve(port, project, show_all, wait))
 }
 
 /// What a receiver needs before it serves: the configuration, the registry of Kinds, and the export
@@ -151,44 +151,71 @@ pub(crate) fn startup() -> Result<Startup, String> {
     })
 }
 
-async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
+async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -> i32 {
+    // One stop request for the whole run, listened for from the first wait on, so one sent while
+    // this receiver waits is not lost before the server listens for it.
+    let mut stop = Box::pin(stop_requested());
+    let addr = format!("127.0.0.1:{port}");
+    // Each attempt starts afresh: it reads the configuration, takes the single-writer lock on the
+    // state dir that configuration names, and binds the port. The cost snapshot and the tool ledger
+    // assume one receiver per state dir, so the lock comes before any write and is held in
+    // `_state_lock` for the whole run; the OS releases it on exit. With `--wait`, as the service runs
+    // it, a receiver that finds either held gives up both and tries again: it takes over as soon as
+    // the holder exits, where a service manager would start it again only after its throttle, it
+    // leaves the store to a receiver started meanwhile on another port, and it serves the file as it
+    // is at takeover. Without `--wait`, it says which is held and exits non-zero.
+    let mut waiting_for = None;
+    let (started, _state_lock, listener) = loop {
+        let started = match startup() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("serve: {e}");
+                return 1;
+            }
+        };
+        let held = match acquire_state_lock(&started.cfg.state_dir) {
+            LockOutcome::Acquired(lock) => match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => break (started, lock, listener),
+                Err(e) if wait && e.kind() == std::io::ErrorKind::AddrInUse => {
+                    format!("{addr} is in use — waiting for it to be freed")
+                }
+                Err(e) => {
+                    eprintln!("serve: cannot bind {addr}: {e}");
+                    return 1;
+                }
+            },
+            LockOutcome::Held if wait => format!(
+                "another hatel receiver holds the lock on {} — waiting for it to exit",
+                started.cfg.state_dir.display()
+            ),
+            LockOutcome::Held => {
+                eprintln!(
+                    "serve: another hatel receiver already holds the lock on {} — exiting (only \
+                     one runs per state dir; `serve --wait` waits for it instead)",
+                    started.cfg.state_dir.display()
+                );
+                return 1;
+            }
+            LockOutcome::Failed(e) => {
+                eprintln!("serve: {e}");
+                return 1;
+            }
+        };
+        if waiting_for.as_ref() != Some(&held) {
+            eprintln!("serve: {held}");
+            waiting_for = Some(held);
+        }
+        if stopped_while_waiting(&mut stop).await {
+            return 0;
+        }
+    };
     let Startup {
         cfg,
         registry,
         export: export_cfg,
-    } = match startup() {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("serve: {e}");
-            return 1;
-        }
-    };
+    } = started;
     let cfg = Arc::new(cfg);
     let registry = Arc::new(registry);
-    // The single-writer lock, taken before any write: the cost snapshot and the tool ledger assume
-    // one receiver per state dir, so a second one is refused here rather than left to race. Held in
-    // `_state_lock` for the whole run; the OS releases it on exit.
-    let _state_lock = match acquire_state_lock(&cfg.state_dir) {
-        LockOutcome::Acquired(f) => f,
-        LockOutcome::Held => {
-            // Another receiver currently holds the lock — this instance can't run. Exit NON-ZERO so
-            // the service manager (launchd `SuccessfulExit=false` / systemd `Restart=on-failure`,
-            // both throttled to ≥5s) RETRIES rather than giving up: that retry is what lets a
-            // service-managed receiver take over gap-free once the holder exits — e.g. when it lost
-            // a startup race to a manual `serve --all`. The ≥5s throttle keeps the retry from
-            // becoming a tight loop. An interactive run simply reports the message and exits non-zero.
-            eprintln!(
-                "serve: another hatel receiver already holds the lock on {} — exiting; a service \
-                 manager will retry (only one runs per state dir)",
-                cfg.state_dir.display()
-            );
-            return 1;
-        }
-        LockOutcome::Failed(e) => {
-            eprintln!("serve: {e}");
-            return 1;
-        }
-    };
     let current_key = std::env::current_dir()
         .ok()
         .and_then(|d| resolve_project(&d.to_string_lossy()))
@@ -224,14 +251,6 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
 
-    let addr = format!("127.0.0.1:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("serve: cannot bind {addr}: {e}");
-            return 1;
-        }
-    };
     println!(
         "hatel receiver on http://{addr} ({}) — point \
          OTEL_EXPORTER_OTLP_ENDPOINT here; Ctrl-C to stop",
@@ -283,7 +302,10 @@ async fn serve(port: u16, project: Option<String>, show_all: bool) -> i32 {
         }
     });
 
-    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        stop.await;
+        eprintln!("\nshutting down; persisting cost snapshot…");
+    });
     if let Err(e) = server.await {
         eprintln!("serve: {e}");
     }
@@ -395,8 +417,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// The outcome of trying to take the receiver's single-writer lock: `Acquired` (the held file —
 /// keep it alive for the process lifetime), `Held` (another receiver currently holds it — this
-/// instance can't run and exits non-zero so a throttled service manager retries until the lock
-/// frees), or `Failed` (a genuine I/O problem).
+/// instance can't run yet: it waits for the lock under `--wait` and exits non-zero otherwise), or
+/// `Failed` (a genuine I/O problem).
 enum LockOutcome {
     Acquired(std::fs::File),
     Held,
@@ -482,7 +504,18 @@ fn acquire_state_lock(_state_dir: &Path) -> LockOutcome {
     LockOutcome::Failed("the receiver's single-writer lock is unsupported on this platform".into())
 }
 
-async fn shutdown_signal() {
+/// How often a receiver started with `--wait` tries the lock or the port again.
+const WAIT_RETRY: Duration = Duration::from_secs(1);
+
+/// Wait one [`WAIT_RETRY`]; `true` when a stop was requested meanwhile.
+async fn stopped_while_waiting<F: Future<Output = ()>>(stop: &mut std::pin::Pin<Box<F>>) -> bool {
+    tokio::select! {
+        () = stop.as_mut() => true,
+        () = tokio::time::sleep(WAIT_RETRY) => false,
+    }
+}
+
+async fn stop_requested() {
     // A service manager (launchd/systemd) stops the daemon with SIGTERM, an interactive run with
     // Ctrl-C (SIGINT) — wait on both so the graceful path (and the final cost flush) runs either way.
     #[cfg(unix)]
@@ -502,8 +535,6 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
-
-    eprintln!("\nshutting down; persisting cost snapshot…");
 }
 
 /// Draw the live per-session rollup. Called on the flush tick, not on ingest: a frame is a human

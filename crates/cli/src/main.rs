@@ -40,6 +40,10 @@ enum Command {
         /// Show every project's sessions.
         #[arg(long)]
         all: bool,
+        /// Wait for the state dir's lock and the port while another process holds them, rather
+        /// than exit (how the service runs the receiver).
+        #[arg(long)]
+        wait: bool,
     },
     /// Aggregate the ledger over a rolling window.
     Report {
@@ -102,7 +106,7 @@ enum Command {
         mode: init::InsertMode,
     },
     /// Install or remove the receiver as a background user service (launchd on macOS,
-    /// systemd --user on Linux) for gap-free collection — the unit runs `serve --all`.
+    /// systemd --user on Linux) for gap-free collection — the unit runs `serve --all --wait`.
     Service {
         /// Remove the service instead of installing it.
         #[arg(long, conflicts_with_all = ["print", "restart"])]
@@ -161,7 +165,12 @@ fn main() {
 
 fn run() -> i32 {
     match Cli::parse().command {
-        Command::Serve { port, project, all } => serve::run(port, project, all),
+        Command::Serve {
+            port,
+            project,
+            all,
+            wait,
+        } => serve::run(port, project, all, wait),
         Command::Report {
             window,
             format,

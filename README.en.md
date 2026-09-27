@@ -216,10 +216,10 @@ claude mcp add hatel -- hatel mcp
 
 | Command | Purpose |
 |---|---|
-| `serve [--port 4318] [--all] [--project N]` | OTLP/HTTP receiver + live per-session rollup (with a per-subagent token/cost breakdown when subagents run). |
+| `serve [--port 4318] [--all] [--project N] [--wait]` | OTLP/HTTP receiver + live per-session rollup (with a per-subagent token/cost breakdown when subagents run). `--wait` waits for a port or store lock another process holds instead of exiting (how the service runs it). |
 | `report [--window 30d] [--format md\|text\|json] [--project N] [--kind K] [--top K] [--group-by F] [--sort-by M] [--filter f=v]` | aggregate over a rolling window — per group: record count and the sum of each Kind's `measures`, plus the cost snapshot. |
 | `init [--scope user\|project\|local] [--print] [--remove] [--insert [--mode raw\|enriched]]` | wire/unwire the telemetry env + hooks in `settings.json` — idempotent, non-destructive, atomic. |
-| `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service (runs `serve --all` for gap-free collection). |
+| `service [--remove] [--print]` | install/remove the receiver as a launchd/systemd user service (runs `serve --all --wait` for gap-free collection). |
 | `doctor [--json]` | verify the wiring and report policy gaps honestly — `--json` renders the same findings machine-readably. |
 | `kinds [--json]` | list the registered Kinds (core + plugins) — and any the ledger holds that no schema declares. |
 | `emit <kind> [key=value...] [--json OBJ]` | record one domain signal for a registered Kind — the programmatic path for custom metrics. |
@@ -287,7 +287,7 @@ hatel serve --all      # every project sharing this collector
 hatel serve --project acme-api   # one project (by label)
 ```
 
-The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running, the configuration file it read and the store it writes (`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.19.0"}`) — what `doctor` compares its own build, file and store against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
+The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down, or with `--wait` waits for the lock (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running, the configuration file it read and the store it writes (`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.19.0"}`) — what `doctor` compares its own build, file and store against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
 
 ### `init` — wire into Claude Code
 
@@ -552,13 +552,13 @@ rotate_bytes = 20971520    # JSONL rotation threshold (default 10 MB)
 Native OTel is push-only — tokens and cost are captured only while the receiver runs. For gap-free collection, install it as a background service; `hatel` writes and loads the unit for you (launchd on macOS, systemd `--user` on Linux):
 
 ```sh
-hatel service           # install + start: runs `serve --all`, kept alive across login/failure
+hatel service           # install + start: runs `serve --all --wait`, kept alive across login/failure
 hatel service --restart # restart it so the binary its unit names runs as now on disk (nothing to do when none is installed)
 hatel service --remove  # stop and remove it
 hatel service --print   # print the unit instead of installing — to inspect or hand to MDM
 ```
 
-> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` (`hatel service` with `--service`) after replacing the binaries (a no-op when no service is installed; a unit an earlier release wrote for this binary is rewritten to this build's, while one edited by hand or pointing at another binary is kept, with a note), and `hatel doctor` says which build answers on the port. The MCP server (`hatel mcp`) of a Claude Code session already open also keeps the binary it started from, so restart such sessions after an upgrade. `hatel service` rewrites a unit hatel wrote with this build's. One edited by hand it keeps, so its settings are not dropped silently, and restarts on the binary now on disk before failing with a note. This build's unit sets nothing but `serve --all`, so the receiver's settings belong in `config.toml`, not the unit. On Linux, any other service setting kept in a drop-in made with `systemctl --user edit hatel` survives. The receiver logs to `~/Library/Logs/hatel/serve.log` on macOS and to the journal on Linux (`journalctl --user -u hatel`). On macOS a receiver that exits right after starting (a broken `config.toml`, a port already taken) is started again five minutes later, so after fixing the cause, `hatel service --restart` starts it at once.
+> The unit runs the exact binary that installed it, so re-running `hatel service` after a `cargo install` or path move repoints it. A running receiver keeps the binary it started from, so an upgrade needs a restart: `scripts/install.sh` runs `hatel service --restart` (`hatel service` with `--service`) after replacing the binaries (a no-op when no service is installed; a unit an earlier release wrote for this binary is rewritten to this build's, while one edited by hand or pointing at another binary is kept, with a note), and `hatel doctor` says which build answers on the port. The MCP server (`hatel mcp`) of a Claude Code session already open also keeps the binary it started from, so restart such sessions after an upgrade. `hatel service` rewrites a unit hatel wrote with this build's. One edited by hand it keeps, so its settings are not dropped silently, and restarts on the binary now on disk before failing with a note. This build's unit sets nothing but `serve --all --wait`, so the receiver's settings belong in `config.toml`, not the unit. On Linux, any other service setting kept in a drop-in made with `systemctl --user edit hatel` survives. The receiver logs to `~/Library/Logs/hatel/serve.log` on macOS and to the journal on Linux (`journalctl --user -u hatel`). The service's receiver waits for a port or store lock another receiver holds and takes over as soon as it is freed. On macOS a receiver that exits right after starting (a broken `config.toml`, say) is started again five minutes later, so after fixing the cause, `hatel service --restart` starts it at once.
 
 ---
 
