@@ -136,7 +136,8 @@ pub fn run(json: bool) -> i32 {
 
 fn build_report() -> Report {
     let files = cs::scope_files();
-    let env = cs::effective_env(&files);
+    let env = cs::effective_env(&files, cs::process_env());
+    let settings_env = cs::settings_env(&files);
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
     // them from the registry rather than the full vocabulary — coverage is judged against these.
     // The configuration file is read exactly once and every view below is derived from that one
@@ -157,7 +158,11 @@ fn build_report() -> Report {
         })
         .collect();
 
-    let mut native = Section::new("native_telemetry", "native telemetry (settings.json env):");
+    let mut native = Section::new(
+        "native_telemetry",
+        "native telemetry (settings.json env + this process):",
+    );
+    report_repository_telemetry(&mut native, &files);
     // Must be `otlp` specifically — `console`/`none` parse as healthy but never reach this
     // receiver.
     check_env(&mut native, &env, "CLAUDE_CODE_ENABLE_TELEMETRY", Some("1"));
@@ -183,8 +188,8 @@ fn build_report() -> Report {
             cfg.state_dir.display()
         )),
     }
-    report_invalid_variables(&mut storage, &invalid, &env);
-    advise_split_environment(&mut storage, &|key| std::env::var_os(key), &env);
+    report_invalid_variables(&mut storage, &invalid, &settings_env);
+    advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
 
     let mut sections = vec![native];
@@ -461,7 +466,7 @@ fn report_receiver(
         .into_iter()
         .flatten()
         .filter(|(endpoint, _)| cs::is_local_receiver(endpoint))
-        .map(|(endpoint, _)| receiver::authority(endpoint))
+        .filter_map(|(endpoint, _)| receiver::authority(endpoint))
         .collect();
     authorities.dedup();
     if authorities.is_empty() {
@@ -580,11 +585,15 @@ fn advise_split_environment(
     location.dedup();
     for var in location {
         if let Some((value, scope)) = env.get(var).filter(|(value, _)| !value.is_empty()) {
-            sec.note(format!(
-                "{var}={value} in the {scope} settings.json env applies to hooks and not to the \
-                 service's receiver, so they can read another config.toml or write another state \
-                 dir — remove it there"
-            ));
+            if cs::repository_scope(scope) && var.starts_with("XDG_") {
+                sec.note(format!("{var} in the {scope} settings.json env is ignored by Claude Code; configure storage in config.toml"));
+            } else {
+                sec.note(format!(
+                    "{var}={value} in the {scope} settings.json env applies to hooks and not to the \
+                     service's receiver, so they can read another config.toml or write another state \
+                     dir — remove it there"
+                ));
+            }
         }
     }
 }
@@ -687,14 +696,23 @@ fn report_export(
         .iter()
         .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
     if needs_json {
-        let proto = env
-            .get("OTEL_EXPORTER_OTLP_PROTOCOL")
-            .map(|(v, _)| v.as_str());
-        if proto != Some("http/json") {
-            sec.warn(format!(
-                "enriched/filtered export needs http/json input — OTEL_EXPORTER_OTLP_PROTOCOL is {} → those targets forward nothing",
-                proto.unwrap_or("unset")
-            ));
+        let mut checked = std::collections::BTreeSet::new();
+        for signal in [
+            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+        ] {
+            let key = if env.contains_key(signal) {
+                signal
+            } else {
+                "OTEL_EXPORTER_OTLP_PROTOCOL"
+            };
+            let proto = env.get(key).map(|(v, _)| v.as_str());
+            if checked.insert(key) && proto != Some("http/json") {
+                sec.warn(format!(
+                    "enriched/filtered export needs http/json input — {key} is {} → those targets skip that signal's batches",
+                    proto.unwrap_or("unset")
+                ));
+            }
         }
     }
 
@@ -734,6 +752,9 @@ fn report_route(sec: &mut Section, signal: Option<&str>, endpoint: Option<EnvEnt
                 "{at}endpoint is managed-locked to {endpoint} — OTel can't be routed through hatel, so export forwards nothing (only the hook ledger is available)"
             ));
         }
+        Some((endpoint, scope)) if *scope == "process" => {
+            sec.fail(format!("{at}OTel goes directly to {endpoint} (from this process), bypassing this receiver — configure config.toml [[export]] and repoint the launch environment"));
+        }
         Some((endpoint, scope)) => {
             sec.fail(format!(
                 "{at}OTel goes directly to {endpoint} (from {scope}), bypassing this receiver — export forwards nothing; run `hatel init --insert` to route it through hatel"
@@ -753,7 +774,7 @@ fn report_route(sec: &mut Section, signal: Option<&str>, endpoint: Option<EnvEnt
 /// Push a ✓/✗ finding for an env key (a hard requirement).
 fn check_env(sec: &mut Section, env: &cs::Env, key: &str, want: Option<&str>) {
     match env.get(key) {
-        Some((val, scope)) if want.is_none_or(|w| w == val) => {
+        Some((val, scope)) if want.is_none_or(|w| cs::telemetry_matches(key, val, w)) => {
             sec.ok(format!("{key}={val} (from {scope})"));
         }
         Some((val, scope)) => {
@@ -768,23 +789,51 @@ fn check_env(sec: &mut Section, env: &cs::Env, key: &str, want: Option<&str>) {
     }
 }
 
-/// At least one OTLP endpoint must be set. The general `OTEL_EXPORTER_OTLP_ENDPOINT` is the
-/// canonical setup (`hatel init` writes it); a per-signal override (`…_METRICS_ENDPOINT` /
-/// `…_LOGS_ENDPOINT`) is honored too rather than mis-reported as unset.
-fn check_endpoint_present(sec: &mut Section, env: &cs::Env) {
-    for key in [
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
-        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
-    ] {
-        if let Some((val, scope)) = env.get(key) {
-            sec.ok(format!("{key}={val} (from {scope})"));
-            return;
+/// Repository exporter values are reported by name only; they can contain credentials.
+fn report_repository_telemetry(sec: &mut Section, files: &[cs::ScopeFile]) {
+    for file in files.iter().filter(|f| cs::repository_scope(f.name)) {
+        let Some(values) = file
+            .load
+            .value()
+            .and_then(|v| v.get("env"))
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let ignored: Vec<&str> = values
+            .iter()
+            .filter_map(|(key, value)| {
+                (cs::restricted_telemetry_key(key)
+                    && !value
+                        .as_str()
+                        .is_some_and(|v| cs::repository_off_value(key, v)))
+                .then_some(key.as_str())
+            })
+            .collect();
+        if !ignored.is_empty() {
+            sec.warn(format!("{} in {} are ignored by Claude Code 2.1.282+; configure native telemetry in your shell, user or managed settings", ignored.join(", "), file.path.display()));
         }
     }
-    sec.fail(
-        "no OTLP endpoint set (OTEL_EXPORTER_OTLP_ENDPOINT, or a per-signal …_METRICS_ENDPOINT / …_LOGS_ENDPOINT)",
-    );
+}
+
+/// Validate the destinations actually used by each signal, including partial configurations.
+fn check_endpoint_present(sec: &mut Section, env: &cs::Env) {
+    let (metrics, logs) = effective_otlp_endpoints(env);
+    for (signal, endpoint) in [("metrics", metrics), ("logs", logs)] {
+        match endpoint {
+            Some((value, scope)) => {
+                let valid = reqwest::Url::parse(value).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                });
+                if valid {
+                    sec.ok(format!("{signal} OTLP endpoint={value} (from {scope})"));
+                } else {
+                    sec.fail(format!("{signal} OTLP endpoint from {scope} must be an absolute HTTP(S) URL"));
+                }
+            }
+            None => sec.fail(format!("no {signal} OTLP endpoint set (set OTEL_EXPORTER_OTLP_ENDPOINT or its per-signal override)")),
+        }
+    }
 }
 
 /// The effective OTLP endpoint per signal: a per-signal override (`…_METRICS_ENDPOINT` /
@@ -805,33 +854,58 @@ fn advise_protocol(sec: &mut Section, env: &cs::Env) {
     // `http/json` is mandatory if EITHER effective signal endpoint reaches the local receiver — a
     // per-signal override could route one signal to hatel even when the general endpoint is remote.
     let (metrics, logs) = effective_otlp_endpoints(env);
+    let generic = "OTEL_EXPORTER_OTLP_PROTOCOL";
+    if env.contains_key("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
+        || env.contains_key("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+    {
+        for (key, endpoint) in [
+            ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", metrics),
+            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", logs),
+        ] {
+            let key = if env.contains_key(key) { key } else { generic };
+            report_protocol(
+                sec,
+                key,
+                env.get(key),
+                endpoint.is_some_and(|(v, _)| cs::is_local_receiver(v)),
+            );
+        }
+        return;
+    }
     let local = [metrics, logs]
         .into_iter()
         .flatten()
         .any(|(v, _)| cs::is_local_receiver(v));
-    match env.get("OTEL_EXPORTER_OTLP_PROTOCOL") {
+    report_protocol(sec, generic, env.get(generic), local);
+}
+
+fn report_protocol(
+    sec: &mut Section,
+    key: &str,
+    value: Option<&(String, &'static str)>,
+    local: bool,
+) {
+    match value {
         Some((v, scope)) if v == "http/json" => {
-            sec.ok(format!(
-                "OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from {scope})"
-            ));
+            sec.ok(format!("{key}=http/json (from {scope})"));
         }
         Some((v, scope)) if local => {
             sec.fail(format!(
-                "OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); the local receiver only decodes http/json"
+                "{key}={v} (from {scope}); the local receiver only decodes http/json"
             ));
         }
         Some((v, scope)) => {
             sec.warn(format!(
-                "OTEL_EXPORTER_OTLP_PROTOCOL={v} (from {scope}); http/json is required for the local receiver"
+                "{key}={v} (from {scope}); http/json is required for the local receiver"
             ));
         }
         None if local => {
-            sec.fail("OTEL_EXPORTER_OTLP_PROTOCOL unset; the local receiver needs http/json");
+            sec.fail(format!("{key} unset; the local receiver needs http/json"));
         }
         None => {
-            sec.warn(
-                "OTEL_EXPORTER_OTLP_PROTOCOL unset; set it to http/json for the local receiver",
-            );
+            sec.warn(format!(
+                "{key} unset; set it to http/json for the local receiver"
+            ));
         }
     }
 }
@@ -856,6 +930,99 @@ fn writable(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints_validate_each_effective_signal_without_accepting_shadowed_values() {
+        for (general, metrics, logs, failures) in [
+            ("http://localhost:4318", None, None, 0),
+            ("localhost:4318", None, None, 2),
+            (
+                "https://valid.example",
+                Some("invalid"),
+                Some("file:///tmp/data"),
+                2,
+            ),
+            (
+                "invalid",
+                Some("https://valid.example"),
+                Some("http://localhost:4318"),
+                0,
+            ),
+        ] {
+            let mut env: cs::Env = [(
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                (general.to_string(), "user"),
+            )]
+            .into_iter()
+            .collect();
+            for (key, value) in [
+                ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", metrics),
+                ("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", logs),
+            ] {
+                if let Some(value) = value {
+                    env.insert(key.to_string(), (value.to_string(), "user"));
+                }
+            }
+            let mut section = Section::new("native_telemetry", "native telemetry:");
+            check_endpoint_present(&mut section, &env);
+            assert_eq!(
+                section
+                    .findings
+                    .iter()
+                    .filter(|f| f.status == Status::Fail)
+                    .count(),
+                failures
+            );
+        }
+    }
+
+    #[test]
+    fn local_protocol_findings_use_the_signal_override() {
+        for (generic, metrics, fails) in [("grpc", "http/json", false), ("http/json", "grpc", true)]
+        {
+            let env: cs::Env = [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", "https://corp.example"),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", generic),
+                ("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", cs::DEFAULT_ENDPOINT),
+                ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", metrics),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), (value.to_string(), "user")))
+            .collect();
+            let mut section = Section::new("native_telemetry", "native telemetry:");
+            advise_protocol(&mut section, &env);
+            assert_eq!(
+                section.findings.iter().any(|f| f.status == Status::Fail),
+                fails
+            );
+            assert!(section.findings.iter().any(|f| {
+                f.message
+                    .starts_with(&format!("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL={metrics}"))
+            }));
+        }
+    }
+
+    #[test]
+    fn ignored_repository_settings_report_names_without_credentials() {
+        let files = vec![cs::ScopeFile {
+            name: "project",
+            path: "repo/.claude/settings.json".into(),
+            load: cs::Load::Found(serde_json::json!({"env": {
+                "OTEL_EXPORTER_OTLP_HEADERS": "authorization=secret",
+                "OTEL_LOGS_EXPORTER": "none"
+            }})),
+        }];
+        let mut section = Section::new("native_telemetry", "native telemetry:");
+        report_repository_telemetry(&mut section, &files);
+        assert_eq!(section.findings.len(), 1);
+        assert!(
+            section.findings[0]
+                .message
+                .contains("OTEL_EXPORTER_OTLP_HEADERS")
+        );
+        assert!(!section.findings[0].message.contains("secret"));
+        assert!(!section.findings[0].message.contains("OTEL_LOGS_EXPORTER"));
+    }
 
     #[test]
     fn a_hook_build_is_judged_against_this_one() {
@@ -1107,9 +1274,12 @@ mod tests {
             found[2]
                 .starts_with("HATEL_CONFIG=/other/config.toml in the project settings.json env")
         );
-        assert!(found[3].starts_with(&format!(
-            "{DEFAULT_STATE_VAR}=/state in the local settings.json env"
-        )));
+        let expected = if DEFAULT_STATE_VAR.starts_with("XDG_") {
+            format!("{DEFAULT_STATE_VAR} in the local settings.json env is ignored")
+        } else {
+            format!("{DEFAULT_STATE_VAR}=/state in the local settings.json env")
+        };
+        assert!(found[3].starts_with(&expected));
     }
 
     #[test]

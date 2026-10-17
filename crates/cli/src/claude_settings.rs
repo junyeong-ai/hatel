@@ -73,28 +73,18 @@ pub fn registry_for_wiring(cfg: &hatel_core::Config) -> hatel_core::Registry {
 /// remote collector's business).
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:4318";
 
-/// Whether an OTLP endpoint points at a loopback (local) receiver — where this collector is the
-/// only thing that could be listening, so `http/json` is mandatory. Normalizes the host so an
-/// alias (`localhost`, `::1`), a non-default port, or a trailing slash/path doesn't slip past as
-/// "remote". Anything non-loopback is treated as a remote collector (protocol is its business).
+/// Whether an OTLP URL addresses a plaintext loopback receiver. URL parsing handles host
+/// normalization, IPv6, paths and queries.
 pub fn is_local_receiver(endpoint: &str) -> bool {
-    // The receiver is plaintext HTTP, so an `https://` endpoint — even on loopback — is not it
-    // (Claude Code would TLS-handshake a server that speaks none). Only plain `http://` (or a
-    // scheme-less authority) on a loopback host counts.
-    if endpoint.starts_with("https://") {
-        return false;
-    }
-    let rest = endpoint.strip_prefix("http://").unwrap_or(endpoint);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let host = if let Some(after) = authority.strip_prefix('[') {
-        after.split(']').next().unwrap_or(after) // [::1]:4318 → ::1
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    reqwest::Url::parse(endpoint).is_ok_and(|url| {
+        url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+    })
+}
+
+pub fn process_env() -> impl Iterator<Item = (String, String)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
 }
 
 /// The native-telemetry `env` block Claude Code reads at session start. The bool marks a
@@ -230,8 +220,9 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 
 // ── reads (diagnosis) ──
 
-/// Merge each scope's `env` block in precedence order; later scopes override.
-pub fn effective_env(files: &[ScopeFile]) -> Env {
+/// Settings environment before Claude Code's telemetry policy is applied. Storage diagnostics
+/// need this view because hook-specific variables are independent of the native exporters.
+pub fn settings_env(files: &[ScopeFile]) -> Env {
     let mut env = Env::new();
     for f in files {
         let Some(obj) = f
@@ -249,6 +240,165 @@ pub fn effective_env(files: &[ScopeFile]) -> Env {
         }
     }
     env
+}
+
+/// Resolve the native exporter configuration for a terminal launch. Repository restrictions and
+/// managed destination locks follow Claude Code's documented environment policy:
+/// https://code.claude.com/docs/en/settings-reference#variables-claude-code-ignores-in-env
+pub fn effective_env(
+    files: &[ScopeFile],
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> Env {
+    let inherited: Env = inherited
+        .into_iter()
+        .filter(|(key, _)| is_telemetry_key(key))
+        .map(|(key, value)| (key, (value, "process")))
+        .collect();
+    let mut env = inherited.clone();
+    for file in files {
+        let Some(values) = file
+            .load
+            .value()
+            .and_then(|v| v.get("env"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (key, value) in values {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            if repository_scope(file.name)
+                && restricted_telemetry_key(key)
+                && (!repository_off_value(key, value) || inherited.contains_key(key))
+            {
+                continue;
+            }
+            env.insert(key.clone(), (value.to_string(), file.name));
+        }
+    }
+    // A generic managed destination shadows developer per-signal overrides. Credentials also
+    // remove developer destinations, so they cannot be redirected to a different collector.
+    for (generic, suffix) in [
+        ("OTEL_EXPORTER_OTLP_ENDPOINT", "ENDPOINT"),
+        ("OTEL_EXPORTER_OTLP_PROTOCOL", "PROTOCOL"),
+        ("OTEL_EXPORTER_OTLP_HEADERS", "HEADERS"),
+        (
+            "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
+            "CLIENT_CERTIFICATE",
+        ),
+        ("OTEL_EXPORTER_OTLP_CLIENT_KEY", "CLIENT_KEY"),
+    ] {
+        if env
+            .get(generic)
+            .is_some_and(|(_, scope)| *scope == "managed")
+        {
+            for signal in ["METRICS", "LOGS", "TRACES"] {
+                remove_developer_value(&mut env, &format!("OTEL_EXPORTER_OTLP_{signal}_{suffix}"));
+            }
+        }
+    }
+    for signal in [None, Some("METRICS"), Some("LOGS"), Some("TRACES")] {
+        let prefix = signal.map_or_else(
+            || "OTEL_EXPORTER_OTLP".to_string(),
+            |s| format!("OTEL_EXPORTER_OTLP_{s}"),
+        );
+        if ["HEADERS", "CLIENT_CERTIFICATE", "CLIENT_KEY"]
+            .iter()
+            .any(|suffix| {
+                env.get(&format!("{prefix}_{suffix}"))
+                    .is_some_and(|(_, scope)| *scope == "managed")
+            })
+        {
+            remove_developer_value(&mut env, &format!("{prefix}_ENDPOINT"));
+            if signal.is_none() {
+                for signal in ["METRICS", "LOGS", "TRACES"] {
+                    remove_developer_value(
+                        &mut env,
+                        &format!("OTEL_EXPORTER_OTLP_{signal}_ENDPOINT"),
+                    );
+                }
+            }
+        }
+    }
+    env
+}
+
+fn remove_developer_value(env: &mut Env, key: &str) {
+    if env.get(key).is_some_and(|(_, scope)| *scope != "managed") {
+        env.remove(key);
+    }
+}
+
+pub fn repository_scope(scope: &str) -> bool {
+    matches!(scope, "project" | "local")
+}
+
+fn is_telemetry_key(key: &str) -> bool {
+    key.starts_with("OTEL_")
+        || matches!(
+            key,
+            "CLAUDE_CODE_ENABLE_TELEMETRY"
+                | "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"
+                | "ENABLE_ENHANCED_TELEMETRY_BETA"
+                | "ENABLE_BETA_TRACING_DETAILED"
+                | "BETA_TRACING_ENDPOINT"
+        )
+}
+
+pub fn restricted_telemetry_key(key: &str) -> bool {
+    matches!(
+        key,
+        "CLAUDE_CODE_ENABLE_TELEMETRY"
+            | "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA"
+            | "ENABLE_ENHANCED_TELEMETRY_BETA"
+            | "OTEL_LOGS_EXPORTER"
+            | "OTEL_METRICS_EXPORTER"
+            | "OTEL_TRACES_EXPORTER"
+            | "OTEL_LOG_USER_PROMPTS"
+            | "OTEL_LOG_ASSISTANT_RESPONSES"
+            | "OTEL_LOG_TOOL_CONTENT"
+            | "OTEL_LOG_TOOL_DETAILS"
+            | "OTEL_LOG_RAW_API_BODIES"
+            | "ENABLE_BETA_TRACING_DETAILED"
+            | "BETA_TRACING_ENDPOINT"
+            | "OTEL_EXPORTER_PROMETHEUS_HOST"
+            | "OTEL_EXPORTER_PROMETHEUS_PORT"
+    ) || (key.starts_with("OTEL_EXPORTER_OTLP_")
+        && [
+            "_ENDPOINT",
+            "_HEADERS",
+            "_PROTOCOL",
+            "_CERTIFICATE",
+            "_CLIENT_KEY",
+            "_INSECURE",
+        ]
+        .iter()
+        .any(|suffix| key.ends_with(suffix)))
+}
+
+pub fn repository_off_value(key: &str, value: &str) -> bool {
+    match key {
+        "OTEL_LOGS_EXPORTER" | "OTEL_METRICS_EXPORTER" | "OTEL_TRACES_EXPORTER" => value == "none",
+        "OTEL_LOG_USER_PROMPTS" | "OTEL_LOG_TOOL_CONTENT" | "OTEL_LOG_TOOL_DETAILS" => {
+            ["", "0", "false", "no", "off"]
+                .iter()
+                .any(|off| value.eq_ignore_ascii_case(off))
+        }
+        _ => false,
+    }
+}
+
+pub fn telemetry_matches(key: &str, value: &str, expected: &str) -> bool {
+    match key {
+        "OTEL_METRICS_EXPORTER" | "OTEL_LOGS_EXPORTER" => {
+            value.split(',').any(|exporter| exporter.trim() == expected)
+        }
+        "CLAUDE_CODE_ENABLE_TELEMETRY" if expected == "1" => ["1", "true", "yes", "on"]
+            .iter()
+            .any(|on| value.eq_ignore_ascii_case(on)),
+        _ => value == expected,
+    }
 }
 
 pub fn managed_hooks_only(files: &[ScopeFile]) -> bool {
@@ -583,6 +733,14 @@ fn strip_our_entries(groups: &mut [Value], keep_current: Option<&str>) -> bool {
 /// managed/org settings where automated writing isn't appropriate. Values go through `{:?}`,
 /// which JSON-escapes them, so a Windows hook path with backslashes stays valid JSON.
 pub fn render_snippet(hook_cmd: &str, events: &[&'static str]) -> String {
+    render_settings_snippet(hook_cmd, events, true)
+}
+
+pub fn render_hook_snippet(hook_cmd: &str, events: &[&'static str]) -> String {
+    render_settings_snippet(hook_cmd, events, false)
+}
+
+fn render_settings_snippet(hook_cmd: &str, events: &[&'static str], telemetry: bool) -> String {
     let env = TELEMETRY_ENV
         .iter()
         .map(|(k, v, _)| format!("    {k:?}: {v:?}"))
@@ -596,7 +754,12 @@ pub fn render_snippet(hook_cmd: &str, events: &[&'static str]) -> String {
         .map(|e| format!("    {e:?}: [{group}]"))
         .collect::<Vec<_>>()
         .join(",\n");
-    format!("{{\n  \"env\": {{\n{env}\n  }},\n  \"hooks\": {{\n{hooks}\n  }}\n}}\n")
+    let env = if telemetry {
+        format!("  \"env\": {{\n{env}\n  }},\n")
+    } else {
+        String::new()
+    };
+    format!("{{\n{env}  \"hooks\": {{\n{hooks}\n  }}\n}}\n")
 }
 
 // ── writes (init) ──
@@ -643,6 +806,19 @@ impl WireReport {
 /// overwritten), and each event's hook is *appended* only when our hook isn't already present,
 /// so a user's own hooks survive and a second run is a no-op.
 pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> WireReport {
+    wire_settings(settings, hook_cmd, events, true)
+}
+
+pub fn wire_hooks(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> WireReport {
+    wire_settings(settings, hook_cmd, events, false)
+}
+
+fn wire_settings(
+    settings: &mut Value,
+    hook_cmd: &str,
+    events: &[&'static str],
+    telemetry: bool,
+) -> WireReport {
     let mut rep = WireReport::default();
     let Some(obj) = settings.as_object_mut() else {
         rep.env_not_object = true;
@@ -650,52 +826,61 @@ pub fn wire(settings: &mut Value, hook_cmd: &str, events: &[&'static str]) -> Wi
         return rep;
     };
 
-    match obj.entry("env").or_insert_with(|| json!({})) {
-        Value::Object(env) => {
-            for (k, v, required) in TELEMETRY_ENV {
-                match env.get(k) {
-                    Some(Value::String(existing)) if existing == v => {}
-                    // A required key set to a different value means native telemetry won't flow
-                    // (disabled / wrong exporter) — block; an advisory key (endpoint, protocol)
-                    // that differs is a legitimate choice — note it.
-                    Some(existing) if required => rep.env_blocked.push((k, existing.to_string())),
-                    Some(existing) => rep.env_conflicts.push((k, existing.to_string())),
-                    None => {
-                        env.insert(k.to_string(), json!(v));
-                        rep.env_added.push(k);
+    if telemetry {
+        match obj.entry("env").or_insert_with(|| json!({})) {
+            Value::Object(env) => {
+                for (k, v, required) in TELEMETRY_ENV {
+                    match env.get(k) {
+                        Some(Value::String(existing)) if telemetry_matches(k, existing, v) => {}
+                        // A required key set to a different value means native telemetry won't flow
+                        // (disabled / wrong exporter) — block; an advisory key (endpoint, protocol)
+                        // that differs is a legitimate choice — note it.
+                        Some(existing) if required => {
+                            rep.env_blocked.push((k, existing.to_string()))
+                        }
+                        Some(existing) => rep.env_conflicts.push((k, existing.to_string())),
+                        None => {
+                            env.insert(k.to_string(), json!(v));
+                            rep.env_added.push(k);
+                        }
                     }
                 }
             }
+            _ => rep.env_not_object = true,
         }
-        _ => rep.env_not_object = true,
-    }
 
-    // The protocol key is advisory in general, but mandatory when an effective endpoint is the
-    // local receiver — promote a mismatch there from advisory to blocking, so `init` and `doctor`
-    // agree that telemetry won't actually reach the receiver. "Effective" is resolved exactly as
-    // `doctor`'s `effective_otlp_endpoints` does: a per-signal `…_METRICS_ENDPOINT` /
-    // `…_LOGS_ENDPOINT` *overrides* (shadows) the general `OTEL_EXPORTER_OTLP_ENDPOINT` for that
-    // signal — so a per-signal route to the receiver is caught, and a per-signal override away from
-    // a local general endpoint is honored (not falsely seen as local).
-    let env_str = |k: &str| {
-        obj.get("env")
-            .and_then(|e| e.get(k))
-            .and_then(Value::as_str)
-    };
-    let general = env_str("OTEL_EXPORTER_OTLP_ENDPOINT");
-    let effective_metrics = env_str("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").or(general);
-    let effective_logs = env_str("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").or(general);
-    let endpoint_is_local = [effective_metrics, effective_logs]
-        .into_iter()
-        .flatten()
-        .any(is_local_receiver);
-    if endpoint_is_local
-        && let Some(i) = rep
-            .env_conflicts
-            .iter()
-            .position(|(k, _)| *k == "OTEL_EXPORTER_OTLP_PROTOCOL")
-    {
-        rep.env_blocked.push(rep.env_conflicts.remove(i));
+        // Each signal's endpoint and protocol independently shadow the generic values.
+        let env_str = |k: &str| {
+            obj.get("env")
+                .and_then(|e| e.get(k))
+                .and_then(Value::as_str)
+        };
+        let general = env_str("OTEL_EXPORTER_OTLP_ENDPOINT");
+        for (endpoint_key, signal_protocol) in [
+            (
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+                "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+            ),
+        ] {
+            let endpoint = env_str(endpoint_key).or(general);
+            let protocol_key = if env_str(signal_protocol).is_some() {
+                signal_protocol
+            } else {
+                "OTEL_EXPORTER_OTLP_PROTOCOL"
+            };
+            if endpoint.is_some_and(is_local_receiver)
+                && let Some(value) = env_str(protocol_key).filter(|v| *v != "http/json")
+                && !rep.env_blocked.iter().any(|(key, _)| *key == protocol_key)
+            {
+                rep.env_conflicts.retain(|(key, _)| *key != protocol_key);
+                rep.env_blocked
+                    .push((protocol_key, json!(value).to_string()));
+            }
+        }
     }
 
     match obj.entry("hooks").or_insert_with(|| json!({})) {
@@ -826,6 +1011,169 @@ mod tests {
     use super::*;
 
     const CMD: &str = "/usr/local/bin/hatel-hook";
+
+    #[test]
+    fn repository_exporters_cannot_enable_or_redirect_native_telemetry() {
+        let files = vec![
+            scope(
+                "user",
+                json!({"env": {
+                    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://corp.example",
+                    "OTEL_LOGS_EXPORTER": "otlp"
+                }}),
+            ),
+            scope(
+                "project",
+                json!({"env": {
+                    "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": DEFAULT_ENDPOINT,
+                    "OTEL_EXPORTER_OTLP_LOGS_HEADERS": "authorization=secret",
+                    "OTEL_LOGS_EXPORTER": "none",
+                    "HATEL_STRICT": "1"
+                }}),
+            ),
+        ];
+        let env = effective_env(&files, []);
+        assert_eq!(env["CLAUDE_CODE_ENABLE_TELEMETRY"], ("1".into(), "user"));
+        assert_eq!(
+            env["OTEL_EXPORTER_OTLP_ENDPOINT"],
+            ("https://corp.example".into(), "user")
+        );
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_LOGS_HEADERS"));
+        assert_eq!(env["OTEL_LOGS_EXPORTER"], ("none".into(), "project"));
+        assert_eq!(
+            settings_env(&files)["HATEL_STRICT"],
+            ("1".into(), "project")
+        );
+        let env = effective_env(
+            &files,
+            [("OTEL_LOGS_EXPORTER".into(), "console,otlp".into())],
+        );
+        assert_eq!(env["OTEL_LOGS_EXPORTER"], ("otlp".into(), "user"));
+        assert!(
+            !effective_env(
+                &[scope(
+                    "local",
+                    json!({"env": {"CLAUDE_CODE_ENABLE_TELEMETRY": "1"}})
+                )],
+                []
+            )
+            .contains_key("CLAUDE_CODE_ENABLE_TELEMETRY")
+        );
+    }
+
+    #[test]
+    fn managed_destinations_and_credentials_remove_developer_routes() {
+        let developer = scope(
+            "user",
+            json!({"env": {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://developer.example",
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "https://metrics.example",
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://logs.example",
+                "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "http/json"
+            }}),
+        );
+        let files = vec![
+            developer,
+            scope(
+                "managed",
+                json!({"env": {
+                    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://managed.example",
+                    "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
+                    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "https://managed-logs.example"
+                }}),
+            ),
+        ];
+        let env = effective_env(&files, []);
+        assert_eq!(env["OTEL_EXPORTER_OTLP_ENDPOINT"].1, "managed");
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"));
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"));
+        assert_eq!(env["OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"].1, "managed");
+        let files = vec![
+            scope(
+                "user",
+                json!({"env": {"OTEL_EXPORTER_OTLP_ENDPOINT": "https://developer.example"}}),
+            ),
+            scope(
+                "managed",
+                json!({"env": {"OTEL_EXPORTER_OTLP_HEADERS": "authorization=secret"}}),
+            ),
+        ];
+        let env = effective_env(
+            &files,
+            [(
+                "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT".into(),
+                "https://process.example".into(),
+            )],
+        );
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"));
+        assert!(!env.contains_key("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"));
+    }
+
+    #[test]
+    fn hook_only_wiring_preserves_env_and_is_idempotent() {
+        let mut settings = json!({"env": {"OTEL_LOGS_EXPORTER": "none", "CUSTOM": "value"}});
+        let env = settings["env"].clone();
+        let first = wire_hooks(&mut settings, CMD, &EVENTS);
+        assert!(first.changed());
+        assert_eq!(settings["env"], env);
+        assert!(first.env_added.is_empty() && first.env_blocked.is_empty());
+        assert!(!wire_hooks(&mut settings, CMD, &EVENTS).changed());
+        let mut empty = json!({});
+        wire_hooks(&mut empty, CMD, &EVENTS);
+        assert!(empty.get("env").is_none());
+        let snippet: Value = serde_json::from_str(&render_hook_snippet(CMD, &EVENTS)).unwrap();
+        assert_eq!(snippet, empty);
+    }
+
+    #[test]
+    fn wire_and_diagnosis_accept_the_same_exporter_values() {
+        let mut settings = json!({"env": {
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "true",
+            "OTEL_METRICS_EXPORTER": "console,otlp",
+            "OTEL_LOGS_EXPORTER": "otlp, console"
+        }});
+        assert!(wire(&mut settings, CMD, &EVENTS).env_blocked.is_empty());
+        assert!(!telemetry_matches("OTEL_LOGS_EXPORTER", "not-otlp", "otlp"));
+        assert!(!telemetry_matches(
+            "CLAUDE_CODE_ENABLE_TELEMETRY",
+            "false",
+            "1"
+        ));
+    }
+
+    #[test]
+    fn signal_protocols_override_the_generic_protocol_without_being_rewritten() {
+        for (generic, metrics, blocked) in
+            [("grpc", "http/json", false), ("http/json", "grpc", true)]
+        {
+            let mut settings = json!({"env": {
+                "OTEL_EXPORTER_OTLP_ENDPOINT": "https://corp.example",
+                "OTEL_EXPORTER_OTLP_PROTOCOL": generic,
+                "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": DEFAULT_ENDPOINT,
+                "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": metrics
+            }});
+            let report = wire(&mut settings, CMD, &EVENTS);
+            assert_eq!(
+                report
+                    .env_blocked
+                    .iter()
+                    .any(|(key, _)| *key == "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"),
+                blocked
+            );
+            assert!(
+                !report
+                    .env_blocked
+                    .iter()
+                    .any(|(key, _)| *key == "OTEL_EXPORTER_OTLP_PROTOCOL")
+            );
+            assert_eq!(
+                settings["env"]["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"],
+                metrics
+            );
+        }
+    }
 
     #[test]
     fn wire_empty_adds_env_and_all_events() {
@@ -1064,6 +1412,11 @@ mod tests {
         // https on loopback is NOT our receiver — serve speaks plaintext HTTP only.
         assert!(!is_local_receiver("https://127.0.0.1:4318"));
         assert!(!is_local_receiver("https://localhost:4318"));
+        assert!(is_local_receiver("http://LOCALHOST:4318?signal=logs"));
+        assert!(!is_local_receiver(
+            "http://localhost@collector.example:4318"
+        ));
+        assert!(!is_local_receiver("127.0.0.1:4318"));
     }
 
     #[test]

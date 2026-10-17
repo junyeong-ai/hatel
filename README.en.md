@@ -23,7 +23,7 @@
 ## Why hatel?
 
 - **🧩 Two signals, joined** — Claude Code emits **native OpenTelemetry** (tokens, cost) and **lifecycle hooks** (project, prompts, subagents). hatel joins them on `session.id`. Native OTel has no "which project" on the wire — hatel fills that in.
-- **📦 Zero infrastructure** — two small static binaries (the receiver + the hook), a local OTLP collector. No Docker, no dashboard to host, no external dependency.
+- **📦 Zero infrastructure** — two small binaries (the receiver + the hook), a local OTLP collector. No Docker, no dashboard to host, no external dependency.
 - **🔒 Privacy first** — prompts store *length only*, tools store *name only* (a `Skill` call also the skill it loaded; never the text or any other argument). By default everything stays on your machine.
 - **🧱 Extensible** — add a custom metric with one TOML file (no code, no recompile). Record CI / deploy / gate outcomes with one `emit`.
 - **🔌 Sit in front of a corporate collector** — keep your existing OTLP collector; hatel sits in front and tees to it, injecting the project label.
@@ -59,7 +59,7 @@ Two small binaries do the work:
 
 | Binary | Role |
 |---|---|
-| `hatel-hook` | wired into `settings.json` hooks; reads one event on stdin, maps it, records matches, exits. No async runtime — **single-digit-millisecond cold start** (~1 ms over a bare process spawn). |
+| `hatel-hook` | wired into `settings.json` hooks; reads one event on stdin, maps it, records matches, exits. No async runtime. |
 | `hatel` | the receiver (`serve`), reports, `init`, `service`, `doctor`, `kinds`, `emit`, the MCP server (`mcp`). |
 
 ---
@@ -106,7 +106,6 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 | source | count | estimated_cache_write_usd | context_tokens |
 |---|---:|---:|---:|
 | resume | 12 | 5.04 | 487,220 |
-| compact | 5 | 1.93 | 186,540 |
 | fork | 2 | 0.71 | 71,026 |
 | startup | 4 | 0 | 0 |
 
@@ -138,11 +137,11 @@ After three people work on `acme-api` and `acme-web`, `hatel report --window 30d
 
 - Every section names its axes: **`by <dimension>, ranked by <measure>`**. That is the question the section answers, and both halves are yours to change — `--group-by` / `--sort-by`.
 - The **`tool`** section is per tool: call count, total duration ms, successes. `Bash | 4 | 5,730 | 3` = Bash called 4×, 5.73 s total (~1.4 s avg), 3 of 4 succeeded → **average latency and success rate in one row**. `--group-by agent_id` separates delegated calls (the row with no value is the main agent), and `--group-by prompt_id` groups the work one request set off.
-- The **`session`** section counts the times a context was established — besides `startup`, each of `resume`, `fork`, `clear` and `compact` fires `SessionStart` again on an existing conversation, so one session is counted more than once. The measures are what rebuilding the prompt cache cost on those starts, spend that appears in no session total. Grouping by `cache_likely_expired` separates the part that was avoidable.
+- The **`session`** section counts the times a context was established — besides `startup`, each of `resume`, `fork`, `clear` and `compact` fires `SessionStart` again on an existing conversation, so one session is counted more than once. For `resume` and `fork`, the measures are the **estimated** cost of writing the next request’s context to the cache (Claude Code 2.1.251+). They are not actual spend and must not be added to OTel costs. `cache_likely_expired` indicates expected cache expiry.
 - The **`cost`** section rolls the native-OTel snapshot up by project. `--format json` keeps the per-session rows whole, so it can be joined against your own records.
 - The **`memory`** section is which instruction files entered context, named by their path in the repository (outside it, `~/…` under home and absolute elsewhere); the same path in two repositories shares a row until you add `--project` or `--group-by project`. Rebuilding context (`session_start`, `compact`) announces every file again, an @-imported one as `include` with `parent_file_path`. A load a file access set off carries `trigger_file_path`, the file that pulled it in, and skips a file the context already holds, so a missing load does not mean the file was absent. `prompt_id` is the latest prompt submitted when the load happened.
 - The **`command`** section is the slash commands and skills that were explicitly invoked. A skill the model loads on its own expands nothing, so it is not counted here; `--kind tool --filter tool_name=Skill --group-by skill` names those, a call that failed included.
-- **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate. An `(empty)` row is an agent Claude Code ran for itself — not one the conversation spawned, so it carries no type, keeps no transcript, and makes no tool calls.
+- **`prompt` / `subagent`** come from **hooks** — prompts per session, how often each subagent was spawned. A subagent emits a stop event at every turn boundary, so runs are counted by `agent_id`. The `agent` value is the label the event carries: the declared type for a plain subagent, the name you gave it for a teammate. An `(empty)` row means the event carried no `agent_type`. Its absence does not establish the agent’s type or tool usage.
 
 > A Kind with nothing in the window says so in place of its table, and Kinds you have no records for are listed the same way (omitted above for brevity). Start the receiver and run Claude Code once and they fill in (see [Troubleshooting](#troubleshooting)).
 
@@ -209,9 +208,11 @@ hatel report --window 30d --kind tool --top 1 --format json
 }
 ```
 
+> Costs are Claude Code estimates and may differ from provider billing. For the cost snapshot, `--window` selects sessions by their last-received timestamp. It returns their cumulative cost, not only the spend incurred within that period.
+
 > Keys serialize in alphabetical order. `--top 1` keeps only the `Bash` group above; the default (top 5) continues with `Edit·Grep·Read` in the same shape. A group's `key` is `null` for the records that carry no value for the dimension at all (the `—` row of the text and markdown views), so a reader tells an absent field from any value by shape rather than by a glyph. `retained_since` is the oldest record of that Kind still stored (of the project `--project` names, when given; `null` when none): retention prunes the store from the back, so a window that starts before it was not measured whole, and a reader should say so rather than read the empty stretch as silence. A non-null `unreadable_kinds` means **the ledger holds Kinds no loaded schema declares** — the rollup answered over less than was collected, and the names and the place to fix it come with it (see [custom metrics](#custom-metrics-plugins)).
 
-In a full report (no `--kind`), each `cost` row serializes three breakdowns alongside its totals — `tokens_by_type` (`input`/`output`/`cacheRead`/`cacheCreation` — the cache-hit accounting), `by_model` (tokens and cost per model — the model mix), and `by_agent` (tokens and cost per subagent). In each breakdown, a series missing the attribute lands in an `(unattributed)` bucket — never guessed. Sessions recorded before the breakdowns existed show empty objects (`{}`) — exactly the fact that nothing was recorded.
+In a full report (no `--kind`), each `cost` row serializes three breakdowns alongside its totals — `tokens_by_type` (`input`/`output`/`cacheRead`/`cacheCreation` — the cache-hit accounting), `by_model` (tokens and cost per model — the model mix), and `by_agent` (tokens and cost per subagent). In each breakdown, a series missing the attribute lands in an `(unattributed)` bucket — never guessed. Sessions recorded before the breakdowns existed show empty objects (`{}`) — exactly the fact that nothing was recorded. When upstream masks `agent.name` as `custom`, costs from multiple custom agent types can share one bucket.
 
 ### The MCP server — `hatel mcp`
 
@@ -304,7 +305,7 @@ hatel serve --all      # every project sharing this collector
 hatel serve --project acme-api   # one project (by label)
 ```
 
-The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down, or with `--wait` waits for the lock (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running, the configuration file it read and the store it writes (`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.20.1"}`) — what `doctor` compares its own build, file and store against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
+The receiver is a **single-writer daemon**: it takes an advisory lock on the state dir, so a second receiver over the same dir stands down, or with `--wait` waits for the lock (the cost snapshot has exactly one writer). `GET /healthz` answers which build is running, the configuration file it read and the store it writes (`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.21.0"}`) — what `doctor` compares its own build, file and store against. It always answers `200` — the status means the body was *received*, not whether this build could decode it, so a raw tee of a body the local view can't read still succeeds and an OTLP client never retries (a retry would inflate delta counts).
 
 ### `init` — wire into Claude Code
 
@@ -317,7 +318,7 @@ hatel init --remove        # cleanly undo (leaves the native telemetry env)
 
 `init` wires only the events a loaded Kind consumes (`SessionStart` is always wired, for the session→project index). An event no Kind binds is left unwired, so the hook never runs for no record. The wiring is `async`, so a tool call never waits on a record being written — a collection gap is what `hatel doctor` is for.
 
-Claude Code's own telemetry config must live in `settings.json` `env` — that is the only channel Claude Code reads at session start, and those `OTEL_*` vars are deliberately **not** passed to hook subprocesses. That is exactly why the two layers are separate. The full shape:
+Configure native telemetry in the launch shell, user `~/.claude/settings.json` `env`, or managed settings. Claude Code 2.1.282+ ignores exporter enablement and destination variables in project/local settings, so `init --scope project/local` wires hooks only. `OTEL_*` variables are **not** passed to hook subprocesses ([Claude Code environment policy](https://code.claude.com/docs/en/settings-reference#variables-claude-code-ignores-in-env)). `doctor` checks this process’s environment and settings; it cannot inspect another session’s launch environment. The full user/managed configuration:
 
 ```jsonc
 {
@@ -357,20 +358,21 @@ settings files:
   local    absent                 /home/you/src/acme-api/.claude/settings.local.json
   managed  absent                 /etc/claude-code/managed-settings.json
 
-native telemetry (settings.json env):
+native telemetry (settings.json env + this process):
   ✓ CLAUDE_CODE_ENABLE_TELEMETRY=1 (from user)
   ✓ OTEL_METRICS_EXPORTER=otlp (from user)
   ✓ OTEL_LOGS_EXPORTER=otlp (from user)
-  ✓ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (from user)
+  ✓ metrics OTLP endpoint=http://127.0.0.1:4318 (from user)
+  ✓ logs OTLP endpoint=http://127.0.0.1:4318 (from user)
   ✓ OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from user)
   ✓ session.id included in metrics (default on)
 
 receiver:
-  ✓ receiver at 127.0.0.1:4318 is this build (0.20.1)
+  ✓ receiver at 127.0.0.1:4318 is this build (0.21.0)
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.20.1)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.21.0)
 
 storage:
   ✓ state dir writable: /home/you/.local/state/hatel
@@ -446,7 +448,7 @@ exclude_projects = ["scratch"]               # forward every project but these�
 - **`enriched`** — injects the `project` label (joined from `session.id`) into each datapoint/record, so the downstream gains the **per-project attribution** raw OTel structurally lacks. It needs an `http/json` stream to transform; a datapoint whose session is unknown is forwarded unchanged (the label is never fabricated).
 - **`projects` / `exclude_projects`** — keep a destination from seeing some projects (allow-list or exclude-list, one or the other). Match by label (the repository's basename) or key (its absolute path as the filesystem resolves it, symlinks followed). A batch whose project can't yet be resolved **fails closed** (not forwarded to a filtered destination), so a personal project never leaks to a corporate collector on a startup race.
 
-> **Egress is not redacted.** `raw`/`enriched` forward the full OTLP body off the host; hatel's allow-list/hashing applies to the *hook ledger*, not to this egress. `doctor` prints this as a standing warning whenever export is configured. (Because hatel is content-free by construction it carries no prompt/tool bodies, so it is still safer than pointing Claude Code's raw OTel at a corporate collector.)
+> **Egress is not redacted.** `raw`/`enriched` forward the full OTLP body off the host; hatel's allow-list/hashing applies to the *hook ledger*, not to this egress. `doctor` prints this as a standing warning whenever export is configured. If Claude Code is configured to capture content, that content can also be forwarded.
 
 ### Insert hatel in front of an existing collector
 
@@ -524,7 +526,7 @@ It is language-agnostic (any project, any language, calls the binary). Unlike a 
 
 Both halves of storage go through one abstraction (the sink) — emitters write via the sink, `report` reads via the same backend (a report consumes SQLite exactly as it does JSONL):
 
-- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MB (`rotate_bytes`) or once its oldest record is older than a tenth of the retention horizon. Git-friendly, greppable, zero dependencies.
+- **`jsonl`** (default) — one append-only file per Kind, rotated at 10 MiB (`rotate_bytes`) or once its oldest record is older than a tenth of the retention horizon. Git-friendly, greppable, zero dependencies.
 - **`sqlite`** — embedded, WAL, indexed by `(kind, ts)` so windowed reads stay cheap (the window is filtered in SQL).
 
 By default, state lives under the XDG state dir (`~/.local/state/hatel`, or the platform equivalent); `[storage]`'s `state_dir` moves it. The session index and the cost snapshot are always written there independent of the sink (the receiver needs the index to attribute project-less OTel data).
@@ -536,7 +538,7 @@ Storage is configured under `[storage]` in `config.toml`. The hook, the receiver
 sink = "sqlite"            # jsonl (default) / sqlite
 state_dir = "/data/hatel"  # override the state directory: absolute, or relative to config.toml's own directory (~ is not expanded)
 retention_days = 30        # retention horizon (default 90, max 100000)
-rotate_bytes = 20971520    # JSONL rotation threshold (default 10 MB)
+rotate_bytes = 20971520    # JSONL rotation threshold (default 10 MiB)
 ```
 
 `retention_days` is the retention horizon for everything stored — the cost snapshot, the ledger, the session index, SQLite rows. The cost snapshot counts from the last time the receiver heard from a session (one heard again after expiring counts only what it reports from then on), and the session index keeps a session's project for as long as the receiver keeps hearing from it. The receiver sweeps at start and then daily (or every tenth of the horizon, when that is under a day); since JSONL files are deleted whole, a record can outlive the horizon by a tenth of it plus two sweep intervals.
@@ -590,7 +592,7 @@ hatel service --print   # print the unit instead of installing — to inspect or
 The collector never fights managed policy; it adapts:
 
 - **OTel repointed at a corporate collector** — the local hook ledger keeps working; the `session.id` join holds wherever the native data lands, so metrics query from the corporate backend and join to the local domain ledger by session.
-- **`allowManagedHooksOnly`** — user/project hooks are blocked, so IT deploys `hatel-hook` as a *managed* hook (the single static binary ships via MDM). `doctor` detects this from the file-based managed settings.
+- **`allowManagedHooksOnly`** — user/project hooks are blocked, so IT deploys `hatel-hook` as a *managed* hook (the single binary ships via MDM). `doctor` detects this from the file-based managed settings.
 - **`OTEL_METRICS_INCLUDE_SESSION_ID=false`** — per-session attribution becomes impossible. hatel **drops** these session-less metrics rather than guess, and `doctor` reports it plainly (org/user-level aggregation survives only at a collector you forward the raw stream to). An unavailable signal is reported as unavailable, never fabricated.
 
 ---

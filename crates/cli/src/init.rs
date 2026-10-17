@@ -20,9 +20,9 @@ use crate::claude_settings as cs;
 pub enum Scope {
     /// `~/.claude/settings.json` — every project (recommended).
     User,
-    /// `.claude/settings.json` — committed, shared with the team.
+    /// `.claude/settings.json` — shared lifecycle hooks; configure native telemetry separately.
     Project,
-    /// `.claude/settings.local.json` — this repo, per-dev.
+    /// `.claude/settings.local.json` — per-project lifecycle hooks only.
     Local,
 }
 
@@ -63,7 +63,12 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
     let events = cs::active_events(&registry);
 
     if print {
-        print!("{}", cs::render_snippet(&hook_cmd, &events));
+        let snippet = if matches!(scope, Scope::User) {
+            cs::render_snippet(&hook_cmd, &events)
+        } else {
+            cs::render_hook_snippet(&hook_cmd, &events)
+        };
+        print!("{snippet}");
         return 0;
     }
 
@@ -104,7 +109,11 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
         }
     };
 
-    let rep = cs::wire(&mut settings, &hook_cmd, &events);
+    let rep = if matches!(scope, Scope::User) {
+        cs::wire(&mut settings, &hook_cmd, &events)
+    } else {
+        cs::wire_hooks(&mut settings, &hook_cmd, &events)
+    };
 
     // An advisory key the user set differently (e.g. an endpoint repointed at a corporate
     // collector) — telemetry still flows, so note it but don't fail.
@@ -174,6 +183,11 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
              (not a supported event)"
         );
     }
+    if !matches!(scope, Scope::User) {
+        println!(
+            "native telemetry: configure your shell, user or managed settings; project/local scope wires hooks only"
+        );
+    }
     println!("verify with `hatel doctor`");
 
     // The hooks are in place, but a blocked required key means native telemetry won't be
@@ -190,7 +204,7 @@ pub fn run(scope: Scope, print: bool, remove: bool) -> i32 {
 pub fn insert(mode: InsertMode) -> i32 {
     let registry = cs::registry_for_wiring(&hatel_core::Config::load_resilient());
     let files = cs::scope_files();
-    let env = cs::effective_env(&files);
+    let env = cs::effective_env(&files, cs::process_env());
 
     // `--insert` models a single general endpoint. A per-signal override (metrics/logs) is a split
     // topology it can't express, so refuse rather than capture the wrong endpoint.
@@ -228,6 +242,13 @@ pub fn insert(mode: InsertMode) -> i32 {
             "init --insert: the endpoint is managed-locked to {endpoint}; it can't be repointed, so \
              hatel can't sit in front of it (only the hook ledger is available). Ask IT to route \
              Claude Code at the local receiver."
+        );
+        return 1;
+    }
+
+    if scope == "process" {
+        eprintln!(
+            "init --insert: the endpoint comes from this process's environment; configure config.toml [[export]] and repoint the launch environment by hand"
         );
         return 1;
     }
@@ -283,6 +304,11 @@ pub fn insert(mode: InsertMode) -> i32 {
         );
     }
 
+    if let Err(error) = repoint(&mut settings, &env, scope) {
+        eprintln!("init --insert: {error}");
+        return 1;
+    }
+
     // Capture the corporate endpoint (and its auth headers) as a forward target. Refuse to clobber
     // an existing-but-broken config rather than overwrite it.
     let mut export = match ExportConfig::load() {
@@ -333,18 +359,6 @@ pub fn insert(mode: InsertMode) -> i32 {
         }
     };
 
-    // Settings already wired+validated above; overwrite the endpoint/protocol (the deliberate
-    // repoint `wire` won't do on its own — it never clobbers an endpoint) and persist.
-    if let Some(env_obj) = settings.get_mut("env").and_then(|e| e.as_object_mut()) {
-        env_obj.insert(
-            "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
-            json!(cs::DEFAULT_ENDPOINT),
-        );
-        env_obj.insert(
-            "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
-            json!("http/json"),
-        );
-    }
     if let Err(e) = write_atomic(&path, &settings) {
         eprintln!("init --insert: failed to write {}: {e}", path.display());
         return 1;
@@ -369,6 +383,44 @@ pub fn insert(mode: InsertMode) -> i32 {
     // Non-zero if a required key keeps native telemetry off, so an installer/script sees that the
     // repoint succeeded but the stream won't flow yet — the same contract as `run`.
     i32::from(!rep.env_blocked.is_empty())
+}
+
+fn repoint(settings: &mut Value, env: &cs::Env, scope: &str) -> Result<(), String> {
+    let generic = "OTEL_EXPORTER_OTLP_PROTOCOL";
+    let signals = [
+        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+    ];
+    for signal in signals {
+        let key = if env.contains_key(signal) {
+            signal
+        } else {
+            generic
+        };
+        if let Some((value, source)) = env.get(key)
+            && value != "http/json"
+            && *source != scope
+        {
+            return Err(format!(
+                "{key} comes from {source}; set it to http/json there before inserting the local receiver"
+            ));
+        }
+    }
+    let values = settings
+        .get_mut("env")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "settings env must be an object".to_string())?;
+    values.insert(
+        "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+        json!(cs::DEFAULT_ENDPOINT),
+    );
+    values.insert(generic.to_string(), json!("http/json"));
+    for signal in signals {
+        if values.contains_key(signal) {
+            values.insert(signal.to_string(), json!("http/json"));
+        }
+    }
+    Ok(())
 }
 
 /// Warn if the hook command we just wired points at a binary that isn't there — a CLI-only
@@ -490,4 +542,38 @@ fn tmp_sibling(path: &Path) -> PathBuf {
         .unwrap_or_default();
     name.push(format!(".init-tmp-{}", std::process::id()));
     path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+
+    #[test]
+    fn repoint_updates_owned_protocols_and_rejects_external_conflicts_before_mutation() {
+        for source in ["user", "process", "managed"] {
+            let mut settings = json!({"env": {"OTEL_EXPORTER_OTLP_METRICS_PROTOCOL": "grpc"}});
+            let before = settings.clone();
+            let env = [(
+                "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL".to_string(),
+                ("grpc".to_string(), source),
+            )]
+            .into_iter()
+            .collect();
+            let result = repoint(&mut settings, &env, "user");
+            if source == "user" {
+                assert!(result.is_ok());
+                assert_eq!(
+                    settings["env"]["OTEL_EXPORTER_OTLP_METRICS_PROTOCOL"],
+                    "http/json"
+                );
+                assert_eq!(
+                    settings["env"]["OTEL_EXPORTER_OTLP_ENDPOINT"],
+                    cs::DEFAULT_ENDPOINT
+                );
+            } else {
+                assert!(result.is_err());
+                assert_eq!(settings, before);
+            }
+        }
+    }
 }

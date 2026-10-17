@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 # The hook entrypoint. Depends on `core` only — no async runtime, no HTTP stack —
-# so it cold-starts in single-digit milliseconds when spawned on every event.
+# so each event process avoids the receiver's runtime and HTTP stack.
 [[bin]]
 name = "hatel-hook"
 path = "src/main.rs"

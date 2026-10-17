@@ -11,10 +11,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use axum::extract::FromRequestParts;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use hatel_core::config::Retention;
 use hatel_core::cost::{self, CostRow};
@@ -35,8 +37,11 @@ pub(crate) const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// OTLP/HTTP body cap. Far above any real batch (axum's 2 MB default would silently
 /// 413 a large export and lose it), but bounded so a runaway body can't exhaust memory.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Limit before buffering the body, including decode work that outlives a disconnected client.
+const MAX_INGEST_REQUESTS: usize = 4;
 #[derive(Clone)]
 struct AppState {
+    ingest_slots: Arc<Semaphore>,
     acc: Arc<Mutex<Accumulator>>,
     tracked: Arc<BTreeSet<String>>,
     counted: Arc<BTreeSet<String>>,
@@ -233,6 +238,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
         (Some(e), Some(h))
     };
     let state = AppState {
+        ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_REQUESTS)),
         acc: Arc::new(Mutex::new(Accumulator::default())),
         tracked: Arc::new(registry.tracked_metrics.clone()),
         counted: Arc::new(registry.counted_events.clone()),
@@ -283,19 +289,15 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     if orphans > 0 {
         eprintln!("hatel: removed {orphans} cost-snapshot temp file(s) a previous run left behind");
     }
-    // Retention sweep, destructive, so under the same lock and once this receiver is serving. The
-    // flush loop repeats it.
-    sweep(&state);
-
-    // Keep the persisted cost snapshot fresh while running (a long-lived daemon
-    // never reaches the shutdown flush otherwise).
+    // Filesystem work has one blocking worker. Shutdown joins it before the final flush, so an
+    // in-flight write cannot overlap the final writer or block an async runtime worker.
     let flush_state = state.clone();
-    let flush_task = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(FLUSH_INTERVAL);
+    let (stop_flush, flush_stop) = std::sync::mpsc::channel::<()>();
+    let flush_task = tokio::task::spawn_blocking(move || {
+        sweep(&flush_state);
         let sweep_every = flush_state.cfg.sweep_interval_secs();
         let mut last_prune = hatel_core::now_epoch();
         loop {
-            tick.tick().await;
             persist_cost(&flush_state);
             renew_index(&flush_state);
             render(&flush_state);
@@ -304,6 +306,11 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
             if sweep_due(now, last_prune, sweep_every) {
                 last_prune = now;
                 sweep(&flush_state);
+            }
+            if flush_stop.recv_timeout(FLUSH_INTERVAL)
+                != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                break;
             }
         }
     });
@@ -315,8 +322,17 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     if let Err(e) = server.await {
         eprintln!("serve: {e}");
     }
-    flush_task.abort();
-    let _ = flush_task.await; // wait for it to fully stop, so the final flush is the sole writer
+    // A disconnected request can leave its blocking decoder running. Its permit is released
+    // only after aggregation, so the final snapshot must wait for all permits to return.
+    let _ingest_drained = state
+        .ingest_slots
+        .acquire_many(MAX_INGEST_REQUESTS as u32)
+        .await
+        .expect("receiver ingest semaphore remains open");
+    let _ = stop_flush.send(());
+    if let Err(e) = flush_task.await {
+        eprintln!("hatel: persistence worker failed: {e}");
+    }
     flush_on_stop(&state);
     // Flush the export queue before exiting (a routine `service` restart would otherwise lose the
     // last, most-recent batches), bounded so an unreachable downstream can't hang the exit.
@@ -360,42 +376,78 @@ async fn identity(State(st): State<AppState>) -> Json<receiver::Identity> {
 
 async fn ingest_metrics(
     State(st): State<AppState>,
+    permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> IngestResponse {
-    // Queue for egress first (cheap refcount clone), independent of local decode — a raw tee must
-    // forward even a body this build can't decode for its own view.
-    if let Some(exporter) = &st.exporter {
-        let (ct, ce) = body_headers(&headers);
-        exporter.enqueue(OtlpSignal::Metrics, body.clone(), ct, ce);
-    }
-    match parse_metrics(body.as_ref(), &st.tracked) {
-        Ok(points) if !points.is_empty() => {
-            lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
-        }
-        Ok(_) => {}
-        Err(e) => note_undecodable(&st.undecodable.metrics, "metrics", &e),
-    }
-    ok()
+    ingest(st, permit, OtlpSignal::Metrics, headers, body).await
 }
 
 async fn ingest_logs(
     State(st): State<AppState>,
+    permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> IngestResponse {
+    ingest(st, permit, OtlpSignal::Logs, headers, body).await
+}
+
+struct IngestPermit(OwnedSemaphorePermit);
+
+impl FromRequestParts<AppState> for IngestPermit {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        _parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        state
+            .ingest_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map(Self)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
+    }
+}
+
+async fn ingest(
+    st: AppState,
+    permit: IngestPermit,
+    signal: OtlpSignal,
+    headers: HeaderMap,
+    body: Bytes,
+) -> IngestResponse {
+    // Raw forwarding is independent of local decode; unsupported bodies still reach raw targets.
     if let Some(exporter) = &st.exporter {
         let (ct, ce) = body_headers(&headers);
-        exporter.enqueue(OtlpSignal::Logs, body.clone(), ct, ce);
+        exporter.enqueue(signal, body.clone(), ct, ce);
     }
-    // Decode the body once for the counted-event tallies the live view folds.
-    match parse_logs(body.as_ref(), &st.counted) {
-        Ok(decoded) => {
-            if !decoded.is_empty() {
-                lock(&st.acc).update_events(decoded, jiff::Timestamp::now());
-            }
+    let counters = st.undecodable.clone();
+    let (counter, name) = match signal {
+        OtlpSignal::Metrics => (&counters.metrics, "metrics"),
+        OtlpSignal::Logs => (&counters.logs, "logs"),
+    };
+    let decoded = tokio::task::spawn_blocking(move || {
+        let IngestPermit(_permit) = permit;
+        match signal {
+            OtlpSignal::Metrics => parse_metrics(&body, &st.tracked).map(|points| {
+                if !points.is_empty() {
+                    lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
+                }
+            }),
+            OtlpSignal::Logs => parse_logs(&body, &st.counted).map(|events| {
+                if !events.is_empty() {
+                    lock(&st.acc).update_events(events, jiff::Timestamp::now());
+                }
+            }),
         }
-        Err(e) => note_undecodable(&st.undecodable.logs, "logs", &e),
+    })
+    .await;
+    match decoded {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => note_undecodable(counter, name, &e),
+        Err(e) => note_undecodable(counter, name, &e.to_string()),
     }
     ok()
 }
@@ -910,6 +962,7 @@ mod tests {
         };
         let registry = Arc::new(build_registry(&cfg).unwrap());
         AppState {
+            ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_REQUESTS)),
             config_file: Some(dir.join("config.toml")),
             env: |_| None,
             acc: Arc::new(Mutex::new(Accumulator::default())),
@@ -926,6 +979,70 @@ mod tests {
             undecodable: Arc::default(),
             failed_writes: Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn saturated_ingest_does_not_block_identity_and_resumes_when_capacity_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let held = state
+            .ingest_slots
+            .clone()
+            .acquire_many_owned(MAX_INGEST_REQUESTS as u32)
+            .await
+            .unwrap();
+        let app = Router::new()
+            .route("/v1/metrics", post(ingest_metrics))
+            .route(receiver::IDENTITY_PATH, get(identity))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let post_client = client.clone();
+        let mut request = tokio::spawn(async move {
+            post_client
+                .post(format!("http://{addr}/v1/metrics"))
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({"resourceMetrics": [{"scopeMetrics": [{"metrics": [{
+                        "name": "claude_code.token.usage",
+                        "sum": {"aggregationTemporality": 1, "dataPoints": [{
+                            "asInt": "7",
+                            "attributes": [{"key": "session.id", "value": {"stringValue": "S"}}]
+                        }]}
+                    }]}]}]})
+                    .to_string(),
+                )
+                .send()
+                .await
+                .unwrap()
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut request)
+                .await
+                .is_err()
+        );
+        let health = client
+            .get(format!("http://{addr}{}", receiver::IDENTITY_PATH))
+            .timeout(Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap();
+        assert!(health.status().is_success());
+        assert!(lock(&state.acc).sessions().is_empty());
+        drop(held);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .unwrap()
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        assert_eq!(lock(&state.acc).sessions().get("S").unwrap().tokens(), 7);
+        assert_eq!(state.ingest_slots.available_permits(), MAX_INGEST_REQUESTS);
+        server.abort();
     }
 
     #[test]

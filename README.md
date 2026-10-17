@@ -23,7 +23,7 @@
 ## 왜 hatel인가?
 
 - **🧩 두 신호를 하나로** — Claude Code가 내보내는 **네이티브 OpenTelemetry**(토큰·비용)와 **라이프사이클 훅**(프로젝트·프롬프트·서브에이전트)을 `session.id`로 조인. OTel 숫자엔 "어느 프로젝트"가 없는데, hatel이 그걸 채웁니다.
-- **📦 제로 인프라** — 작은 정적 바이너리 둘(수신기 + 훅)이 전부인 로컬 OTLP 수집기. 도커도, 대시보드도, 외부 의존도 없음.
+- **📦 제로 인프라** — 작은 바이너리 둘(수신기 + 훅)이 전부인 로컬 OTLP 수집기. 도커도, 대시보드도, 외부 의존도 없음.
 - **🔒 프라이버시 우선** — 프롬프트는 *길이만*, 도구는 *이름만* 저장(`Skill` 호출은 불러온 스킬 이름까지. 본문과 그 밖의 인자는 저장 안 함). 기본적으로 전부 로컬에만.
 - **🧱 확장 가능** — TOML 한 장으로 커스텀 지표 추가(코드·재컴파일 없음). CI·배포·게이트 결과도 `emit` 한 줄로 기록.
 - **🔌 사내 컬렉터 앞에 끼우기** — 기존 OTLP 컬렉터를 그대로 두고, hatel이 앞에 앉아 프로젝트 라벨을 주입해 전달.
@@ -59,7 +59,7 @@ flowchart LR
 
 | 바이너리 | 역할 |
 |---|---|
-| `hatel-hook` | `settings.json` 훅에 연결. stdin으로 이벤트 하나를 읽어 매핑·기록 후 종료. async 런타임 없음 — **한 자릿수 밀리초 콜드스타트** (빈 프로세스 spawn 대비 약 1ms). |
+| `hatel-hook` | `settings.json` 훅에 연결. stdin으로 이벤트 하나를 읽어 매핑·기록 후 종료. async 런타임 없음. |
 | `hatel` | 수신기(`serve`), 리포트, `init`, `service`, `doctor`, `kinds`, `emit`, MCP 서버(`mcp`). |
 
 ---
@@ -106,7 +106,6 @@ hatel report --window 30d
 | source | count | estimated_cache_write_usd | context_tokens |
 |---|---:|---:|---:|
 | resume | 12 | 5.04 | 487,220 |
-| compact | 5 | 1.93 | 186,540 |
 | fork | 2 | 0.71 | 71,026 |
 | startup | 4 | 0 | 0 |
 
@@ -138,11 +137,11 @@ hatel report --window 30d
 
 - 모든 섹션은 자신의 축을 밝힙니다 — **`by <차원>, ranked by <측정값>`**. 그 섹션이 답하는 질문이며, 양쪽 다 `--group-by` / `--sort-by`로 바꿀 수 있습니다.
 - **`tool`** 섹션은 도구별 호출 수·총 소요 ms·성공 수입니다. `Bash | 4 | 5,730 | 3` = Bash를 4번 호출, 합 5.73초(평균 ~1.4초), 4번 중 3번 성공 → **평균 지연과 성공률**이 한 행에서 나옵니다. `--group-by agent_id`는 위임된 호출을 갈라 보여주고(값이 없는 행이 메인 에이전트입니다), `--group-by prompt_id`는 한 요청이 유발한 작업량을 묶습니다.
-- **`session`** 섹션은 컨텍스트를 세운 시점을 셉니다 — `startup` 외에 `resume`·`fork`·`clear`·`compact`가 모두 기존 대화에서 `SessionStart`를 다시 일으키므로, 한 세션이 여러 번 집계됩니다. 측정값은 그렇게 다시 세울 때 프롬프트 캐시를 재작성한 비용이고, 세션 총계 어디에도 나타나지 않습니다. `cache_likely_expired`로 묶으면 피할 수 있었던 지출이 갈립니다.
+- **`session`** 섹션은 컨텍스트를 세운 시점을 셉니다 — `startup` 외에 `resume`·`fork`·`clear`·`compact`가 모두 기존 대화에서 `SessionStart`를 다시 일으키므로, 한 세션이 여러 번 집계됩니다. `resume`·`fork`의 측정값은 다음 요청에서 컨텍스트를 캐시에 쓸 때의 **추정 비용**입니다(Claude Code 2.1.251 이상). 실제 지출과 다르므로 OTel 비용에 더하지 않습니다. `cache_likely_expired`는 예상 캐시 만료 여부입니다.
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`memory`** 섹션은 어떤 지침 파일이 컨텍스트에 들어왔는지를 저장소 안 경로(저장소 밖이면 홈 아래는 `~/…`, 나머지는 절대 경로)로 보여줍니다. 두 저장소의 같은 경로는 `--project`나 `--group-by project`를 더하기 전까지 한 행으로 합쳐집니다. 컨텍스트를 다시 세우면(`session_start`, `compact`) 모든 파일이 다시 알려지고, @-import된 파일은 `parent_file_path`를 가진 `include`로 알려집니다. 파일 접근이 일으킨 로드는 그 파일(`trigger_file_path`)을 싣고, 컨텍스트가 이미 가진 파일은 건너뛰므로 로드 기록이 없다고 파일이 없었던 것은 아닙니다. `prompt_id`는 로드가 일어난 시점에 마지막으로 제출된 프롬프트입니다.
 - **`command`** 섹션은 명시적으로 호출한 슬래시 명령과 스킬입니다. 모델이 스스로 불러온 스킬은 확장을 일으키지 않으므로 여기 없고, `--kind tool --filter tool_name=Skill --group-by skill`이 그 이름을 보여주며, 실패한 호출도 함께 셉니다.
-- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다. 라벨이 없는 `(empty)` 행은 Claude Code가 스스로 돌린 에이전트입니다 — 대화가 띄운 것이 아니어서 유형도 대화 기록도 없고 도구도 쓰지 않습니다.
+- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다. 라벨이 없는 `(empty)` 행은 이벤트에 `agent_type`이 없었던 기록입니다. 누락만으로 에이전트 유형이나 도구 사용 여부를 추측하지 않습니다.
 
 > 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적고, 기록이 아예 없는 Kind도 같은 방식으로 나열됩니다(위에서는 줄였습니다). 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
@@ -209,9 +208,11 @@ hatel report --window 30d --kind tool --top 1 --format json
 }
 ```
 
+> 비용은 Claude Code의 추정치이며 실제 청구액과 다를 수 있습니다. 비용 스냅샷의 `--window`는 마지막 수신 시각으로 세션을 고릅니다. 선택된 세션의 누적 비용이며 그 기간에 발생한 지출만을 계산한 값은 아닙니다.
+
 > 키는 알파벳 순으로 직렬화됩니다. 위는 `--top 1`로 `Bash` 그룹만 남겼고, 기본값(상위 5)이면 `Edit·Grep·Read`가 같은 형태로 이어집니다. 그 차원의 값을 아예 싣지 않은 기록의 그룹은 `key`가 `null`입니다(텍스트·마크다운 뷰의 `—` 행). 필드가 없는 것과 어떤 값이 있는 것을 글자가 아니라 모양으로 구분할 수 있습니다. `retained_since`는 그 Kind에서 아직 보관 중인 가장 오래된 기록의 시각입니다(`--project`를 주면 그 프로젝트의 기록 중에서 고르고, 남은 기록이 없으면 `null`). 보존 기간이 저장소를 뒤에서부터 잘라 내므로, 그보다 앞서 시작하는 구간은 전부 측정된 것이 아니며 읽는 쪽은 그 빈 앞부분을 침묵으로 읽지 말고 그렇게 말해야 합니다. `unreadable_kinds`가 `null`이 아니면 **로드된 스키마가 선언하지 않는 Kind가 원장에 있다**는 뜻입니다 — 이 집계는 수집된 것보다 적게 답한 것이고, 이름과 고칠 위치가 거기 실려 옵니다([커스텀 지표](#커스텀-지표-플러그인) 참조).
 
-전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로).
+전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로). upstream이 `agent.name`을 `custom`으로 가리면 여러 커스텀 에이전트 유형의 비용이 한 버킷에 합쳐질 수 있습니다.
 
 ### MCP 서버 — `hatel mcp`
 
@@ -304,7 +305,7 @@ hatel serve --all      # 이 컬렉터를 공유하는 모든 프로젝트
 hatel serve --project acme-api   # 특정 프로젝트(라벨)만
 ```
 
-수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러나고, `--wait`로 실행한 것은 락이 풀릴 때까지 기다립니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드와 그 수신기가 읽은 설정 파일, 쓰는 저장소를 답합니다(`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.20.1"}`) — `doctor`가 자기 빌드·설정 파일·저장소와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
+수신기는 **단일-writer 데몬**입니다: state 디렉터리에 advisory 락을 잡아 같은 디렉터리의 두 번째 수신기는 즉시 물러나고, `--wait`로 실행한 것은 락이 풀릴 때까지 기다립니다(비용 스냅샷의 writer는 정확히 하나). `GET /healthz`는 실행 중인 빌드와 그 수신기가 읽은 설정 파일, 쓰는 저장소를 답합니다(`{"config":"/home/you/.config/hatel/config.toml","service":"hatel","storage":{"retention_days":90,"sink":"jsonl","state_dir":"/home/you/.local/state/hatel"},"version":"0.21.0"}`) — `doctor`가 자기 빌드·설정 파일·저장소와 견주는 값입니다. 항상 `200`을 답합니다 — 상태는 "본문을 *수신*했음"을 뜻하지 이 빌드가 디코드했는지가 아니라서, 로컬 뷰가 못 읽는 raw 본문도 전달이 성공하고 OTLP 클라이언트는 재시도하지 않습니다(재시도는 delta 카운트를 부풀림).
 
 ### `init` — Claude Code에 연결
 
@@ -317,7 +318,7 @@ hatel init --remove        # 깔끔히 해제(네이티브 텔레메트리 env�
 
 `init`은 **로드된 Kind가 소비하는 이벤트만** 연결합니다(세션→프로젝트 인덱스를 위해 `SessionStart`는 항상). 어떤 Kind도 바인딩하지 않는 이벤트는 연결되지 않으므로, 훅이 기록 없이 실행되는 일이 없습니다. 배선은 `async`라 도구 호출이 기록을 기다리지 않습니다 — 수집 공백은 `hatel doctor`가 알려주는 자리입니다.
 
-Claude Code 자신의 텔레메트리 설정은 `settings.json`의 `env`에 있어야 합니다 — 그게 Claude Code가 세션 시작 시 읽는 유일한 채널이고, 그 `OTEL_*` 변수는 의도적으로 훅 서브프로세스에 **전달되지 않습니다**. 두 레이어가 분리된 이유가 바로 이것입니다. 전체 형태:
+네이티브 텔레메트리는 시작 셸 환경, 사용자 `~/.claude/settings.json`의 `env` 또는 관리 설정에 구성합니다. Claude Code 2.1.282 이상은 project/local 설정의 exporter 활성화·목적지 변수를 무시하므로, `init --scope project/local`은 훅만 연결합니다. `OTEL_*` 변수는 훅 서브프로세스에 **전달되지 않습니다**([Claude Code 설정 정책](https://code.claude.com/docs/en/settings-reference#variables-claude-code-ignores-in-env)). `doctor`는 이 프로세스의 환경과 설정을 확인하며 다른 세션의 시작 환경은 볼 수 없습니다. 사용자·관리 설정의 전체 형태:
 
 ```jsonc
 {
@@ -357,20 +358,21 @@ settings files:
   local    absent                 /home/you/src/acme-api/.claude/settings.local.json
   managed  absent                 /etc/claude-code/managed-settings.json
 
-native telemetry (settings.json env):
+native telemetry (settings.json env + this process):
   ✓ CLAUDE_CODE_ENABLE_TELEMETRY=1 (from user)
   ✓ OTEL_METRICS_EXPORTER=otlp (from user)
   ✓ OTEL_LOGS_EXPORTER=otlp (from user)
-  ✓ OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (from user)
+  ✓ metrics OTLP endpoint=http://127.0.0.1:4318 (from user)
+  ✓ logs OTLP endpoint=http://127.0.0.1:4318 (from user)
   ✓ OTEL_EXPORTER_OTLP_PROTOCOL=http/json (from user)
   ✓ session.id included in metrics (default on)
 
 receiver:
-  ✓ receiver at 127.0.0.1:4318 is this build (0.20.1)
+  ✓ receiver at 127.0.0.1:4318 is this build (0.21.0)
 
 hooks:
   ✓ all 8 lifecycle events invoke `hatel-hook`
-  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.20.1)
+  ✓ wired hook `/home/you/.local/bin/hatel-hook` is this build (0.21.0)
 
 storage:
   ✓ state dir writable: /home/you/.local/state/hatel
@@ -446,7 +448,7 @@ exclude_projects = ["scratch"]               # 이 프로젝트만 빼고 전부
 - **`enriched`** — `session.id`로 조인한 `project` 라벨을 각 datapoint/record에 주입 → 다운스트림이 raw OTel엔 구조적으로 없는 **프로젝트별 귀속**을 얻습니다. 변환하려면 `http/json` 스트림 필요. 세션을 모르는 datapoint는 그대로 전달(라벨을 절대 지어내지 않음).
 - **`projects` / `exclude_projects`** — 특정 프로젝트를 목적지에서 가리기(허용-목록 또는 제외-목록, 둘 중 하나). 라벨(저장소 basename) 또는 키(파일 시스템이 심볼릭 링크를 따라가 푼 저장소 절대 경로)로 매칭. 프로젝트를 아직 못 푼 배치는 **fail-closed**(필터 목적지로 전달 안 함) — 개인 프로젝트가 startup race에 사내 컬렉터로 새지 않습니다.
 
-> **egress는 redact되지 않습니다.** `raw`/`enriched`는 전체 OTLP 본문을 호스트 밖으로 보냅니다. hatel의 allow-list/해싱은 *훅 원장*에 적용되지 *이 egress*엔 아닙니다. export가 설정되면 `doctor`가 이를 상시 경고로 출력합니다. (단, hatel은 본문이 없는 설계라 프롬프트·도구 본문을 나르지 않으므로, Claude Code의 raw OTel을 사내 컬렉터에 직접 꽂는 것보단 안전합니다.)
+> **egress는 redact되지 않습니다.** `raw`/`enriched`는 전체 OTLP 본문을 호스트 밖으로 보냅니다. hatel의 allow-list/해싱은 *훅 원장*에 적용되지 *이 egress*엔 아닙니다. export가 설정되면 `doctor`가 이를 상시 경고로 출력합니다. Claude Code에서 본문 수집을 켰다면 그 본문도 전달될 수 있습니다.
 
 ### 기존 컬렉터 앞에 hatel 끼우기
 
@@ -524,7 +526,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 
 저장의 두 면이 하나의 추상화(sink)를 거칩니다 — emitter는 sink로 쓰고, `report`는 같은 백엔드로 읽습니다(리포트는 SQLite든 JSONL이든 동일하게 소비):
 
-- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MB(`rotate_bytes`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
+- **`jsonl`**(기본) — Kind당 append-only 파일 하나, 10MiB(`rotate_bytes`)가 되거나 가장 오래된 기록이 보존 기간의 1/10을 넘기면 회전. git 친화·grep 가능·의존성 0.
 - **`sqlite`** — 임베디드, WAL, `(kind, ts)` 인덱스 — 윈도우 읽기를 SQL에서 필터.
 
 상태는 기본적으로 XDG state 디렉터리(`~/.local/state/hatel` 또는 플랫폼 등가)에 저장되고, `[storage]`의 `state_dir`로 옮길 수 있습니다. 세션 인덱스와 비용 스냅샷은 sink와 무관하게 항상 거기 기록됩니다(수신기가 프로젝트 없는 OTel 데이터를 귀속하려면 인덱스가 필요).
@@ -536,7 +538,7 @@ emit: ci_check does not accept ["failurez"] (dropped) — accepted fields: actor
 sink = "sqlite"            # jsonl(기본) / sqlite
 state_dir = "/data/hatel"  # 상태 디렉터리 재정의: 절대 경로, 또는 config.toml 자신의 디렉터리 기준 상대 경로(~는 확장하지 않음)
 retention_days = 30        # 보존 기간(기본 90, 최대 100000)
-rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MB)
+rotate_bytes = 20971520    # JSONL 회전 임계값(기본 10MiB)
 ```
 
 `retention_days`는 저장 전체의 보존 기간입니다 — 비용 스냅샷·원장·세션 인덱스·SQLite 행. 비용 스냅샷은 수신기가 그 세션의 활동을 마지막으로 받은 때부터 세고(만료 뒤 다시 들리는 세션은 그때부터 보고한 것만 합산), 세션 인덱스는 수신기가 활동을 받는 동안 그 세션의 프로젝트를 유지합니다. 수신기는 시작할 때와 그 뒤 하루마다(보존 기간의 1/10이 하루보다 짧으면 그 간격마다) 정리합니다. JSONL은 파일을 통째로 지우므로 기록이 기한을 넘겨 보존 기간의 1/10에 정리 간격 두 번을 더한 만큼 남을 수 있습니다.
@@ -590,7 +592,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 수집기는 managed 정책과 싸우지 않고 적응합니다:
 
 - **OTel이 사내 컬렉터로 재지정됨** — 로컬 훅 원장은 계속 작동. `session.id` 조인이 네이티브 데이터가 어디 떨어지든 유지되어, 사내 백엔드의 메트릭과 로컬 도메인 원장이 세션으로 조인됩니다.
-- **`allowManagedHooksOnly`** — user/project 훅이 차단되면 IT가 `hatel-hook`을 *managed* 훅으로 배포(단일 정적 바이너리를 MDM으로). `doctor`가 파일 기반 managed 설정에서 감지.
+- **`allowManagedHooksOnly`** — user/project 훅이 차단되면 IT가 `hatel-hook`을 *managed* 훅으로 배포(단일 바이너리를 MDM으로). `doctor`가 파일 기반 managed 설정에서 감지.
 - **`OTEL_METRICS_INCLUDE_SESSION_ID=false`** — 세션별 귀속이 불가능. hatel은 세션 없는 메트릭을 추측 없이 **드롭**하고 `doctor`가 그 사실을 명확히 보고합니다(org/user 단위 집계는 raw 스트림을 전달받는 다운스트림 컬렉터에서만 가능). 못 쓰는 신호는 못 쓴다고 보고하지 지어내지 않습니다.
 
 ---

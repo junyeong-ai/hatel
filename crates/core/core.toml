@@ -60,8 +60,8 @@ identity = "agent_id"
 # One record per session start. A session starts more than once: `resume`, `fork`, `clear` and
 # `compact` each fire `SessionStart` again on an existing conversation, so the record counts starts
 # rather than sessions and carries no identity — a start has no identifier of its own. `source`
-# names what began it, and where a start re-establishes an existing context Claude Code computes
-# what rebuilding the prompt cache costs, which is spend a session-level total never shows.
+# names what began it. Resume/fork can carry the estimated cost of writing the next request's
+# context to the cache; this is a forecast, not an amount to add to native-OTel spend.
 [[kind]]
 name = "session"
 fields = ["session_id", "project", "source", "context_tokens", "since_last_response_s", "estimated_cache_write_usd", "cache_likely_expired"]
@@ -152,9 +152,8 @@ map.parent_file_path = { from = "parent_file_path", repo_path = true }
 # a report counts. `agent` is the label the event carries: the declared type for a plain subagent,
 # the operator's name for a teammate (Claude Code puts the name in that field and exposes the
 # declared type nowhere a hook can read), so it is recorded as the label it is rather than
-# asserted to be a type. Claude Code also runs agents of its own through this event — they carry
-# no `agent_type`, so their records group under the empty label rather than being mistaken for a
-# subagent the conversation spawned.
+# asserted to be a type. A missing `agent_type` stays absent rather than implying a particular
+# agent implementation.
 [[binding]]
 event = "SubagentStop"
 kind = "subagent"

@@ -115,11 +115,11 @@ impl Exporter {
         let len = body.len();
         // Atomically reserve the bytes, or drop if it would breach the memory ceiling — a hard
         // bound even under concurrent enqueues (no check-then-add race).
-        let reserved =
-            self.queued_bytes
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    (cur.saturating_add(len) <= MAX_QUEUED_BYTES).then(|| cur + len)
-                });
+        let reserved = self
+            .queued_bytes
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (cur.saturating_add(len) <= MAX_QUEUED_BYTES).then(|| cur + len)
+            });
         if reserved.is_err() {
             self.record_drop();
             return;

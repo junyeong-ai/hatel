@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.20.1
+version: 0.21.0
 description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
 when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, which CLAUDE.md or rules got loaded, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
 allowed-tools: Bash, Read, Edit
@@ -33,13 +33,18 @@ never overwrites an `OTEL_*` endpoint they've repointed at a corporate collector
 
 ```bash
 hatel init                 # user scope (~/.claude/settings.json — all projects)
-hatel init --scope local   # this repo only (.claude/settings.local.json)
-hatel init --scope project # committed, shared with the team
+hatel init --scope local   # hooks only (.claude/settings.local.json)
+hatel init --scope project # hooks only, committed and shared with the team
 hatel init --print         # print the block instead (for managed/org settings)
 hatel init --remove        # remove our wiring (leaves the native telemetry env)
 hatel init --insert        # keep a corporate endpoint AND route through hatel (see Forwarding)
 hatel doctor               # verify and explain any gaps
 ```
+
+Native telemetry belongs in the launch shell, user settings, or managed settings. Claude Code
+2.1.282+ ignores exporter enablement and destination variables in project/local settings;
+those scopes wire hooks only. `doctor` checks settings and this process's telemetry environment.
+It cannot inspect another session's launch environment; restart Claude Code after changing it.
 
 hatel's own settings live in `config.toml`: `$HATEL_CONFIG`, else
 `~/.config/hatel/config.toml` (under `$XDG_CONFIG_HOME` when set, `%APPDATA%\hatel` on Windows;
@@ -136,20 +141,20 @@ snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_tim
 `ts` — when the receiver last heard from that session, which is what `--window` judges — plus
 three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
 (tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
-one ran, its `agent` label being the declared type for a plain subagent and the given name for
-a teammate; a row with no label is an agent Claude Code ran for itself, which spawns no
-transcript and calls no tools — report it as such, not as a subagent that went unnamed),
+one ran; its `agent` label is the event's `agent_type`. A missing label means that field was
+absent, not evidence of a particular agent type or tool usage),
 `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
 (`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
-`cacheRead / total`). A series missing the dimension lands in `(unattributed)` — report it as
+`cacheRead / (input + cacheRead + cacheCreation)`, excluding output tokens; a zero denominator
+has no ratio). A series missing the dimension lands in `(unattributed)` — report it as
 such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
-say so rather than treating it as zero). Spend does not end there: the `session` Kind carries what
-rebuilding the prompt cache cost each time a context was re-established, which no cost row includes
-— `hatel report --kind session` groups by `source` (`resume` · `fork` · `clear` · `compact` ·
-`startup`) and sums `estimated_cache_write_usd` and `context_tokens`; `since_last_response_s` and
-`cache_likely_expired` say how long the gap was and whether the cache had gone cold. Add that sum
-when asked what a project or a period actually cost. A fresh `startup` carries no such field at all
-rather than a zero, so it contributes nothing instead of diluting the average.
+say so rather than treating it as zero). `--window` selects cost rows by the session's last-heard
+timestamp and returns cumulative session totals, not spend incurred only during that period.
+`hatel report --kind session` separately sums `estimated_cache_write_usd` and `context_tokens`.
+Claude Code 2.1.251+ supplies these estimates on `resume`/`fork` when a prior response exists.
+They estimate the next request's cache write, not actual spend: never add them to OTel costs.
+An absent estimate means it was not supplied, not that rebuilding the cache was free.
+Upstream-redacted agent names such as `custom` are aggregate buckets, not distinct identities.
 `report --project <label>` matches by the project's basename label. A project is a repository:
 work done in a linked worktree rolls up to the repository it checks out, and a session run
 outside any repository has no project and groups under `(empty)` — report that as unattributed,

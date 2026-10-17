@@ -14,12 +14,18 @@ warnings — run the same gates locally before considering work done:
 RUSTFLAGS="-D warnings" cargo test --workspace --locked
 RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
 cargo fmt --all --check
+RUSTFLAGS="-D warnings" cargo +1.98.0 check --workspace --all-targets --all-features --locked
+cargo audit                             # after dependency updates
 actionlint .github/workflows/*.yml        # after workflow edits
 uvx zizmor .github/                       # after workflow edits (security audit)
 ```
 
 `RUSTFLAGS` is what the workflows set, so omitting it locally lets a warning through that CI
 rejects.
+
+Dependency updates keep `Cargo.toml` and `Cargo.lock` together. The pinned build toolchain and
+`workspace.package.rust-version` have different roles; preserve the minimum supported version
+and its CI check unless a deliberate compatibility change requires raising both.
 
 ## Layout
 
@@ -38,6 +44,11 @@ rejects.
 - **Never fabricate a missing signal.** A series without a dimension buckets under
   `(unattributed)`; session-less metrics are dropped, not guessed; `doctor` reports gaps
   instead of inventing fallbacks. New code follows this or doesn't merge.
+- **Estimates are separate from spend.** Session cache-write forecasts are not added to native
+  OTel costs. A cost report window selects sessions by last activity; their totals are cumulative.
+- **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
+  only. Diagnosis applies repository restrictions and managed destination locks without changing
+  user settings; inherited variables describe this process, not another session's launch.
 - **A project is a repository, never the directory work ran in.** A linked worktree attributes
   to the repository it checks out; a tree outside one has no project. Every identified session
   start is recorded either way, so the receiver can tell a session that has no project from one

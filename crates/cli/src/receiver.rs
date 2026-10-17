@@ -146,19 +146,14 @@ fn identify(answer: &[u8]) -> Probe {
     }
 }
 
-/// The `host:port` an OTLP endpoint addresses — the part a probe connects to. A scheme-less
-/// endpoint is an authority already; a path after it is Claude Code's business.
-pub fn authority(endpoint: &str) -> String {
-    let rest = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(endpoint);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if (authority.starts_with('[') && !authority.contains("]:")) || !authority.contains(':') {
-        format!("{authority}:80")
-    } else {
-        authority.to_string()
-    }
+/// The parsed host and port used by the receiver probe, without credentials, path or query.
+pub fn authority(endpoint: &str) -> Option<String> {
+    let url = reqwest::Url::parse(endpoint).ok()?;
+    Some(format!(
+        "{}:{}",
+        url.host_str()?,
+        url.port_or_known_default()?
+    ))
 }
 
 #[cfg(test)]
@@ -242,10 +237,15 @@ mod tests {
 
     #[test]
     fn an_endpoint_reduces_to_its_authority() {
-        assert_eq!(authority("http://127.0.0.1:4318"), "127.0.0.1:4318");
-        assert_eq!(authority("http://localhost:4318/"), "localhost:4318");
-        assert_eq!(authority("http://[::1]:4318/v1/metrics"), "[::1]:4318");
-        assert_eq!(authority("127.0.0.1:4318"), "127.0.0.1:4318");
-        assert_eq!(authority("http://localhost"), "localhost:80");
+        for (endpoint, expected) in [
+            ("http://127.0.0.1:4318", "127.0.0.1:4318"),
+            ("http://localhost:4318/", "localhost:4318"),
+            ("http://[::1]:4318/v1/metrics", "[::1]:4318"),
+            ("http://localhost?source=telemetry", "localhost:80"),
+            ("http://LOCALHOST:4318/v1/logs", "localhost:4318"),
+        ] {
+            assert_eq!(authority(endpoint).as_deref(), Some(expected));
+        }
+        assert_eq!(authority("127.0.0.1:4318"), None);
     }
 }
