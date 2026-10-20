@@ -140,9 +140,13 @@ values when the Kind declares one — and the summed `measures`; the `cost` arra
 snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_time_s`, `lines`,
 `ts` — when the receiver last heard from that session, which is what `--window` judges — plus
 three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
-(tokens/cost per subagent — "which subagent costs most"; the `subagent` Kind answers how often
-one ran; its `agent` label is the event's `agent_type`. A missing label means that field was
-absent, not evidence of a particular agent type or tool usage),
+(tokens/cost per subagent — "which subagent costs most"; a label is the series' `agent.name`,
+else its `query_source` (`main` / `subagent` / `auxiliary` — upstream does not list which requests
+are `auxiliary`), else `(unattributed)`; the `subagent` Kind answers how often one ran; its `agent`
+label is the event's `agent_type`. A missing label means that field was absent, not evidence of a
+particular agent type or tool usage; Claude Code's internal agents (prompt suggestion, `/btw`)
+also stop, with the session's agent name or an empty one, so count the empty row apart
+(`--filter agent=`) before reading it as spawns),
 `by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
 (`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
 `cacheRead / (input + cacheRead + cacheCreation)`, excluding output tokens; a zero denominator
