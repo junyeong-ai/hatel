@@ -141,7 +141,7 @@ hatel report --window 30d
 - **`cost`** 섹션은 네이티브 OTel 스냅샷을 프로젝트별로 롤업합니다. `--format json`은 세션별 원본 행을 그대로 유지하므로, 자체 기록과 조인할 수 있습니다.
 - **`memory`** 섹션은 어떤 지침 파일이 컨텍스트에 들어왔는지를 저장소 안 경로(저장소 밖이면 홈 아래는 `~/…`, 나머지는 절대 경로)로 보여줍니다. 두 저장소의 같은 경로는 `--project`나 `--group-by project`를 더하기 전까지 한 행으로 합쳐집니다. 컨텍스트를 다시 세우면(`session_start`, `compact`) 모든 파일이 다시 알려지고, @-import된 파일은 `parent_file_path`를 가진 `include`로 알려집니다. 파일 접근이 일으킨 로드는 그 파일(`trigger_file_path`)을 싣고, 컨텍스트가 이미 가진 파일은 건너뛰므로 로드 기록이 없다고 파일이 없었던 것은 아닙니다. `prompt_id`는 로드가 일어난 시점에 마지막으로 제출된 프롬프트입니다.
 - **`command`** 섹션은 명시적으로 호출한 슬래시 명령과 스킬입니다. 모델이 스스로 불러온 스킬은 확장을 일으키지 않으므로 여기 없고, `--kind tool --filter tool_name=Skill --group-by skill`이 그 이름을 보여주며, 실패한 호출도 함께 셉니다.
-- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수, 어떤 서브에이전트가 몇 번 떴는지. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로 `agent_id`로 실행 횟수를 셉니다. `agent` 값은 이벤트가 싣고 오는 라벨이며, 평범한 서브에이전트는 선언된 유형이 오고 팀메이트는 붙여준 이름이 옵니다. 라벨이 없는 `(empty)` 행은 이벤트에 `agent_type`이 없었던 기록입니다. 누락만으로 에이전트 유형이나 도구 사용 여부를 추측하지 않습니다. Claude Code의 내부 에이전트(prompt suggestion, `/btw` 부수 질문)도 `SubagentStop`을 내고, 그때 `agent_type`은 세션의 에이전트 이름이거나 비어 있습니다([hooks](https://code.claude.com/docs/en/hooks.md)). 그래서 `(empty)` 행은 띄운 서브에이전트의 수가 아닙니다. `--filter agent=`로 따로 셀 수 있습니다.
+- **`prompt`·`subagent`**는 **훅**에서 — 세션당 프롬프트 수와 에이전트별 실행 수입니다. 서브에이전트는 턴이 끝날 때마다 종료 이벤트를 내므로, `subagent`는 행마다 서로 다른 `agent_id`를 세며, ID 없는 기록은 각각 셉니다. `agent`는 이벤트의 `agent_type`이며, 평범한 서브에이전트는 선언된 유형, 팀메이트는 붙여준 이름입니다. `(empty)`는 빈 문자열(`key: ""`), `—`는 필드 누락(`key: null`)이며, 어느 쪽도 에이전트 유형이나 도구 사용 여부의 증거가 아닙니다. Claude Code의 내부 에이전트(prompt suggestion, `/btw` 부수 질문)도 `SubagentStop`을 내고, 그때 `agent_type`은 세션의 에이전트 이름이거나 빈 문자열입니다([hooks](https://code.claude.com/docs/en/hooks.md)). `hatel report --kind subagent --filter agent=`는 빈 문자열 행만 셉니다. 이름 있는 행에도 내부 에이전트가 섞일 수 있으므로, 라벨만으로 띄운 서브에이전트 수를 분리할 수는 없습니다.
 
 > 윈도우에 기록이 없는 Kind는 표 대신 그 사실을 적고, 기록이 아예 없는 Kind도 같은 방식으로 나열됩니다(위에서는 줄였습니다). 아직 아무 데이터도 없다면 수신기를 켜고 Claude Code를 한 번 돌리면 채워집니다([문제 해결](#문제-해결) 참고).
 
@@ -161,7 +161,7 @@ a1b2c3d4 acme-api                248913    1.8423   1284.6    342       2      0
 e5f6a7b8 acme-api                 97540    0.7218    612.3    118       1      0         3
 ```
 
-> 들여쓴 `└` 행은 **서브에이전트별 토큰·비용** 분해입니다 — "어느 서브에이전트가 예산을 썼나"가 세션 합계에 묻히지 않습니다.
+> 들여쓴 `└` 행은 **에이전트 이름·요청 범주별 토큰·비용**입니다. `agent.name`이 있으면 그 이름을, 없으면 `main` 같은 `query_source`를 씁니다(아래 `by_agent` 설명 참고).
 
 ### 머신 판독용 JSON — `--format json`
 
@@ -212,7 +212,7 @@ hatel report --window 30d --kind tool --top 1 --format json
 
 > 키는 알파벳 순으로 직렬화됩니다. 위는 `--top 1`로 `Bash` 그룹만 남겼고, 기본값(상위 5)이면 `Edit·Grep·Read`가 같은 형태로 이어집니다. 그 차원의 값을 아예 싣지 않은 기록의 그룹은 `key`가 `null`입니다(텍스트·마크다운 뷰의 `—` 행). 필드가 없는 것과 어떤 값이 있는 것을 글자가 아니라 모양으로 구분할 수 있습니다. `retained_since`는 그 Kind에서 아직 보관 중인 가장 오래된 기록의 시각입니다(`--project`를 주면 그 프로젝트의 기록 중에서 고르고, 남은 기록이 없으면 `null`). 보존 기간이 저장소를 뒤에서부터 잘라 내므로, 그보다 앞서 시작하는 구간은 전부 측정된 것이 아니며 읽는 쪽은 그 빈 앞부분을 침묵으로 읽지 말고 그렇게 말해야 합니다. `unreadable_kinds`가 `null`이 아니면 **로드된 스키마가 선언하지 않는 Kind가 원장에 있다**는 뜻입니다 — 이 집계는 수집된 것보다 적게 답한 것이고, 이름과 고칠 위치가 거기 실려 옵니다([커스텀 지표](#커스텀-지표-플러그인) 참조).
 
-전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용 — 모델 믹스), `by_agent`(서브에이전트별 토큰·비용). 각 분해에서 해당 속성이 없는 시리즈는 `(unattributed)` 버킷에 기록됩니다 — 추측하지 않습니다. `by_agent`의 라벨은 `agent.name`이고, 그 속성이 없으면 요청을 낸 범주인 `query_source`(`main`·`subagent`·`auxiliary`)입니다. 둘 다 없을 때만 `(unattributed)`입니다. Claude Code는 이름 있는 서브에이전트 유형이 낸 요청이 아니면 `agent.name`을 붙이지 않으며, `auxiliary`에 어떤 요청이 드는지는 문서에 없습니다([monitoring-usage](https://code.claude.com/docs/en/monitoring-usage.md)). 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로). upstream이 `agent.name`을 `custom`으로 가리면 여러 커스텀 에이전트 유형의 비용이 한 버킷에 합쳐질 수 있습니다.
+전체 리포트(`--kind` 없이)의 `cost` 행에는 합계와 함께 세 가지 분해가 직렬화됩니다 — `tokens_by_type`(`input`/`output`/`cacheRead`/`cacheCreation` — 캐시 적중 회계), `by_model`(모델별 토큰·비용), `by_agent`(에이전트 이름·요청 범주별 토큰·비용). `tokens_by_type`과 `by_model`에서 해당 속성이 없는 시리즈는 `(unattributed)`에 기록됩니다. `by_agent`의 라벨은 `agent.name`이고, 그 속성이 없으면 요청을 낸 범주인 `query_source`(`main`·`subagent`·`auxiliary`)입니다. 둘 다 없을 때만 `(unattributed)`입니다. Claude Code는 이름 있는 서브에이전트 유형이 낸 요청이 아니면 `agent.name`을 붙이지 않으며, `auxiliary`에 어떤 요청이 드는지는 문서에 없습니다([monitoring-usage](https://code.claude.com/docs/en/monitoring-usage.md)). 분해가 도입되기 전에 기록된 세션은 빈 객체(`{}`)로 나옵니다(기록되지 않았다는 사실 그대로). upstream이 `agent.name`을 `custom`으로 가리면 여러 커스텀 에이전트 유형의 비용이 한 버킷에 합쳐질 수 있습니다.
 
 ### MCP 서버 — `hatel mcp`
 
@@ -601,7 +601,7 @@ hatel service --print   # 설치 대신 유닛 출력(검토·MDM 전달용)
 
 | 증상 | 원인 / 해결 |
 |---|---|
-| **리포트가 전부 `—`** | 아직 데이터가 없습니다. ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
+| **리포트에 `no records in this window`만 나옴** | 조회 범위에 기록이 없습니다. 기간·프로젝트·필터를 확인하고, 수집을 시작하려면 ① `hatel doctor`로 연결 확인 → ② 수신기 실행(`hatel serve --all` 또는 `hatel service`) → ③ Claude Code로 작업 한 번 → 다시 `hatel report`. |
 | **훅 Kind는 잡히는데 `cost`·`tokens`가 비어있음** | 비용과 토큰은 네이티브 OTel 메트릭이라 **수신기**를 거쳐 옵니다. 훅 원장은 수신기 없이도 쌓이지만, 이 둘은 수신기가 *그 순간* 켜져 있어야 합니다. `hatel service`로 상시 실행하세요. |
 | **훅 Kind 수치가 두 배로 보임** | 같은 이벤트에 `hatel-hook`이 두 경로로 걸려 있습니다 — 사용자 `settings.json`과 프로젝트 `.claude/settings.json` 양쪽, 또는 프로젝트 쪽이 `hatel-hook`을 다시 부르는 래퍼 스크립트. 훅 봉투에는 이벤트 고유 식별자가 없어 hatel이 중복 전달과 실제 반복을 구분할 수 없으므로, 한쪽 배선을 걷어야 합니다. `subagent`와 `tool`은 각각 `agent_id`·`tool_use_id`로 실체를 세므로 영향을 받지 않습니다. |
 | **`doctor`에 `⚠ wired hook … names no version` / `… did not name its build` / `… is <버전> while this hatel is …`** | Claude Code가 실행하는 훅이 `hatel`과 다른 빌드이거나, 어느 빌드인지 답하지 못한 경우입니다. 기록의 필드가 `hatel kinds`가 보여주는 것과 다를 수 있습니다. 둘이 같은 릴리스가 되도록 다시 설치하거나, 대신 답하는 래퍼를 확인하세요. |

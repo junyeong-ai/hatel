@@ -1,8 +1,7 @@
 ---
 name: hatel
 version: 0.21.0
-description: Set up, diagnose, and query hatel — the local Claude Code telemetry collector. Use when the user wants to wire Claude Code telemetry into settings.json, find out why cost or token data isn't showing up, report on Claude Code cost / token / subagent usage for a project, or add a custom per-project metric.
-when_to_use: "Trigger phrases: set up telemetry, wire up the hooks, how much did Claude Code cost, token usage this month, which subagent burns the most tokens, which CLAUDE.md or rules got loaded, why is cost empty, telemetry doctor, add a custom metric, track deploys in telemetry."
+description: Configures, diagnoses, and queries hatel, the local Claude Code telemetry collector. Use for telemetry setup, missing cost or token data, project or subagent usage reports, checking which CLAUDE.md or rules loaded, and custom project metrics.
 allowed-tools: Bash, Read, Edit
 ---
 
@@ -122,6 +121,8 @@ headers = { authorization = "…" }           # never logged by value
 
 Run the receiver to capture native OTel (cost/tokens are push-only — captured only while it
 runs); query history with `report`. Use `--format json` whenever you need to parse or compare.
+For a new query, inspect `hatel kinds --json` for the available fields and measures, then choose
+the Kind, project and window. Check retention and collection gaps before interpreting the totals.
 
 ```bash
 hatel serve --all                          # live view; leave running to collect
@@ -139,26 +140,36 @@ Reading a report: each Kind lists groups with a count — of records, or of dist
 values when the Kind declares one — and the summed `measures`; the `cost` array is the latest
 snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_time_s`, `lines`,
 `ts` — when the receiver last heard from that session, which is what `--window` judges — plus
-three breakdowns). Answer the budget questions from those breakdowns: `by_agent`
-(tokens/cost per subagent — "which subagent costs most"; a label is the series' `agent.name`,
-else its `query_source` (`main` / `subagent` / `auxiliary` — upstream does not list which requests
-are `auxiliary`), else `(unattributed)`; the `subagent` Kind answers how often one ran; its `agent`
-label is the event's `agent_type`. A missing label means that field was absent, not evidence of a
-particular agent type or tool usage; Claude Code's internal agents (prompt suggestion, `/btw`)
-also stop, with the session's agent name or an empty one, so count the empty row apart
-(`--filter agent=`) before reading it as spawns),
-`by_model` (the model mix — Opus vs Haiku spend), and `tokens_by_type`
-(`input`/`output`/`cacheRead`/`cacheCreation` — compute the cache-hit ratio as
-`cacheRead / (input + cacheRead + cacheCreation)`, excluding output tokens; a zero denominator
-has no ratio). A series missing the dimension lands in `(unattributed)` — report it as
-such, never guess. Sessions recorded before the breakdowns existed show `{}` (not recorded —
-say so rather than treating it as zero). `--window` selects cost rows by the session's last-heard
+three breakdowns):
+
+| Breakdown | Meaning |
+|---|---|
+| `by_agent` | Tokens/cost by the series' `agent.name`, else its `query_source` (`main` / `subagent` / `auxiliary`), else `(unattributed)`. Upstream does not list which requests are `auxiliary`; do not infer their purpose. |
+| `by_model` | Tokens/cost by model; a missing model lands in `(unattributed)`. |
+| `tokens_by_type` | `input` / `output` / `cacheRead` / `cacheCreation`; a missing type lands in `(unattributed)`. Cache-hit ratio: `cacheRead / (input + cacheRead + cacheCreation)`, excluding output; a zero denominator has no ratio. |
+
+Sessions recorded before the breakdowns existed show `{}` (not recorded, not zero).
+`--window` selects cost rows by the session's last-heard
 timestamp and returns cumulative session totals, not spend incurred only during that period.
 `hatel report --kind session` separately sums `estimated_cache_write_usd` and `context_tokens`.
 Claude Code 2.1.251+ supplies these estimates on `resume`/`fork` when a prior response exists.
 They estimate the next request's cache write, not actual spend: never add them to OTel costs.
 An absent estimate means it was not supplied, not that rebuilding the cache was free.
 Upstream-redacted agent names such as `custom` are aggregate buckets, not distinct identities.
+
+### Subagent counts
+
+The `subagent` Kind counts distinct `agent_id` values per label; records without an ID count
+separately. Repeated stops with the same ID count once. Its `agent` label is the event's `agent_type`: the declared type for a plain subagent, the operator's name
+for a teammate. `(empty)` means `agent_type` was an empty string (`key: ""`); `—` means the field
+was absent (`key: null`). Neither establishes an agent type or tool usage.
+Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`, using the
+session's agent name or an empty string. Use `hatel report --kind subagent --filter agent=` to
+count the empty-string row separately; it does not select missing fields. A named row can also
+include internal agents, so these labels alone cannot isolate spawned subagents.
+
+### Project and collection scope
+
 `report --project <label>` matches by the project's basename label. A project is a repository:
 work done in a linked worktree rolls up to the repository it checks out, and a session run
 outside any repository has no project and groups under `(empty)` — report that as unattributed,
@@ -171,6 +182,8 @@ schema declares: the answer covered less than was collected. Report that gap wit
 the surface it carries, never the totals alone. Its `expires_by` is the date a running receiver's
 retention sweep removes the last of them if nothing writes them again — for a Kind retired on
 purpose, waiting with the receiver running is the fix and no plugin is needed.
+
+### Query dimensions and instruction loads
 
 Each Kind section names the axes it was computed on (`group_by`, `sort_by` — `null` means groups
 rank by count — and `identity`, naming what that count counts when it is not records).
@@ -193,9 +206,10 @@ for, a failed call included, so add `--filter ok=1` to count the ones that ran.
 Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
 error rather than an empty answer.
 
-`--filter` (repeatable, needs `--kind`) matches a field exactly by the rendering the group-key
-column shows; a redacted field is matched by its *original* value (the query is hashed exactly as
-the ledger stored it). The receiver prunes ledger records and cost rows past `retention_days`, so
+`--filter` (repeatable, needs `--kind`) matches a field's value exactly (`agent=` selects an
+empty string, not a missing field); a redacted field is matched by its *original* value (the
+query is hashed exactly as the ledger stored it). The receiver prunes ledger records and cost rows
+past `retention_days`, so
 a `--window` beyond the horizon shows only what is retained — say so rather than presenting it as
 low usage. Each Kind section carries `retained_since`, the oldest record still stored — of the
 project `--project` names, when given (`null` when none); a window starting before it was not
@@ -243,7 +257,8 @@ Pointer such as `/tool_input/skill` reads a nested value), `capture` (regex grou
 `present`, `basename`, `repo_path`, `const`; `when = { tool_name = "Skill" }` writes the field only
 for events whose sources equal those values.
 
-`emit` records a domain signal directly (`key=value` is a string, `key:=value` is JSON):
+After registering a Kind such as `ci_check`, `emit` records a domain signal directly
+(`key=value` is a string, `key:=value` is JSON):
 
 ```bash
 hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3 project=acme-api
@@ -254,4 +269,5 @@ echo '{"check":"lint","runs":14000,"project":"acme-api"}' | hatel emit ci_check
 so include attribution (`project`, a slug) as fields. A field the Kind doesn't accept is dropped
 *and warned to stderr* with the accepted list (under `HATEL_STRICT=1` it is an error and nothing
 is written) — surface that to the user rather than ignoring it.
-See `plugins/example.toml` for a worked example.
+The repository's [example plugin](https://github.com/junyeong-ai/hatel/blob/main/plugins/example.toml)
+defines `ci_check` and `branch_work`; it is not bundled with the installed skill.

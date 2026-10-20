@@ -153,8 +153,9 @@ map.parent_file_path = { from = "parent_file_path", repo_path = true }
 # the operator's name for a teammate (Claude Code puts the name in that field and exposes the
 # declared type nowhere a hook can read), so it is recorded as the label it is rather than
 # asserted to be a type. A missing `agent_type` stays absent rather than implying a particular
-# agent implementation; Claude Code's internal agents (prompt suggestion, `/btw`) stop with the
-# session's agent name or an empty one, so an empty label is not a count of spawned subagents.
+# agent implementation. An empty `agent_type` stays an empty string; Claude Code's internal agents
+# (prompt suggestion, `/btw`) stop with the session's agent name or an empty string, so neither
+# an empty nor a named label alone isolates spawned subagents.
 [[binding]]
 event = "SubagentStop"
 kind = "subagent"

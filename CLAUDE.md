@@ -93,13 +93,18 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **Machine outputs are one shape per question**: `--json` / `--format json` serialize
   keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
   the JSON their CLI counterparts print. Changing one means changing both (they share
-  the same functions — keep it that way).
+  the same functions — keep it that way). A missing group field is `key: null` (`—` in human
+  output); an empty string is `key: ""` (`(empty)`). An exact empty-value filter selects only
+  the latter. Keep that distinction in report explanations.
 - **README samples are real output.** Human-facing CLI output is quoted verbatim in both
   READMEs; changing output text means updating `README.md` and `README.en.md` together
   (they are maintained line-for-line parallel, ko/en).
 - `SKILL.md` frontmatter keeps a `version` field tracking the workspace version. It is not
   part of the official skill spec — it exists so an installed skill can be matched to its
   binaries — keep it when editing frontmatter, and bump it with `workspace.package.version`.
+  The installer and release workflow copy only `SKILL.md`; keep it self-contained unless both
+  packaging paths are updated to ship supporting files. Put discovery cues in `description` and
+  keep query guidance separate from setup and diagnosis.
 - Comments state rationale and constraints ("why", failure modes avoided) — never change
   history or narration of edits.
 
