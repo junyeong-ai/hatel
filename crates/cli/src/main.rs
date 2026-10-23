@@ -349,20 +349,29 @@ pub(crate) fn emit_batch(
         .collect())
 }
 
-fn emit_batch_cmd() -> i32 {
+const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
+
+fn read_input(reader: impl std::io::Read) -> Result<String, String> {
     use std::io::Read as _;
     let mut input = String::new();
-    if let Err(e) = std::io::stdin()
-        .take(8 * 1024 * 1024 + 1)
+    reader
+        .take(MAX_INPUT_BYTES as u64 + 1)
         .read_to_string(&mut input)
-    {
-        eprintln!("emit-batch: {e}");
-        return 2;
+        .map_err(|error| error.to_string())?;
+    if input.len() > MAX_INPUT_BYTES {
+        return Err("input exceeds 8 MiB".into());
     }
-    if input.len() > 8 * 1024 * 1024 {
-        eprintln!("emit-batch: input exceeds 8 MiB");
-        return 2;
-    }
+    Ok(input)
+}
+
+fn emit_batch_cmd() -> i32 {
+    let input = match read_input(std::io::stdin()) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("emit-batch: {error}");
+            return 2;
+        }
+    };
     let result = serde_json::from_str::<Vec<serde_json::Value>>(&input)
         .map_err(|e| e.to_string())
         .and_then(emit_batch);
@@ -468,10 +477,7 @@ fn build_payload(fields: Vec<String>, json: Option<String>) -> Result<Payload, S
     if !fields.is_empty() {
         return parse_pairs(&fields);
     }
-    use std::io::Read as _;
-    let mut buf = String::new();
-    let _ = std::io::stdin().read_to_string(&mut buf);
-    parse_json_object(&buf)
+    read_input(std::io::stdin()).and_then(|input| parse_json_object(&input))
 }
 
 fn parse_json_object(s: &str) -> Result<Payload, String> {
@@ -824,6 +830,18 @@ mod tests {
         let alpha = cost(Some("alpha"));
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].session_id, "recent");
+    }
+
+    #[test]
+    fn input_limit_accepts_the_boundary_and_preserves_read_errors() {
+        let mut input = vec![b' '; MAX_INPUT_BYTES - 2];
+        input.extend_from_slice(b"{}");
+        assert!(
+            parse_json_object(&read_input(input.as_slice()).unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(read_input([0xff].as_slice()).is_err());
     }
 
     #[test]

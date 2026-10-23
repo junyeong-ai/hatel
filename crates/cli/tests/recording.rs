@@ -17,6 +17,44 @@ fn isolated(home: &std::path::Path) -> Command {
 }
 
 #[test]
+fn record_commands_reject_oversized_stdin_before_storing_records() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            home.path().join("state").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    for (args, json) in [
+        (vec!["emit", "prompt", "--receipt"], "{}"),
+        (vec!["emit-batch"], r#"[{"kind":"prompt","payload":{}}]"#),
+    ] {
+        let mut input = vec![b' '; 8 * 1024 * 1024 + 1];
+        input.extend_from_slice(json.as_bytes());
+        let mut child = isolated(home.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Err(error) = child.stdin.take().unwrap().write_all(&input) {
+            assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("input exceeds 8 MiB")
+        );
+        assert!(!home.path().join("state/telemetry.db").exists());
+    }
+}
+
+#[test]
 fn batch_returns_each_storage_outcome_and_only_stored_rows_are_queryable() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
