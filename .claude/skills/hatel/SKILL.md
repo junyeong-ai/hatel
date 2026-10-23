@@ -1,273 +1,171 @@
 ---
 name: hatel
-version: 0.21.0
-description: Configures, diagnoses, and queries hatel, the local Claude Code telemetry collector. Use for telemetry setup, missing cost or token data, project or subagent usage reports, checking which CLAUDE.md or rules loaded, and custom project metrics.
+version: 0.22.0
+description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code usage, instruction loads, storage diagnosis, and selective downstream delivery. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
 allowed-tools: Bash, Read, Edit
 ---
 
-# hatel
+# Hatel
 
-Two binaries: `hatel` (the receiver — `serve`, `report`, `init`, `service`, `doctor`, `kinds`,
-`emit`, `mcp`) and `hatel-hook` (wired into Claude Code lifecycle events; runs automatically —
-never invoke it by hand). The receiver runs locally; by default nothing leaves the machine
-(opt-in export tees downstream — see Forwarding).
+Use the installed contract: `hatel --version`, `hatel <command> --help`, and
+`hatel kinds --json`. This skill targets 0.22.0. A running receiver or MCP session
+keeps the build it started; restart it after upgrading before relying on new features.
 
-Always check wiring with `hatel doctor` first when something looks off — it reports
-each gap honestly (it never fabricates a missing signal) and exits non-zero when the wiring is
-incomplete, so you can gate on it. `hatel doctor --json` returns the same findings as stable
-JSON (top-level `ok`, per-section `findings` with `status` `ok`/`fail`/`warn`/`note`) — prefer
-it when you need to branch on a specific gap.
+Choose the relevant operation below. Local domain records need neither Claude Code
+nor a receiver. `hatel-hook` runs through lifecycle wiring; do not invoke it manually.
 
-`hatel mcp` serves `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio
-(`claude mcp add hatel -- hatel mcp`); the read tools return exactly the JSON their CLI
-counterparts print (`--format json` / `--json`), and `emit` answers with its outcome as
-text — so everything below applies to both surfaces. A session's `hatel mcp` keeps the build it
-started with, so after an upgrade restart the session before trusting what it says about builds.
+## Query recorded facts
 
-## Set up / wire
+1. Inspect `hatel kinds --json` for loaded schemas, fields, mode, identity and measures.
+2. Choose Kind, project, window, filters and grouping. Use JSON for parsing or comparison.
+3. Check section `error`, `unreadable_kinds`, measurement counts and retention limits
+   before interpreting totals. An empty answer does not establish zero activity.
 
-`init` wires Claude Code's `settings.json` (the telemetry `env` + the lifecycle hooks). It is
-idempotent and non-destructive: it appends our hook without touching the user's own hooks, and
-never overwrites an `OTEL_*` endpoint they've repointed at a corporate collector.
-
-```bash
-hatel init                 # user scope (~/.claude/settings.json — all projects)
-hatel init --scope local   # hooks only (.claude/settings.local.json)
-hatel init --scope project # hooks only, committed and shared with the team
-hatel init --print         # print the block instead (for managed/org settings)
-hatel init --remove        # remove our wiring (leaves the native telemetry env)
-hatel init --insert        # keep a corporate endpoint AND route through hatel (see Forwarding)
-hatel doctor               # verify and explain any gaps
+```sh
+hatel report --kind check --window 7d --format json
+hatel report --kind check --filter outcome=failed --group-by name --top 0
+hatel report --kind check --group-by metadata.source --sort-by duration_s
+hatel report --kind claude.api_request --window 7d --group-by model --format json
+hatel report --kind memory --group-by file_path --format json
+hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
+hatel report --project /absolute/repository/path --format json
 ```
 
-Native telemetry belongs in the launch shell, user settings, or managed settings. Claude Code
-2.1.282+ ignores exporter enablement and destination variables in project/local settings;
-those scopes wire hooks only. `doctor` checks settings and this process's telemetry environment.
-It cannot inspect another session's launch environment; restart Claude Code after changing it.
+`--filter` is repeatable exact equality; all filters must match. An empty string differs
+from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
+`--top 0` returns all groups. Filter hashed payload fields by their original value.
+`--project` accepts canonical key or display label; labels may combine equal-named repos.
+`project` grouping and filtering prefer the common key, using payload attribution only
+for legacy records. Use `metadata.project.key` to address that common field explicitly.
 
-hatel's own settings live in `config.toml`: `$HATEL_CONFIG`, else
-`~/.config/hatel/config.toml` (under `$XDG_CONFIG_HOME` when set, `%APPDATA%\hatel` on Windows;
-`doctor` prints the path). The hook, the receiver and `report` all read it. Storage goes under
-`[storage]`: `sink`, `state_dir`, `retention_days` (default 90) and `rotate_bytes`. `state_dir` is
-absolute or relative to that file's directory, and `~` is refused rather than expanded. The
-receiver reads the file when it starts, so restart it after an edit (`hatel service --restart`),
-except that it rereads the file before deleting anything and keeps whatever the file now keeps.
-A `HATEL_*` storage variable overrides a key for one process only: never put one, `HATEL_CONFIG`
-or an `XDG_*` directory in settings.json `env`, which hooks inherit and the service's receiver
-does not, since that splits the store.
+Report interpretation:
 
-`doctor` gaps and what they mean:
-- **no hook invokes …** → run `init`.
-- **HATEL_… in this process / in the … settings.json env: must be …** → a variable holds a value
-  hatel cannot read: `serve`, `report`, `kinds` and `emit` fail on it, as do the MCP `report` /
-  `kinds` / `emit` tools (the `doctor` tool still answers); `service` refuses to install or
-  restart, and hooks ignore it. Fix it where doctor says it is set.
-- **BLOCKED by allowManagedHooksOnly** → IT must deploy the hook as a *managed* hook (MDM).
-- **OTEL_METRICS_INCLUDE_SESSION_ID=false** → per-session/project attribution is impossible;
-  hatel drops session-less metrics rather than guess (org/user aggregation only survives at a
-  downstream collector you forward the raw stream to). There is no fallback — report it as-is.
-- **OTEL_EXPORTER_OTLP_PROTOCOL not http/json** → this receiver only decodes `http/json`.
-- **nothing listens at 127.0.0.1:4318** (a warning) → no receiver is running, so native metrics
-  and logs are dropped as they are pushed (the hook ledger still accrues); `hatel serve --all`,
-  or `hatel service` for gap-free collection. With the service installed, its log
-  (`~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux) says why the
-  receiver exits; fix that, then `hatel service --restart`. When `hatel service` or `--restart`
-  answers **kept the installed unit …, which is not one this build or an earlier release wrote**,
-  the unit was edited by hand, and the lines after it say whether the receiver was restarted: show
-  the user what the unit sets and let them move it into `config.toml` before it is replaced —
-  never `--remove` it on your own.
-- **receiver at … is build <version>, not this build** (a warning) → the receiver kept the binary
-  it started from across an upgrade; `hatel service --restart` (or restart the `serve` you run).
-  **something answers … but not as a hatel receiver** is a build before 0.18.0 or another
-  collector on that port — say which is unknown rather than assume.
-- **receiver at … read … but this process reads …** / **receiver at … writes … but this process
-  reads …** (warnings) → the receiver started before a `config.toml` edit (`hatel service
-  --restart`), or `HATEL_CONFIG`, an `XDG_*` directory or a storage variable is set on one side
-  only, which splits the store: cost can look empty while a receiver runs. Move the setting into
-  `config.toml` and out of settings.json `env`; doctor's notes name where it is set.
-- **wired hook … is <version> while this hatel is …** (a warning) → the hook writing records is a
-  different build from the `hatel` reading them, so its fields can differ from what `kinds` lists.
-- **wired hook … names no version / did not name its build** (a warning) → which build writes the
-  records is unknown, not known to differ: an older hook, a wrapper that drops its arguments, or
-  one that failed to answer. Reinstall (or check the wrapper) before trusting a Kind's shape.
-- **… wired synchronously** (a warning, not a gap) → wiring written before the hook was wired
-  asynchronously. Every record still arrives, but Claude Code waits for the hook each time the
-  event fires; `hatel init` rewrites it.
-- **export forwards nothing / endpoint bypasses this receiver** → export only forwards what
-  reaches hatel; the OTel endpoint must point at hatel. Run `hatel init --insert` (or, if the
-  endpoint is managed-locked, only the hook ledger is available — report it as-is).
+- `sum` requires its `valid_count`; `missing_count` and `invalid_count` name what was
+  excluded. Human `—` means unmeasured, `7 (1/3)` a sum over one measured record of three.
+  A measured zero remains zero. Numeric strings are not coerced into measures.
+- `retained_since` is the oldest retained record, not proof of continuous collection.
+  `unreadable_kinds` means some stored records have no loaded schema.
+- Event mode counts records, or the earliest matching identity per group when declared.
+  ID-less event records count individually. This is not storage deduplication.
+- Snapshot mode selects the latest occurrence per project and identity inside the window
+  before filtering/grouping. Equal occurrences use observation time; conflicting ties
+  fail. Unchanged entities outside the window are absent: no complete-inventory claim.
+- Native `cost` is lifetime session totals selected by last activity, as `cost_basis`
+  states. Use `claude.api_request` for occurrence-window request cost estimates.
+  Neither is an invoice. `observed_metrics` absent means measurement coverage is unknown.
+- Session cache-write estimates forecast a later request; never add them to native costs.
+  Never subtract active time from wall time to invent idle time or infer saved time/ROI.
+- Subagent labels can include internal agents. A missing memory-load announcement does
+  not establish that the file was absent from context. Tool duration ends at return,
+  including early acceptance of a background command.
 
-## Forward to other collectors (export)
+The MCP tools share CLI read JSON and recording validation. Register with
+`claude mcp add hatel -- hatel mcp`. Inspect tool schemas for parameters; writes return
+storage receipts or explicit failures, including ordered per-item batch results.
 
-The receiver can tee what it ingests to downstream OTLP/HTTP collectors, so you keep a corporate
-collector *and* gain hatel. Destinations live in `config.toml`, one `[[export]]` per destination:
+## Record or extend a domain signal
+
+Reuse `check` for producer-observed command executions: required `name`, `outcome`,
+optional `suite`, `duration_s`, actual `exit_code` or `signal`. Keep timeout, spawn error,
+signal and reuse distinct at the producer. Do not infer a verdict from magic exit codes,
+stdout, tool names or elapsed-time thresholds. An absent measurement stays absent.
+
+```sh
+hatel emit check name=lint suite=quality outcome=passed duration_s:=1.25 --receipt
+printf '%s\n' '[{"kind":"check","payload":{"name":"lint","outcome":"passed"},"context":{"source":"quality-tool","run_id":"run-123"}}]' | hatel emit-batch
+```
+
+Run in the correct repository directory: CLI/MCP derive `metadata.project` from actual
+Git identity; linked worktrees share the repository, and outside Git no project is invented.
+Common context accepts `occurred_at` (RFC 3339), `source`, `run_id`, `correlation_id`.
+`key=value` is a string; `key:=value` is JSON. A whole object can use `--json` or stdin.
+
+For domain-specific facts, add a namespaced schema TOML to the operator's existing
+`plugins` list in `config.toml`, preserving other entries. Relative plugin paths resolve
+against that file. Never replace `HATEL_PLUGINS` inside a project integration.
+
+```toml
+[[kind]]
+name = "team.deploy"
+version = 1
+fields = { service = { type = "string", required = true }, outcome = { type = "string", required = true }, duration_s = { type = "number", unit = "s" } }
+group_key = "service"
+measures = ["duration_s"]
+```
+
+Typed fields support `string`, `number`, `integer`, `boolean`, `array`, `object`, `any`,
+requiredness and units. `redact` hashes selected payload fields before storage.
+For state, add `mode = "snapshot"` and `identity` naming a required non-empty string field.
+A data contract's `schema_id` changes with field, redaction or mode changes; pending old
+contracts cancel. Semantic/unit changes require an explicit Kind/version and history decision.
+
+Use hook bindings only for facts present in lifecycle input. Producers own domain meaning.
+Keep one writer for each fact. Check `hatel kinds --json` and exercise a real receipt/query
+in an isolated store when changing a schema; do not write test records to the user's ledger.
+
+Single writes exit 0 stored, 1 storage failure, 2 rejected input. Batches exit 0 all stored,
+1 item failures, 2 top-level input failure; the whole batch is not atomic. CLI stdin cap is
+8 MiB; batches allow 4096 items; sanitized payloads allow 256 KiB. A receipt confirms local
+storage. Inspect warnings and `delivery` enqueue outcomes; neither confirms downstream receipt.
+Detached best-effort producers cannot claim acknowledged storage or exactly-once recording.
+
+## Configure local storage or delivery
+
+Find the actual path with `hatel doctor --local --json`. Shared settings belong in
+`config.toml` (`$HATEL_CONFIG`, otherwise the platform's `hatel/config.toml`). Per-process
+storage or plugin overrides can split writers from readers and services.
+Fresh stores use SQLite/WAL; existing JSONL is retained until explicit migration.
+Stop all writers before `hatel migrate --quiescent`; preserve the source and inspect results.
+Restart the receiver after configuration changes. Do not migrate or restart a live service
+just to test an integration.
+
+Each destination is `[[export]]`. Native metrics only, with no logs or local Kinds:
 
 ```toml
 [[export]]
-endpoint = "http://collector.corp:4318"   # /v1/metrics, /v1/logs appended
-mode = "enriched"                           # raw (byte-verbatim) | enriched (injects `project`)
-headers = { authorization = "…" }           # never logged by value
+endpoint = "https://collector.example.com"
+mode = "raw"
+signals = ["metrics"]
+kinds = []
 ```
 
-- `raw` forwards verbatim (protocol-agnostic, tees protobuf too); `enriched` injects the
-  `project` label so the downstream backend gains attribution raw OTel lacks (needs `http/json`).
-- A duplicate endpoint is rejected (it would double-count); forwarding is best-effort and never
-  retried; **egress is NOT redacted** (it forwards the full OTLP body off-host — `doctor` warns).
-- `hatel init --insert [--mode raw|enriched]` captures an existing corporate endpoint as a
-  target and repoints Claude Code at hatel in one step (this is how export becomes usable when the
-  endpoint already points elsewhere). Always finish with `hatel doctor`.
+To include selected local records, set `kinds = ["check", "team.deploy"]`; native selection
+is independent. Omitted `signals` means metrics+logs, omitted `kinds` means no local records.
+`signals=[]` can send domain records alone. `projects` or `exclude_projects` match key/label;
+unresolved attribution fails closed for filtered targets. Duplicate endpoints are rejected.
 
-## Analyse cost & usage
+Native forwarding is best-effort and carries the full body without local payload redaction.
+Local record delivery requires SQLite and commits an outbox with the record. The receiver
+retries the same ID under current policy, bounded by capacity, age, attempts and retention.
+Queue refusal does not undo local storage. Inspect `hatel deliveries --json`: grouped by
+destination/status/error reason. Failed delivery differs from failed storage; pre-send
+encoding refusal is not an HTTP attempt. Lost acknowledgements can duplicate delivery.
+Local projections are not exported again with their native source.
 
-Run the receiver to capture native OTel (cost/tokens are push-only — captured only while it
-runs); query history with `report`. Use `--format json` whenever you need to parse or compare.
-For a new query, inspect `hatel kinds --json` for the available fields and measures, then choose
-the Kind, project and window. Check retention and collection gaps before interpreting the totals.
+## Diagnose Claude Code wiring
 
-```bash
-hatel serve --all                          # live view; leave running to collect
-hatel report --window 30d --format json    # machine-readable rollup + cost snapshot
-hatel report --project <label> --format json
-hatel report --kind <name> --format json    # scope to one Kind (omits the cost snapshot)
-hatel report --kind <name> --filter field=value   # only records matching every --filter
-hatel report --kind <name> --group-by <field>     # a dimension other than the Kind's default
-hatel report --kind <name> --sort-by <measure>    # rank by a measure other than the first
-hatel report --top 0                        # all groups, not just the top N
-hatel kinds --json                          # queryable Kinds + any the ledger holds unreadable
-```
+Use `hatel doctor --json`; for ordinary local records use `--local` instead. Report findings
+with their actual `status` and scope. Full diagnosis returning nonzero means wiring is
+incomplete, not that every local recording path is broken.
 
-Reading a report: each Kind lists groups with a count — of records, or of distinct `identity`
-values when the Kind declares one — and the summed `measures`; the `cost` array is the latest
-snapshot per session (`session_id`, `project`, `tokens`, `cost_usd`, `active_time_s`, `lines`,
-`ts` — when the receiver last heard from that session, which is what `--window` judges — plus
-three breakdowns):
+`hatel init` merges user wiring without replacing existing hooks or corporate endpoints.
+Project/local scopes wire hooks only. Native enablement/destinations belong in the launch
+shell, user settings or managed settings. `init --print` supplies a managed-settings block;
+`init --insert` captures a corporate destination before routing through Hatel. Inspect its
+signals/Kinds. Respect managed endpoint and hook locks.
 
-| Breakdown | Meaning |
-|---|---|
-| `by_agent` | Tokens/cost by the series' `agent.name`, else its `query_source` (`main` / `subagent` / `auxiliary`), else `(unattributed)`. Upstream does not list which requests are `auxiliary`; do not infer their purpose. |
-| `by_model` | Tokens/cost by model; a missing model lands in `(unattributed)`. |
-| `tokens_by_type` | `input` / `output` / `cacheRead` / `cacheCreation`; a missing type lands in `(unattributed)`. Cache-hit ratio: `cacheRead / (input + cacheRead + cacheCreation)`, excluding output; a zero denominator has no ratio. |
+The receiver locally supports uncompressed HTTP/JSON sums, gauges and selected safe events.
+It drops session-less metrics; compound metric dimensions are explicitly unsupported locally.
+Duplicate keys and invalid attribute types are errors, not default values. Traces return 501.
+Hook-observed project attribution takes precedence; explicit VCS browser URLs can identify
+unseen sessions, without guessing equality with local paths. Cost needs a running receiver.
+`/healthz` names build, configuration, store and capabilities.
 
-Sessions recorded before the breakdowns existed show `{}` (not recorded, not zero).
-`--window` selects cost rows by the session's last-heard
-timestamp and returns cumulative session totals, not spend incurred only during that period.
-`hatel report --kind session` separately sums `estimated_cache_write_usd` and `context_tokens`.
-Claude Code 2.1.251+ supplies these estimates on `resume`/`fork` when a prior response exists.
-They estimate the next request's cache write, not actual spend: never add them to OTel costs.
-An absent estimate means it was not supplied, not that rebuilding the cache was free.
-Upstream-redacted agent names such as `custom` are aggregate buckets, not distinct identities.
+Doctor cannot inspect another session's launch environment. Claude Code strips `OTEL_*`
+from child processes; the tool environment alone does not prove the session's destination.
+For a configuration/store/build mismatch, resolve the named path or restart the appropriate
+receiver. `hatel service --print` inspects service wiring; preserve hand-edited units.
+Logs: `~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux.
 
-### Subagent counts
-
-The `subagent` Kind counts distinct `agent_id` values per label; records without an ID count
-separately. Repeated stops with the same ID count once. Its `agent` label is the event's `agent_type`: the declared type for a plain subagent, the operator's name
-for a teammate. `(empty)` means `agent_type` was an empty string (`key: ""`); `—` means the field
-was absent (`key: null`). Neither establishes an agent type or tool usage.
-Claude Code's internal agents (prompt suggestion, `/btw`) also fire `SubagentStop`, using the
-session's agent name or an empty string. Use `hatel report --kind subagent --filter agent=` to
-count the empty-string row separately; it does not select missing fields. A named row can also
-include internal agents, so these labels alone cannot isolate spawned subagents.
-
-### Project and collection scope
-
-`report --project <label>` matches by the project's basename label. A project is a repository:
-work done in a linked worktree rolls up to the repository it checks out, and a session run
-outside any repository has no project and groups under `(empty)` — report that as unattributed,
-never as a project of its own. A Kind that carries no
-`project` field records none, so a project scope cannot select it: its `project_scope` reads
-`unsupported` and it renders as a note, not an empty table — read that as "not applicable",
-never as zero usage. `unreadable_kinds` — on every report, and on `kinds --json`, whose payload
-is `{"kinds": [...], "unreadable_kinds": …}` — is non-null when the ledger holds Kinds no loaded
-schema declares: the answer covered less than was collected. Report that gap with the names and
-the surface it carries, never the totals alone. Its `expires_by` is the date a running receiver's
-retention sweep removes the last of them if nothing writes them again — for a Kind retired on
-purpose, waiting with the receiver running is the fix and no plugin is needed.
-
-### Query dimensions and instruction loads
-
-Each Kind section names the axes it was computed on (`group_by`, `sort_by` — `null` means groups
-rank by count — and `identity`, naming what that count counts when it is not records).
-`--group-by` and `--sort-by` (both need `--kind`) change the question without touching the schema:
-the Kind declares the defaults, the query overrides them. Two dimensions every turn-scoped Kind
-carries: `--group-by prompt_id` groups one request's work (its tool calls, its subagents, its
-memory loads), and on `tool`, `--group-by agent_id` separates a subagent's calls from the main
-agent's — the row with no value (`—` in text, `key: null` in JSON) is the main agent, which never
-carries one. The `memory` Kind answers which instruction files (CLAUDE.md, rules) entered context:
-`file_path` is the path in the repository, else `~/…` under home, else absolute (add `--group-by
-project` across repositories), and `load_reason` says why. A context rebuild (`session_start`,
-`compact`) announces every file
-again, an @-import as `include` with `parent_file_path`; a load a file access set off carries
-`trigger_file_path` and skips a file the context already holds — so report a missing load as "not
-announced", never as "not in context". `prompt_id` is the latest prompt submitted at load time, not
-proof the load was lazy. The `command` Kind answers which slash commands and skills were explicitly
-invoked; a skill the model loads on its own expands nothing and is not counted there —
-`--kind tool --filter tool_name=Skill --group-by skill` names those — the skill each call asked
-for, a failed call included, so add `--filter ok=1` to count the ones that ran.
-Name a field outside the Kind's allow-list, or a measure it does not declare, and it is a loud
-error rather than an empty answer.
-
-`--filter` (repeatable, needs `--kind`) matches a field's value exactly (`agent=` selects an
-empty string, not a missing field); a redacted field is matched by its *original* value (the
-query is hashed exactly as the ledger stored it). The receiver prunes ledger records and cost rows
-past `retention_days`, so
-a `--window` beyond the horizon shows only what is retained — say so rather than presenting it as
-low usage. Each Kind section carries `retained_since`, the oldest record still stored — of the
-project `--project` names, when given (`null` when none); a window starting before it was not
-measured whole, which is the check to make before reading a zero as an absence.
-
-## Add a custom per-project metric
-
-A plugin is a TOML schema file (no code, no recompile). List it under `plugins` in
-`config.toml` (relative paths resolve against that file's directory), then confirm with
-`hatel kinds`. Configuring it there is what makes the write and read paths agree —
-`HATEL_PLUGINS` overrides the list for one process only, so a Kind registered that way is
-invisible to any command run without it. `doctor`, `kinds`, `report`, and the error from
-`--kind <that name>` all name such a Kind and the surface where its schema would be listed —
-listing it there is the fix. **Choose the path by where the signal originates, and keep one
-writer per Kind** — a Kind written by both paths double-counts:
-
-- A signal the Claude Code lifecycle can observe → a **hook binding** (zero code,
-  auto-attributed to the session's project).
-- A signal only the project's own tooling knows (a gate decision, a CI rollup, a deploy
-  outcome) → **`emit`**.
-
-```toml
-# hook-bound: zero-code attribution from a spec branch (the hook reads git_branch only because
-# this binding maps from it).
-[[kind]]
-name = "branch_work"
-fields = ["session_id", "project", "spec"]
-group_key = "spec"
-
-[[binding]]
-event = "SessionEnd"
-kind = "branch_work"
-map.session_id = { from = "session_id" }
-map.spec = { from = "git_branch", capture = "^spec/(.+)$" }
-```
-
-Per Kind: `fields` (the allow-list — anything else is dropped before write), `group_key` (what
-a report groups by), `measures` (numeric fields a report sums; first is the primary metric),
-`redact` (fields hashed before storage), `identity` (the field identifying the entity a record
-describes, when a lifecycle event fires more than once per entity; a report then counts entities
-rather than records, representing each by its earliest one, and sums the measures over what
-survives). Namespace plugin Kinds (`team.deploy`) so they can't
-collide with core's flat names. Field-map transforms: `from` (a list tries each in order; a JSON
-Pointer such as `/tool_input/skill` reads a nested value), `capture` (regex group 1), `len`,
-`present`, `basename`, `repo_path`, `const`; `when = { tool_name = "Skill" }` writes the field only
-for events whose sources equal those values.
-
-After registering a Kind such as `ci_check`, `emit` records a domain signal directly
-(`key=value` is a string, `key:=value` is JSON):
-
-```bash
-hatel emit ci_check check=lint date=2026-06-09 runs:=14000 failures:=3 project=acme-api
-echo '{"check":"lint","runs":14000,"project":"acme-api"}' | hatel emit ci_check
-```
-
-`emit` does **not** infer the project from its working directory (the emitter may run anywhere),
-so include attribution (`project`, a slug) as fields. A field the Kind doesn't accept is dropped
-*and warned to stderr* with the accepted list (under `HATEL_STRICT=1` it is an error and nothing
-is written) — surface that to the user rather than ignoring it.
-The repository's [example plugin](https://github.com/junyeong-ai/hatel/blob/main/plugins/example.toml)
-defines `ci_check` and `branch_work`; it is not bundled with the installed skill.
+Local ledgers can contain paths and identifiers. Hashing is pseudonymization, not guaranteed
+anonymity; never paste raw ledgers into external services without considering their fields.

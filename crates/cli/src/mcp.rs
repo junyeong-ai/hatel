@@ -26,7 +26,7 @@ pub struct ReportParams {
     #[schemars(description = "Rolling window in days, e.g. \"30d\" (days only; default \"30d\")")]
     pub window: Option<String>,
     #[schemars(
-        description = "Restrict to one project (its basename label); default is all projects"
+        description = "Restrict to one project by canonical key or label; default is all projects"
     )]
     pub project: Option<String>,
     #[schemars(

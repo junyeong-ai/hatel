@@ -1,7 +1,7 @@
 //! Export configuration — the collector's egress destinations, validated from the `[[export]]`
-//! section of the configuration file (see [`crate::settings`]). Only the receiver
-//! (`serve`/`doctor`/`init`) reads it — never the hook. Each entry is one downstream OTLP
-//! collector and the transform applied on the way there.
+//! section of the configuration file (see [`crate::settings`]). Writers reserve delivery rows
+//! with local records; the receiver performs network delivery. Each entry selects native
+//! signals, local Kinds and the transform for one downstream OTLP collector.
 //!
 //! A/B selection is modelled as a per-destination transform, not two toggles: `raw` forwards
 //! the incoming OTLP byte-verbatim; `enriched` injects the `project` label (joined from
@@ -123,8 +123,7 @@ pub struct ExportConfig {
 
 impl ExportConfig {
     /// Validate the configuration file's `[[export]]` section. A missing file means export is
-    /// simply off (empty), never an error. Only ever called by the receiver, so a bad export
-    /// destination can never affect the hook.
+    /// simply off (empty), never an error.
     pub fn load() -> Result<ExportConfig> {
         Self::from_settings(&Settings::load()?)
     }

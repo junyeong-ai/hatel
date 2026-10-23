@@ -35,7 +35,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - `crates/hook` — the hook binary; depends on core only, no async runtime (spawned on
   every lifecycle event — cold-start is a design constraint).
 - `crates/cli` — the `hatel` binary: `serve` (receiver), `report`, `init`, `service`,
-  `doctor`, `kinds`, `emit`, `mcp` (stdio MCP server via the official `rmcp` SDK).
+  `doctor`, `kinds`, `emit`, `emit-batch`, `deliveries`, `migrate`,
+  `mcp` (stdio MCP server via the official `rmcp` SDK).
 - `.claude/skills/hatel/SKILL.md` — the Claude Code skill; packaged into every release
   archive and installed by `scripts/install.sh`.
 
@@ -122,6 +123,12 @@ and its CI check unless a deliberate compatibility change requires raising both.
   splitting variables it can see, in its own environment and in settings.json `env`. The service
   unit therefore carries nothing to configure. `doctor` names any stored Kind no loaded schema
   declares.
+- **Delivery outcomes describe actual work.** A storage receipt confirms local storage and
+  reports queue acceptance, not downstream delivery. `deliveries` groups by destination, status
+  and error reason. Encoding rejection and an exhausted policy are not HTTP attempts. Unsupported
+  OTLP integer or timestamp representations fail that record before sending; valid neighbors
+  remain deliverable. Retry acknowledgements can be lost, so IDs enable downstream deduplication
+  without claiming exactly-once delivery.
 - **A unit is hatel's own only while it is byte-equal to a rendering some release wrote.**
   `service` and `service --restart` replace only such a unit and keep any other as a hand edit,
   since replacing it would silently drop what it sets. Changing `launchd_plist` or `systemd_unit`
@@ -134,6 +141,12 @@ and its CI check unless a deliberate compatibility change requires raising both.
   the same functions — keep it that way). A missing group field is `key: null` (`—` in human
   output); an empty string is `key: ""` (`(empty)`). An exact empty-value filter selects only
   the latter. Keep that distinction in report explanations.
+- **Numbers need a measurement basis.** Read a measure with its valid/missing/invalid counts.
+  Human reports distinguish no measurement from zero and show the measured fraction for partial
+  sums. Native summaries count a metric only when `observed_metrics` explicitly names it; a
+  legacy row has unknown coverage. Aggregate overflow is a section error. Native Claude metric
+  dimensions keep scalar types distinct; compound dimensions are unsupported locally rather than
+  converted to empty labels. Attribute keys are unique and known identifiers are strings.
 - **README samples are real output.** Human-facing CLI output is quoted verbatim in both
   READMEs; changing output text means updating `README.md` and `README.en.md` together
   (they are maintained line-for-line parallel, ko/en).
