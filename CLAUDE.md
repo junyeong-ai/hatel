@@ -91,6 +91,14 @@ and its CI check unless a deliberate compatibility change requires raising both.
   entity the Kind exists to count, never a deduplication key: `subagent` declares `agent_id`
   because a spawn is what it counts, while `session` declares none — `/resume` re-enters the same
   `session_id`, so keying on it would erase every resume and the cache spend each one pays.
+- **Snapshots describe state rather than repeated events.** A Kind with `mode = "snapshot"`
+  requires a non-empty string `identity`. Reports select the latest occurrence per project and
+  identity within the requested window before filtering or grouping. Equal occurrences use observation
+  time; conflicting states tied on both times fail the section, as do missing retained identities
+  or observation times. Legacy records without observation time cannot be reinterpreted as snapshots.
+  Event mode remains the default and
+  its identity selects the earliest matching record per group. An unchanged entity outside the
+  window is absent, so a rolling snapshot report is not a complete current inventory.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
   override those per query. Answering a new question is a query, not a schema edit.

@@ -12,15 +12,13 @@ fn io(e: impl std::fmt::Display) -> crate::Error {
 pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("hatel_epoch", 1, flags, |c| {
-        Ok(c.get::<String>(0)?
-            .parse::<jiff::Timestamp>()
-            .ok()
+        Ok(c.get::<Option<String>>(0)?
+            .and_then(|value| value.parse::<jiff::Timestamp>().ok())
             .map(|t| t.as_second()))
     })?;
     conn.create_scalar_function("hatel_nanos", 1, flags, |c| {
-        Ok(c.get::<String>(0)?
-            .parse::<jiff::Timestamp>()
-            .ok()
+        Ok(c.get::<Option<String>>(0)?
+            .and_then(|value| value.parse::<jiff::Timestamp>().ok())
             .map(|t| t.subsec_nanosecond()))
     })
 }
@@ -148,13 +146,19 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
     use rusqlite::OptionalExtension;
-    let conn = connection(cfg, &spec.name)?;
-    let retained_since = conn.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?2)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project],|r|r.get(0)).optional().map_err(io)?;
-    let groups = aggregate_connection(&conn, spec, q)?;
+    let mut conn = connection(cfg, &spec.name)?;
+    let transaction = conn.transaction().map_err(io)?;
+    let retained_since = transaction.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?2)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project],|r|r.get(0)).optional().map_err(io)?;
+    let groups = aggregate_connection(&transaction, spec, q)?;
     Ok(SectionResult {
         groups,
         retained_since,
     })
+}
+
+fn parameter(args: &mut Vec<Value>, value: String) -> String {
+    args.push(value.into());
+    format!("?{}", args.len())
 }
 
 fn aggregate_connection(
@@ -167,12 +171,8 @@ fn aggregate_connection(
         q.since.into(),
         i64::from(crate::SCHEMA_VERSION).into(),
     ];
-    let mut parameter = |value: String| {
-        args.push(value.into());
-        format!("?{}", args.len())
-    };
     let (document, field_path) = selector(q.group_by.unwrap_or(&spec.group_key));
-    let dimension = parameter(field_path);
+    let dimension = parameter(&mut args, field_path);
     let dimension_label = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
             "COALESCE(json_extract(metadata, '$.project.key'), {})",
@@ -187,22 +187,8 @@ fn aggregate_connection(
         "schema_version<=?3".into(),
     ];
     if let Some(project) = q.project {
-        let p = parameter(project.into());
+        let p = parameter(&mut args, project.into());
         conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={p}))"));
-    }
-    for (field, value) in q.filters {
-        if field == "project" {
-            let value = parameter(value.clone());
-            conditions.push(format!("COALESCE(json_extract(metadata,'$.project.key'),json_extract(payload,'$.project'))={value}"));
-            continue;
-        }
-        let (filter_document, filter_path) = selector(field);
-        let field_path = parameter(filter_path);
-        let value_param = parameter(value.clone());
-        conditions.push(format!(
-            "json_type({filter_document}, {field_path}) IS NOT NULL AND {}={value_param}",
-            label_in(filter_document, &field_path)
-        ));
     }
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
@@ -214,30 +200,86 @@ fn aggregate_connection(
         )
     };
     let identity = spec.identity.as_ref().map(|field| {
-        let p = parameter(path(field));
-        format!(
-            "CASE WHEN json_type(payload, {p}) IS NULL THEN NULL ELSE {} END",
-            label(&p)
-        )
+        let p = parameter(&mut args, path(field));
+        if spec.mode == crate::registry::KindMode::Snapshot {
+            format!("CASE WHEN json_type(payload, {p})='text' THEN json_extract(payload, {p}) END")
+        } else {
+            format!(
+                "CASE WHEN json_type(payload, {p}) IS NULL THEN NULL ELSE {} END",
+                label(&p)
+            )
+        }
     });
     let mut sql = format!(
-        "WITH scoped AS (SELECT sequence, ts, payload, {key} AS key {} FROM records_read WHERE {})",
+        "WITH scoped AS (SELECT sequence, ts, payload, metadata, {key} AS key {} FROM records_read WHERE {})",
         identity
             .as_ref()
             .map(|i| format!(", {i} AS identity"))
             .unwrap_or_default(),
         conditions.join(" AND ")
     );
-    let from = if identity.is_some() {
-        sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY hatel_epoch(ts), hatel_nanos(ts), sequence) AS ordinal FROM scoped)");
-        "ranked WHERE identity IS NULL OR ordinal=1"
+    let selected = if spec.mode == crate::registry::KindMode::Snapshot {
+        let invalid = conn.query_row(
+            &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE identity IS NULL OR identity='' OR hatel_epoch(json_extract(metadata,'$.observed_at')) IS NULL)"),
+            rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
+        ).map_err(io)?;
+        if invalid {
+            return Err(crate::Error::InvalidPayload(format!(
+                "snapshot Kind '{}' contains a record without a non-empty string identity or valid observation time",
+                spec.name
+            )));
+        }
+        let entity = "COALESCE(json_extract(metadata,'$.project.key'), json_extract(metadata,'$.project.label'), json_extract(payload,'$.project')), identity";
+        let observed = "json_extract(metadata,'$.observed_at')";
+        sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY hatel_epoch(ts) DESC, hatel_nanos(ts) DESC, hatel_epoch({observed}) DESC, hatel_nanos({observed}) DESC) AS revision FROM scoped), latest AS (SELECT * FROM versions WHERE revision=1)"));
+        let ambiguous = conn.query_row(
+            &format!("{sql} SELECT EXISTS(SELECT 1 FROM latest GROUP BY {entity} HAVING COUNT(DISTINCT payload)>1)"),
+            rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
+        ).map_err(io)?;
+        if ambiguous {
+            return Err(crate::Error::InvalidPayload(format!(
+                "snapshot Kind '{}' has conflicting states with identical occurrence and observation times",
+                spec.name
+            )));
+        }
+        sql.push_str(&format!(", representatives AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY {entity} ORDER BY sequence DESC) AS duplicate FROM latest), selected AS (SELECT * FROM representatives WHERE duplicate=1)"));
+        "selected"
     } else {
         "scoped"
+    };
+    let mut filters = Vec::new();
+    for (field, value) in q.filters {
+        if field == "project" {
+            let value = parameter(&mut args, value.clone());
+            filters.push(format!("COALESCE(json_extract(metadata,'$.project.key'),json_extract(payload,'$.project'))={value}"));
+            continue;
+        }
+        let (filter_document, filter_path) = selector(field);
+        let field_path = parameter(&mut args, filter_path);
+        let value_param = parameter(&mut args, value.clone());
+        filters.push(format!(
+            "json_type({filter_document}, {field_path}) IS NOT NULL AND {}={value_param}",
+            label_in(filter_document, &field_path)
+        ));
+    }
+    sql.push_str(&format!(
+        ", matching AS (SELECT * FROM {selected} WHERE {})",
+        if filters.is_empty() {
+            "1".into()
+        } else {
+            filters.join(" AND ")
+        }
+    ));
+    let from = if identity.is_some() && spec.mode == crate::registry::KindMode::Event {
+        sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY hatel_epoch(ts), hatel_nanos(ts), sequence) AS ordinal FROM matching)");
+        "ranked WHERE identity IS NULL OR ordinal=1"
+    } else {
+        "matching"
     };
     let mut columns = vec!["key".to_string(), "COUNT(*)".into()];
     let mut layouts = Vec::new();
     for measure in &spec.measures {
-        let p = parameter(path(measure));
+        let p = parameter(&mut args, path(measure));
         let value = format!("json_extract(payload, {p})");
         let valid = format!(
             "json_type(payload, {p}) IN ('integer','real') AND abs({value})<=1.7976931348623157e308"

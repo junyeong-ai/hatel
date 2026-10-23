@@ -120,6 +120,7 @@ pub enum ProjectScope {
 #[derive(Debug, Clone, Serialize)]
 pub struct KindSection {
     pub kind: String,
+    pub mode: crate::registry::KindMode,
     pub group_by: String,
     pub sort_by: Option<String>,
     pub identity: Option<String>,
@@ -168,6 +169,7 @@ impl Report {
                 };
                 KindSection {
                     kind: spec.name.clone(),
+                    mode: spec.mode,
                     group_by: group_by.to_string(),
                     sort_by: sort_by.map(str::to_string),
                     identity: spec.identity.clone(),

@@ -26,6 +26,7 @@ pub const METADATA_FIELDS: &[&str] = &[
 #[derive(Debug, Clone)]
 pub struct KindSpec {
     pub name: String,
+    pub mode: KindMode,
     /// Allow-list: the only keys that survive sanitization. Single source of truth.
     pub fields: BTreeSet<String>,
     pub field_specs: BTreeMap<String, FieldSpec>,
@@ -40,9 +41,17 @@ pub struct KindSpec {
     pub measures: Vec<String>,
     /// The field identifying the entity a record describes, when several records can describe
     /// the same one — a lifecycle event that fires at every turn boundary, not once per entity.
-    /// Declared, a report counts distinct values of it per group and represents each entity by
-    /// its earliest record, measures included.
+    /// Event reports select the earliest matching record per group. Snapshot reports select
+    /// the latest record per project and entity before applying payload filters or grouping.
     pub identity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum KindMode {
+    #[default]
+    Event,
+    Snapshot,
 }
 
 /// The raw, deserialized form of a `[[kind]]` table before validation.
@@ -50,6 +59,8 @@ pub struct KindSpec {
 #[serde(deny_unknown_fields)]
 pub struct KindSpecRaw {
     pub name: String,
+    #[serde(default)]
+    pub mode: KindMode,
     pub fields: Fields,
     #[serde(default = "default_version")]
     pub version: u32,
@@ -189,10 +200,20 @@ impl KindSpec {
         {
             return Err(invalid(format!("identity '{identity}' not in fields")));
         }
+        if raw.mode == KindMode::Snapshot
+            && !raw.identity.as_ref().is_some_and(|identity| {
+                field_specs[identity].required
+                    && field_specs[identity].field_type == FieldType::String
+            })
+        {
+            return Err(invalid(
+                "snapshot mode requires an identity declared as a required string field".into(),
+            ));
+        }
         if raw.measures.iter().any(|measure| redact.contains(measure)) {
             return Err(invalid("numeric measures cannot be redacted".into()));
         }
-        let contract = serde_json::json!({"kind":raw.name,"version":raw.version,"fields":field_specs,"redact":redact});
+        let contract = serde_json::json!({"kind":raw.name,"mode":raw.mode,"version":raw.version,"fields":field_specs,"redact":redact});
         let schema_id = blake3::hash(
             serde_json::to_string(&contract)
                 .expect("schema serializes")
@@ -210,6 +231,7 @@ impl KindSpec {
         }
         Ok(KindSpec {
             name: raw.name,
+            mode: raw.mode,
             fields,
             field_specs,
             version: raw.version,

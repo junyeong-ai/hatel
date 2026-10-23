@@ -10,6 +10,19 @@ use crate::{Error, Payload, Result};
 /// an unknown key is an error (the test suite proves no leakage); otherwise it is
 /// silently dropped.
 pub fn sanitize(spec: &KindSpec, payload: Payload, strict: bool) -> Result<Payload> {
+    if spec.mode == crate::registry::KindMode::Snapshot
+        && spec.identity.as_ref().is_none_or(|field| {
+            payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(str::is_empty)
+        })
+    {
+        return Err(Error::InvalidPayload(format!(
+            "{} requires a non-empty string identity",
+            spec.name
+        )));
+    }
     for (name, field) in &spec.field_specs {
         match payload.get(name) {
             None if field.required => {

@@ -382,6 +382,7 @@ mod tests {
     fn section(kind: &str, groups: Vec<GroupAgg>) -> KindSection {
         KindSection {
             kind: kind.to_string(),
+            mode: Default::default(),
             group_by: "tool_name".to_string(),
             sort_by: Some("duration_ms".to_string()),
             identity: None,

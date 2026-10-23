@@ -189,6 +189,56 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_require_a_nonempty_typed_identity() {
+        let schema = r#"
+[[kind]]
+name = "state"
+mode = "snapshot"
+identity = "id"
+fields = { id = { type = "string", required = true }, status = { type = "string" } }
+group_key = "status"
+"#;
+        let mut registry = Registry::new();
+        merge(&mut registry, schema, "<test>", false).unwrap();
+        for invalid in [
+            schema.replace("mode = \"snapshot\"", "mode = \"unknown\""),
+            schema.replace("identity = \"id\"", ""),
+            schema.replace("identity = \"id\"", "identity = \"missing\""),
+            schema.replace("required = true", "required = false"),
+            schema.replace(
+                "type = \"string\", required",
+                "type = \"integer\", required",
+            ),
+        ] {
+            assert!(merge(&mut Registry::new(), &invalid, "<test>", false).is_err());
+        }
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({"id":""}),
+            serde_json::json!({"id":1}),
+        ] {
+            assert!(
+                crate::make_envelope(
+                    "state",
+                    serde_json::from_value(invalid).unwrap(),
+                    &registry,
+                    true
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            crate::make_envelope(
+                "state",
+                serde_json::from_value(serde_json::json!({"id":"one"})).unwrap(),
+                &registry,
+                true
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn checks_keep_missing_measurements_distinct_from_zero() {
         let registry = load_core().unwrap();
         let record = |payload| {

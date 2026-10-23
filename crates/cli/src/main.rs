@@ -711,6 +711,7 @@ pub(crate) fn kinds_value(
         .map(|s| {
             serde_json::json!({
                 "name": s.name,
+                "mode": s.mode,
                 "fields": s.fields,
                 "field_specs": s.field_specs,
                 "version": s.version,
@@ -755,11 +756,16 @@ fn kinds_cmd(json: bool) -> i32 {
                 .map(|i| format!(" identity={i}"))
                 .unwrap_or_default();
             println!(
-                "{:<14} group_key={:<12} fields=[{}]{}",
+                "{:<14} group_key={:<12} fields=[{}]{}{}",
                 s.name,
                 s.group_key,
                 fields.join(", "),
-                identity
+                identity,
+                if s.mode == hatel_core::registry::KindMode::Snapshot {
+                    " mode=snapshot"
+                } else {
+                    ""
+                }
             );
         }
         if let Some(unreadable) = &unreadable {

@@ -1474,6 +1474,7 @@ fn an_identity_must_name_a_field_of_its_kind() {
     use hatel_core::registry::{KindSpec, KindSpecRaw};
     let raw = |identity: Option<&str>| KindSpecRaw {
         name: "k".into(),
+        mode: Default::default(),
         fields: vec!["id".into(), "label".into(), "ms".into()].into(),
         version: 1,
         group_key: "label".into(),
@@ -1615,6 +1616,155 @@ measures = ["ms"]
     );
     assert_eq!(jsonl[0].count, sqlite[0].count);
     assert_eq!(jsonl[0].sums[0].sum, sqlite[0].sums[0].sum);
+}
+
+#[test]
+fn snapshot_queries_select_latest_project_entities_before_filtering_and_grouping() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("snapshot.toml");
+    std::fs::write(&plugin, r#"
+[[kind]]
+name = "state.job"
+mode = "snapshot"
+identity = "id"
+fields = { id = { type = "string", required = true }, status = { type = "string", required = true }, value = { type = "integer", required = true } }
+group_key = "status"
+measures = ["value"]
+"#).unwrap();
+    for sink in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let store = tempfile::tempdir().unwrap();
+        let mut cfg = config_in(store.path(), vec![plugin.clone()]);
+        cfg.sink = sink;
+        cfg.rotate_bytes = 1;
+        let registry = build_registry(&cfg).unwrap();
+        let spec = registry.kind("state.job").unwrap();
+        let mut out = hatel_core::build_sink(&cfg);
+        for (project, id, status, value, seconds) in [
+            ("A", "j1", "open", 2, "00"),
+            ("A", "j1", "closed", 7, "02"),
+            ("A", "j2", "open", 3, "01"),
+            ("A", "j1", "open", 99, "01"),
+            ("B", "j1", "open", 4, "03"),
+            ("A", "j1", "closed", 8, "02"),
+        ] {
+            let mut env = make_envelope(
+                "state.job",
+                serde_json::from_value(serde_json::json!({"id":id,"status":status,"value":value}))
+                    .unwrap(),
+                &registry,
+                true,
+            )
+            .unwrap();
+            env.ts = format!("2026-01-01T00:00:{seconds}Z");
+            env.metadata.project = Some(hatel_core::ProjectRef {
+                key: project.into(),
+                label: "same-label".into(),
+            });
+            out.write_record(&env).unwrap();
+        }
+        out.flush().unwrap();
+        let all = hatel_core::query::aggregate(&cfg, spec, &query(0, 0, None)).unwrap();
+        assert_eq!(all.len(), 2);
+        let open = all
+            .iter()
+            .find(|group| group.key.as_deref() == Some("open"))
+            .unwrap();
+        assert_eq!((open.count, open.sums[0].sum), (2, 7.0));
+        let closed = all
+            .iter()
+            .find(|group| group.key.as_deref() == Some("closed"))
+            .unwrap();
+        assert_eq!((closed.count, closed.sums[0].sum), (1, 8.0));
+        let filters = vec![("status".into(), "open".into())];
+        let filtered = hatel_core::query::aggregate(
+            &cfg,
+            spec,
+            &report::Query {
+                filters: &filters,
+                ..query(0, 0, Some("A"))
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!((filtered[0].count, filtered[0].sums[0].sum), (1, 3.0));
+        let recent =
+            hatel_core::query::aggregate(&cfg, spec, &query(1_767_225_603, 0, None)).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!((recent[0].count, recent[0].sums[0].sum), (1, 4.0));
+        for value in [1, 1, 2] {
+            let mut tied = make_envelope(
+                "state.job",
+                serde_json::from_value(
+                    serde_json::json!({"id":"tied","status":"open","value":value}),
+                )
+                .unwrap(),
+                &registry,
+                true,
+            )
+            .unwrap();
+            tied.ts = "2026-01-01T00:00:05Z".into();
+            tied.metadata.observed_at = Some("2026-01-01T00:00:06Z".into());
+            out.write_record(&tied).unwrap();
+            out.flush().unwrap();
+            let result = hatel_core::query::aggregate(&cfg, spec, &query(0, 0, None));
+            if value == 1 {
+                let groups = result.unwrap();
+                let open = groups
+                    .iter()
+                    .find(|group| group.key.as_deref() == Some("open"))
+                    .unwrap();
+                assert_eq!((open.count, open.sums[0].sum), (3, 8.0));
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("identical occurrence and observation times")
+                );
+            }
+        }
+        let mut invalid = make_envelope(
+            "state.job",
+            serde_json::from_value(serde_json::json!({"id":"bad","status":"open","value":1}))
+                .unwrap(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        invalid.payload.remove("id");
+        out.write_record(&invalid).unwrap();
+        out.flush().unwrap();
+        assert!(
+            hatel_core::query::aggregate(&cfg, spec, &query(0, 0, None))
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty string identity")
+        );
+        let mut unobserved = make_envelope(
+            "state.job",
+            serde_json::from_value(
+                serde_json::json!({"id":"unobserved","status":"open","value":1}),
+            )
+            .unwrap(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        unobserved.metadata.observed_at = None;
+        unobserved.metadata.project = Some(hatel_core::ProjectRef {
+            key: "no-time".into(),
+            label: "no-time".into(),
+        });
+        out.write_record(&unobserved).unwrap();
+        out.flush().unwrap();
+        assert!(
+            hatel_core::query::aggregate(&cfg, spec, &query(0, 0, Some("no-time")))
+                .unwrap_err()
+                .to_string()
+                .contains("valid observation time")
+        );
+        assert!(hatel_core::query::aggregate(&cfg, spec, &query(0, 0, Some("A"))).is_ok());
+    }
 }
 #[test]
 fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
