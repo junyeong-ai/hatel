@@ -121,7 +121,9 @@ and its CI check unless a deliberate compatibility change requires raising both.
   started, so a Kind the hook can record is one `report` can read, in the store it reads;
   `HATEL_PLUGINS` and the storage variables override them for a single process only. Fresh stores
   default to SQLite; an existing JSONL ledger keeps its backend until `migrate --quiescent`
-  imports it and saves the selection. Stop its writers first; the command holds the receiver
+  imports it and saves the selection. SQLite physical schema changes and time backfills also require
+  explicit quiescent maintenance; hooks only initialize fresh stores. Preserve raw timestamps and
+  normalized seconds/nanoseconds; compatibility reads parse only rows without normalized time. Stop its writers first; the command holds the receiver
   lock, preserves sources, and records an atomic import manifest so retries do not duplicate rows. The receiver
   reads the file when it starts, and again before it deletes anything, keeping the longer retention
   and deleting nothing while the file cannot be read. It reports that file and its store on

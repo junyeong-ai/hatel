@@ -4,6 +4,11 @@ use crate::{Envelope, model::RecordMetadata};
 use std::io::{BufRead, Read};
 use std::path::Path;
 
+/// Explicit maintenance of a SQLite store whose writers have stopped.
+pub fn upgrade_sqlite(database: &Path) -> crate::Result<usize> {
+    crate::sink::upgrade_database(database).map(|(_, count)| count)
+}
+
 fn io(e: impl std::fmt::Display) -> crate::Error {
     crate::Error::Io(e.to_string())
 }
@@ -67,7 +72,7 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
     }
     let mut count = 0usize;
     {
-        let mut insert = tx.prepare("INSERT INTO records (ts,kind,schema_version,payload,metadata,occurred_seconds) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING").map_err(io)?;
+        let mut insert = tx.prepare("INSERT INTO records (ts,kind,schema_version,payload,metadata,occurred_seconds,occurred_nanos) VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT DO NOTHING").map_err(io)?;
         for (path, file) in &mut files {
             for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
                 let line = line.map_err(io)?;
@@ -81,15 +86,20 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         index + 1
                     ))
                 })?;
-                if !crate::registry::is_valid_kind_name(&env.kind)
-                    || crate::ts_epoch(&env.ts).is_none()
-                {
+                if !crate::registry::is_valid_kind_name(&env.kind) {
                     return Err(io(format!(
                         "{}:{}: invalid kind or timestamp",
                         path.display(),
                         index + 1
                     )));
                 }
+                let occurred = env.ts.parse::<jiff::Timestamp>().map_err(|_| {
+                    io(format!(
+                        "{}:{}: invalid timestamp",
+                        path.display(),
+                        index + 1
+                    ))
+                })?;
                 if env.metadata.record_id.is_none() {
                     env.metadata = RecordMetadata {
                         record_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -103,7 +113,8 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         env.schema_version,
                         serde_json::to_string(&env.payload).map_err(io)?,
                         serde_json::to_string(&env.metadata).map_err(io)?,
-                        crate::ts_epoch(&env.ts)
+                        occurred.as_second(),
+                        occurred.subsec_nanosecond()
                     ])
                     .map_err(io)?;
                 if inserted == 0 {

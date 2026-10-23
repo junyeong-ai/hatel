@@ -8,9 +8,9 @@ mod jsonl;
 mod sqlite;
 
 pub use jsonl::JsonlSink;
-pub use sqlite::SqliteSink;
+pub use sqlite::{DATABASE_VERSION, SqliteSink, database_version, write_readiness};
 
-pub(crate) use sqlite::record_by_id;
+pub(crate) use sqlite::{record_by_id, upgrade_database};
 use std::path::PathBuf;
 
 use crate::config::Retention;
@@ -130,7 +130,7 @@ pub(crate) fn jsonl_kinds(dir: &std::path::Path) -> std::io::Result<Vec<String>>
 }
 
 pub(crate) fn open_database(path: &std::path::Path) -> crate::Result<rusqlite::Connection> {
-    SqliteSink::init(&path.to_path_buf()).map_err(|e| crate::Error::Io(e.to_string()))
+    sqlite::upgrade_database(path).map(|(conn, _)| conn)
 }
 
 pub(crate) fn default_kind(state: &std::path::Path) -> SinkKind {

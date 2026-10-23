@@ -203,6 +203,11 @@ fn build_report_for(local: bool) -> Report {
     report_invalid_variables(&mut storage, &invalid, &settings_env);
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
+    if cfg.sink == hatel_core::SinkKind::Sqlite
+        && let Err(error) = hatel_core::sink::write_readiness(&cfg.state_dir.join("telemetry.db"))
+    {
+        storage.fail(format!("SQLite is not ready for writes: {error}"));
+    }
     if let Err(error) = hatel_core::cost::read_snapshot(&cfg.state_dir) {
         storage.fail(format!("cost baseline unreadable: {error}"));
     }
@@ -531,6 +536,9 @@ fn report_receiver(
     for authority in authorities {
         match receiver::probe(&authority) {
             receiver::Probe::Receiver(id) => {
+                if let Some(error) = &id.storage_error {
+                    sec.fail(format!("receiver at {authority} cannot write records: {error}"));
+                }
                 if let Some(error) = &id.cost_error {
                     sec.fail(format!("receiver at {authority} cannot persist costs; repair the baseline and restart: {error}"));
                 }
@@ -1192,6 +1200,7 @@ mod tests {
                 version: version.to_string(),
                 capabilities: None,
                 cost_error: None,
+                storage_error: None,
             })
             .unwrap()
         };
@@ -1265,6 +1274,7 @@ mod tests {
         let other_file = serde_json::to_string(&receiver::Identity {
             capabilities: None,
             cost_error: None,
+            storage_error: None,
             config: Some("/elsewhere/config.toml".into()),
             service: "hatel".to_string(),
             storage: Some(store.clone()),

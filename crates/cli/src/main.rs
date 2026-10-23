@@ -169,7 +169,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Import a stopped JSONL ledger without changing its files, then select SQLite in config.
+    /// Maintain a stopped SQLite store, or import JSONL and select SQLite in config.
     Migrate {
         /// Assert that hooks and receiver writing this ledger have been stopped.
         #[arg(long, required = true)]
@@ -434,7 +434,7 @@ fn deliveries_cmd(json: bool) -> i32 {
 }
 
 fn migrate_cmd() -> i32 {
-    let result = (|| -> hatel_core::Result<usize> {
+    let result = (|| -> hatel_core::Result<(usize, bool)> {
         for variable in ["HATEL_SINK", "HATEL_STATE_DIR"] {
             if std::env::var_os(variable).is_some_and(|v| !v.is_empty()) {
                 return Err(hatel_core::Error::Io(format!(
@@ -452,6 +452,11 @@ fn migrate_cmd() -> i32 {
             }
             serve::LockOutcome::Failed(error) => return Err(hatel_core::Error::Io(error)),
         };
+        if cfg.sink == hatel_core::SinkKind::Sqlite {
+            let normalized =
+                hatel_core::migration::upgrade_sqlite(&cfg.state_dir.join("telemetry.db"))?;
+            return Ok((normalized, false));
+        }
         let imported = hatel_core::migration::import_jsonl(
             &cfg.ledger_dir,
             &cfg.state_dir.join("telemetry.db"),
@@ -459,11 +464,15 @@ fn migrate_cmd() -> i32 {
         let mut settings = hatel_core::Settings::load()?;
         settings.storage.sink = Some(hatel_core::SinkKind::Sqlite);
         settings.save()?;
-        Ok(imported)
+        Ok((imported, true))
     })();
     match result {
-        Ok(count) => {
-            println!("imported {count} records; storage=sqlite; source files preserved");
+        Ok((count, imported)) => {
+            if imported {
+                println!("imported {count} records; storage=sqlite; source files preserved");
+            } else {
+                println!("normalized {count} records; storage=sqlite");
+            }
             0
         }
         Err(e) => {

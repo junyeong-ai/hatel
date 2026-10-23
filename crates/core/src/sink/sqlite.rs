@@ -1,5 +1,5 @@
 //! SQLite sink (embedded, WAL) — indexed storage for higher volume or richer
-//! queries, indexed by `(kind, ts)` so windowed reads stay cheap as the table grows.
+//! queries, indexed by Kind and normalized occurrence time.
 
 use std::path::{Path, PathBuf};
 
@@ -7,6 +7,192 @@ use rusqlite::{Connection, OpenFlags};
 
 use super::Sink;
 use crate::Envelope;
+
+pub const DATABASE_VERSION: i64 = 1;
+
+fn io(error: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Io(error.to_string())
+}
+
+pub fn database_version(path: &Path) -> crate::Result<Option<i64>> {
+    if !path.try_exists().map_err(io)? {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
+    conn.pragma_query_value(None, "user_version", |r| r.get(0))
+        .map(Some)
+        .map_err(io)
+}
+
+pub fn write_readiness(path: &Path) -> crate::Result<()> {
+    if !path.try_exists().map_err(io)? {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
+    let version = check_version(&conn)?;
+    let records: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='records')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(io)?;
+    if records && version != DATABASE_VERSION {
+        return Err(io(
+            "SQLite schema requires maintenance; stop writers and run migrate --quiescent",
+        ));
+    }
+    Ok(())
+}
+
+fn connect(path: &Path) -> crate::Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(io)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(io)?;
+    }
+    let conn = Connection::open(path).map_err(io)?;
+    conn.busy_timeout(std::time::Duration::from_millis(100))
+        .map_err(io)?;
+    check_version(&conn)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(io)?;
+    crate::query::functions(&conn).map_err(io)?;
+    Ok(conn)
+}
+
+fn check_version(conn: &Connection) -> crate::Result<i64> {
+    let version = conn
+        .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+        .map_err(io)?;
+    if version > DATABASE_VERSION {
+        return Err(io(format!(
+            "SQLite schema {version} is newer than supported {DATABASE_VERSION}"
+        )));
+    }
+    Ok(version)
+}
+
+enum Initialization {
+    FreshStore,
+    QuiescentUpgrade,
+}
+
+fn initialize(conn: &mut Connection, mode: Initialization) -> crate::Result<usize> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(io)?;
+    let version = check_version(&tx)?;
+    let exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='records')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(io)?;
+    if matches!(mode, Initialization::FreshStore) && exists {
+        if version == DATABASE_VERSION {
+            tx.commit().map_err(io)?;
+            return Ok(0);
+        }
+        return Err(io(
+            "SQLite schema requires maintenance; stop writers and run migrate --quiescent",
+        ));
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS records (
+        ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL
+    );",
+    )
+    .map_err(io)?;
+    let columns = {
+        let mut stmt = tx.prepare("PRAGMA table_info(records)").map_err(io)?;
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .map_err(io)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(io)?
+    };
+    for (name, sql) in [
+        (
+            "metadata",
+            "ALTER TABLE records ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
+        ),
+        (
+            "occurred_seconds",
+            "ALTER TABLE records ADD COLUMN occurred_seconds INTEGER;",
+        ),
+        (
+            "occurred_nanos",
+            "ALTER TABLE records ADD COLUMN occurred_nanos INTEGER;",
+        ),
+    ] {
+        if !columns.iter().any(|c| c == name) {
+            tx.execute_batch(sql).map_err(io)?;
+        }
+    }
+    let mut normalized = 0;
+    let mut after = i64::MIN;
+    loop {
+        let rows = {
+            let mut stmt=tx.prepare("SELECT rowid,ts FROM records WHERE rowid>=?1 AND (occurred_seconds IS NULL OR occurred_nanos IS NULL) ORDER BY rowid LIMIT 1000").map_err(io)?;
+            stmt.query_map([after], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(io)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(io)?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        let mut update = tx
+            .prepare("UPDATE records SET occurred_seconds=?1,occurred_nanos=?2 WHERE rowid=?3")
+            .map_err(io)?;
+        for (id, ts) in &rows {
+            let ts = ts.parse::<jiff::Timestamp>().map_err(|_| {
+                io(format!(
+                    "invalid timestamp in SQLite row {id}; maintenance rolled back"
+                ))
+            })?;
+            update
+                .execute(rusqlite::params![
+                    ts.as_second(),
+                    ts.subsec_nanosecond(),
+                    id
+                ])
+                .map_err(io)?;
+            normalized += 1;
+        }
+        match rows.last().expect("nonempty batch").0.checked_add(1) {
+            Some(next) => after = next,
+            None => break,
+        }
+    }
+    tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata,'$.record_id')) WHERE json_extract(metadata,'$.record_id') IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_records_kind_time ON records(kind,occurred_seconds,occurred_nanos);
+        CREATE INDEX IF NOT EXISTS idx_records_time ON records(occurred_seconds,occurred_nanos);
+        DROP INDEX IF EXISTS idx_records_kind_ts;
+        DROP INDEX IF EXISTS idx_records_kind_occurred;").map_err(io)?;
+    tx.execute_batch(crate::outbox::SCHEMA).map_err(io)?;
+    tx.execute_batch(crate::catalog::SCHEMA).map_err(io)?;
+    tx.pragma_update(None, "user_version", DATABASE_VERSION)
+        .map_err(io)?;
+    tx.commit().map_err(io)?;
+    Ok(normalized)
+}
+
+pub(crate) fn upgrade_database(path: &Path) -> crate::Result<(Connection, usize)> {
+    let mut conn = connect(path)?;
+    let normalized = initialize(&mut conn, Initialization::QuiescentUpgrade)?;
+    Ok((conn, normalized))
+}
 
 pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelope> {
     let io = |e: rusqlite::Error| crate::Error::Io(e.to_string());
@@ -47,10 +233,10 @@ pub fn last_written(path: &Path, kind: &str) -> Option<i64> {
         return None;
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    crate::query::functions(&conn).ok()?;
+    crate::query::prepare_read(&conn).ok()?;
     let ts: Option<String> = conn
         .query_row(
-            "SELECT ts FROM records WHERE kind = ?1 ORDER BY hatel_epoch(ts) DESC, hatel_nanos(ts) DESC LIMIT 1",
+            "SELECT ts FROM records_read WHERE kind = ?1 AND occurred_seconds IS NOT NULL ORDER BY occurred_seconds DESC, occurred_nanos DESC,sequence DESC LIMIT 1",
             [kind],
             |row| row.get(0),
         )
@@ -73,23 +259,15 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
             return Vec::new();
         }
     };
-    if let Err(e) = crate::query::functions(&conn) {
+    if let Err(e) = crate::query::prepare_read(&conn) {
         eprintln!("hatel: sqlite read: {e}");
         return Vec::new();
     }
-    let has_metadata = conn
-        .prepare("PRAGMA table_info(records)")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .is_ok_and(|cols| cols.iter().any(|c| c == "metadata"));
-    let metadata = if has_metadata { "metadata" } else { "'{}'" };
-    let mut stmt = match conn.prepare(&format!("SELECT ts, schema_version, payload, {metadata} FROM records WHERE kind = ?1 AND (?2 IS NULL OR hatel_epoch(ts)>=?2)")) {
+    let mut stmt = match conn.prepare("SELECT ts, schema_version, payload, metadata FROM records_read WHERE kind = ?1 AND occurred_seconds>=?2") {
         Ok(stmt) => stmt,
         Err(e) => { eprintln!("hatel: sqlite query: {e}"); return Vec::new(); }
     };
-    let rows = stmt.query_map(rusqlite::params![kind, since], |row| {
+    let rows = stmt.query_map(rusqlite::params![kind, since.unwrap_or(i64::MIN)], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, u32>(1)?,
@@ -129,8 +307,8 @@ pub fn oldest_ts(path: &Path, kind: &str, project: Option<&str>) -> Option<Strin
         return None;
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    crate::query::functions(&conn).ok()?;
-    conn.query_row("SELECT ts FROM records WHERE kind=?1 AND (?2 IS NULL OR json_extract(payload, '$.project')=?2) ORDER BY hatel_epoch(ts),hatel_nanos(ts) LIMIT 1", rusqlite::params![kind,project], |r| r.get(0)).ok()
+    crate::query::prepare_read(&conn).ok()?;
+    conn.query_row("SELECT ts FROM records_read WHERE kind=?1 AND occurred_seconds IS NOT NULL AND (?2 IS NULL OR json_extract(payload, '$.project')=?2) ORDER BY occurred_seconds,occurred_nanos,sequence LIMIT 1", rusqlite::params![kind,project], |r| r.get(0)).ok()
 }
 
 /// Rows deleted per DELETE statement during the retention sweep. Batching keeps each writer-lock
@@ -159,9 +337,9 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
         )?;
         let mut total = 0;
         loop {
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute("DELETE FROM prune_records", [])?;
-            let count = tx.execute("INSERT INTO prune_records SELECT rowid FROM records WHERE hatel_epoch(ts)<?1 LIMIT ?2",rusqlite::params![cutoff_epoch,PRUNE_BATCH])?;
+            let count = tx.execute("INSERT INTO prune_records SELECT rowid FROM records WHERE occurred_seconds<?1 UNION ALL SELECT rowid FROM records WHERE occurred_seconds IS NULL AND hatel_epoch(ts)<?1 LIMIT ?2",rusqlite::params![cutoff_epoch,PRUNE_BATCH])?;
             if count == 0 {
                 tx.commit()?;
                 break;
@@ -226,46 +404,11 @@ impl SqliteSink {
         sink
     }
 
-    pub(crate) fn init(path: &PathBuf) -> rusqlite::Result<Connection> {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    pub(crate) fn init(path: &Path) -> crate::Result<Connection> {
+        let mut conn = connect(path)?;
+        if check_version(&conn)? != DATABASE_VERSION {
+            initialize(&mut conn, Initialization::FreshStore)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(path)
-                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        }
-        let mut conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_millis(100))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS records (
-            ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL
-        ); CREATE INDEX IF NOT EXISTS idx_records_kind_ts ON records(kind, ts);")?;
-        let columns = {
-            let mut stmt = tx.prepare("PRAGMA table_info(records)")?;
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        if !columns.iter().any(|c| c == "metadata") {
-            tx.execute_batch(
-                "ALTER TABLE records ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
-            )?;
-        }
-        if !columns.iter().any(|c| c == "occurred_seconds") {
-            tx.execute_batch("ALTER TABLE records ADD COLUMN occurred_seconds INTEGER;")?;
-        }
-        tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata, '$.record_id')) WHERE json_extract(metadata, '$.record_id') IS NOT NULL;
-            CREATE INDEX IF NOT EXISTS idx_records_kind_occurred ON records(kind, occurred_seconds);")?;
-        tx.execute_batch(crate::outbox::SCHEMA)?;
-        tx.execute_batch(crate::catalog::SCHEMA)?;
-        tx.commit()?;
-        crate::query::functions(&conn)?;
         Ok(conn)
     }
 }
@@ -278,6 +421,10 @@ impl Sink for SqliteSink {
             .map_err(|e| crate::Error::Io(e.clone()))?;
         let payload =
             serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
+        let occurred = env
+            .ts
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
         let tx = conn
             .transaction()
             .map_err(|e| crate::Error::Io(e.to_string()))?;
@@ -287,8 +434,8 @@ impl Sink for SqliteSink {
             crate::catalog::save(&tx, spec)?;
         }
         let inserted = tx.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
-            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, crate::ts_epoch(&env.ts)],
+            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds,occurred_nanos) VALUES (?1, ?2, ?3, ?4, ?5, ?6,?7) ON CONFLICT DO NOTHING",
+            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, occurred.as_second(),occurred.subsec_nanosecond()],
         ).map_err(|e| crate::Error::Io(e.to_string()))?;
         if inserted == 0 {
             let id = env.metadata.record_id.as_deref().ok_or_else(|| {

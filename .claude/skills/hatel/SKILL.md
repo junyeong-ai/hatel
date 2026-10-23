@@ -123,6 +123,8 @@ Find the actual path with `hatel doctor --local --json`. Shared settings belong 
 storage or plugin overrides can split writers from readers and services.
 Fresh stores use SQLite/WAL; existing JSONL is retained until explicit migration.
 Stop all writers before `hatel migrate --quiescent`; preserve the source and inspect results.
+Existing SQLite stores can also require this explicit physical schema maintenance before writing.
+`doctor --local` and `/healthz` report this state; compatibility reads remain available.
 Restart the receiver after configuration changes. Do not migrate or restart a live service
 just to test an integration.
 

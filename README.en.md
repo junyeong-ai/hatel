@@ -81,6 +81,8 @@ To migrate JSONL, stop the receiver and all hook and record writers first. Impor
 hatel migrate --quiescent
 ```
 
+Use the same command for physical schema maintenance of existing SQLite stores. Time indexes preserve the original timestamp and nanosecond precision. Old stores remain readable but refuse writes until maintenance. Hooks never perform bulk conversion; `doctor --local` and `/healthz` report required maintenance.
+
 | Variable | Purpose |
 |---|---|
 | `HATEL_CONFIG` | Select configuration file |

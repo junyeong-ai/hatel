@@ -1244,6 +1244,98 @@ fn duplicate_event_kind_binding_is_rejected() {
 }
 
 #[test]
+fn sqlite_maintenance_is_explicit_and_preserves_exact_occurrence_times() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("telemetry.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE records(ts TEXT NOT NULL,kind TEXT NOT NULL,schema_version INTEGER NOT NULL,payload TEXT NOT NULL);").unwrap();
+    let times = [
+        "2026-01-01T09:00:00.000000002+09:00",
+        "2026-01-01T00:00:00.000000001Z",
+    ];
+    for time in times {
+        conn.execute("INSERT INTO records VALUES (?1,'prompt',1,'{}')", [time])
+            .unwrap();
+    }
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let reg = load_core().unwrap();
+    let env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+    assert!(
+        hatel_core::build_sink(&cfg, &reg)
+            .write_record(&env)
+            .unwrap_err()
+            .to_string()
+            .contains("migrate --quiescent")
+    );
+    assert!(hatel_core::sink::write_readiness(&db).is_err());
+    let section =
+        hatel_core::query::section(&cfg, reg.kind("prompt").unwrap(), &legacy_query(0, 0, None))
+            .unwrap();
+    assert_eq!(section.groups.unwrap()[0].count, 2);
+    assert_eq!(section.retained_since.as_deref(), Some(times[1]));
+    assert_eq!(hatel_core::migration::upgrade_sqlite(&db).unwrap(), 2);
+    hatel_core::sink::write_readiness(&db).unwrap();
+    assert_eq!(
+        hatel_core::sink::database_version(&db).unwrap(),
+        Some(hatel_core::sink::DATABASE_VERSION)
+    );
+    let stored = conn.prepare("SELECT ts,occurred_seconds,occurred_nanos FROM records ORDER BY occurred_seconds,occurred_nanos").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,i32>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let second = times[0].parse::<jiff::Timestamp>().unwrap().as_second();
+    assert_eq!(
+        stored,
+        vec![(times[1].into(), second, 1), (times[0].into(), second, 2)]
+    );
+    assert_eq!(hatel_core::migration::upgrade_sqlite(&db).unwrap(), 0);
+    hatel_core::build_sink(&cfg, &reg)
+        .write_record(&env)
+        .unwrap();
+    assert_eq!(
+        hatel_core::sink::read_records(&cfg, "prompt", None).len(),
+        3
+    );
+}
+
+#[test]
+fn sqlite_maintenance_rolls_back_invalid_times_and_refuses_future_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("telemetry.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE records(ts TEXT NOT NULL,kind TEXT NOT NULL,schema_version INTEGER NOT NULL,payload TEXT NOT NULL); INSERT INTO records VALUES ('invalid','prompt',1,'{}');").unwrap();
+    assert!(
+        hatel_core::migration::upgrade_sqlite(&db)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid timestamp")
+    );
+    let columns = conn
+        .prepare("PRAGMA table_info(records)")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(1))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, vec!["ts", "kind", "schema_version", "payload"]);
+    assert_eq!(hatel_core::sink::database_version(&db).unwrap(), Some(0));
+    conn.pragma_update(None, "user_version", hatel_core::sink::DATABASE_VERSION + 1)
+        .unwrap();
+    assert!(
+        hatel_core::migration::upgrade_sqlite(&db)
+            .unwrap_err()
+            .to_string()
+            .contains("newer than supported")
+    );
+    assert!(hatel_core::sink::write_readiness(&db).is_err());
+    assert_eq!(
+        conn.query_row("SELECT ts FROM records", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "invalid"
+    );
+}
+
+#[test]
 fn sqlite_window_filter_excludes_old_records() {
     // The SQLite reader pushes the time window into SQL; an out-of-window row is excluded.
     let dir = tempfile::tempdir().unwrap();
@@ -1336,11 +1428,8 @@ fn sqlite_sink_round_trips_through_report() {
 
 #[test]
 fn a_kind_section_says_how_far_back_its_store_reaches() {
-    // Retention prunes a store from the back, so a window that starts before the oldest record
-    // still held was not measured whole; the section names that record's time so a reader can
-    // tell an empty early stretch from one nobody recorded. It is read from every file's first
-    // line rather than from the records the window admits — an archive older than the window is
-    // exactly what places the reach before it.
+    // The oldest retained occurrence is scoped to the selected contract and project,
+    // independent of the query window.
     let reg = load_core().unwrap();
     // A record carrying no `project` at all — a tree outside any repository — sits in the store
     // under no project's reach, the way the aggregate leaves it out of every project's groups.
@@ -1359,7 +1448,7 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
             ..config_in(dir.path(), vec![])
         };
         let section = |cfg: &Config, project: Option<&str>| {
-            report::Report::build(&reg, cfg, "30d", &query(0, 0, project))
+            report::Report::build(&reg, cfg, "30d", &legacy_query(0, 0, project))
                 .kinds
                 .into_iter()
                 .find(|k| k.kind == "tool")

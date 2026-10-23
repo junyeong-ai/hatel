@@ -41,6 +41,8 @@ pub struct Identity {
     pub capabilities: Option<Capabilities>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +82,13 @@ impl Identity {
             storage: Some(Store::of(cfg)),
             version: env!("CARGO_PKG_VERSION").to_string(),
             cost_error: None,
+            storage_error: (cfg.sink == SinkKind::Sqlite)
+                .then(|| {
+                    hatel_core::sink::write_readiness(&cfg.state_dir.join("telemetry.db"))
+                        .err()
+                        .map(|e| e.to_string())
+                })
+                .flatten(),
             capabilities: Some(Capabilities {
                 local_decode_protocol: "http/json".into(),
                 local_metric_types: vec!["sum".into(), "gauge".into()],
@@ -95,7 +104,7 @@ impl Identity {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Probe {
     /// A hatel receiver, and what it says about itself.
-    Receiver(Identity),
+    Receiver(Box<Identity>),
     /// Something accepted the connection but did not identify as a hatel receiver — a build
     /// from before the identity route, or another collector.
     Foreign,
@@ -162,7 +171,7 @@ fn identify(answer: &[u8]) -> Probe {
         return Probe::Foreign;
     }
     match serde_json::from_str::<Identity>(body.trim()) {
-        Ok(id) if id.service == "hatel" => Probe::Receiver(id),
+        Ok(id) if id.service == "hatel" => Probe::Receiver(Box::new(id)),
         _ => Probe::Foreign,
     }
 }
@@ -208,14 +217,15 @@ mod tests {
         ));
         assert_eq!(
             probe(&authority),
-            Probe::Receiver(Identity {
+            Probe::Receiver(Box::new(Identity {
                 config: None,
                 service: "hatel".to_string(),
                 storage: None,
                 version: "9.9.9".to_string(),
                 capabilities: None,
                 cost_error: None,
-            }),
+                storage_error: None,
+            })),
             "a build from before the store was reported still identifies"
         );
     }
