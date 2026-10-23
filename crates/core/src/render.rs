@@ -246,7 +246,15 @@ fn key_label(key: Option<&str>) -> &str {
 /// A group's count and measure sums as display strings, in column order.
 fn numeric_cells(group: &GroupAgg) -> Vec<String> {
     std::iter::once(fmt_num(group.count as f64))
-        .chain(group.sums.iter().map(|m| fmt_num(m.sum)))
+        .chain(group.sums.iter().map(|m| {
+            if m.valid_count == 0 {
+                "—".into()
+            } else if m.valid_count < group.count {
+                format!("{} ({}/{})", fmt_num(m.sum), m.valid_count, group.count)
+            } else {
+                fmt_num(m.sum)
+            }
+        }))
         .collect()
 }
 
@@ -400,6 +408,7 @@ mod tests {
             sums: vec![Measure {
                 name: "duration_ms".to_string(),
                 sum,
+                valid_count: count,
                 ..Default::default()
             }],
         }
@@ -568,11 +577,13 @@ mod tests {
                 Measure {
                     name: "evaluations".to_string(),
                     sum: first,
+                    valid_count: 1,
                     ..Default::default()
                 },
                 Measure {
                     name: "violations".to_string(),
                     sum: second,
+                    valid_count: 1,
                     ..Default::default()
                 },
             ],
@@ -590,6 +601,41 @@ mod tests {
         let imports = text.lines().find(|l| l.contains("imports")).unwrap();
         assert_eq!(citation.matches('█').count(), BAR_WIDTH);
         assert_eq!(imports.matches('█').count(), BAR_WIDTH / 2);
+    }
+
+    #[test]
+    fn reports_distinguish_missing_zero_and_partial_measurements() {
+        let mut missing = group(Some("missing"), 2, 0.0);
+        missing.sums[0].valid_count = 0;
+        missing.sums[0].missing_count = 2;
+        let zero = group(Some("zero"), 2, 0.0);
+        let mut partial = group(Some("partial"), 3, 7.0);
+        partial.sums[0].valid_count = 1;
+        partial.sums[0].missing_count = 2;
+        let report = report(vec![section("check", vec![missing, zero, partial])]);
+        for output in [format_text(&report), format_markdown(&report)] {
+            assert!(
+                output
+                    .lines()
+                    .find(|line| line.contains("missing"))
+                    .unwrap()
+                    .contains('—'),
+                "{output}"
+            );
+            let measured_zero = output.lines().find(|line| line.contains("zero")).unwrap();
+            assert!(
+                measured_zero.contains('0') && !measured_zero.contains('—'),
+                "{output}"
+            );
+            assert!(
+                output
+                    .lines()
+                    .find(|line| line.contains("partial"))
+                    .unwrap()
+                    .contains("7 (1/3)"),
+                "{output}"
+            );
+        }
     }
 
     #[test]

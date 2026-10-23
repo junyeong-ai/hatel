@@ -2251,6 +2251,32 @@ fn query_reports_zero_missing_invalid_and_duration_buckets_without_coercion() {
     assert_eq!(measure.buckets[2].count, 2);
 }
 
+#[test]
+fn numeric_aggregation_reports_overflow_and_accepts_the_signed_integer_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    hatel_core::build_sink(&cfg).flush().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
+    let registry = build_registry(&cfg).unwrap();
+    for value in [f64::MAX, f64::MAX] {
+        conn.execute("INSERT INTO records(ts,kind,schema_version,payload) VALUES ('2026-01-01T00:00:00Z','tool',1,?1)", [serde_json::json!({"duration_ms":value}).to_string()]).unwrap();
+    }
+    assert!(
+        hatel_core::query::aggregate(&cfg, registry.kind("tool").unwrap(), &query(0, 0, None))
+            .is_err()
+    );
+    conn.execute("DELETE FROM records", []).unwrap();
+    conn.execute("INSERT INTO records(ts,kind,schema_version,payload) VALUES ('2026-01-01T00:00:00Z','tool',1,?1)", [serde_json::json!({"duration_ms":i64::MIN}).to_string()]).unwrap();
+    let groups =
+        hatel_core::query::aggregate(&cfg, registry.kind("tool").unwrap(), &query(0, 0, None))
+            .unwrap();
+    assert_eq!(groups[0].sums[0].valid_count, 1);
+    assert_eq!(groups[0].sums[0].sum, i64::MIN as f64);
+}
+
 fn export_config(dir: &Path, policy: &str) -> hatel_core::ExportConfig {
     let path = dir.join("exports.toml");
     std::fs::write(&path, policy).unwrap();
@@ -2429,6 +2455,29 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
     assert_eq!(result.groups.len(), 1);
     assert_eq!(result.groups[0].key.as_deref(), Some("/team-one/repo"));
     assert!(result.retained_since.is_some());
+    let filters = [("metadata.schema_id".into(), spec.schema_id.clone())];
+    let q = report::Query {
+        group_by: Some("metadata.schema_id"),
+        filters: &filters,
+        ..query(0, 0, None)
+    };
+    let groups = hatel_core::query::aggregate(&cfg, spec, &q).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].count, 2);
+    assert_eq!(groups[0].key.as_deref(), Some(spec.schema_id.as_str()));
+    let filters = [("metadata.schema_id".into(), "different-contract".into())];
+    assert!(
+        hatel_core::query::aggregate(
+            &cfg,
+            spec,
+            &report::Query {
+                filters: &filters,
+                ..q
+            }
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 #[test]

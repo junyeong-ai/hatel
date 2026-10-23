@@ -19,6 +19,7 @@ pub const METADATA_FIELDS: &[&str] = &[
     "metadata.run_id",
     "metadata.correlation_id",
     "metadata.kind_version",
+    "metadata.schema_id",
     "metadata.observed_at",
 ];
 

@@ -282,11 +282,11 @@ fn aggregate_connection(
         let p = parameter(&mut args, path(measure));
         let value = format!("json_extract(payload, {p})");
         let valid = format!(
-            "json_type(payload, {p}) IN ('integer','real') AND abs({value})<=1.7976931348623157e308"
+            "json_type(payload, {p}) IN ('integer','real') AND abs(CAST({value} AS REAL))<=1.7976931348623157e308"
         );
         let start = columns.len();
         columns.extend([
-            format!("COALESCE(SUM(CASE WHEN {valid} THEN CAST({value} AS REAL) END),0.0)"),
+            format!("SUM(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"),
             format!("COUNT(CASE WHEN {valid} THEN 1 END)"),
             format!("COUNT(CASE WHEN json_type(payload, {p}) IS NULL THEN 1 END)"),
             format!("AVG(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"),
@@ -337,13 +337,26 @@ fn aggregate_connection(
                     let start = *start;
                     let valid_count: i64 = row.get(start + 1)?;
                     let missing_count: i64 = row.get(start + 2)?;
+                    let sum: Option<f64> = row.get(start)?;
+                    let avg: Option<f64> = row.get(start + 3)?;
+                    if (valid_count > 0 && (sum.is_none() || avg.is_none()))
+                        || [sum, avg].into_iter().flatten().any(|n| !n.is_finite())
+                    {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            start,
+                            rusqlite::types::Type::Real,
+                            Box::new(std::io::Error::other(format!(
+                                "{name} aggregate exceeds the finite numeric range"
+                            ))),
+                        ));
+                    }
                     Ok(Measure {
                         name: name.clone(),
-                        sum: row.get(start)?,
+                        sum: sum.unwrap_or(0.0),
                         valid_count,
                         missing_count,
                         invalid_count: count - valid_count - missing_count,
-                        avg: row.get(start + 3)?,
+                        avg,
                         min: row.get(start + 4)?,
                         max: row.get(start + 5)?,
                         unit: spec.field_specs[name].unit.clone(),

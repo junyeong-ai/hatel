@@ -224,28 +224,51 @@ fn cost_rows(state_dir: &std::path::Path, q: &Query) -> Vec<CostRow> {
 /// resolved keys on the empty string it actually holds, so it can never merge with a real
 /// project however that project happens to be named; naming it is the renderer's job.
 pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
-    let mut by_project: BTreeMap<&str, (i64, [f64; 4])> = BTreeMap::new();
+    let mut by_project: BTreeMap<&str, (i64, [f64; 4], [i64; 4])> = BTreeMap::new();
+    let metrics = [
+        "token.usage",
+        "cost.usage",
+        "active_time.total",
+        "lines_of_code.count",
+    ];
     for row in rows {
         let entry = by_project
             .entry(row.project_key.as_deref().unwrap_or(&row.project))
-            .or_insert((0, [0.0; 4]));
+            .or_insert((0, [0.0; 4], [0; 4]));
         entry.0 += 1;
-        entry.1[0] += row.tokens as f64;
-        entry.1[1] += row.cost_usd;
-        entry.1[2] += row.active_time_s;
-        entry.1[3] += row.lines as f64;
+        for (i, value) in [
+            row.tokens as f64,
+            row.cost_usd,
+            row.active_time_s,
+            row.lines as f64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if row
+                .observed_metrics
+                .as_ref()
+                .is_some_and(|observed| observed.contains(metrics[i]))
+            {
+                entry.1[i] += value;
+                entry.2[i] += 1;
+            }
+        }
     }
     let mut groups: Vec<GroupAgg> = by_project
         .into_iter()
-        .map(|(key, (count, sums))| GroupAgg {
+        .map(|(key, (count, sums, observed))| GroupAgg {
             key: Some(key.to_string()),
             count,
             sums: ["tokens", COST_RANK, "active_time_s", "lines"]
                 .iter()
                 .zip(sums)
-                .map(|(name, sum)| Measure {
+                .zip(observed)
+                .map(|((name, sum), valid_count)| Measure {
                     name: name.to_string(),
                     sum,
+                    valid_count,
+                    missing_count: count - valid_count,
                     ..Default::default()
                 })
                 .collect(),
@@ -368,6 +391,16 @@ mod tests {
             active_time_s: 1.0,
             lines: 2,
             ts: "2026-01-01T00:00:00Z".to_string(),
+            observed_metrics: Some(
+                [
+                    "token.usage",
+                    "cost.usage",
+                    "active_time.total",
+                    "lines_of_code.count",
+                ]
+                .map(String::from)
+                .into(),
+            ),
             ..CostRow::default()
         };
         let groups = cost_by_project(
@@ -387,5 +420,29 @@ mod tests {
         // A row whose project was never resolved keys on the empty string it holds, so a real
         // project can never absorb its spend — whatever that project is called.
         assert_eq!(groups[2].key.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn cost_summary_uses_explicit_observations_and_keeps_true_zero() {
+        let rows = [
+            CostRow {
+                project: "repo".into(),
+                cost_usd: 0.0,
+                observed_metrics: Some(["cost.usage".into()].into()),
+                ..Default::default()
+            },
+            CostRow {
+                project: "repo".into(),
+                cost_usd: 19.0,
+                ..Default::default()
+            },
+        ];
+        let groups = cost_by_project(&rows, 0);
+        let cost = &groups[0].sums[1];
+        assert_eq!(
+            (cost.sum, cost.valid_count, cost.missing_count),
+            (0.0, 1, 1)
+        );
+        assert_eq!(groups[0].sums[0].valid_count, 0);
     }
 }
