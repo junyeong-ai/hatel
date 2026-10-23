@@ -82,6 +82,12 @@ fields = { session_id = { type = "string" }, project = { type = "string" }, prom
 group_key = "session_id"
 
 [[kind]]
+name = "check"
+fields = { name = { type = "string", required = true }, suite = { type = "string" }, outcome = { type = "string", required = true }, duration_s = { type = "number", unit = "s" }, exit_code = { type = "integer" }, signal = { type = "string" } }
+group_key = "name"
+measures = ["duration_s"]
+
+[[kind]]
 name = "claude.api_request"
 fields = { session_id = { type = "string", required = true }, request_id = { type = "string" }, model = { type = "string" }, agent = { type = "string" }, skill = { type = "string" }, query_source = { type = "string" }, cost_usd = { type = "number", unit = "USD" }, duration_ms = { type = "number", unit = "ms" }, input_tokens = { type = "integer", unit = "tokens" }, output_tokens = { type = "integer", unit = "tokens" }, cache_read_tokens = { type = "integer", unit = "tokens" }, cache_creation_tokens = { type = "integer", unit = "tokens" } }
 group_key = "model"

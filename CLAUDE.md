@@ -94,6 +94,9 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
   override those per query. Answering a new question is a query, not a schema edit.
+  The common `check` Kind records producer-observed execution outcomes and seconds. Producers
+  distinguish a command exit, timeout, spawn error, signal and reuse at their execution boundary;
+  missing durations or exit codes stay absent. It implies no defect, flakiness or saved time.
 - **Typed records and explicit missingness.** A Kind's field declarations own types, requiredness
   and units. Numbers are JSON numbers; invalid legacy values remain visible as `invalid_count`.
   Reports aggregate inside SQLite with bounded caches, including when reading a legacy JSONL

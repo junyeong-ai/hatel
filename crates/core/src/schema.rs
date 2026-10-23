@@ -187,4 +187,26 @@ mod tests {
         // Guard: the strict schema must still accept the embedded core TOML in full.
         assert!(load_core().is_ok());
     }
+
+    #[test]
+    fn checks_keep_missing_measurements_distinct_from_zero() {
+        let registry = load_core().unwrap();
+        let record = |payload| {
+            crate::make_envelope(
+                "check",
+                serde_json::from_value(payload).unwrap(),
+                &registry,
+                true,
+            )
+        };
+        let reused = record(serde_json::json!({"name":"lint","outcome":"reused"})).unwrap();
+        assert!(!reused.payload.contains_key("duration_s"));
+        let zero =
+            record(serde_json::json!({"name":"lint","outcome":"passed","duration_s":0})).unwrap();
+        assert_eq!(zero.payload["duration_s"], 0);
+        assert!(record(serde_json::json!({"name":"lint","duration_s":1})).is_err());
+        assert!(
+            record(serde_json::json!({"name":"lint","outcome":"passed","duration_s":"1"})).is_err()
+        );
+    }
 }
