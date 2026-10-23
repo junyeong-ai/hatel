@@ -242,7 +242,7 @@ hatel service --restart
 
 Full diagnosis also checks Claude Code wiring; `--local` checks local recording, registry, storage and delivery. `doctor` observes this process and configuration, not another session’s launch environment. Claude Code strips its `OTEL_*` variables from subprocesses, so a tool’s environment alone cannot establish a session’s actual destination.
 
-After upgrading, restart the receiver and existing MCP sessions to use the new build. Services point to the installing binary and preserve hand-edited units. Logs are `~/Library/Logs/hatel/serve.log` on macOS and `journalctl --user -u hatel` on Linux. Resolve configuration, storage and missing-schema findings before interpreting empty reports.
+After upgrading, restart the receiver and reconnect existing MCP servers to use the new build. In Claude Code, use `/mcp` → `hatel` → `Reconnect` while keeping the conversation open. Services point to the installing binary and preserve hand-edited units. Logs are `~/Library/Logs/hatel/serve.log` on macOS and `journalctl --user -u hatel` on Linux. Resolve configuration, storage and missing-schema findings before interpreting empty reports.
 
 Built-in local Kinds do not store raw prompts, command output or arbitrary tool inputs. Operators own custom-schema data selection. Hashing does not guarantee anonymity. Common metadata can contain repository paths and identifiers; treat ledgers and reports as sensitive local data. Custom delivery omits the local path key but includes project labels and selected fields and IDs.
 
