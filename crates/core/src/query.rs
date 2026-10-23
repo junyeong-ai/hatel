@@ -1,0 +1,279 @@
+//! One bounded-memory aggregation engine for the runtime ledger and legacy imports.
+
+use crate::report::{GroupAgg, Measure, Query};
+use crate::{Config, Envelope, KindSpec, SinkKind};
+use rusqlite::{Connection, functions::FunctionFlags, types::Value};
+use std::io::BufRead;
+
+fn io(e: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Io(e.to_string())
+}
+
+pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_scalar_function("hatel_epoch", 1, flags, |c| {
+        Ok(c.get::<String>(0)?
+            .parse::<jiff::Timestamp>()
+            .ok()
+            .map(|t| t.as_second()))
+    })?;
+    conn.create_scalar_function("hatel_nanos", 1, flags, |c| {
+        Ok(c.get::<String>(0)?
+            .parse::<jiff::Timestamp>()
+            .ok()
+            .map(|t| t.subsec_nanosecond()))
+    })
+}
+
+fn path(field: &str) -> String {
+    format!(
+        "$.{}",
+        serde_json::to_string(field).expect("field serializes")
+    )
+}
+
+fn label(expression: &str) -> String {
+    format!(
+        "CASE json_type(payload, {expression}) WHEN 'text' THEN json_extract(payload, {expression}) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN 'null' ELSE json_quote(json_extract(payload, {expression})) END"
+    )
+}
+
+fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
+    let conn = if cfg.sink == SinkKind::Sqlite {
+        let db = cfg.state_dir.join("telemetry.db");
+        if !db.exists() {
+            scratch()?
+        } else {
+            Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(io)?
+        }
+    } else {
+        let mut conn = scratch()?;
+        let tx = conn.transaction().map_err(io)?;
+        {
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO records (ts, kind, schema_version, payload, metadata) VALUES (?1,?2,?3,?4,?5)",
+                )
+                .map_err(io)?;
+            for (_, file) in
+                crate::rolling::open_snapshot(&cfg.ledger_dir, &format!("{kind}.jsonl"))
+                    .map_err(io)?
+            {
+                for line in std::io::BufReader::new(file).lines() {
+                    let line = line.map_err(io)?;
+                    let Some(env) = Envelope::from_json_line(&line) else {
+                        continue;
+                    };
+                    if env.kind != kind {
+                        continue;
+                    }
+                    insert
+                        .execute(rusqlite::params![
+                            env.ts,
+                            env.kind,
+                            env.schema_version,
+                            serde_json::to_string(&env.payload).map_err(io)?,
+                            serde_json::to_string(&env.metadata).map_err(io)?
+                        ])
+                        .map_err(io)?;
+                }
+            }
+        }
+        tx.commit().map_err(io)?;
+        conn
+    };
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(io)?;
+    conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")
+        .map_err(io)?;
+    functions(&conn).map_err(io)?;
+    let columns = conn
+        .prepare("PRAGMA table_info(records)")
+        .map_err(io)?
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(io)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(io)?;
+    let metadata = if columns.iter().any(|c| c == "metadata") {
+        "metadata"
+    } else {
+        "'{}'"
+    };
+    let seconds = if columns.iter().any(|c| c == "occurred_seconds") {
+        "occurred_seconds"
+    } else {
+        "NULL"
+    };
+    conn.execute_batch(&format!("CREATE TEMP VIEW records_read AS SELECT rowid AS sequence, ts,kind,schema_version,payload,{metadata} AS metadata,{seconds} AS occurred_seconds FROM records;")).map_err(io)?;
+    Ok(conn)
+}
+
+fn scratch() -> crate::Result<Connection> {
+    let conn = Connection::open("").map_err(io)?;
+    conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
+        CREATE TABLE records (ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}');").map_err(io)?;
+    functions(&conn).map_err(io)?;
+    Ok(conn)
+}
+
+pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
+    let conn = connection(cfg, &spec.name)?;
+    let mut args: Vec<Value> = vec![
+        spec.name.clone().into(),
+        q.since.into(),
+        i64::from(crate::SCHEMA_VERSION).into(),
+    ];
+    let mut parameter = |value: String| {
+        args.push(value.into());
+        format!("?{}", args.len())
+    };
+    let dimension = parameter(path(q.group_by.unwrap_or(&spec.group_key)));
+    let dimension_label = if q.group_by.unwrap_or(&spec.group_key) == "project" {
+        format!(
+            "COALESCE(json_extract(metadata, '$.project.key'), {})",
+            label(&dimension)
+        )
+    } else {
+        label(&dimension)
+    };
+    let mut conditions = vec![
+        "kind=?1".to_string(),
+        "(occurred_seconds>=?2 OR (occurred_seconds IS NULL AND hatel_epoch(ts)>=?2))".into(),
+        "schema_version<=?3".into(),
+    ];
+    if let Some(project) = q.project {
+        let p = parameter(project.into());
+        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={p}))"));
+    }
+    for (field, value) in q.filters {
+        let field_path = parameter(path(field));
+        let value_param = parameter(value.clone());
+        conditions.push(format!(
+            "json_type(payload, {field_path}) IS NOT NULL AND {}={value_param}",
+            label(&field_path)
+        ));
+    }
+    let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
+        format!(
+            "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"
+        )
+    } else {
+        format!(
+            "CASE WHEN json_type(payload, {dimension}) IS NULL THEN NULL ELSE {dimension_label} END"
+        )
+    };
+    let identity = spec.identity.as_ref().map(|field| {
+        let p = parameter(path(field));
+        format!(
+            "CASE WHEN json_type(payload, {p}) IS NULL THEN NULL ELSE {} END",
+            label(&p)
+        )
+    });
+    let mut sql = format!(
+        "WITH scoped AS (SELECT sequence, ts, payload, {key} AS key {} FROM records_read WHERE {})",
+        identity
+            .as_ref()
+            .map(|i| format!(", {i} AS identity"))
+            .unwrap_or_default(),
+        conditions.join(" AND ")
+    );
+    let from = if identity.is_some() {
+        sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY hatel_epoch(ts), hatel_nanos(ts), sequence) AS ordinal FROM scoped)");
+        "ranked WHERE identity IS NULL OR ordinal=1"
+    } else {
+        "scoped"
+    };
+    let mut columns = vec!["key".to_string(), "COUNT(*)".into()];
+    let mut layouts = Vec::new();
+    for measure in &spec.measures {
+        let p = parameter(path(measure));
+        let value = format!("json_extract(payload, {p})");
+        let valid = format!(
+            "json_type(payload, {p}) IN ('integer','real') AND abs({value})<=1.7976931348623157e308"
+        );
+        let start = columns.len();
+        columns.extend([
+            format!("COALESCE(SUM(CASE WHEN {valid} THEN CAST({value} AS REAL) END),0.0)"),
+            format!("COUNT(CASE WHEN {valid} THEN 1 END)"),
+            format!("COUNT(CASE WHEN json_type(payload, {p}) IS NULL THEN 1 END)"),
+            format!("AVG(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"),
+            format!("MIN(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"),
+            format!("MAX(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"),
+        ]);
+        let scale = match spec.field_specs[measure].unit.as_deref() {
+            Some("s") => Some(1.0),
+            Some("ms") => Some(1000.0),
+            _ => None,
+        };
+        let bounds: Vec<f64> = scale
+            .map(|scale| {
+                [0.01, 0.1, 1.0, 10.0, 60.0, 300.0]
+                    .map(|b| b * scale)
+                    .to_vec()
+            })
+            .unwrap_or_default();
+        for bound in &bounds {
+            columns.push(format!(
+                "COUNT(CASE WHEN {valid} AND {value}<={bound} THEN 1 END)"
+            ));
+        }
+        layouts.push((start, bounds));
+    }
+    sql.push_str(&format!(
+        " SELECT {} FROM {from} GROUP BY key",
+        columns.join(",")
+    ));
+    let sort = q.sort_by.or(spec.measures.first().map(String::as_str));
+    let sort_column = sort
+        .and_then(|s| spec.measures.iter().position(|m| m == s))
+        .map_or(2, |i| layouts[i].0 + 1);
+    sql.push_str(&format!(" ORDER BY {sort_column} DESC, key IS NULL, key"));
+    if q.top_n > 0 {
+        sql.push_str(&format!(" LIMIT {}", q.top_n));
+    }
+    let mut stmt = conn.prepare(&sql).map_err(io)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |row| {
+            let count: i64 = row.get(1)?;
+            let sums = spec
+                .measures
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let (start, bounds) = &layouts[i];
+                    let start = *start;
+                    let valid_count: i64 = row.get(start + 1)?;
+                    let missing_count: i64 = row.get(start + 2)?;
+                    Ok(Measure {
+                        name: name.clone(),
+                        sum: row.get(start)?,
+                        valid_count,
+                        missing_count,
+                        invalid_count: count - valid_count - missing_count,
+                        avg: row.get(start + 3)?,
+                        min: row.get(start + 4)?,
+                        max: row.get(start + 5)?,
+                        unit: spec.field_specs[name].unit.clone(),
+                        buckets: bounds
+                            .iter()
+                            .enumerate()
+                            .map(|(j, upper_bound)| {
+                                Ok(crate::report::Bucket {
+                                    upper_bound: *upper_bound,
+                                    count: row.get(start + 6 + j)?,
+                                })
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                    })
+                })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(GroupAgg {
+                key: row.get(0)?,
+                count,
+                sums,
+            })
+        })
+        .map_err(io)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)
+}

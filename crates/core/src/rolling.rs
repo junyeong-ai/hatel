@@ -189,6 +189,29 @@ fn matching_files(dir: &Path, base: &str) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
+/// Open one stable file set before streaming. Renames after opening do not invalidate handles.
+pub(crate) fn open_snapshot(dir: &Path, base: &str) -> std::io::Result<Vec<(PathBuf, fs::File)>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    for _ in 0..4 {
+        let before =
+            matching_files(dir, base).ok_or_else(|| std::io::Error::other("cannot list ledger"))?;
+        let opened: std::io::Result<Vec<_>> = before
+            .iter()
+            .map(|p| fs::File::open(p).map(|f| (p.clone(), f)))
+            .collect();
+        match opened {
+            Ok(files) if matching_files(dir, base).as_ref() == Some(&before) => return Ok(files),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Err(std::io::Error::other(
+        "ledger changed while opening; retry after writers settle",
+    ))
+}
+
 /// A cheap change signature over `base`'s files — `(file count, total bytes, newest mtime)` — for a
 /// reader that caches the folded contents and only re-reads when this changes. Total bytes strictly
 /// increases on append and falls on a prune, so it catches a change the 1-second mtime granularity

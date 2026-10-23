@@ -115,3 +115,19 @@ pub fn prune(cfg: &Config, retention: Retention) -> usize {
         SinkKind::Sqlite => sqlite::prune_records(&sqlite_db_path(cfg), retention.cutoff),
     }
 }
+
+pub(crate) fn jsonl_kinds(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    jsonl::stored_kinds(dir)
+}
+
+pub(crate) fn open_database(path: &std::path::Path) -> crate::Result<rusqlite::Connection> {
+    SqliteSink::init(&path.to_path_buf()).map_err(|e| crate::Error::Io(e.to_string()))
+}
+
+pub(crate) fn default_kind(state: &std::path::Path) -> SinkKind {
+    if jsonl::stored_kinds(&state.join("ledger")).is_ok_and(|kinds| !kinds.is_empty()) {
+        SinkKind::Jsonl
+    } else {
+        SinkKind::Sqlite
+    }
+}

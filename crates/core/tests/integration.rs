@@ -946,7 +946,7 @@ fn parse_window_rejects_overflow_and_nonsense() {
 }
 
 #[test]
-fn report_sums_measures_and_coerces_numeric_strings() {
+fn report_separates_legacy_invalid_measures_from_real_numbers() {
     let cfg = test_config(vec![example_plugin()]);
     let reg = build_registry(&cfg).unwrap();
     std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
@@ -970,9 +970,12 @@ fn report_sums_measures_and_coerces_numeric_strings() {
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key.as_deref(), Some("lint"));
     assert_eq!(groups[0].count, 2);
-    // runs: 14000 (number) + "1000" (numeric string, coerced) = 15000
     assert_eq!(groups[0].sums[0].name, "runs");
-    assert_eq!(groups[0].sums[0].sum, 15000.0);
+    assert_eq!(groups[0].sums[0].sum, 14000.0);
+    assert_eq!(groups[0].sums[0].valid_count, 1);
+    assert_eq!(groups[0].sums[0].invalid_count, 1);
+    assert_eq!(groups[0].sums[0].missing_count, 0);
+    assert_eq!(groups[0].sums[0].avg, Some(14000.0));
     assert_eq!(groups[0].sums[1].name, "failures");
     assert_eq!(groups[0].sums[1].sum, 5.0);
 }
@@ -2007,4 +2010,91 @@ fn receipts_follow_storage_and_metadata_survives_each_backend() {
     let reg = build_registry(&cfg).unwrap();
     let env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
     assert!(hatel_core::build_sink(&cfg).write_record(&env).is_err());
+}
+
+#[test]
+fn jsonl_import_is_atomic_repeatable_and_preserves_identical_legacy_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("ledger");
+    std::fs::create_dir(&source).unwrap();
+    let line = r#"{"ts":"2026-01-01T00:00:00Z","kind":"prompt","payload":{"session_id":"s"}}"#;
+    let path = source.join("prompt.jsonl");
+    std::fs::write(&path, format!("{line}\n{line}\ninvalid\n")).unwrap();
+    let db = dir.path().join("telemetry.db");
+    assert!(hatel_core::migration::import_jsonl(&source, &db).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let original = format!("{line}\n{line}\n");
+    std::fs::write(&path, &original).unwrap();
+    assert_eq!(
+        hatel_core::migration::import_jsonl(&source, &db).unwrap(),
+        2
+    );
+    assert_eq!(
+        hatel_core::migration::import_jsonl(&source, &db).unwrap(),
+        0
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(DISTINCT json_extract(metadata, '$.record_id')) FROM records",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        2
+    );
+    std::fs::write(&path, format!("{original}{line}\n")).unwrap();
+    assert!(hatel_core::migration::import_jsonl(&source, &db).is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn query_reports_zero_missing_invalid_and_duration_buckets_without_coercion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    hatel_core::build_sink(&cfg).flush().unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
+    for payload in [
+        serde_json::json!({"duration_ms": 0}),
+        serde_json::json!({"duration_ms": 1000}),
+        serde_json::json!({}),
+        serde_json::json!({"duration_ms": "1000"}),
+    ] {
+        conn.execute(
+            "INSERT INTO records(ts,kind,schema_version,payload) VALUES (?1,'tool',1,?2)",
+            rusqlite::params!["2026-01-01T00:00:00Z", payload.to_string()],
+        )
+        .unwrap();
+    }
+    let reg = build_registry(&cfg).unwrap();
+    let groups =
+        hatel_core::query::aggregate(&cfg, reg.kind("tool").unwrap(), &query(0, 0, None)).unwrap();
+    let measure = &groups[0].sums[0];
+    assert_eq!(groups[0].key, None);
+    assert_eq!(
+        (
+            measure.valid_count,
+            measure.missing_count,
+            measure.invalid_count
+        ),
+        (2, 1, 1)
+    );
+    assert_eq!(measure.sum, 1000.0);
+    assert_eq!(measure.avg, Some(500.0));
+    assert_eq!(measure.min, Some(0.0));
+    assert_eq!(measure.max, Some(1000.0));
+    assert_eq!(measure.buckets[0].count, 1);
+    assert_eq!(measure.buckets[2].count, 2);
 }

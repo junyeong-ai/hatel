@@ -30,7 +30,7 @@ and its CI check unless a deliberate compatibility change requires raising both.
 ## Layout
 
 - `crates/core` — async-free library: registry/schema (Kind definitions, `core.toml`),
-  settings (`config.toml`) and the resolved runtime config, sinks (JSONL/SQLite), sessions,
+  settings (`config.toml`) and the resolved runtime config, SQLite/WAL ledger, JSONL compatibility/import, sessions,
   cost snapshot, report aggregation and its render, PII.
 - `crates/hook` — the hook binary; depends on core only, no async runtime (spawned on
   every lifecycle event — cold-start is a design constraint).
@@ -74,10 +74,17 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`
   override those per query. Answering a new question is a query, not a schema edit.
+- **Typed records and explicit missingness.** A Kind's field declarations own types, requiredness
+  and units. Numbers are JSON numbers; invalid legacy values remain visible as `invalid_count`.
+  Reports aggregate inside SQLite with bounded caches, including when reading a legacy JSONL
+  store. A field's duration buckets are cumulative and use its declared `s` or `ms` unit.
 - **One registry and one store for the write and read paths.** Plugins and `[storage]` live in
   `config.toml`, which the hook, the service's receiver and `report` all read however each was
   started, so a Kind the hook can record is one `report` can read, in the store it reads;
-  `HATEL_PLUGINS` and the storage variables override them for a single process only. The receiver
+  `HATEL_PLUGINS` and the storage variables override them for a single process only. Fresh stores
+  default to SQLite; an existing JSONL ledger keeps its backend until `migrate --quiescent`
+  imports it and saves the selection. Stop its writers first; the command holds the receiver
+  lock, preserves sources, and records an atomic import manifest so retries do not duplicate rows. The receiver
   reads the file when it starts, and again before it deletes anything, keeping the longer retention
   and deleting nothing while the file cannot be read. It reports that file and its store on
   `/healthz`; `doctor` names a receiver that reads another file or writes another store, and the

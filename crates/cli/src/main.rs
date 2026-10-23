@@ -158,6 +158,12 @@ enum Command {
     },
     /// Record a JSON array of {kind, payload, context?} from stdin; returns one result per item.
     EmitBatch,
+    /// Import a stopped JSONL ledger without changing its files, then select SQLite in config.
+    Migrate {
+        /// Assert that hooks and receiver writing this ledger have been stopped.
+        #[arg(long, required = true)]
+        quiescent: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -235,6 +241,7 @@ fn run() -> i32 {
             context,
         } => emit_cmd(&kind, fields, json, receipt, context),
         Command::EmitBatch => emit_batch_cmd(),
+        Command::Migrate { quiescent: _ } => migrate_cmd(),
     }
 }
 
@@ -362,6 +369,46 @@ fn emit_batch_cmd() -> i32 {
     }
 }
 
+fn migrate_cmd() -> i32 {
+    let result = (|| -> hatel_core::Result<usize> {
+        for variable in ["HATEL_SINK", "HATEL_STATE_DIR"] {
+            if std::env::var_os(variable).is_some_and(|v| !v.is_empty()) {
+                return Err(hatel_core::Error::Io(format!(
+                    "unset {variable} before migrating; configure storage in config.toml"
+                )));
+            }
+        }
+        let cfg = Config::load()?;
+        let _lock = match serve::acquire_state_lock(&cfg.state_dir) {
+            serve::LockOutcome::Acquired(lock) => lock,
+            serve::LockOutcome::Held => {
+                return Err(hatel_core::Error::Io(
+                    "stop the receiver before migrating".into(),
+                ));
+            }
+            serve::LockOutcome::Failed(error) => return Err(hatel_core::Error::Io(error)),
+        };
+        let imported = hatel_core::migration::import_jsonl(
+            &cfg.ledger_dir,
+            &cfg.state_dir.join("telemetry.db"),
+        )?;
+        let mut settings = hatel_core::Settings::load()?;
+        settings.storage.sink = Some(hatel_core::SinkKind::Sqlite);
+        settings.save()?;
+        Ok(imported)
+    })();
+    match result {
+        Ok(count) => {
+            println!("imported {count} records; storage=sqlite; source files preserved");
+            0
+        }
+        Err(e) => {
+            eprintln!("migrate: {e}");
+            1
+        }
+    }
+}
+
 /// Build the payload from, in precedence: an explicit `--json` object, else
 /// `key=value` / `key:=json` field pairs, else a JSON object on stdin.
 fn build_payload(fields: Vec<String>, json: Option<String>) -> Result<Payload, String> {
@@ -459,12 +506,13 @@ fn report_cmd(
         filters: &filters,
     };
     let report = report::Report::build(&reg, &cfg, window, &q);
+    let failed = report.kinds.iter().any(|kind| kind.error.is_some());
     match format {
         Format::Json => print!("{}", report_json(&report)),
         Format::Md => print!("{}", render::format_markdown(&report)),
         Format::Text => print!("{}", render::format_text(&report)),
     }
-    0
+    i32::from(failed)
 }
 
 /// Why a Kind name did not resolve. A name the store already holds records for is not a typo but

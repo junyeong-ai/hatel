@@ -477,7 +477,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// keep it alive for the process lifetime), `Held` (another receiver currently holds it — this
 /// instance can't run yet: it waits for the lock under `--wait` and exits non-zero otherwise), or
 /// `Failed` (a genuine I/O problem).
-enum LockOutcome {
+pub(crate) enum LockOutcome {
     Acquired(std::fs::File),
     Held,
     Failed(String),
@@ -488,7 +488,7 @@ enum LockOutcome {
 /// is told to stand down instead of racing the cost snapshot and the tool ledger, which assume one
 /// writer.
 #[cfg(unix)]
-fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
+pub(crate) fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
     use std::os::unix::io::AsRawFd as _;
     if let Err(e) = std::fs::create_dir_all(state_dir) {
         return LockOutcome::Failed(format!(
@@ -529,7 +529,7 @@ fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
 }
 
 #[cfg(windows)]
-fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
+pub(crate) fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
     use std::os::windows::fs::OpenOptionsExt as _;
     if let Err(e) = std::fs::create_dir_all(state_dir) {
         return LockOutcome::Failed(format!(
@@ -555,7 +555,7 @@ fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn acquire_state_lock(_state_dir: &Path) -> LockOutcome {
+pub(crate) fn acquire_state_lock(_state_dir: &Path) -> LockOutcome {
     // No advisory-lock primitive on this platform: the cost snapshot and tool ledger require one
     // writer, so refuse rather than run without that guarantee (never a silent no-op). Unreachable
     // on real targets — unix and windows cover every platform that can run the receiver.

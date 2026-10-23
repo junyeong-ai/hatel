@@ -7,14 +7,14 @@
 //! two apart is what lets one schema answer more than one question, and what keeps every output
 //! format rendering the same computed answer rather than deriving its own.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::Serialize;
 
 use crate::cost::{self, CostRow};
 use crate::registry::Registry;
 use crate::schema::UnreadableKinds;
-use crate::{Config, Envelope, sink, ts_epoch};
+use crate::{Config, sink, ts_epoch};
 
 /// How many groups a report shows per Kind.
 pub const TOP_N: usize = 5;
@@ -38,10 +38,24 @@ pub fn parse_window(spec: &str) -> Option<i64> {
 }
 
 /// One measure's summed value for a group.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Measure {
     pub name: String,
     pub sum: f64,
+    pub valid_count: i64,
+    pub missing_count: i64,
+    pub invalid_count: i64,
+    pub avg: Option<f64>,
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub unit: Option<String>,
+    pub buckets: Vec<Bucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Bucket {
+    pub upper_bound: f64,
+    pub count: i64,
 }
 
 /// One group's aggregate: its key, how many records it had, and the sum of each
@@ -117,6 +131,7 @@ pub struct KindSection {
     pub project_scope: ProjectScope,
     pub retained_since: Option<String>,
     pub groups: Vec<GroupAgg>,
+    pub error: Option<String>,
 }
 
 /// A whole report: the query that produced it and the answer to it. Computed once, rendered by
@@ -147,11 +162,18 @@ impl Report {
             .map(|spec| {
                 let project_scope = match q.project {
                     None => ProjectScope::Unrestricted,
-                    Some(_) if spec.fields.contains("project") => ProjectScope::Applied,
-                    Some(_) => ProjectScope::Unsupported,
+                    Some(_) => ProjectScope::Applied,
                 };
                 let group_by = q.group_by.unwrap_or(&spec.group_key);
                 let sort_by = q.sort_by.or(spec.measures.first().map(String::as_str));
+                let result = match project_scope {
+                    ProjectScope::Unsupported => Ok(Vec::new()),
+                    _ => crate::query::aggregate(cfg, spec, q),
+                };
+                let (groups, error) = match result {
+                    Ok(groups) => (groups, None),
+                    Err(e) => (Vec::new(), Some(e.to_string())),
+                };
                 KindSection {
                     kind: spec.name.clone(),
                     group_by: group_by.to_string(),
@@ -159,10 +181,8 @@ impl Report {
                     identity: spec.identity.clone(),
                     project_scope,
                     retained_since: sink::oldest_record_ts(cfg, &spec.name, q.project),
-                    groups: match project_scope {
-                        ProjectScope::Unsupported => Vec::new(),
-                        _ => aggregate(reg, cfg, &spec.name, q),
-                    },
+                    groups,
+                    error,
                 }
             })
             .collect();
@@ -228,6 +248,7 @@ pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
                 .map(|(name, sum)| Measure {
                     name: name.to_string(),
                     sum,
+                    ..Default::default()
                 })
                 .collect(),
         })
@@ -243,93 +264,19 @@ pub fn cost_axes() -> (&'static str, &'static str) {
     (COST_DIMENSION, COST_RANK)
 }
 
-/// Aggregate one Kind under `q`: group in-window records by the query's dimension (the Kind's
-/// `group_key` unless overridden), count them, and sum each declared measure. A Kind declaring
-/// an `identity` counts the distinct entities its records describe rather than the records, and
-/// each entity contributes its earliest record's measures. Records are read from the configured
-/// storage backend (JSONL / SQLite) in no particular order and put in time order here.
-///
-/// `kind` is the Kind being aggregated right now (the caller's loop variable); `q.kind` is
-/// the report-level restriction the caller applies when choosing which Kinds to loop over,
-/// and is not consulted here.
+/// Aggregate one Kind through the shared SQL engine. Reports retain query failures in their
+/// section; this convenience API also reports them on stderr.
 pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<GroupAgg> {
     let Some(spec) = reg.kind(kind) else {
         return Vec::new();
     };
-    let dimension = q.group_by.unwrap_or(&spec.group_key);
-    let mut groups: BTreeMap<Option<String>, (i64, Vec<f64>, BTreeSet<String>)> = BTreeMap::new();
-    // `since` lets the backend skip out-of-window history (SQLite); the filter here is the
-    // correctness gate (and does the windowing for JSONL). A record with an unparseable timestamp
-    // is dropped rather than silently bucketed at epoch 0, which would flip between always-in and
-    // always-out by window size.
-    let mut records: Vec<(jiff::Timestamp, Envelope)> =
-        sink::read_records(cfg, kind, Some(q.since))
-            .into_iter()
-            .filter_map(|env| {
-                let ts = env.ts.parse::<jiff::Timestamp>().ok()?;
-                (ts.as_second() >= q.since).then_some((ts, env))
-            })
-            .collect();
-    // An identity Kind reports each entity's earliest record, which the storage order does not
-    // supply: the JSONL reader returns the active file before its older archives, and an
-    // asynchronous hook can write within one file out of the order its records are stamped in.
-    // Ordering here — the one place that needs it — is what makes the answer the same whichever
-    // backend served it.
-    if spec.identity.is_some() {
-        records.sort_by_key(|(ts, _)| *ts);
-    }
-    for (_, env) in records {
-        if let Some(p) = q.project
-            && env.payload.get("project").and_then(|v| v.as_str()) != Some(p)
-        {
-            continue;
-        }
-        // `--filter field=value`: a record lacking the field never matches.
-        if !q
-            .filters
-            .iter()
-            .all(|(field, want)| env.payload.get(field).map(value_label).as_deref() == Some(want))
-        {
-            continue;
-        }
-        let key = env.payload.get(dimension).map(value_label);
-        let entry = groups
-            .entry(key)
-            .or_insert_with(|| (0, vec![0.0; spec.measures.len()], BTreeSet::new()));
-        // A repeated identity describes an entity this group already holds. A record carrying
-        // none says nothing about being the same entity as another, so it counts as its own
-        // rather than merging into one bucket of everything unidentified.
-        if let Some(identity) = &spec.identity
-            && let Some(id) = env.payload.get(identity).map(value_label)
-            && !entry.2.insert(id)
-        {
-            continue;
-        }
-        entry.0 += 1;
-        for (i, m) in spec.measures.iter().enumerate() {
-            entry.1[i] += env.payload.get(m).map(numeric).unwrap_or(0.0);
+    match crate::query::aggregate(cfg, spec, q) {
+        Ok(groups) => groups,
+        Err(e) => {
+            eprintln!("hatel report: {kind}: {e}");
+            Vec::new()
         }
     }
-    let mut rows: Vec<GroupAgg> = groups
-        .into_iter()
-        .map(|(key, (count, sums, _))| GroupAgg {
-            key,
-            count,
-            sums: spec
-                .measures
-                .iter()
-                .cloned()
-                .zip(sums)
-                .map(|(name, sum)| Measure { name, sum })
-                .collect(),
-        })
-        .collect();
-    rank(
-        &mut rows,
-        q.sort_by.or(spec.measures.first().map(String::as_str)),
-    );
-    truncate(&mut rows, q.top_n);
-    rows
 }
 
 /// The value a group is ranked by: its sum of `measure`, or its record count when the Kind
@@ -364,25 +311,6 @@ fn truncate(groups: &mut Vec<GroupAgg>, top_n: usize) {
     }
 }
 
-fn value_label(v: &serde_json::Value) -> String {
-    match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
-}
-
-/// A measure's numeric value, accepting a JSON number or a numeric string — so a
-/// field emitted as `runs=14000` (string) sums the same as `runs:=14000` (number),
-/// turning an easy type slip into correct data rather than a silent zero. Non-finite
-/// values (`NaN` / `inf`, including the string forms) are rejected so they cannot
-/// poison a sum or the ranking.
-fn numeric(v: &serde_json::Value) -> f64 {
-    v.as_f64()
-        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        .filter(|n| n.is_finite())
-        .unwrap_or(0.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,6 +324,7 @@ mod tests {
                 .map(|(name, sum)| Measure {
                     name: name.to_string(),
                     sum: *sum,
+                    ..Default::default()
                 })
                 .collect(),
         }

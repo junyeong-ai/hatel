@@ -144,7 +144,7 @@ impl Config {
         let ledger_dir = state_dir.join("ledger");
         let sink = valid(env.sink(), &mut invalid)
             .or(settings.storage.sink)
-            .unwrap_or(SinkKind::Jsonl);
+            .unwrap_or_else(|| crate::sink::default_kind(&state_dir));
         // `HATEL_PLUGINS` replaces the file's list rather than adding to it, so a shell can pin a
         // registry exactly. An empty value is treated as unset — as `HATEL_CONFIG` is — so an
         // exported-but-blank variable cannot silently unregister every Kind. Split on the OS
@@ -424,7 +424,11 @@ mod tests {
         assert_eq!(overridden.rotate_bytes, 2048);
 
         let defaults = resolved("", &[]);
-        assert_eq!(defaults.sink, SinkKind::Jsonl);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolved("", &[("HATEL_STATE_DIR", dir.path().to_str().unwrap())]).sink,
+            SinkKind::Sqlite
+        );
         assert_eq!(defaults.state_dir, xdg_state_dir());
         assert_eq!(defaults.retention_days, DEFAULT_RETENTION_DAYS);
         assert_eq!(defaults.rotate_bytes, DEFAULT_ROTATE_BYTES);

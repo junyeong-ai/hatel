@@ -33,9 +33,10 @@ pub fn last_written(path: &Path, kind: &str) -> Option<i64> {
         return None;
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    crate::query::functions(&conn).ok()?;
     let ts: Option<String> = conn
         .query_row(
-            "SELECT MAX(ts) FROM records WHERE kind = ?1",
+            "SELECT ts FROM records WHERE kind = ?1 ORDER BY hatel_epoch(ts) DESC, hatel_nanos(ts) DESC LIMIT 1",
             [kind],
             |row| row.get(0),
         )
@@ -59,27 +60,23 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
             return Vec::new();
         }
     };
-    // The SQL pre-filter must be a safe SUPERSET (the caller applies the exact
-    // `ts >= cutoff` window in code). Stored timestamps carry fractional seconds
-    // (`...:20.5Z`) while a whole-second cutoff renders without a fraction (`...:20Z`),
-    // and the comparison is lexical — `'.'` < `'Z'`, so a fraction-less cutoff would
-    // sort AFTER a same-second record and wrongly drop it. Subtracting one second
-    // moves the cutoff strictly below every in-window record. An empty cutoff (`since`
-    // = None) sorts before any timestamp, so `ts >= ""` matches all.
-    let cutoff = since
-        .and_then(|s| jiff::Timestamp::from_second(s.saturating_sub(1)).ok())
-        .map(|t| t.to_string())
-        .unwrap_or_default();
-    let mut stmt = match conn.prepare(
-        "SELECT ts, schema_version, payload, metadata FROM records WHERE kind = ?1 AND ts >= ?2",
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("hatel: sqlite query prepare failed ({e})");
-            return Vec::new();
-        }
+    if let Err(e) = crate::query::functions(&conn) {
+        eprintln!("hatel: sqlite read: {e}");
+        return Vec::new();
+    }
+    let has_metadata = conn
+        .prepare("PRAGMA table_info(records)")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .is_ok_and(|cols| cols.iter().any(|c| c == "metadata"));
+    let metadata = if has_metadata { "metadata" } else { "'{}'" };
+    let mut stmt = match conn.prepare(&format!("SELECT ts, schema_version, payload, {metadata} FROM records WHERE kind = ?1 AND (?2 IS NULL OR hatel_epoch(ts)>=?2)")) {
+        Ok(stmt) => stmt,
+        Err(e) => { eprintln!("hatel: sqlite query: {e}"); return Vec::new(); }
     };
-    let rows = stmt.query_map(rusqlite::params![kind, cutoff], |row| {
+    let rows = stmt.query_map(rusqlite::params![kind, since], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, u32>(1)?,
@@ -119,14 +116,8 @@ pub fn oldest_ts(path: &Path, kind: &str, project: Option<&str>) -> Option<Strin
         return None;
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    conn.query_row(
-        "SELECT MIN(ts) FROM records
-         WHERE kind = ?1 AND (?2 IS NULL OR json_extract(payload, '$.project') = ?2)",
-        rusqlite::params![kind, project],
-        |row| row.get::<_, Option<String>>(0),
-    )
-    .ok()
-    .flatten()
+    crate::query::functions(&conn).ok()?;
+    conn.query_row("SELECT ts FROM records WHERE kind=?1 AND (?2 IS NULL OR json_extract(payload, '$.project')=?2) ORDER BY hatel_epoch(ts),hatel_nanos(ts) LIMIT 1", rusqlite::params![kind,project], |r| r.get(0)).ok()
 }
 
 /// Rows deleted per DELETE statement during the retention sweep. Batching keeps each writer-lock
@@ -152,17 +143,17 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
     };
     // The sweep is the patient side: it waits out other writers rather than failing busy.
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    let Ok(cutoff) = jiff::Timestamp::from_second(cutoff_epoch.saturating_sub(1)) else {
-        return 0; // a cutoff outside representable time prunes nothing
-    };
+    if crate::query::functions(&conn).is_err() {
+        return 0;
+    }
     // `rowid IN (… LIMIT n)` rather than `DELETE … LIMIT`, which needs a non-default
     // SQLite compile flag.
     let mut total = 0;
     loop {
         match conn.execute(
             "DELETE FROM records WHERE rowid IN \
-             (SELECT rowid FROM records WHERE ts < ?1 LIMIT ?2)",
-            rusqlite::params![cutoff.to_string(), PRUNE_BATCH],
+             (SELECT rowid FROM records WHERE hatel_epoch(ts) < ?1 LIMIT ?2)",
+            rusqlite::params![cutoff_epoch, PRUNE_BATCH],
         ) {
             Ok(0) => break,
             Ok(n) => total += n,
@@ -186,37 +177,44 @@ impl SqliteSink {
         }
     }
 
-    fn init(path: &PathBuf) -> rusqlite::Result<Connection> {
+    pub(crate) fn init(path: &PathBuf) -> rusqlite::Result<Connection> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = Connection::open(path)?;
-        // Brief writer contention (another hook, the receiver's flush, a prune batch) should be
-        // absorbed, not turned into a dropped record — but only briefly: the hook sits on the
-        // interaction path, so it must never stall behind a slow writer for long.
-        let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             CREATE TABLE IF NOT EXISTS records (
-                 ts TEXT NOT NULL,
-                 kind TEXT NOT NULL,
-                 schema_version INTEGER NOT NULL,
-                 payload TEXT NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_records_kind_ts ON records(kind, ts);",
-        )?;
-        let has_metadata = {
-            let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_millis(100))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS records (
+            ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL
+        ); CREATE INDEX IF NOT EXISTS idx_records_kind_ts ON records(kind, ts);")?;
+        let columns = {
+            let mut stmt = tx.prepare("PRAGMA table_info(records)")?;
             stmt.query_map([], |r| r.get::<_, String>(1))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
-                .iter()
-                .any(|c| c == "metadata")
         };
-        if !has_metadata {
-            conn.execute_batch(
+        if !columns.iter().any(|c| c == "metadata") {
+            tx.execute_batch(
                 "ALTER TABLE records ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
             )?;
         }
+        if !columns.iter().any(|c| c == "occurred_seconds") {
+            tx.execute_batch("ALTER TABLE records ADD COLUMN occurred_seconds INTEGER;")?;
+        }
+        tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata, '$.record_id')) WHERE json_extract(metadata, '$.record_id') IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_records_kind_occurred ON records(kind, occurred_seconds);")?;
+        tx.commit()?;
+        crate::query::functions(&conn)?;
         Ok(conn)
     }
 }
@@ -230,8 +228,8 @@ impl Sink for SqliteSink {
         let payload =
             serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
         conn.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?],
+            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, crate::ts_epoch(&env.ts)],
         ).map_err(|e| crate::Error::Io(e.to_string()))?;
         Ok(super::WriteReceipt {
             record_id: env.metadata.record_id.clone(),

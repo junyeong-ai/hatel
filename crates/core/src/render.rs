@@ -31,6 +31,10 @@ pub fn format_text(report: &Report) -> String {
     for section in &report.kinds {
         out.push('\n');
         out.push_str(&format!("{} — {}\n", section.kind, axes(section)));
+        if let Some(error) = &section.error {
+            out.push_str(&format!("  (query failed: {error})\n"));
+            continue;
+        }
         out.push_str(&text_table(
             &section.group_by,
             "count",
@@ -61,6 +65,10 @@ pub fn format_markdown(report: &Report) -> String {
     }
     for section in &report.kinds {
         out.push_str(&format!("\n## {} — {}\n\n", section.kind, axes(section)));
+        if let Some(error) = &section.error {
+            out.push_str(&format!("Query failed: {error}\n"));
+            continue;
+        }
         out.push_str(&markdown_table(
             &section.group_by,
             "count",
@@ -384,6 +392,7 @@ mod tests {
             identity: None,
             project_scope: ProjectScope::Unrestricted,
             retained_since: None,
+            error: None,
             groups,
         }
     }
@@ -395,6 +404,7 @@ mod tests {
             sums: vec![Measure {
                 name: "duration_ms".to_string(),
                 sum,
+                ..Default::default()
             }],
         }
     }
@@ -564,10 +574,12 @@ mod tests {
                 Measure {
                     name: "evaluations".to_string(),
                     sum: first,
+                    ..Default::default()
                 },
                 Measure {
                     name: "violations".to_string(),
                     sum: second,
+                    ..Default::default()
                 },
             ],
         };
