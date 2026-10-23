@@ -2,6 +2,7 @@
 
 pub mod accumulator;
 pub mod decode;
+pub mod projection;
 
 pub use accumulator::{Accumulator, SessionTotals, UNATTRIBUTED};
 pub use decode::{parse_logs, parse_metrics};

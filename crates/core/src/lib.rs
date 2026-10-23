@@ -4,10 +4,10 @@
 //! link it without pulling in the receiver's async stack. The receiver (in the
 //! `cli` crate) reuses the same model, registry, sinks, and session index.
 
+pub mod claude;
 pub mod config;
 pub mod cost;
 pub mod export;
-pub mod hook;
 pub mod migration;
 pub mod model;
 pub mod outbox;

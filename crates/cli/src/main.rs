@@ -1,12 +1,12 @@
 //! `hatel` — the collector binary: OTLP receiver, reports, doctor, registry
 //! introspection, and the MCP server (the same surfaces, served as typed tools).
 
+mod claude;
 mod claude_settings;
 mod doctor;
 mod export;
 mod init;
 mod mcp;
-mod otlp;
 mod receiver;
 mod serve;
 mod service;
@@ -21,7 +21,7 @@ use hatel_core::{Config, Payload, Registry, render, report};
 #[command(
     name = "hatel",
     version,
-    about = "Local Claude Code telemetry collector"
+    about = "Local telemetry records, reports and Claude Code observability"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -123,6 +123,9 @@ enum Command {
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Inspect local recording, schemas and deliveries without Claude Code wiring checks.
+        #[arg(long)]
+        local: bool,
     },
     /// Serve `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio —
     /// the programmatic surface for agents (`claude mcp add hatel -- hatel mcp`).
@@ -235,7 +238,7 @@ fn run() -> i32 {
         } else {
             service::Action::Install
         }),
-        Command::Doctor { json } => doctor::run(json),
+        Command::Doctor { json, local } => doctor::run(json, local),
         Command::Mcp => mcp::run(),
         Command::Kinds { json } => kinds_cmd(json),
         Command::Emit {
@@ -601,7 +604,7 @@ pub(crate) fn parse_query(
     }
     if let Some(field) = group_by {
         let spec = kind_of(reg, kind, "--group-by")?;
-        if !spec.fields.contains(field) {
+        if !spec.query_field(field) {
             let accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
             return Err(format!(
                 "{} has no field {field:?} to group by — accepted fields: {}",
@@ -669,7 +672,7 @@ pub(crate) fn parse_filters(
         if field.is_empty() {
             return Err(format!("filter {f:?} has an empty field"));
         }
-        if !spec.fields.contains(field) {
+        if !spec.query_field(field) {
             let accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
             return Err(format!(
                 "{kind} has no field {field:?} to filter on — accepted fields: {}",
@@ -711,6 +714,8 @@ pub(crate) fn kinds_value(
                 "fields": s.fields,
                 "field_specs": s.field_specs,
                 "version": s.version,
+                "schema_id": s.schema_id,
+                "metadata_fields": hatel_core::registry::METADATA_FIELDS,
                 "group_key": s.group_key,
                 "redact": s.redact,
                 "measures": s.measures,

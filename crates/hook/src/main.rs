@@ -18,5 +18,5 @@ fn main() {
     let _ = std::io::stdin()
         .take(MAX_STDIN_BYTES)
         .read_to_string(&mut buf);
-    std::process::exit(hatel_core::hook::run_hook(&buf));
+    std::process::exit(hatel_core::claude::hook::run_hook(&buf));
 }

@@ -4,9 +4,7 @@
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::report::{
-    GroupAgg, KindSection, ProjectScope, Report, cost_axes, cost_by_project, rank_value,
-};
+use crate::report::{GroupAgg, KindSection, Report, cost_axes, cost_by_project, rank_value};
 
 /// Width of the magnitude bar that prefixes a terminal row. Fixed, so rows stay aligned across
 /// sections and the eye can compare within one.
@@ -126,13 +124,10 @@ fn inline(s: &str) -> String {
 
 /// What to say in place of rows, when there are none to say anything about.
 fn note(section: &KindSection) -> Option<&'static str> {
-    match section.project_scope {
-        ProjectScope::Unsupported => {
-            Some("records no project, so a project scope cannot select it")
-        }
-        _ if section.groups.is_empty() => Some("no records in this window"),
-        _ => None,
-    }
+    section
+        .groups
+        .is_empty()
+        .then_some("no records in this window")
 }
 
 fn text_table(
@@ -382,7 +377,7 @@ fn pad_left(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{Filter, Measure};
+    use crate::report::{Filter, Measure, ProjectScope};
 
     fn section(kind: &str, groups: Vec<GroupAgg>) -> KindSection {
         KindSection {
@@ -417,6 +412,7 @@ mod tests {
             top_n: 5,
             kinds,
             cost: Vec::new(),
+            cost_basis: "session_lifetime_totals_selected_by_last_seen",
             unreadable_kinds: None,
         }
     }
@@ -495,16 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_that_records_no_project_says_so_instead_of_showing_nothing() {
-        // The distinction the report exists to preserve: "this Kind cannot be project-scoped" is
-        // not "this project did none of it".
+    fn an_empty_project_scope_reports_records_without_asserting_inactivity() {
         let mut s = section("aix.rules", Vec::new());
-        s.project_scope = ProjectScope::Unsupported;
+        s.project_scope = ProjectScope::Applied;
         let mut r = report(vec![s]);
         r.project = Some("acme".to_string());
         let text = format_text(&r);
-        assert!(text.contains("records no project"), "{text}");
-        assert!(!text.contains("no records in this window"), "{text}");
+        assert!(text.contains("no records in this window"), "{text}");
     }
 
     #[test]

@@ -30,7 +30,14 @@ fn nanos(ts: &str) -> Option<String> {
         .and_then(|t| (t.as_nanosecond() >= 0).then(|| t.as_nanosecond().to_string()))
 }
 
-fn log(env: &Envelope) -> Value {
+fn log(env: &Envelope, redact_project: bool) -> Value {
+    let project_label = env.metadata.project.as_ref().map(|p| {
+        if redact_project {
+            hatel_core::pii::redacted(&p.label)
+        } else {
+            p.label.clone()
+        }
+    });
     let mut attributes = Vec::new();
     for (key, item) in [
         ("log.record.uid", env.metadata.record_id.as_deref()),
@@ -40,10 +47,7 @@ fn log(env: &Envelope) -> Value {
             "hatel.correlation.id",
             env.metadata.correlation_id.as_deref(),
         ),
-        (
-            "project.label",
-            env.metadata.project.as_ref().map(|p| p.label.as_str()),
-        ),
+        ("project.label", project_label.as_deref()),
     ] {
         if let Some(item) = item {
             attributes.push(json!({"key":key,"value":{"stringValue":item}}));
@@ -60,21 +64,37 @@ fn log(env: &Envelope) -> Value {
     record
 }
 
-fn body(records: &[outbox::Pending]) -> Vec<u8> {
+fn body(records: &[outbox::Pending], registry: &hatel_core::Registry) -> Vec<u8> {
     serde_json::to_vec(&json!({"resourceLogs":[{
         "resource":{"attributes":[{"key":"service.name","value":{"stringValue":"hatel"}}]},
-        "scopeLogs":[{"scope":{"name":"hatel","version":env!("CARGO_PKG_VERSION")},"logRecords":records.iter().map(|p| log(&p.record)).collect::<Vec<_>>() }]
+        "scopeLogs":[{"scope":{"name":"hatel","version":env!("CARGO_PKG_VERSION")},"logRecords":records.iter().map(|p| log(&p.record,registry.kind(&p.record.kind).is_some_and(|s|s.redact.contains("project")))).collect::<Vec<_>>() }]
     }]})).expect("OTLP logs serialize")
 }
 
-fn policy(path: &Path, state: &Path) -> Result<ExportConfig, String> {
+struct Policy {
+    export: ExportConfig,
+    registry: hatel_core::Registry,
+}
+
+impl Policy {
+    fn schema_matches(&self, record: &Envelope) -> bool {
+        self.registry.kind(&record.kind).is_some_and(|spec| {
+            record.metadata.schema_id.as_deref() == Some(spec.schema_id.as_str())
+        })
+    }
+}
+
+fn policy(path: &Path, state: &Path) -> Result<Policy, String> {
     let settings = Settings::read(path).map_err(|e| e.to_string())?;
     let (cfg, invalid) = hatel_core::Config::from_settings(&settings);
     if !invalid.is_empty() || cfg.state_dir != state || cfg.sink != hatel_core::SinkKind::Sqlite {
         return Err("running store differs from current configuration".into());
     }
-    hatel_core::schema::build_registry(&cfg).map_err(|e| e.to_string())?;
-    ExportConfig::from_settings(&settings).map_err(|e| e.to_string())
+    let registry = hatel_core::schema::build_registry(&cfg).map_err(|e| e.to_string())?;
+    Ok(Policy {
+        registry,
+        export: ExportConfig::from_settings(&settings).map_err(|e| e.to_string())?,
+    })
 }
 
 enum Delivery {
@@ -87,12 +107,13 @@ async fn send(
     client: &reqwest::Client,
     target: &ExportTarget,
     records: &[outbox::Pending],
+    registry: &hatel_core::Registry,
 ) -> Delivery {
     let mut request = client
         .post(format!("{}/v1/logs", target.endpoint))
         .header("content-type", "application/json")
         .timeout(Duration::from_millis(target.timeout_ms.unwrap_or(5000)))
-        .body(body(records));
+        .body(body(records, registry));
     for (key, value) in &target.headers {
         request = request.header(key, value);
     }
@@ -161,6 +182,9 @@ async fn send(
         .get("partialSuccess")
         .or_else(|| ack.get("partial_success"))
     {
+        if !partial.is_object() {
+            return Delivery::Failed("invalid OTLP partial acknowledgement".into());
+        }
         let rejected = partial
             .get("rejectedLogRecords")
             .or_else(|| partial.get("rejected_log_records"));
@@ -191,6 +215,7 @@ pub(crate) async fn deliver(
     let current = policy(path, state)?;
     let conn = rusqlite_connection(state)?;
     let Some(target) = current
+        .export
         .targets
         .iter()
         .find(|t| t.endpoint == destination && !t.kinds.is_empty())
@@ -207,7 +232,11 @@ pub(crate) async fn deliver(
             .record_id
             .as_deref()
             .ok_or("record has no id")?;
-        let outcome = if !target.allows_record(&pending.record) {
+        let outcome = if !current.schema_matches(&pending.record) {
+            Some(Outcome::Cancelled(
+                "record schema changed; explicit migration is required",
+            ))
+        } else if !target.allows_record(&pending.record) {
             Some(Outcome::Cancelled(
                 "current kind or project policy excludes record",
             ))
@@ -230,14 +259,15 @@ pub(crate) async fn deliver(
     }
     // Policy is checked after loading the batch as well; an unreadable policy never authorizes egress.
     let latest = policy(path, state)?;
-    let Some(target) = latest
-        .targets
-        .iter()
-        .find(|t| t.endpoint == destination && records.iter().all(|p| t.allows_record(&p.record)))
-    else {
+    let Some(target) = latest.export.targets.iter().find(|t| {
+        t.endpoint == destination
+            && records
+                .iter()
+                .all(|p| t.allows_record(&p.record) && latest.schema_matches(&p.record))
+    }) else {
         return Ok(());
     };
-    let delivery = send(client, target, &records).await;
+    let delivery = send(client, target, &records, &latest.registry).await;
     let conn = rusqlite_connection(state)?;
     let now = hatel_core::now_epoch();
     for pending in records {
@@ -430,5 +460,45 @@ mod tests {
                 .any(|s| s.status == "cancelled")
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn a_changed_redaction_contract_cancels_pending_data_even_without_a_version_bump() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join("plugin.toml");
+        std::fs::write(
+            &plugin,
+            "[[kind]]\nname='secret'\nfields=['label','secret']\ngroup_key='label'\n",
+        )
+        .unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['secret']\n",home.path().to_string_lossy())).unwrap();
+        let settings = Settings::read(&path).unwrap();
+        let (cfg, _) = hatel_core::Config::from_settings_in(&settings, &|_| None);
+        let registry = hatel_core::schema::build_registry(&cfg).unwrap();
+        let env = hatel_core::make_envelope(
+            "secret",
+            [
+                ("label".into(), json!("check")),
+                ("secret".into(), json!("private")),
+            ]
+            .into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+        std::fs::write(&plugin,"[[kind]]\nname='secret'\nfields=['label','secret']\ngroup_key='label'\nredact=['secret']\n").unwrap();
+        deliver(
+            &path,
+            home.path(),
+            "http://127.0.0.1:1",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
+            "cancelled"
+        );
     }
 }

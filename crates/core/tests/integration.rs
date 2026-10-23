@@ -209,7 +209,7 @@ fn prompt_stores_length_not_text() {
         "session_id": "S2", "cwd": "/tmp/x",
         "prompt": "hello world"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -230,7 +230,7 @@ fn session_start_is_recorded_in_the_index() {
         "hook_event_name": "SessionStart",
         "session_id": "S3", "cwd": repo.to_str().unwrap()
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     let index = SessionIndex::new(cfg.state_dir.clone()).load();
     let row = index.get("S3").expect("session recorded");
     assert_eq!(row.project_label, "myproj");
@@ -254,7 +254,7 @@ fn an_unattributable_session_start_is_recorded_without_a_project() {
             "hook_event_name": "SessionStart",
             "session_id": session_id, "cwd": cwd
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let index = SessionIndex::new(cfg.state_dir.clone()).load();
     let mut cache = hatel_core::SessionIndexCache::new(cfg.state_dir.clone());
@@ -285,7 +285,7 @@ fn an_unattributable_session_records_the_empty_project_label() {
         "hook_event_name": "UserPromptSubmit",
         "session_id": "S6", "cwd": outside.path().to_str().unwrap(), "prompt": "hello"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -335,7 +335,7 @@ fn compaction_records_trigger_with_either_field_name() {
         "hook_event_name": "PreCompact", "session_id": "S", "cwd": "/tmp/x",
         "compact_trigger": "auto"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "compaction", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -388,7 +388,7 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
     let mut end = serde_json::json!({
         "hook_event_name": "SessionEnd", "session_id": "S", "cwd": repo.to_str().unwrap()
     });
-    hatel_core::hook::process_event(&mut end, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut end, &cfg, &reg);
     assert_eq!(
         end.get("git_branch").and_then(|v| v.as_str()),
         Some("spec/checkout")
@@ -404,7 +404,7 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
     let mut tool = serde_json::json!({
         "hook_event_name": "PostToolUse", "session_id": "S", "cwd": repo.to_str().unwrap(), "tool_name": "Bash"
     });
-    hatel_core::hook::process_event(&mut tool, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut tool, &cfg, &reg);
     assert!(
         tool.get("git_branch").is_none(),
         "git_branch not read when no binding uses it"
@@ -883,7 +883,7 @@ fn compaction_writes_one_record_per_compaction() {
         let mut ev = serde_json::json!({
             "hook_event_name": name, "session_id": "S", "cwd": "/tmp/x", "compact_trigger": "auto"
         });
-        hatel_core::hook::process_event(&mut ev, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut ev, &cfg, &reg);
     }
     assert_eq!(
         hatel_core::sink::read_records(&cfg, "compaction", None).len(),
@@ -1136,7 +1136,7 @@ fn sqlite_window_filter_excludes_old_records() {
     let mut event = serde_json::json!({
         "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     // an ancient record inserted directly
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
@@ -1171,7 +1171,7 @@ fn sqlite_window_keeps_records_in_the_cutoff_second() {
     let mut event = serde_json::json!({
         "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     // cutoff = the exact second of the record we just wrote.
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     let secs = recs[0].ts.parse::<jiff::Timestamp>().unwrap().as_second();
@@ -1197,7 +1197,7 @@ fn sqlite_sink_round_trips_through_report() {
     let mut event = serde_json::json!({
         "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/p", "prompt": "hi"
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
 
     let recs = hatel_core::sink::read_records(&cfg, "prompt", None);
     assert_eq!(recs.len(), 1, "record read back from sqlite");
@@ -1417,7 +1417,7 @@ fn a_resumed_agent_counts_once_however_many_turns_it_stops_on() {
             "agent_id": "a43e754af29bd6784", "agent_type": "general-purpose",
             "turn": turn,
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
@@ -1443,7 +1443,7 @@ fn agents_without_an_identity_never_merge_into_one() {
             "session_id": "S", "cwd": "/tmp/x",
             "agent_type": "general-purpose",
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups[0].count, 3);
@@ -1462,7 +1462,7 @@ fn an_identity_is_scoped_to_the_group_it_is_counted_in() {
             "session_id": "S", "cwd": "/tmp/x",
             "agent_id": "a1", "agent_type": agent,
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups.len(), 2);
@@ -1500,7 +1500,7 @@ fn each_start_of_one_session_counts_its_own_resume_cost() {
         "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
         "source": "startup",
     });
-    hatel_core::hook::process_event(&mut fresh, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut fresh, &cfg, &reg);
     for usd in [0.40, 0.55] {
         let mut resumed = serde_json::json!({
             "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
@@ -1508,7 +1508,7 @@ fn each_start_of_one_session_counts_its_own_resume_cost() {
             "seconds_since_last_response": 30, "estimated_cache_write_usd": usd,
             "prompt_cache_likely_expired": false,
         });
-        hatel_core::hook::process_event(&mut resumed, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut resumed, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "session", &query(0, 0, None));
     let resume = groups
@@ -1538,7 +1538,7 @@ fn a_fresh_start_carries_no_resume_cost_rather_than_a_zero() {
         "hook_event_name": "SessionStart", "session_id": "S", "cwd": "/tmp/x",
         "source": "startup",
     });
-    hatel_core::hook::process_event(&mut fresh, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut fresh, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "session", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -1631,7 +1631,7 @@ fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
         if let Some(a) = agent {
             event["agent_id"] = serde_json::Value::from(a);
         }
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     };
     call("t1", None);
     call("t2", Some("a9"));
@@ -1696,7 +1696,7 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
             "hook_event_name": event, "session_id": "S", "cwd": "/tmp/x", "prompt_id": "P",
             "tool_name": tool, "tool_use_id": id, "duration_ms": 3, "tool_input": input,
         });
-        hatel_core::hook::process_event(&mut e, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut e, &cfg, &reg);
     }
     let recs = hatel_core::sink::read_records(&cfg, "tool", None);
     let skill_of = |id: &str| {
@@ -1750,7 +1750,7 @@ fn a_failed_call_and_a_returning_one_land_in_the_same_kind() {
             "hook_event_name": event_name, "session_id": "S", "cwd": "/tmp/x",
             "tool_name": "Bash", "tool_use_id": use_id, "duration_ms": 10,
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
@@ -1771,7 +1771,7 @@ fn one_call_delivered_twice_counts_once() {
             "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/x",
             "tool_name": "Read", "tool_use_id": "t1", "duration_ms": 7,
         });
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
     let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
     assert_eq!(groups[0].count, 1);
@@ -1794,7 +1794,7 @@ fn a_command_record_keeps_the_name_and_nothing_the_operator_typed() {
         "prompt_id": "P1", "expansion_type": "slash_command", "command_name": "hatel",
         "command_args": "a secret argument", "prompt": "/hatel a secret argument",
     });
-    hatel_core::hook::process_event(&mut event, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     let recs = hatel_core::sink::read_records(&cfg, "command", None);
     assert_eq!(recs.len(), 1);
     assert_eq!(
@@ -1839,7 +1839,7 @@ fn memory_files_are_told_apart_by_their_path_in_the_repository() {
             "parent_file_path": at("crates/api/CLAUDE.md"),
         }),
     ] {
-        hatel_core::hook::process_event(&mut event, &cfg, &reg);
+        hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
 
     let recs = hatel_core::sink::read_records(&cfg, "memory", None);
@@ -1898,17 +1898,17 @@ fn one_turn_joins_its_records_across_kinds() {
         "hook_event_name": "UserPromptSubmit", "session_id": "S", "cwd": "/tmp/x",
         "prompt_id": "T1", "prompt": "do the thing",
     });
-    hatel_core::hook::process_event(&mut prompt, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut prompt, &cfg, &reg);
     let mut call = serde_json::json!({
         "hook_event_name": "PostToolUse", "session_id": "S", "cwd": "/tmp/x",
         "prompt_id": "T1", "tool_name": "Bash", "tool_use_id": "t1", "duration_ms": 5,
     });
-    hatel_core::hook::process_event(&mut call, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut call, &cfg, &reg);
     let mut agent = serde_json::json!({
         "hook_event_name": "SubagentStop", "session_id": "S", "cwd": "/tmp/x",
         "prompt_id": "T1", "agent_id": "a1", "agent_type": "general-purpose",
     });
-    hatel_core::hook::process_event(&mut agent, &cfg, &reg);
+    hatel_core::claude::hook::process_event(&mut agent, &cfg, &reg);
     let turn = |kind: &str| {
         report::aggregate(
             &reg,
@@ -2242,4 +2242,81 @@ fn retention_removes_pending_references_and_releases_queue_capacity() {
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn common_metadata_separates_equal_project_labels_and_filters_runs_without_payload_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let registry = build_registry(&cfg).unwrap();
+    let mut sink = hatel_core::build_sink(&cfg);
+    for (key, run) in [("/team-one/repo", "first"), ("/team-two/repo", "second")] {
+        let mut record = make_envelope("prompt", Payload::new(), &registry, true).unwrap();
+        record.metadata.project = Some(hatel_core::ProjectRef {
+            key: key.into(),
+            label: "repo".into(),
+        });
+        record.metadata.run_id = Some(run.into());
+        sink.write_record(&record).unwrap();
+    }
+    let spec = registry.kind("prompt").unwrap();
+    let q = report::Query {
+        group_by: Some("metadata.project.key"),
+        ..query(0, 0, None)
+    };
+    let result = hatel_core::query::aggregate(&cfg, spec, &q).unwrap();
+    assert_eq!(result.len(), 2);
+    let filters = [("metadata.run_id".into(), "first".into())];
+    let q = report::Query {
+        group_by: Some("metadata.project.key"),
+        filters: &filters,
+        ..query(0, 0, Some("/team-one/repo"))
+    };
+    let result = hatel_core::query::section(&cfg, spec, &q).unwrap();
+    assert_eq!(result.groups.len(), 1);
+    assert_eq!(result.groups[0].key.as_deref(), Some("/team-one/repo"));
+    assert!(result.retained_since.is_some());
+}
+
+#[test]
+fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let registry = build_registry(&cfg).unwrap();
+    let now = hatel_core::now_epoch();
+    let mut sink = hatel_core::build_sink(&cfg);
+    for (request, age, cost) in [("old", 14 * 86400, 99.0), ("recent", 0, 0.02)] {
+        let mut env = make_envelope(
+            "claude.api_request",
+            [
+                ("session_id".into(), serde_json::json!("session")),
+                ("request_id".into(), serde_json::json!(request)),
+                ("cost_usd".into(), serde_json::json!(cost)),
+            ]
+            .into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        env.ts = jiff::Timestamp::from_second(now - age).unwrap().to_string();
+        sink.write_record(&env).unwrap();
+    }
+    let q = report::Query {
+        kind: Some("claude.api_request"),
+        ..query(now - 7 * 86400, 0, None)
+    };
+    let report = report::Report::build(&registry, &cfg, "7d", &q);
+    assert_eq!(
+        report.cost_basis,
+        "session_lifetime_totals_selected_by_last_seen"
+    );
+    assert!(report.cost.is_empty());
+    assert_eq!(report.kinds[0].groups[0].sums[0].sum, 0.02);
+    assert_eq!(report.kinds[0].groups[0].count, 1);
 }

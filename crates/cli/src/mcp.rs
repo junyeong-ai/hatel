@@ -61,6 +61,11 @@ pub struct EmitParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct DoctorParams {
+    pub local: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
     pub records: Vec<serde_json::Value>,
 }
@@ -104,9 +109,17 @@ impl HatelMcp {
     #[tool(
         description = "Verify the Claude Code ↔ collector wiring. `ok: false` means a hard requirement failed; each section's findings carry a status (ok / fail / warn / note) and the message names the gap and its fix. `snippet` is the managed-settings paste block. Same JSON as `hatel doctor --json`."
     )]
-    async fn doctor(&self) -> Result<CallToolResult, McpError> {
-        blocking(|| {
-            let json = serde_json::to_string_pretty(&doctor::report_value()).unwrap_or_default();
+    async fn doctor(
+        &self,
+        Parameters(p): Parameters<DoctorParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(move || {
+            let json = serde_json::to_string_pretty(&if p.local.unwrap_or(false) {
+                doctor::local_report_value()
+            } else {
+                doctor::report_value()
+            })
+            .unwrap_or_default();
             text_result(format!("{json}\n"))
         })
         .await

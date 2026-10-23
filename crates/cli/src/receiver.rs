@@ -37,6 +37,17 @@ pub struct Identity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<Store>,
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Capabilities>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Capabilities {
+    pub local_decode_protocol: String,
+    pub local_metric_types: Vec<String>,
+    pub forward_signals: Vec<String>,
+    pub durable_local_records: bool,
+    pub traces: bool,
 }
 
 /// The settings that decide which records a store holds: where it is, which backend, and how long
@@ -66,6 +77,13 @@ impl Identity {
             service: "hatel".to_string(),
             storage: Some(Store::of(cfg)),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: Some(Capabilities {
+                local_decode_protocol: "http/json".into(),
+                local_metric_types: vec!["sum".into(), "gauge".into()],
+                forward_signals: vec!["metrics".into(), "logs".into()],
+                durable_local_records: true,
+                traces: false,
+            }),
         }
     }
 }
@@ -192,6 +210,7 @@ mod tests {
                 service: "hatel".to_string(),
                 storage: None,
                 version: "9.9.9".to_string(),
+                capabilities: None,
             }),
             "a build from before the store was reported still identifies"
         );

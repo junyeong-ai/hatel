@@ -173,6 +173,7 @@ impl ExportConfig {
                 http::HeaderValue::from_str(value)
                     .map_err(|_| Error::InvalidExport("invalid HTTP header value".into()))?;
             }
+            let endpoint = parsed.to_string().trim_end_matches('/').to_string();
             let mode = ExportMode::parse(&raw.mode).ok_or_else(|| {
                 Error::InvalidExport(format!(
                     "export endpoint {endpoint:?}: unknown mode {:?} (expected raw|enriched)",

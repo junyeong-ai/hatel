@@ -115,8 +115,8 @@ pub(crate) fn report_value() -> serde_json::Value {
     serde_json::to_value(build_report()).unwrap_or_default()
 }
 
-pub fn run(json: bool) -> i32 {
-    let report = build_report();
+pub fn run(json: bool, local: bool) -> i32 {
+    let report = build_report_for(local);
     if json {
         // Through `to_value` so object keys serialize alphabetically, like every other
         // machine output.
@@ -135,7 +135,15 @@ pub fn run(json: bool) -> i32 {
 }
 
 fn build_report() -> Report {
-    let files = cs::scope_files();
+    build_report_for(false)
+}
+
+pub(crate) fn local_report_value() -> serde_json::Value {
+    serde_json::to_value(build_report_for(true)).expect("doctor serializes")
+}
+
+fn build_report_for(local: bool) -> Report {
+    let files = if local { Vec::new() } else { cs::scope_files() };
     let env = cs::effective_env(&files, cs::process_env());
     let settings_env = cs::settings_env(&files);
     // The events worth wiring depend on which Kinds are loaded (a plugin may bind more), so derive
@@ -172,7 +180,11 @@ fn build_report() -> Report {
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
 
-    let receiver = report_receiver(&env, &settings, &cfg);
+    let receiver = if local {
+        None
+    } else {
+        report_receiver(&env, &settings, &cfg)
+    };
 
     let wiring = cs::event_wiring(&files, &events);
     let mut hooks = Section::new("hooks", "hooks:");
@@ -192,10 +204,15 @@ fn build_report() -> Report {
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
 
-    let mut sections = vec![native];
-    sections.extend(receiver);
-    sections.extend([hooks, storage]);
-    if let Some(export) = report_export(&env, &settings, &resolved) {
+    let mut sections = if local {
+        vec![storage]
+    } else {
+        let mut sections = vec![native];
+        sections.extend(receiver);
+        sections.extend([hooks, storage]);
+        sections
+    };
+    if let Some(export) = report_export(&env, &settings, &resolved, local) {
         sections.push(export);
     }
 
@@ -231,17 +248,23 @@ fn build_report() -> Report {
         ok,
         sections,
         settings_files,
-        snippet: cs::render_snippet(&cs::hook_command(), &events),
+        snippet: if local {
+            String::new()
+        } else {
+            cs::render_snippet(&cs::hook_command(), &events)
+        },
     }
 }
 
 fn render_human(r: &Report) -> String {
     let mut out = String::from("hatel doctor\n\n");
-    out.push_str("settings files:\n");
-    for f in &r.settings_files {
-        out.push_str(&format!("  {:<8} {:<22} {}\n", f.name, f.load, f.path));
+    if !r.settings_files.is_empty() {
+        out.push_str("settings files:\n");
+        for f in &r.settings_files {
+            out.push_str(&format!("  {:<8} {:<22} {}\n", f.name, f.load, f.path));
+        }
+        out.push('\n');
     }
-    out.push('\n');
     for s in &r.sections {
         out.push_str(s.header);
         out.push('\n');
@@ -250,10 +273,12 @@ fn render_human(r: &Report) -> String {
         }
         out.push('\n');
     }
-    out.push_str(
+    if !r.snippet.is_empty() {
+        out.push_str(
         "to wire automatically run `hatel init` — or paste this into managed settings for an org:\n\n",
     );
-    out.push_str(&r.snippet);
+        out.push_str(&r.snippet);
+    }
     out
 }
 
@@ -663,6 +688,7 @@ fn report_export(
     env: &cs::Env,
     settings: &hatel_core::Result<Settings>,
     resolved: &Settings,
+    local: bool,
 ) -> Option<Section> {
     // A configuration file that would not parse is one fault about one file, already reported
     // where the file is; repeating it here would present a second problem that does not exist.
@@ -715,7 +741,7 @@ fn report_export(
         );
     }
 
-    if export.targets.iter().all(|t| t.signals.is_empty()) {
+    if local || export.targets.iter().all(|t| t.signals.is_empty()) {
         return Some(sec);
     }
     // Both enriching and filtering read the JSON body (to inject, or to resolve a batch's project
@@ -1158,6 +1184,7 @@ mod tests {
                 service: "hatel".to_string(),
                 storage: store,
                 version: version.to_string(),
+                capabilities: None,
             })
             .unwrap()
         };
@@ -1229,6 +1256,7 @@ mod tests {
         }
 
         let other_file = serde_json::to_string(&receiver::Identity {
+            capabilities: None,
             config: Some("/elsewhere/config.toml".into()),
             service: "hatel".to_string(),
             storage: Some(store.clone()),

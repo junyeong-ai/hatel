@@ -25,8 +25,8 @@ use hatel_core::{
     Config, ExportConfig, Registry, SessionIndex, SessionIndexCache, Settings, resolve_project,
 };
 
+use crate::claude::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
 use crate::export::{Exporter, OtlpSignal};
-use crate::otlp::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
 use crate::receiver;
 use crate::throttle::{Tally, Throttle};
 
@@ -44,6 +44,7 @@ struct AppState {
     ingest_slots: Arc<Semaphore>,
     acc: Arc<Mutex<Accumulator>>,
     tracked: Arc<BTreeSet<String>>,
+    registry: Arc<Registry>,
     counted: Arc<BTreeSet<String>>,
     cfg: Arc<Config>,
     /// The configuration file this receiver read when it started, read again by a step that
@@ -109,6 +110,7 @@ fn note_undecodable(bodies: &Throttle, signal: &str, e: &str) {
 #[derive(Default)]
 struct FailedWrites {
     cost: Throttle,
+    records: Throttle,
     index: Throttle,
 }
 
@@ -258,6 +260,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
         acc: Arc::new(Mutex::new(Accumulator::default())),
         tracked: Arc::new(registry.tracked_metrics.clone()),
         counted: Arc::new(registry.counted_events.clone()),
+        registry: registry.clone(),
         cfg: cfg.clone(),
         config_file: Settings::path(),
         env: |key| std::env::var_os(key),
@@ -275,6 +278,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
         .route("/v1/logs", post(ingest_logs))
+        .route("/v1/traces", post(|| async { (StatusCode::NOT_IMPLEMENTED,Json(serde_json::json!({"code":12,"message":"traces are not supported; route traces directly to a trace collector"}))) }))
         .route(receiver::IDENTITY_PATH, get(identity))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
@@ -438,6 +442,24 @@ async fn ingest(
     headers: HeaderMap,
     body: Bytes,
 ) -> IngestResponse {
+    let is_json = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"))
+        });
+    let uncompressed = headers
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|v| v.eq_ignore_ascii_case("identity"));
+    if is_json && uncompressed && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"code":3,"message":"invalid OTLP/JSON body"})),
+        );
+    }
     // Raw forwarding is independent of local decode; unsupported bodies still reach raw targets.
     if let Some(exporter) = &st.exporter {
         let (ct, ce) = body_headers(&headers);
@@ -456,10 +478,38 @@ async fn ingest(
                     lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
                 }
             }),
-            OtlpSignal::Logs => parse_logs(&body, &st.counted).map(|events| {
+            OtlpSignal::Logs => parse_logs(&body, &st.counted).and_then(|events| {
                 if !events.is_empty() {
                     lock(&st.acc).update_events(events, jiff::Timestamp::now());
                 }
+                let mut records = crate::claude::projection::records(&body, &st.registry)?;
+                let mut index = lock(&st.index_cache);
+                index.refresh();
+                for record in &mut records {
+                    if let Some(session) = record.payload.get("session_id").and_then(|v| v.as_str())
+                    {
+                        if let Some(row) = index.get(session) {
+                            record.metadata.project = Some(hatel_core::ProjectRef {
+                                key: row.project_key.clone(),
+                                label: row.project_label.clone(),
+                            });
+                        } else if index.contains(session) {
+                            record.metadata.project = None;
+                        }
+                    }
+                }
+                drop(index);
+                let mut sink = hatel_core::build_sink(&st.cfg);
+                for record in records {
+                    note_failed_write(
+                        &st.failed_writes.records,
+                        "native projection",
+                        sink.write_record(&record)
+                            .map(|_| ())
+                            .map_err(|e| std::io::Error::other(e.to_string())),
+                    );
+                }
+                Ok(())
             }),
         }
     })
@@ -756,6 +806,7 @@ fn note_tallies(st: &AppState, when: Tally) {
     for (writes, store) in [
         (&st.failed_writes.cost, "cost snapshot"),
         (&st.failed_writes.index, "session index"),
+        (&st.failed_writes.records, "native projection"),
     ] {
         if let Some(count) = writes.tally(when) {
             eprintln!("hatel: {store} writes failed: {count} so far");
@@ -896,6 +947,7 @@ fn persist_cost(st: &AppState) {
     let rows: Vec<CostRow> = acc
         .sessions()
         .iter()
+        .filter(|(_, t)| !t.observed_metrics().is_empty())
         .map(|(sid, t)| {
             // The pre-restart baseline is added per metric, and only where that metric
             // is delta — a cumulative metric already reports its full total, so adding
@@ -917,6 +969,10 @@ fn persist_cost(st: &AppState) {
             let project = match index.get(sid) {
                 Some(r) => r.project_label.clone(),
                 None if index.contains(sid) => String::new(),
+                None if t.project_conflicted() => String::new(),
+                None if t.project().is_some() => {
+                    t.project().expect("checked project").label.clone()
+                }
                 None => costs
                     .snapshot
                     .rows()
@@ -926,7 +982,31 @@ fn persist_cost(st: &AppState) {
             };
             CostRow {
                 session_id: sid.clone(),
+                project_key: index.get(sid).map(|r| r.project_key.clone()).or_else(|| {
+                    if index.contains(sid) || t.project_conflicted() {
+                        None
+                    } else {
+                        t.project().map(|p| p.key.clone()).or_else(|| {
+                            costs
+                                .snapshot
+                                .rows()
+                                .get(sid)
+                                .and_then(|r| r.project_key.clone())
+                        })
+                    }
+                }),
                 project,
+                observed_metrics: Some(
+                    t.observed_metrics()
+                        .into_iter()
+                        .chain(
+                            base.and_then(|b| b.observed_metrics.as_ref())
+                                .into_iter()
+                                .flatten()
+                                .cloned(),
+                        )
+                        .collect(),
+                ),
                 tokens: t.tokens() + add(t.tokens_is_delta(), |b| b.tokens as f64) as i64,
                 cost_usd: t.cost() + add(t.cost_is_delta(), |b| b.cost_usd),
                 active_time_s: t.active_time_s()
@@ -989,6 +1069,7 @@ mod tests {
             acc: Arc::new(Mutex::new(Accumulator::default())),
             tracked: Arc::new(registry.tracked_metrics.clone()),
             counted: Arc::new(registry.counted_events.clone()),
+            registry: registry.clone(),
             index_cache: Arc::new(Mutex::new(SessionIndexCache::new(dir.to_path_buf()))),
             cfg: Arc::new(cfg),
             costs: Arc::new(Mutex::new(Costs::load(dir))),
@@ -1090,7 +1171,7 @@ mod tests {
 
     #[test]
     fn persist_cost_merges_dimensional_baselines_across_restart() {
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
@@ -1121,6 +1202,7 @@ mod tests {
         lock(&st.acc).update_metrics(
             vec![
                 MetricPoint {
+                    project: None,
                     name: "token.usage".into(),
                     value: 50.0,
                     session_id: "S1".into(),
@@ -1131,6 +1213,7 @@ mod tests {
                     delta: true,
                 },
                 MetricPoint {
+                    project: None,
                     name: "cost.usage".into(),
                     value: 0.5,
                     session_id: "S1".into(),
@@ -1185,7 +1268,7 @@ mod tests {
     fn a_session_still_heard_from_keeps_its_project_past_the_horizon_of_its_start() {
         // Both started past the 90-day horizon; the receiver hears from `live` now and never from
         // `quiet`. The flush renews what it heard, so the sweep after it expires only `quiet`.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
@@ -1208,6 +1291,7 @@ mod tests {
             .unwrap();
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
+                project: None,
                 name: "cost.usage".into(),
                 value: 0.5,
                 session_id: "live".into(),
@@ -1241,7 +1325,7 @@ mod tests {
     fn a_cost_row_keeps_its_project_once_the_index_forgets_its_session() {
         // Every flush recomputes every session the receiver holds. `kept` loses its index lines
         // while its cost row is still retained; `moved` resumes outside any repository.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
@@ -1253,6 +1337,7 @@ mod tests {
         index.record("kept", Some(&a), 1 << 20);
         index.record("moved", Some(&a), 1 << 20);
         let heard = |sid: &str| MetricPoint {
+            project: None,
             name: "cost.usage".into(),
             value: 0.5,
             session_id: sid.into(),
@@ -1279,7 +1364,7 @@ mod tests {
         // S1 was persisted by an earlier run and last heard by this one, both past the 90-day
         // horizon. Once the sweep expires its row, a point it sends again is all it counts: no
         // earlier total comes back from the baseline, from this run's memory, or from disk.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
@@ -1296,6 +1381,7 @@ mod tests {
         let tokens = |value: f64, at: jiff::Timestamp| {
             lock(&st.acc).update_metrics(
                 vec![MetricPoint {
+                    project: None,
                     name: "token.usage".into(),
                     value,
                     session_id: "S1".into(),
@@ -1323,7 +1409,7 @@ mod tests {
         // This receiver loaded S1's row 100 days ago, when it was fresh, and has heard S1 since.
         // The flush dates the row by that, so the sweep keeps it, and with it what S1 counted
         // before this receiver started.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
@@ -1340,6 +1426,7 @@ mod tests {
         let tokens = |value: f64| {
             lock(&st.acc).update_metrics(
                 vec![MetricPoint {
+                    project: None,
                     name: "token.usage".into(),
                     value,
                     session_id: "S1".into(),
@@ -1425,12 +1512,13 @@ mod tests {
 
     #[test]
     fn a_stopped_receiver_leaves_every_row_in_the_snapshot_file() {
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
+                project: None,
                 name: "token.usage".into(),
                 value: 7.0,
                 session_id: "S1".into(),
@@ -1453,7 +1541,7 @@ mod tests {
     #[test]
     fn a_store_that_stays_unwritable_is_noted_through_its_throttle_and_retried() {
         // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let changes = dir.path().join("cost_changes.jsonl");
@@ -1461,6 +1549,7 @@ mod tests {
         let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
+                project: None,
                 name: "cost.usage".into(),
                 value: 0.5,
                 session_id: "S1".into(),
@@ -1500,12 +1589,13 @@ mod tests {
 
     #[test]
     fn a_flush_in_which_no_session_changed_writes_nothing() {
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
+                project: None,
                 name: "cost.usage".into(),
                 value: 0.5,
                 session_id: "S1".into(),
@@ -1525,13 +1615,14 @@ mod tests {
     fn a_flush_dates_each_session_by_when_it_was_last_heard_from() {
         // Every flush recomputes every session the receiver holds. Were a row dated by the flush, a
         // session silent for weeks would sit inside every report window and never expire.
-        use crate::otlp::decode::MetricPoint;
+        use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();
         let st = test_state(dir.path());
         let heard = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 5);
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
+                project: None,
                 name: "cost.usage".into(),
                 value: 0.5,
                 session_id: "S1".into(),
@@ -1545,5 +1636,42 @@ mod tests {
         let rows = cost::read_snapshot(&st.cfg.state_dir);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, heard.to_string());
+    }
+    #[test]
+    fn native_repository_identity_keeps_same_named_repositories_apart_without_a_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let state = test_state(home.path());
+        let body = serde_json::json!({"resourceMetrics":[
+            {"resource":{"attributes":[{"key":"vcs.repository.url.full","value":{"stringValue":"https://example.com/a/repo"}},{"key":"vcs.repository.name","value":{"stringValue":"repo"}}]},"scopeMetrics":[{"metrics":[{"name":"claude_code.cost.usage","sum":{"aggregationTemporality":1,"dataPoints":[{"attributes":[{"key":"session.id","value":{"stringValue":"one"}}],"asDouble":1.0}]}}]}]},
+            {"resource":{"attributes":[{"key":"vcs.repository.url.full","value":{"stringValue":"https://example.com/b/repo"}},{"key":"vcs.repository.name","value":{"stringValue":"repo"}}]},"scopeMetrics":[{"metrics":[{"name":"claude_code.cost.usage","sum":{"aggregationTemporality":1,"dataPoints":[{"attributes":[{"key":"session.id","value":{"stringValue":"two"}}],"asDouble":2.0}]}}]}]}
+        ]});
+        let points = parse_metrics(&serde_json::to_vec(&body).unwrap(), &state.tracked).unwrap();
+        lock(&state.acc).update_metrics(points, jiff::Timestamp::now());
+        persist_cost(&state);
+        let rows = cost::read_snapshot(home.path());
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.project == "repo"));
+        assert_ne!(rows[0].project_key, rows[1].project_key);
+        assert_eq!(hatel_core::report::cost_by_project(&rows, 0).len(), 2);
+        assert!(
+            rows.iter()
+                .all(|r| r.observed_metrics.as_ref().unwrap().contains("cost.usage"))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_is_rejected_before_it_can_enter_a_forwarding_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let state = test_state(home.path());
+        let permit = IngestPermit(state.ingest_slots.clone().acquire_owned().await.unwrap());
+        let response = ingest(
+            state,
+            permit,
+            OtlpSignal::Metrics,
+            HeaderMap::new(),
+            Bytes::from_static(b"{bad"),
+        )
+        .await;
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
     }
 }

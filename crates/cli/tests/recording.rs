@@ -161,3 +161,35 @@ async fn a_record_waits_without_a_receiver_and_delivery_resumes_after_restart() 
     }
     server.abort();
 }
+
+#[test]
+fn local_diagnosis_does_not_require_claude_code_settings() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nstate_dir={:?}\n",
+            home.path().join("state").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let output = isolated(home.path())
+        .args(["doctor", "--local", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert!(value["settings_files"].as_array().unwrap().is_empty());
+    assert!(
+        value["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "hooks" && s["name"] != "native_telemetry")
+    );
+}

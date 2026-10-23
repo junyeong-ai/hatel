@@ -11,6 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{Error, Result};
 
+pub const METADATA_FIELDS: &[&str] = &[
+    "metadata.record_id",
+    "metadata.project.key",
+    "metadata.project.label",
+    "metadata.source",
+    "metadata.run_id",
+    "metadata.correlation_id",
+    "metadata.kind_version",
+    "metadata.observed_at",
+];
+
 /// A validated Kind declaration.
 #[derive(Debug, Clone)]
 pub struct KindSpec {
@@ -19,6 +30,7 @@ pub struct KindSpec {
     pub fields: BTreeSet<String>,
     pub field_specs: BTreeMap<String, FieldSpec>,
     pub version: u32,
+    pub schema_id: String,
     /// Field that identifies a record when aggregating in reports.
     pub group_key: String,
     /// Fields hashed before write (e.g. a raw user identifier).
@@ -115,6 +127,10 @@ pub fn is_valid_kind_name(name: &str) -> bool {
 }
 
 impl KindSpec {
+    pub fn query_field(&self, name: &str) -> bool {
+        self.fields.contains(name) || name == "project" || METADATA_FIELDS.contains(&name)
+    }
+
     pub fn from_raw(raw: KindSpecRaw) -> Result<KindSpec> {
         let field_specs = match raw.fields {
             Fields::Typed(fields) => fields,
@@ -150,7 +166,12 @@ impl KindSpec {
                 "name must be non-empty and use only [A-Za-z0-9._-]".to_string(),
             ));
         }
-        if !fields.contains(&raw.group_key) {
+        if fields.iter().any(|name| name.starts_with("metadata.")) {
+            return Err(invalid(
+                "metadata.* is reserved for common record context".into(),
+            ));
+        }
+        if !fields.contains(&raw.group_key) && !METADATA_FIELDS.contains(&raw.group_key.as_str()) {
             return Err(invalid(format!(
                 "group_key '{}' not in fields",
                 raw.group_key
@@ -168,6 +189,17 @@ impl KindSpec {
         {
             return Err(invalid(format!("identity '{identity}' not in fields")));
         }
+        if raw.measures.iter().any(|measure| redact.contains(measure)) {
+            return Err(invalid("numeric measures cannot be redacted".into()));
+        }
+        let contract = serde_json::json!({"kind":raw.name,"version":raw.version,"fields":field_specs,"redact":redact});
+        let schema_id = blake3::hash(
+            serde_json::to_string(&contract)
+                .expect("schema serializes")
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
         for measure in &raw.measures {
             if !matches!(
                 field_specs[measure].field_type,
@@ -181,6 +213,7 @@ impl KindSpec {
             fields,
             field_specs,
             version: raw.version,
+            schema_id,
             group_key: raw.group_key,
             redact,
             measures: raw.measures,

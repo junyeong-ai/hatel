@@ -26,6 +26,10 @@ pub struct Spend {
 pub struct CostRow {
     pub session_id: String,
     pub project: String,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub observed_metrics: Option<BTreeSet<String>>,
     pub tokens: i64,
     pub cost_usd: f64,
     pub active_time_s: f64,

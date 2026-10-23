@@ -67,7 +67,7 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
     }
     let mut count = 0usize;
     {
-        let mut insert = tx.prepare("INSERT INTO records (ts,kind,schema_version,payload,metadata,occurred_seconds) VALUES (?1,?2,?3,?4,?5,?6)").map_err(io)?;
+        let mut insert = tx.prepare("INSERT INTO records (ts,kind,schema_version,payload,metadata,occurred_seconds) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING").map_err(io)?;
         for (path, file) in &mut files {
             for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
                 let line = line.map_err(io)?;
@@ -96,7 +96,7 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         ..env.metadata
                     };
                 }
-                insert
+                let inserted = insert
                     .execute(rusqlite::params![
                         env.ts,
                         env.kind,
@@ -106,7 +106,24 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         crate::ts_epoch(&env.ts)
                     ])
                     .map_err(io)?;
-                count += 1;
+                if inserted == 0 {
+                    let id = env
+                        .metadata
+                        .record_id
+                        .as_deref()
+                        .ok_or_else(|| io("duplicate without record id"))?;
+                    let stored: (String,String,String) = tx.query_row("SELECT kind,ts,payload FROM records WHERE json_extract(metadata,'$.record_id')=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(io)?;
+                    if stored
+                        != (
+                            env.kind,
+                            env.ts,
+                            serde_json::to_string(&env.payload).map_err(io)?,
+                        )
+                    {
+                        return Err(io("one record id describes different imported data"));
+                    }
+                }
+                count += inserted;
             }
         }
     }

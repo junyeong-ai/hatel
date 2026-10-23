@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-hatel is a local telemetry collector for Claude Code: an OTLP/HTTP receiver (`hatel serve`)
+hatel is a local telemetry record store and query tool with a Claude Code adapter: an OTLP/HTTP receiver (`hatel serve`)
 joined with lifecycle-hook records (`hatel-hook`) through `session.id`, stored locally,
 queried via `report` / the MCP server. Read `README.md` (ko) / `README.en.md` (en) for the
 product; this file is for working on the code.
@@ -31,7 +31,7 @@ and its CI check unless a deliberate compatibility change requires raising both.
 
 - `crates/core` — async-free library: registry/schema (Kind definitions, `core.toml`),
   settings (`config.toml`) and the resolved runtime config, SQLite/WAL ledger, JSONL compatibility/import, sessions,
-  cost snapshot, report aggregation and its render, PII.
+  cost snapshot, report aggregation and its render, PII. `claude/` owns lifecycle interpretation.
 - `crates/hook` — the hook binary; depends on core only, no async runtime (spawned on
   every lifecycle event — cold-start is a design constraint).
 - `crates/cli` — the `hatel` binary: `serve` (receiver), `report`, `init`, `service`,
@@ -44,8 +44,19 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **Never fabricate a missing signal.** A series without a dimension buckets under
   `(unattributed)`; session-less metrics are dropped, not guessed; `doctor` reports gaps
   instead of inventing fallbacks. New code follows this or doesn't merge.
-- **Estimates are separate from spend.** Session cache-write forecasts are not added to native
-  OTel costs. A cost report window selects sessions by last activity; their totals are cumulative.
+- **Cost bases stay explicit.** Session cache-write forecasts are not added to native OTel costs.
+  `cost_basis` names the snapshot as lifetime session totals selected by last activity.
+  `claude.api_request` records answer occurrence-window questions from native request cost
+  estimates; missing request costs stay missing. Neither source is a billing invoice.
+  `CostRow.observed_metrics` names the native metrics this build has seen; an absent metric is
+  not a measured zero. `project_key` keeps same-named repositories apart.
+- **Vendor interpretation stays in adapters.** `crates/core/src/claude` maps lifecycle hooks;
+  `crates/cli/src/claude` decodes Claude Code's metrics and safe event projections. Plugins add
+  record Kinds and bindings, not unused native counters. Repository attributes provide a
+  `vcs:<browser-URL>` identity when the session index has not observed the session; a known
+  unattributed start is never replaced. Local decode supports HTTP/JSON sums, gauges and selected
+  events; native forwarding can relay opaque bodies. Traces are unsupported and return 501.
+  `/healthz` reports these capabilities.
 - **Routing is destination-specific.** `signals` selects native OTLP input; `kinds` is an exact
   opt-in allow-list for sanitized local records. Omitted keys preserve metrics+logs and no local
   Kinds. A local record and its delivery rows commit together. Network work belongs to the
@@ -53,6 +64,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   stays best-effort. Vendor projections set `metadata.projection` so forwarding the original
   signal cannot also export its local projection. Queue counters change in the same transaction
   as delivery state; retention deletes delivery references and releases capacity with records.
+  A Kind data-contract fingerprint accompanies each record. A changed contract cancels pending
+  records rather than interpreting them under new redaction or field rules.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

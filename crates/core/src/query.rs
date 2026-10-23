@@ -32,10 +32,30 @@ fn path(field: &str) -> String {
     )
 }
 
-fn label(expression: &str) -> String {
+fn label_in(document: &str, expression: &str) -> String {
     format!(
-        "CASE json_type(payload, {expression}) WHEN 'text' THEN json_extract(payload, {expression}) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN 'null' ELSE json_quote(json_extract(payload, {expression})) END"
+        "CASE json_type({document}, {expression}) WHEN 'text' THEN json_extract({document}, {expression}) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN 'null' ELSE json_quote(json_extract({document}, {expression})) END"
     )
+}
+
+fn label(expression: &str) -> String {
+    label_in("payload", expression)
+}
+
+fn selector(field: &str) -> (&'static str, String) {
+    if crate::registry::METADATA_FIELDS.contains(&field) {
+        (
+            "metadata",
+            format!(
+                "$.{}",
+                field
+                    .strip_prefix("metadata.")
+                    .expect("known metadata field")
+            ),
+        )
+    } else {
+        ("payload", path(field))
+    }
 }
 
 fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
@@ -117,8 +137,31 @@ fn scratch() -> crate::Result<Connection> {
     Ok(conn)
 }
 
+pub struct SectionResult {
+    pub groups: Vec<GroupAgg>,
+    pub retained_since: Option<String>,
+}
+
 pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
+    section(cfg, spec, q).map(|result| result.groups)
+}
+
+pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
+    use rusqlite::OptionalExtension;
     let conn = connection(cfg, &spec.name)?;
+    let retained_since = conn.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?2)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project],|r|r.get(0)).optional().map_err(io)?;
+    let groups = aggregate_connection(&conn, spec, q)?;
+    Ok(SectionResult {
+        groups,
+        retained_since,
+    })
+}
+
+fn aggregate_connection(
+    conn: &Connection,
+    spec: &KindSpec,
+    q: &Query,
+) -> crate::Result<Vec<GroupAgg>> {
     let mut args: Vec<Value> = vec![
         spec.name.clone().into(),
         q.since.into(),
@@ -128,14 +171,15 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
         args.push(value.into());
         format!("?{}", args.len())
     };
-    let dimension = parameter(path(q.group_by.unwrap_or(&spec.group_key)));
+    let (document, field_path) = selector(q.group_by.unwrap_or(&spec.group_key));
+    let dimension = parameter(field_path);
     let dimension_label = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
             "COALESCE(json_extract(metadata, '$.project.key'), {})",
             label(&dimension)
         )
     } else {
-        label(&dimension)
+        label_in(document, &dimension)
     };
     let mut conditions = vec![
         "kind=?1".to_string(),
@@ -147,11 +191,17 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
         conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={p}))"));
     }
     for (field, value) in q.filters {
-        let field_path = parameter(path(field));
+        if field == "project" {
+            let value = parameter(value.clone());
+            conditions.push(format!("COALESCE(json_extract(metadata,'$.project.key'),json_extract(payload,'$.project'))={value}"));
+            continue;
+        }
+        let (filter_document, filter_path) = selector(field);
+        let field_path = parameter(filter_path);
         let value_param = parameter(value.clone());
         conditions.push(format!(
-            "json_type(payload, {field_path}) IS NOT NULL AND {}={value_param}",
-            label(&field_path)
+            "json_type({filter_document}, {field_path}) IS NOT NULL AND {}={value_param}",
+            label_in(filter_document, &field_path)
         ));
     }
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
@@ -160,7 +210,7 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
         )
     } else {
         format!(
-            "CASE WHEN json_type(payload, {dimension}) IS NULL THEN NULL ELSE {dimension_label} END"
+            "CASE WHEN json_type({document}, {dimension}) IS NULL THEN NULL ELSE {dimension_label} END"
         )
     };
     let identity = spec.identity.as_ref().map(|field| {

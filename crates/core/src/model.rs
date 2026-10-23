@@ -43,6 +43,8 @@ pub struct RecordMetadata {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_id: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -124,6 +126,7 @@ pub fn make_envelope(
             record_id: Some(uuid::Uuid::new_v4().to_string()),
             observed_at: Some(now_iso_utc()),
             kind_version: Some(spec.version),
+            schema_id: Some(spec.schema_id.clone()),
             ..RecordMetadata::default()
         },
     })
@@ -146,4 +149,13 @@ pub fn now_epoch() -> i64 {
 /// than bucketing it at epoch 0.
 pub fn ts_epoch(ts: &str) -> Option<i64> {
     ts.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
+}
+
+pub fn source_record_id(source: &str, parts: &[&str]) -> String {
+    let mut hash = blake3::Hasher::new();
+    for part in parts {
+        hash.update(&(part.len() as u64).to_le_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{source}:{}", hash.finalize().to_hex())
 }

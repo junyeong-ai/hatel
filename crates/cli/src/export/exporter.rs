@@ -493,6 +493,11 @@ impl Worker {
         if matches!(&policy, Some(Err(_))) {
             return;
         }
+        let native = crate::claude::decode::repository_projects(
+            &out.body,
+            matches!(out.signal, OtlpSignal::Metrics),
+        )
+        .ok();
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
@@ -549,7 +554,18 @@ impl Worker {
                 )),
                 ExportMode::Enriched => {
                     let body = enriched.get_or_insert_with(|| {
-                        let resolve = |sid: &str| index.label(sid);
+                        let resolve = |sid: &str| {
+                            index.label(sid).or_else(|| {
+                                if index.contains(sid) {
+                                    None
+                                } else {
+                                    native
+                                        .as_ref()
+                                        .and_then(|projects| projects.get(sid))
+                                        .map(|p| p.label.clone())
+                                }
+                            })
+                        };
                         match out.signal {
                             OtlpSignal::Metrics => enrich_metrics(&out.body, &resolve),
                             OtlpSignal::Logs => enrich_logs(&out.body, &resolve),
@@ -620,6 +636,9 @@ impl Worker {
         if ids.is_empty() {
             return BatchProjects::Unattributable;
         }
+        let native =
+            crate::claude::decode::repository_projects(body, matches!(signal, OtlpSignal::Metrics))
+                .ok();
         let mut projects = BTreeSet::new();
         let mut missing = BTreeSet::new();
         for sid in ids {
@@ -631,7 +650,11 @@ impl Worker {
                     return BatchProjects::Unattributable;
                 }
                 None => {
-                    missing.insert(sid);
+                    if let Some(project) = native.as_ref().and_then(|p| p.get(&sid)) {
+                        projects.insert((project.label.clone(), project.key.clone()));
+                    } else {
+                        missing.insert(sid);
+                    }
                 }
             }
         }

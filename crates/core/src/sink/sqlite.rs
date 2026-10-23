@@ -261,10 +261,25 @@ impl Sink for SqliteSink {
         let tx = conn
             .transaction()
             .map_err(|e| crate::Error::Io(e.to_string()))?;
-        tx.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let inserted = tx.execute(
+            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
             rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, crate::ts_epoch(&env.ts)],
         ).map_err(|e| crate::Error::Io(e.to_string()))?;
+        if inserted == 0 {
+            let id = env.metadata.record_id.as_deref().ok_or_else(|| {
+                crate::Error::InvalidPayload("duplicate record without id".into())
+            })?;
+            let stored: (String,String,String) = tx.query_row("SELECT kind,ts,payload FROM records WHERE json_extract(metadata,'$.record_id')=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|crate::Error::Io(e.to_string()))?;
+            if stored != (env.kind.clone(), env.ts.clone(), payload) {
+                return Err(crate::Error::InvalidPayload(
+                    "record id already describes different data".into(),
+                ));
+            }
+            return Ok(super::WriteReceipt {
+                record_id: Some(id.into()),
+                delivery: Default::default(),
+            });
+        }
         let delivery = crate::outbox::enqueue(&tx, env, &self.targets, crate::now_epoch())
             .map_err(|e| crate::Error::Io(e.to_string()))?;
         tx.commit().map_err(|e| crate::Error::Io(e.to_string()))?;

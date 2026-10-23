@@ -81,6 +81,19 @@ name = "compaction"
 fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, trigger = { type = "string" } }
 group_key = "session_id"
 
+[[kind]]
+name = "claude.api_request"
+fields = { session_id = { type = "string", required = true }, request_id = { type = "string" }, model = { type = "string" }, agent = { type = "string" }, skill = { type = "string" }, query_source = { type = "string" }, cost_usd = { type = "number", unit = "USD" }, duration_ms = { type = "number", unit = "ms" }, input_tokens = { type = "integer", unit = "tokens" }, output_tokens = { type = "integer", unit = "tokens" }, cache_read_tokens = { type = "integer", unit = "tokens" }, cache_creation_tokens = { type = "integer", unit = "tokens" } }
+group_key = "model"
+identity = "request_id"
+measures = ["cost_usd", "duration_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"]
+
+[[kind]]
+name = "claude.hook"
+fields = { session_id = { type = "string", required = true }, hook_event = { type = "string" }, hook_name = { type = "string" }, num_hooks = { type = "integer" }, num_success = { type = "integer" }, num_blocking = { type = "integer" }, num_non_blocking_error = { type = "integer" }, num_cancelled = { type = "integer" }, duration_ms = { type = "number", unit = "ms" } }
+group_key = "hook_name"
+measures = ["duration_ms", "num_hooks", "num_success", "num_blocking", "num_non_blocking_error", "num_cancelled"]
+
 # Native-OTel cost/tokens are a snapshot, not a hook event — they live in a
 # rewritten snapshot file (see cost.rs), not as a Kind in the append-only sink.
 

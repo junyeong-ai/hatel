@@ -33,8 +33,17 @@ const LINES: &str = "lines_of_code.count";
 type SeriesKey = (String, Vec<(String, String)>);
 
 #[derive(Debug, Default, Clone)]
+enum Attribution {
+    #[default]
+    Unseen,
+    Known(hatel_core::ProjectRef),
+    Conflict,
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct SessionTotals {
     metric_series: BTreeMap<SeriesKey, f64>,
+    project: Attribution,
     events: BTreeMap<String, i64>,
     /// Metric names that have seen a non-delta (cumulative / gauge) point. Tracked per
     /// metric, not per session, so the cross-restart baseline is added only to the
@@ -47,6 +56,17 @@ pub struct SessionTotals {
 }
 
 impl SessionTotals {
+    pub fn project_conflicted(&self) -> bool {
+        matches!(self.project, Attribution::Conflict)
+    }
+
+    pub fn project(&self) -> Option<&hatel_core::ProjectRef> {
+        match &self.project {
+            Attribution::Known(project) => Some(project),
+            _ => None,
+        }
+    }
+
     fn metric_sum(&self, name: &str) -> f64 {
         let total: f64 = self
             .metric_series
@@ -56,6 +76,13 @@ impl SessionTotals {
             .sum();
         // f64's `Sum` identity is -0.0, so an empty series yields -0.0; normalize it.
         total + 0.0
+    }
+
+    pub fn observed_metrics(&self) -> std::collections::BTreeSet<String> {
+        self.metric_series
+            .keys()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     pub fn tokens(&self) -> i64 {
@@ -171,6 +198,15 @@ impl Accumulator {
         for p in points {
             let totals = self.by_session.entry(p.session_id).or_default();
             totals.last_seen = totals.last_seen.max(at);
+            if let Some(project) = p.project {
+                match &totals.project {
+                    Attribution::Unseen => totals.project = Attribution::Known(project),
+                    Attribution::Known(previous) if previous.key != project.key => {
+                        totals.project = Attribution::Conflict
+                    }
+                    _ => {}
+                }
+            }
             if !p.delta {
                 totals.cumulative_metrics.insert(p.name.clone());
             }
@@ -215,6 +251,7 @@ mod tests {
             name: name.to_string(),
             value,
             session_id: "S".to_string(),
+            project: None,
             series: series
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

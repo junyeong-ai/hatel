@@ -18,6 +18,7 @@ pub struct MetricPoint {
     /// True when the datapoint is a per-interval increment to accumulate; false
     /// when it is a running total (cumulative sum or gauge) that replaces.
     pub delta: bool,
+    pub project: Option<hatel_core::ProjectRef>,
 }
 
 /// Metric names are normalized by stripping the `claude_code.` prefix, exactly as
@@ -36,9 +37,12 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
                     continue;
                 }
                 let (points, delta) = match (&metric.sum, &metric.gauge) {
-                    (Some(sum), _) => (&sum.data_points, is_delta(&sum.aggregation_temporality)),
+                    (Some(sum), None) => {
+                        (&sum.data_points, is_delta(&sum.aggregation_temporality)?)
+                    }
                     (None, Some(gauge)) => (&gauge.data_points, false),
                     (None, None) => continue,
+                    (Some(_), Some(_)) => return Err("metric contains both sum and gauge".into()),
                 };
                 for dp in points {
                     let mut attrs: Vec<(String, String)> = dp
@@ -53,10 +57,11 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
                     attrs.sort();
                     out.push(MetricPoint {
                         name: name.to_string(),
-                        value: dp.value(),
+                        value: dp.value()?,
                         session_id,
                         series: attrs,
                         delta,
+                        project: repository(&rm.resource.attributes, &dp.attributes)?,
                     });
                 }
             }
@@ -80,11 +85,11 @@ pub fn parse_logs(
     for rl in &req.resource_logs {
         for sl in &rl.scope_logs {
             for record in &sl.log_records {
-                let mut event = String::new();
+                let event = record.name()?.unwrap_or_default();
                 let mut session = String::new();
                 for kv in &record.attributes {
                     match kv.key.as_str() {
-                        "event.name" => event = kv.value.as_string(),
+                        "event.name" => {}
                         super::SESSION_ID => session = kv.value.as_string(),
                         _ => {}
                     }
@@ -113,28 +118,135 @@ fn take(attrs: &mut Vec<(String, String)>, key: &str) -> String {
     }
 }
 
-/// Whether a sum's `aggregationTemporality` marks it delta. Anything else — cumulative,
-/// unspecified, or absent (proto3-JSON may omit an unspecified enum) — reads as non-delta.
-/// That is the conservative direction: treating a running total as a per-interval increment
-/// would inflate counts, while the reverse merely replaces; it also matches OTLP, whose
-/// default temporality for sums is cumulative.
-fn is_delta(v: &serde_json::Value) -> bool {
+fn is_delta(v: &serde_json::Value) -> Result<bool, String> {
     match v {
-        serde_json::Value::Number(n) => n.as_i64() == Some(1),
-        serde_json::Value::String(s) => s == "1" || s == "AGGREGATION_TEMPORALITY_DELTA",
-        _ => false,
+        serde_json::Value::Number(n) if n.as_i64() == Some(1) => Ok(true),
+        serde_json::Value::Number(n) if n.as_i64() == Some(2) => Ok(false),
+        serde_json::Value::String(s) if s == "1" || s == "AGGREGATION_TEMPORALITY_DELTA" => {
+            Ok(true)
+        }
+        serde_json::Value::String(s) if s == "2" || s == "AGGREGATION_TEMPORALITY_CUMULATIVE" => {
+            Ok(false)
+        }
+        _ => Err("sum must declare delta or cumulative aggregationTemporality".into()),
     }
 }
 
-fn json_to_f64(v: &serde_json::Value) -> f64 {
-    match v {
-        serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
+fn json_to_f64(v: &serde_json::Value) -> Result<f64, String> {
+    let number = match v {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    };
+    number
+        .filter(|n: &f64| n.is_finite())
+        .ok_or_else(|| "expected a finite OTLP number".into())
+}
+
+pub(super) fn repository(
+    resource: &[KeyValue],
+    attributes: &[KeyValue],
+) -> Result<Option<hatel_core::ProjectRef>, String> {
+    let field = |name: &str| -> Result<Option<String>, String> {
+        let resource = resource
+            .iter()
+            .find(|kv| kv.key == name)
+            .map(|kv| kv.value.as_string());
+        let point = attributes
+            .iter()
+            .find(|kv| kv.key == name)
+            .map(|kv| kv.value.as_string());
+        if matches!((&resource,&point),(Some(a),Some(b)) if a!=b) {
+            return Err(format!("conflicting repository attribute: {name}"));
+        }
+        Ok(point.or(resource))
+    };
+    let Some(url) = field("vcs.repository.url.full")? else {
+        return Ok(None);
+    };
+    let parsed = reqwest::Url::parse(&url).map_err(|_| "invalid vcs.repository.url.full")?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err("invalid repository browser URL".into());
     }
+    Ok(Some(hatel_core::ProjectRef {
+        key: format!("vcs:{url}"),
+        label: field("vcs.repository.name")?.unwrap_or(url),
+    }))
+}
+
+pub fn repository_projects(
+    bytes: &[u8],
+    metrics: bool,
+) -> Result<std::collections::BTreeMap<String, hatel_core::ProjectRef>, String> {
+    let mut projects = std::collections::BTreeMap::new();
+    let mut add = |resource: &[KeyValue], attrs: &[KeyValue]| -> Result<(), String> {
+        let session = attrs
+            .iter()
+            .find(|a| a.key == super::SESSION_ID)
+            .map(|a| a.value.as_string());
+        if let (Some(session), Some(project)) = (session, repository(resource, attrs)?) {
+            if projects
+                .get(&session)
+                .is_some_and(|p: &hatel_core::ProjectRef| p.key != project.key)
+            {
+                return Err("conflicting repository identities in one session".into());
+            }
+            projects.insert(session, project);
+        }
+        Ok(())
+    };
+    if metrics {
+        let request: MetricsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        for resource in request.resource_metrics {
+            for scope in resource.scope_metrics {
+                for metric in scope.metrics {
+                    if let Some(sum) = metric.sum {
+                        for point in sum.data_points {
+                            add(&resource.resource.attributes, &point.attributes)?;
+                        }
+                    }
+                    for shape in [
+                        metric.gauge,
+                        metric.histogram,
+                        metric.exponential_histogram,
+                        metric.summary,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        for point in shape.data_points {
+                            add(&resource.resource.attributes, &point.attributes)?;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        let request: LogsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        for resource in request.resource_logs {
+            for scope in resource.scope_logs {
+                for record in scope.log_records {
+                    add(&resource.resource.attributes, &record.attributes)?;
+                }
+            }
+        }
+    }
+    Ok(projects)
 }
 
 // ── OTLP/JSON shapes (only the fields we read) ──
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct Resource {
+    #[serde(default)]
+    pub attributes: Vec<KeyValue>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct MetricsRequest {
@@ -144,6 +256,8 @@ struct MetricsRequest {
 
 #[derive(Debug, Default, Deserialize)]
 struct ResourceMetrics {
+    #[serde(default)]
+    resource: Resource,
     #[serde(default, rename = "scopeMetrics")]
     scope_metrics: Vec<ScopeMetrics>,
 }
@@ -162,6 +276,12 @@ struct Metric {
     sum: Option<Sum>,
     #[serde(default)]
     gauge: Option<Gauge>,
+    #[serde(default)]
+    histogram: Option<Gauge>,
+    #[serde(default, rename = "exponentialHistogram")]
+    exponential_histogram: Option<Gauge>,
+    #[serde(default)]
+    summary: Option<Gauge>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -189,47 +309,74 @@ struct DataPoint {
 }
 
 impl DataPoint {
-    fn value(&self) -> f64 {
-        if let Some(i) = &self.as_int {
-            return json_to_f64(i);
+    fn value(&self) -> Result<f64, String> {
+        match (&self.as_int, self.as_double) {
+            (Some(i), None) => json_to_f64(i),
+            (None, Some(value)) if value.is_finite() => Ok(value),
+            _ => Err("datapoint must contain exactly one finite asInt or asDouble".into()),
         }
-        self.as_double.unwrap_or(0.0)
     }
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct LogsRequest {
+pub(super) struct LogsRequest {
     #[serde(default, rename = "resourceLogs")]
-    resource_logs: Vec<ResourceLogs>,
+    pub resource_logs: Vec<ResourceLogs>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ResourceLogs {
+pub(super) struct ResourceLogs {
+    #[serde(default)]
+    pub resource: Resource,
     #[serde(default, rename = "scopeLogs")]
-    scope_logs: Vec<ScopeLogs>,
+    pub scope_logs: Vec<ScopeLogs>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct ScopeLogs {
+pub(super) struct ScopeLogs {
     #[serde(default, rename = "logRecords")]
-    log_records: Vec<LogRecord>,
+    pub log_records: Vec<LogRecord>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct LogRecord {
+pub(super) struct LogRecord {
+    #[serde(default, rename = "timeUnixNano")]
+    pub time_unix_nano: Option<serde_json::Value>,
+    #[serde(default, rename = "eventName")]
+    pub event_name: Option<String>,
     #[serde(default)]
-    attributes: Vec<KeyValue>,
+    pub attributes: Vec<KeyValue>,
+}
+
+impl LogRecord {
+    pub(super) fn name(&self) -> Result<Option<String>, String> {
+        let attribute = self
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "event.name")
+            .map(|kv| kv.value.as_string());
+        if let (Some(event), Some(attribute)) = (&self.event_name, &attribute)
+            && normalize(event) != normalize(attribute)
+        {
+            return Err("conflicting event names".into());
+        }
+        Ok(self
+            .event_name
+            .as_deref()
+            .or(attribute.as_deref())
+            .map(|name| normalize(name).to_string()))
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct KeyValue {
-    key: String,
+pub(super) struct KeyValue {
+    pub key: String,
     #[serde(default)]
-    value: AnyValue,
+    pub value: AnyValue,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct AnyValue {
+pub(super) struct AnyValue {
     #[serde(default, rename = "stringValue")]
     string_value: Option<String>,
     #[serde(default, rename = "intValue")]
@@ -241,7 +388,21 @@ struct AnyValue {
 }
 
 impl AnyValue {
-    fn as_string(&self) -> String {
+    pub(super) fn number(&self) -> Result<serde_json::Value, String> {
+        let raw = self.as_string();
+        if let Ok(number) = raw.parse::<i64>() {
+            return Ok(number.into());
+        }
+        if let Ok(number) = raw.parse::<u64>() {
+            return Ok(number.into());
+        }
+        let parsed = json_to_f64(&serde_json::Value::String(raw))?;
+        serde_json::Number::from_f64(parsed)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| "invalid number".into())
+    }
+
+    pub(super) fn as_string(&self) -> String {
         if let Some(s) = &self.string_value {
             return s.clone();
         }
@@ -314,10 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_temporality_reads_as_cumulative() {
-        // A sum with no `aggregationTemporality` must read as cumulative (replace, never
-        // accumulate) — the OTLP default, and the direction that can inflate nothing. This is
-        // load-bearing for the accumulator, which adds delta points and replaces cumulative ones.
+    fn missing_sum_temporality_is_rejected() {
         let body = serde_json::json!({
             "resourceMetrics": [{ "scopeMetrics": [{ "metrics": [{
                 "name": "claude_code.token.usage",
@@ -328,9 +486,7 @@ mod tests {
             }]}]}]
         })
         .to_string();
-        let points = parse_metrics(body.as_bytes(), &tracked()).unwrap();
-        assert_eq!(points.len(), 1);
-        assert!(!points[0].delta, "absent temporality is cumulative");
+        assert!(parse_metrics(body.as_bytes(), &tracked()).is_err());
     }
 
     #[test]

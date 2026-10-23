@@ -1,13 +1,13 @@
 //! Enriched transform: inject the `project` label — resolved per datapoint from its own
 //! `session.id` — into an OTLP/JSON metrics or logs body. Pure (a resolver closure, no fs), so
 //! it is fully unit-testable. It walks an untyped `serde_json::Value` rather than the typed
-//! shapes in `otlp/decode.rs`, which drop unknown fields: forwarding must be lossless, so every
+//! shapes in `claude/decode.rs`, which drop unknown fields: forwarding must be lossless, so every
 //! field's value and structure is preserved (object key order may be re-sorted on re-serialization,
 //! which is insignificant to any OTLP parser) except the one attribute we add. A datapoint whose
 //! session is unknown is forwarded unchanged (the label is omitted, never fabricated).
 //!
 //! `session.id` is read at the datapoint / log-record level — the layer Claude Code emits it on,
-//! and the same layer `otlp/decode.rs` reads for the local view, so the two never disagree. A
+//! and the same layer `claude/decode.rs` reads for the local view, so the two never disagree. A
 //! resource-level `session.id` (a layout Claude Code does not produce) is intentionally not
 //! consulted; that would have to change in lockstep with `decode.rs` to stay consistent.
 
@@ -15,15 +15,14 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use crate::otlp::{PROJECT, SESSION_ID};
+use crate::claude::{PROJECT, SESSION_ID};
 
 /// Resolve a `session.id` to a project label (`None` when unknown).
 pub type Resolve<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 /// Collect the distinct `session.id`s carried by an OTLP body — at the datapoint level for
-/// metrics, the log-record level for logs (the same layer enrichment reads). Returns `None` when
-/// the body isn't parseable JSON; `Some` (possibly empty) otherwise. The per-destination project
-/// filter uses this to resolve a batch's project before deciding whether to forward it.
+/// metrics, the log-record level for logs. A filtered batch requires an unambiguous session on
+/// every record, including metric types the local Claude Code view does not aggregate.
 pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
     let root: Value = serde_json::from_slice(body).ok()?;
     let mut ids = BTreeSet::new();
@@ -31,15 +30,28 @@ pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
         for rm in read_children(&root, "resourceMetrics") {
             for sm in read_children(rm, "scopeMetrics") {
                 for metric in read_children(sm, "metrics") {
-                    for shape in ["sum", "gauge"] {
+                    let shapes = [
+                        "sum",
+                        "gauge",
+                        "histogram",
+                        "exponentialHistogram",
+                        "summary",
+                    ];
+                    if shapes
+                        .iter()
+                        .filter(|shape| metric.get(**shape).is_some())
+                        .count()
+                        != 1
+                    {
+                        return None;
+                    }
+                    for shape in shapes {
                         let points = metric
                             .get(shape)
                             .and_then(|s| s.get("dataPoints"))
                             .and_then(Value::as_array);
                         for dp in points.into_iter().flatten() {
-                            if let Some(sid) = point_session_id(dp) {
-                                ids.insert(sid.to_string());
-                            }
+                            ids.insert(point_session_id(dp)?.to_string());
                         }
                     }
                 }
@@ -49,9 +61,7 @@ pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
         for rl in read_children(&root, "resourceLogs") {
             for sl in read_children(rl, "scopeLogs") {
                 for rec in read_children(sl, "logRecords") {
-                    if let Some(sid) = point_session_id(rec) {
-                        ids.insert(sid.to_string());
-                    }
+                    ids.insert(point_session_id(rec)?.to_string());
                 }
             }
         }
@@ -68,8 +78,13 @@ pub fn enrich_metrics(body: &[u8], resolve: &Resolve) -> Result<Vec<u8>, String>
     for rm in children(&mut root, "resourceMetrics") {
         for sm in children(rm, "scopeMetrics") {
             for metric in children(sm, "metrics") {
-                // A metric is a sum or a gauge (the two shapes carrying datapoints we attribute).
-                for shape in ["sum", "gauge"] {
+                for shape in [
+                    "sum",
+                    "gauge",
+                    "histogram",
+                    "exponentialHistogram",
+                    "summary",
+                ] {
                     let Some(points) = metric
                         .get_mut(shape)
                         .and_then(|s| s.get_mut("dataPoints"))
@@ -134,14 +149,20 @@ fn inject_project(point: &mut Value, resolve: &Resolve) {
 
 /// The `session.id` string attribute on one datapoint/record, if present.
 fn point_session_id(point: &Value) -> Option<&str> {
-    point
+    let mut attributes = point
         .get("attributes")?
         .as_array()?
         .iter()
-        .find(|a| attr_key(a) == Some(SESSION_ID))?
+        .filter(|a| attr_key(a) == Some(SESSION_ID));
+    let attribute = attributes.next()?;
+    if attributes.next().is_some() {
+        return None;
+    }
+    attribute
         .get("value")?
         .get("stringValue")?
         .as_str()
+        .filter(|value| !value.is_empty())
 }
 
 fn attr_key(attr: &Value) -> Option<&str> {
@@ -333,15 +354,44 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_none_for_non_json_some_empty_for_sessionless() {
+    fn session_ids_reject_non_json_and_sessionless_records() {
         assert!(
             session_ids(b"\x00proto", true).is_none(),
             "non-JSON is None"
         );
         let body = metrics_body(json!([{ "attributes": [], "asInt": "1" }]));
         assert!(
-            session_ids(&body, true).unwrap().is_empty(),
-            "parseable but sessionless is an empty set"
+            session_ids(&body, true).is_none(),
+            "a record without a session cannot authorize a filtered batch"
         );
+    }
+    #[test]
+    fn a_filtered_batch_cannot_hide_unattributed_records_behind_a_known_session() {
+        for shape in [
+            "sum",
+            "gauge",
+            "histogram",
+            "exponentialHistogram",
+            "summary",
+        ] {
+            let body = json!({"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+                {"name":"known","sum":{"dataPoints":[{"attributes":[{"key":"session.id","value":{"stringValue":"company"}}]}]}},
+                {"name":"unattributed",shape:{"dataPoints":[{"attributes":[]}]}}
+            ]}]}]});
+            assert!(
+                session_ids(&serde_json::to_vec(&body).unwrap(), true).is_none(),
+                "{shape}"
+            );
+        }
+        let body = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[
+            {"attributes":[{"key":"session.id","value":{"stringValue":"company"}}]},
+            {"attributes":[]}
+        ]}]}]});
+        assert!(session_ids(&serde_json::to_vec(&body).unwrap(), false).is_none());
+        let duplicate = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
+            {"key":"session.id","value":{"stringValue":"company"}},
+            {"key":"session.id","value":{"stringValue":"personal"}}
+        ]}]}]}]});
+        assert!(session_ids(&serde_json::to_vec(&duplicate).unwrap(), false).is_none());
     }
 }

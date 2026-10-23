@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::cost::{self, CostRow};
 use crate::registry::Registry;
 use crate::schema::UnreadableKinds;
-use crate::{Config, sink, ts_epoch};
+use crate::{Config, ts_epoch};
 
 /// How many groups a report shows per Kind.
 pub const TOP_N: usize = 5;
@@ -103,25 +103,20 @@ pub struct Query<'a> {
     pub filters: &'a [(String, String)],
 }
 
-/// Where a Kind's records stand relative to a requested project scope. A Kind that does not
-/// record `project` carries no project at all, so a project-scoped report has nothing of its to
-/// show — which is a different statement from "this project did none of it", and is reported as
-/// such rather than as an empty result.
+/// Whether this query applies a project restriction. Common metadata supplies attribution for
+/// every Kind; legacy records without attribution cannot match a project restriction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectScope {
     Unrestricted,
     Applied,
-    Unsupported,
 }
 
 /// One Kind's answer, self-describing: which dimension it was grouped by, which measure ranked
 /// it (`None` — and so count — when the Kind declares no measures), what each group's count
 /// counts (`identity`: distinct values of that field, else records), how the project scope
-/// applied, and how far back the store reaches (`retained_since`: the oldest record still held —
-/// of the project the query names, else of any — `None` when it holds none). A window that starts
-/// before it was not measured whole, and a reader that would take an empty early stretch for a
-/// measured silence reads it.
+/// applied, and the oldest retained occurrence (`retained_since`). This timestamp does not
+/// establish continuous collection; an empty period is an absence of records, not proof of inactivity.
 #[derive(Debug, Clone, Serialize)]
 pub struct KindSection {
     pub kind: String,
@@ -147,10 +142,10 @@ pub struct Report {
     /// join table a caller reaches for when relating spend to its own records — while
     /// [`cost_by_project`] provides the ranked rollup a summary shows.
     pub cost: Vec<CostRow>,
+    pub cost_basis: &'static str,
     /// Kinds the ledger holds that this registry cannot read. A report answered over less than
     /// the store contains says so here, rather than presenting the part it could read as the
-    /// whole — the same honesty [`ProjectScope::Unsupported`] gives a Kind that records no
-    /// project.
+    /// whole.
     pub unreadable_kinds: Option<UnreadableKinds>,
 }
 
@@ -166,13 +161,10 @@ impl Report {
                 };
                 let group_by = q.group_by.unwrap_or(&spec.group_key);
                 let sort_by = q.sort_by.or(spec.measures.first().map(String::as_str));
-                let result = match project_scope {
-                    ProjectScope::Unsupported => Ok(Vec::new()),
-                    _ => crate::query::aggregate(cfg, spec, q),
-                };
-                let (groups, error) = match result {
-                    Ok(groups) => (groups, None),
-                    Err(e) => (Vec::new(), Some(e.to_string())),
+                let result = crate::query::section(cfg, spec, q);
+                let (groups, retained_since, error) = match result {
+                    Ok(result) => (result.groups, result.retained_since, None),
+                    Err(e) => (Vec::new(), None, Some(e.to_string())),
                 };
                 KindSection {
                     kind: spec.name.clone(),
@@ -180,7 +172,7 @@ impl Report {
                     sort_by: sort_by.map(str::to_string),
                     identity: spec.identity.clone(),
                     project_scope,
-                    retained_since: sink::oldest_record_ts(cfg, &spec.name, q.project),
+                    retained_since,
                     groups,
                     error,
                 }
@@ -205,6 +197,7 @@ impl Report {
                 Some(_) => Vec::new(),
                 None => cost_rows(&cfg.state_dir, q),
             },
+            cost_basis: "session_lifetime_totals_selected_by_last_seen",
             unreadable_kinds: UnreadableKinds::detect_resilient(reg, cfg),
         }
     }
@@ -215,7 +208,10 @@ impl Report {
 fn cost_rows(state_dir: &std::path::Path, q: &Query) -> Vec<CostRow> {
     cost::read_snapshot(state_dir)
         .into_iter()
-        .filter(|r| q.project.is_none_or(|p| r.project == p))
+        .filter(|r| {
+            q.project
+                .is_none_or(|p| r.project == p || r.project_key.as_deref() == Some(p))
+        })
         .filter(|r| ts_epoch(&r.ts).is_some_and(|t| t >= q.since))
         .collect()
 }
@@ -229,7 +225,7 @@ pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
     let mut by_project: BTreeMap<&str, (i64, [f64; 4])> = BTreeMap::new();
     for row in rows {
         let entry = by_project
-            .entry(row.project.as_str())
+            .entry(row.project_key.as_deref().unwrap_or(&row.project))
             .or_insert((0, [0.0; 4]));
         entry.0 += 1;
         entry.1[0] += row.tokens as f64;
