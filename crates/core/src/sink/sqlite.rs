@@ -161,12 +161,9 @@ fn initialize(conn: &mut Connection, mode: Initialization) -> crate::Result<usiz
                     "invalid timestamp in SQLite row {id}; maintenance rolled back"
                 ))
             })?;
+            let (seconds, nanos) = crate::model::timestamp_parts(ts);
             update
-                .execute(rusqlite::params![
-                    ts.as_second(),
-                    ts.subsec_nanosecond(),
-                    id
-                ])
+                .execute(rusqlite::params![seconds, nanos, id])
                 .map_err(io)?;
             normalized += 1;
         }
@@ -325,6 +322,10 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
     if !path.exists() {
         return 0;
     }
+    if let Err(error) = write_readiness(path) {
+        eprintln!("hatel: sqlite retention skipped: {error}");
+        return 0;
+    }
     let result = (|| -> rusqlite::Result<usize> {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -425,6 +426,7 @@ impl Sink for SqliteSink {
             .ts
             .parse::<jiff::Timestamp>()
             .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
+        let (seconds, nanos) = crate::model::timestamp_parts(occurred);
         let tx = conn
             .transaction()
             .map_err(|e| crate::Error::Io(e.to_string()))?;
@@ -435,7 +437,7 @@ impl Sink for SqliteSink {
         }
         let inserted = tx.execute(
             "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds,occurred_nanos) VALUES (?1, ?2, ?3, ?4, ?5, ?6,?7) ON CONFLICT DO NOTHING",
-            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, occurred.as_second(),occurred.subsec_nanosecond()],
+            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, seconds,nanos],
         ).map_err(|e| crate::Error::Io(e.to_string()))?;
         if inserted == 0 {
             let id = env.metadata.record_id.as_deref().ok_or_else(|| {

@@ -161,7 +161,18 @@ pub fn now_epoch() -> i64 {
 /// unparseable timestamp consistently yields `None`, so the caller drops the record rather
 /// than bucketing it at epoch 0.
 pub fn ts_epoch(ts: &str) -> Option<i64> {
-    ts.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
+    ts.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| timestamp_parts(t).0)
+}
+
+/// Floor seconds keep fractional instants before the epoch on the correct side of a cutoff.
+pub(crate) fn timestamp_parts(ts: jiff::Timestamp) -> (i64, i32) {
+    let nanos = ts.subsec_nanosecond();
+    (
+        ts.as_second() - i64::from(nanos < 0),
+        nanos.rem_euclid(1_000_000_000),
+    )
 }
 
 pub fn source_record_id(source: &str, parts: &[&str]) -> String {

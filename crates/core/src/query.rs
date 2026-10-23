@@ -14,12 +14,12 @@ pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function("hatel_epoch", 1, flags, |c| {
         Ok(c.get::<Option<String>>(0)?
             .and_then(|value| value.parse::<jiff::Timestamp>().ok())
-            .map(|t| t.as_second()))
+            .map(|t| crate::model::timestamp_parts(t).0))
     })?;
     conn.create_scalar_function("hatel_nanos", 1, flags, |c| {
         Ok(c.get::<Option<String>>(0)?
             .and_then(|value| value.parse::<jiff::Timestamp>().ok())
-            .map(|t| t.subsec_nanosecond()))
+            .map(|t| crate::model::timestamp_parts(t).1))
     })
 }
 
@@ -86,7 +86,11 @@ fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
                     if env.kind != kind {
                         continue;
                     }
-                    let occurred = env.ts.parse::<jiff::Timestamp>().ok();
+                    let occurred = env
+                        .ts
+                        .parse::<jiff::Timestamp>()
+                        .ok()
+                        .map(crate::model::timestamp_parts);
                     insert
                         .execute(rusqlite::params![
                             env.ts,
@@ -94,8 +98,8 @@ fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
                             env.schema_version,
                             serde_json::to_string(&env.payload).map_err(io)?,
                             serde_json::to_string(&env.metadata).map_err(io)?,
-                            occurred.map(|t| t.as_second()),
-                            occurred.map(|t| t.subsec_nanosecond())
+                            occurred.map(|t| t.0),
+                            occurred.map(|t| t.1)
                         ])
                         .map_err(io)?;
                 }
@@ -139,7 +143,7 @@ pub(crate) fn prepare_read(conn: &Connection) -> crate::Result<()> {
     };
     conn.execute_batch(&format!("CREATE TEMP VIEW records_read AS
         SELECT rowid AS sequence,ts,kind,schema_version,payload,{metadata} AS metadata,{seconds} AS occurred_seconds,{nanos} AS occurred_nanos FROM records WHERE {seconds} IS NOT NULL AND {nanos} IS NOT NULL
-        UNION ALL SELECT rowid,ts,kind,schema_version,payload,{metadata},{seconds},hatel_nanos(ts) FROM records WHERE {seconds} IS NOT NULL AND {nanos} IS NULL
+        UNION ALL SELECT rowid,ts,kind,schema_version,payload,{metadata},hatel_epoch(ts),hatel_nanos(ts) FROM records WHERE {seconds} IS NOT NULL AND {nanos} IS NULL
         UNION ALL SELECT rowid,ts,kind,schema_version,payload,{metadata},hatel_epoch(ts),hatel_nanos(ts) FROM records WHERE {seconds} IS NULL;")).map_err(io)?;
     Ok(())
 }

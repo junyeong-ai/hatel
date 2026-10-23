@@ -276,6 +276,7 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                     continue;
                 }
                 let (mut env, occurred) = parse_record(&line, path, index + 1)?;
+                let (seconds, nanos) = crate::model::timestamp_parts(occurred);
                 if env.metadata.record_id.is_none() {
                     env.metadata = RecordMetadata {
                         record_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -289,8 +290,8 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         env.schema_version,
                         serde_json::to_string(&env.payload).map_err(io)?,
                         serde_json::to_string(&env.metadata).map_err(io)?,
-                        occurred.as_second(),
-                        occurred.subsec_nanosecond()
+                        seconds,
+                        nanos
                     ])
                     .map_err(io)?;
                 if inserted == 0 {

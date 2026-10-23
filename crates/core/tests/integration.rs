@@ -1244,6 +1244,109 @@ fn duplicate_event_kind_binding_is_rejected() {
 }
 
 #[test]
+fn time_windows_respect_fractional_timestamps_before_the_unix_epoch() {
+    for sink in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            sink,
+            ..config_in(dir.path(), vec![])
+        };
+        let reg = load_core().unwrap();
+        let mut writer = hatel_core::build_sink(&cfg, &reg);
+        for ts in [
+            "1969-12-31T23:59:58.999999999Z",
+            "1969-12-31T23:59:59Z",
+            "1969-12-31T23:59:59.5Z",
+            "1970-01-01T00:00:00.5Z",
+        ] {
+            let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+            env.ts = ts.into();
+            writer.write_record(&env).unwrap();
+        }
+        writer.flush().unwrap();
+        let groups = aggregate(&reg, &cfg, "prompt", &query(-1, 0, None));
+        assert_eq!(
+            groups[0].count, 3,
+            "{sink:?}: an occurrence before the exact cutoff is excluded"
+        );
+        if sink == SinkKind::Jsonl {
+            assert_eq!(
+                hatel_core::migration::import_jsonl(
+                    &cfg.ledger_dir,
+                    &cfg.state_dir.join("telemetry.db")
+                )
+                .unwrap(),
+                4
+            );
+            let imported = Config {
+                sink: SinkKind::Sqlite,
+                ..cfg
+            };
+            assert_eq!(
+                aggregate(&reg, &imported, "prompt", &query(-1, 0, None))[0].count,
+                3
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_negative_seconds_are_read_and_normalized_from_the_exact_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let db = dir.path().join("telemetry.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let ts = "1969-12-31T23:59:58.999999999Z";
+    conn.execute_batch("CREATE TABLE records(ts TEXT NOT NULL,kind TEXT NOT NULL,schema_version INTEGER NOT NULL,payload TEXT NOT NULL,occurred_seconds INTEGER);").unwrap();
+    conn.execute("INSERT INTO records VALUES (?1,'prompt',1,'{}',-1)", [ts])
+        .unwrap();
+    let reg = load_core().unwrap();
+    assert!(aggregate(&reg, &cfg, "prompt", &legacy_query(-1, 0, None)).is_empty());
+    assert_eq!(
+        hatel_core::sink::prune(
+            &cfg,
+            hatel_core::config::Retention {
+                cutoff: 0,
+                rotate_before: 0
+            }
+        ),
+        0
+    );
+    assert_eq!(hatel_core::migration::upgrade_sqlite(&db).unwrap(), 1);
+    assert_eq!(
+        conn.query_row(
+            "SELECT ts,occurred_seconds,occurred_nanos FROM records",
+            [],
+            |r| Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i32>(2)?
+            ))
+        )
+        .unwrap(),
+        (ts.into(), -2, 999_999_999)
+    );
+    assert_eq!(
+        aggregate(&reg, &cfg, "prompt", &legacy_query(-2, 0, None))[0].count,
+        1
+    );
+    assert_eq!(hatel_core::ts_epoch(ts), Some(-2));
+    assert_eq!(
+        hatel_core::sink::prune(
+            &cfg,
+            hatel_core::config::Retention {
+                cutoff: -1,
+                rotate_before: -1
+            }
+        ),
+        1
+    );
+}
+
+#[test]
 fn a_contended_sqlite_write_fails_without_receipt_and_can_be_retried() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config {
