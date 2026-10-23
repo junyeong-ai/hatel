@@ -20,6 +20,51 @@ pub struct Envelope {
     #[serde(rename = "_schema_version", default = "schema_v1")]
     pub schema_version: u32,
     pub payload: Payload,
+    #[serde(default)]
+    pub metadata: RecordMetadata,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<crate::ProjectRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_version: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordContext {
+    pub occurred_at: Option<String>,
+    pub source: Option<String>,
+    pub run_id: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+impl Envelope {
+    pub fn apply_context(&mut self, context: RecordContext) -> crate::Result<()> {
+        if let Some(ts) = context.occurred_at {
+            let parsed = ts
+                .parse::<jiff::Timestamp>()
+                .map_err(|_| crate::Error::InvalidPayload("occurred_at must be RFC 3339".into()))?;
+            self.ts = parsed.to_string();
+        }
+        self.metadata.source = context.source;
+        self.metadata.run_id = context.run_id;
+        self.metadata.correlation_id = context.correlation_id;
+        Ok(())
+    }
 }
 
 /// A line written by an older or foreign producer defaults to v1 rather than
@@ -60,6 +105,12 @@ pub fn make_envelope(
         kind: kind.to_string(),
         schema_version: SCHEMA_VERSION,
         payload,
+        metadata: RecordMetadata {
+            record_id: Some(uuid::Uuid::new_v4().to_string()),
+            observed_at: Some(now_iso_utc()),
+            kind_version: Some(spec.version),
+            ..RecordMetadata::default()
+        },
     })
 }
 

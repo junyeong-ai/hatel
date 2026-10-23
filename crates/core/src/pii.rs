@@ -10,6 +10,23 @@ use crate::{Error, Payload, Result};
 /// an unknown key is an error (the test suite proves no leakage); otherwise it is
 /// silently dropped.
 pub fn sanitize(spec: &KindSpec, payload: Payload, strict: bool) -> Result<Payload> {
+    for (name, field) in &spec.field_specs {
+        match payload.get(name) {
+            None if field.required => {
+                return Err(Error::InvalidPayload(format!(
+                    "{}.{name} is required",
+                    spec.name
+                )));
+            }
+            Some(value) if !field.field_type.accepts(value) => {
+                return Err(Error::InvalidPayload(format!(
+                    "{}.{name} must be {:?}",
+                    spec.name, field.field_type
+                )));
+            }
+            _ => {}
+        }
+    }
     let mut out = Payload::new();
     let mut rejected = Vec::new();
     for (key, value) in payload {

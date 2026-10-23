@@ -70,9 +70,9 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
         .and_then(|s| jiff::Timestamp::from_second(s.saturating_sub(1)).ok())
         .map(|t| t.to_string())
         .unwrap_or_default();
-    let mut stmt = match conn
-        .prepare("SELECT ts, schema_version, payload FROM records WHERE kind = ?1 AND ts >= ?2")
-    {
+    let mut stmt = match conn.prepare(
+        "SELECT ts, schema_version, payload, metadata FROM records WHERE kind = ?1 AND ts >= ?2",
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("hatel: sqlite query prepare failed ({e})");
@@ -84,12 +84,13 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
             row.get::<_, String>(0)?,
             row.get::<_, u32>(1)?,
             row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
         ))
     });
     let mut out = Vec::new();
     match rows {
         Ok(rows) => {
-            for (ts, schema_version, payload) in rows.flatten() {
+            for (ts, schema_version, payload, metadata) in rows.flatten() {
                 // Skip a record stamped newer than this build understands (same guard
                 // as the JSONL path) so a future format bump degrades safely.
                 if schema_version > crate::SCHEMA_VERSION {
@@ -101,6 +102,7 @@ pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope
                         kind: kind.to_string(),
                         schema_version,
                         payload,
+                        metadata: serde_json::from_str(&metadata).unwrap_or_default(),
                     });
                 }
             }
@@ -174,19 +176,14 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
 }
 
 pub struct SqliteSink {
-    conn: Option<Connection>,
+    conn: Result<Connection, String>,
 }
 
 impl SqliteSink {
     pub fn open(path: PathBuf) -> Self {
-        let conn = match Self::init(&path) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                eprintln!("hatel: sqlite open failed: {e}");
-                None
-            }
-        };
-        Self { conn }
+        Self {
+            conn: Self::init(&path).map_err(|e| e.to_string()),
+        }
     }
 
     fn init(path: &PathBuf) -> rusqlite::Result<Connection> {
@@ -208,21 +205,36 @@ impl SqliteSink {
              );
              CREATE INDEX IF NOT EXISTS idx_records_kind_ts ON records(kind, ts);",
         )?;
+        let has_metadata = {
+            let mut stmt = conn.prepare("PRAGMA table_info(records)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .iter()
+                .any(|c| c == "metadata")
+        };
+        if !has_metadata {
+            conn.execute_batch(
+                "ALTER TABLE records ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}';",
+            )?;
+        }
         Ok(conn)
     }
 }
 
 impl Sink for SqliteSink {
-    fn write_record(&mut self, env: &Envelope) {
-        let Some(conn) = &self.conn else {
-            return;
-        };
-        let payload = serde_json::to_string(&env.payload).unwrap_or_default();
-        if let Err(e) = conn.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![env.ts, env.kind, env.schema_version, payload],
-        ) {
-            eprintln!("hatel: sqlite insert failed kind={}: {e}", env.kind);
-        }
+    fn write_record(&mut self, env: &Envelope) -> crate::Result<super::WriteReceipt> {
+        let conn = self
+            .conn
+            .as_ref()
+            .map_err(|e| crate::Error::Io(e.clone()))?;
+        let payload =
+            serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO records (ts, kind, schema_version, payload, metadata) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?],
+        ).map_err(|e| crate::Error::Io(e.to_string()))?;
+        Ok(super::WriteReceipt {
+            record_id: env.metadata.record_id.clone(),
+        })
     }
 }

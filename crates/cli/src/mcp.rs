@@ -2,8 +2,7 @@
 //! `kinds`, `doctor`) and its one write (`emit`) as typed MCP tools over stdio, so an
 //! agent calls them in-protocol instead of shelling out and parsing stdout. Each read
 //! tool returns exactly the JSON its CLI counterpart prints (`--format json` /
-//! `--json`) — one payload shape per question, however it is asked; `emit` answers
-//! with its outcome as text, since the CLI write path prints nothing on success.
+//! `--json`). Writes return storage receipts, including per-item batch outcomes.
 //! stdout is the protocol channel; diagnostics go to stderr only.
 
 use rmcp::{
@@ -58,6 +57,12 @@ pub struct EmitParams {
         description = "The record's fields as a JSON object. Keys outside the Kind's allow-list are dropped and warned about in the result text."
     )]
     pub payload: serde_json::Map<String, serde_json::Value>,
+    pub context: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct BatchParams {
+    pub records: Vec<serde_json::Value>,
 }
 
 #[tool_router]
@@ -88,6 +93,22 @@ impl HatelMcp {
             text_result(format!("{json}\n"))
         })
         .await
+    }
+
+    #[tool(
+        description = "Record up to 4096 structured {kind, payload, context?} entries. Each result is stored, rejected, or failed; a stored receipt confirms local storage only."
+    )]
+    async fn emit_batch(
+        &self,
+        Parameters(p): Parameters<BatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        blocking(move || {
+            let results = crate::emit_batch(p.records).map_err(internal)?;
+            Ok(text_result(
+                serde_json::to_string(&results).expect("batch serializes"),
+            ))
+        })
+        .await?
     }
 
     #[tool(
@@ -155,12 +176,16 @@ fn kinds_tool() -> Result<CallToolResult, McpError> {
 
 fn emit_tool(p: EmitParams) -> Result<CallToolResult, McpError> {
     let payload: Payload = p.payload.into_iter().collect();
-    match emit_record(&p.kind, || Ok(payload)) {
-        Ok(None) => Ok(text_result(format!("recorded {}", p.kind))),
-        Ok(Some(warning)) => Ok(text_result(format!(
-            "recorded {} — warning: {warning}",
-            p.kind
-        ))),
+    let context = p
+        .context
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| McpError::invalid_params(format!("invalid context: {e}"), None))?
+        .unwrap_or_default();
+    match emit_record(&p.kind, || Ok(payload), context) {
+        Ok(receipt) => Ok(text_result(
+            serde_json::to_string(&receipt).expect("receipt serializes"),
+        )),
         Err(EmitError::Registry(e)) => Err(internal(e)),
         Err(EmitError::Rejected(e)) => Err(McpError::invalid_params(e, None)),
     }

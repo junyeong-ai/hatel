@@ -504,8 +504,8 @@ fn a_redacted_field_is_filterable_by_its_stored_form() {
     payload.insert("actor".into(), "alice@example.com".into());
     let env = make_envelope("ci_check", payload, &reg, false).unwrap();
     let mut sink = hatel_core::build_sink(&cfg);
-    sink.write_record(&env);
-    sink.flush();
+    sink.write_record(&env).unwrap();
+    sink.flush().unwrap();
     let stored = vec![(
         "actor".to_string(),
         hatel_core::pii::redacted("alice@example.com"),
@@ -659,8 +659,8 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
     payload.insert("tool_name".into(), "Bash".into());
     let env = make_envelope("tool", payload, &reg, false).unwrap();
     let mut sink = hatel_core::build_sink(&cfg);
-    sink.write_record(&env);
-    sink.flush();
+    sink.write_record(&env).unwrap();
+    sink.flush().unwrap();
     // …and an ancient row inserted directly.
     {
         let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
@@ -724,7 +724,7 @@ fn an_undeclared_kind_says_when_retention_removes_it() {
         ..config_in(dir.path(), vec![])
     };
     let mut sink = hatel_core::build_sink(&cfg);
-    sink.flush();
+    sink.flush().unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
     for (kind, ts) in [
         ("retired", "2026-01-01T00:00:00Z"),
@@ -1275,9 +1275,10 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
                 ] {
                     s.write_record(
                         &hatel_core::Envelope::from_json_line(&stamped(ts, project)).unwrap(),
-                    );
+                    )
+                    .unwrap();
                 }
-                s.flush();
+                s.flush().unwrap();
             }
         }
         assert_eq!(
@@ -1468,7 +1469,8 @@ fn an_identity_must_name_a_field_of_its_kind() {
     use hatel_core::registry::{KindSpec, KindSpecRaw};
     let raw = |identity: Option<&str>| KindSpecRaw {
         name: "k".into(),
-        fields: vec!["id".into(), "label".into(), "ms".into()],
+        fields: vec!["id".into(), "label".into(), "ms".into()].into(),
+        version: 1,
         group_key: "label".into(),
         redact: vec![],
         measures: vec!["ms".into()],
@@ -1592,8 +1594,9 @@ measures = ["ms"]
             payload.insert("stage".into(), stage.into());
             payload.insert("ms".into(), ms.into());
             let mut out = hatel_core::build_sink(&cfg);
-            out.write_record(&make_envelope("ord.job", payload, &reg, true).unwrap());
-            out.flush();
+            out.write_record(&make_envelope("ord.job", payload, &reg, true).unwrap())
+                .unwrap();
+            out.flush().unwrap();
         }
         report::aggregate(&reg, &cfg, "ord.job", &query(0, 0, None))
     };
@@ -1921,4 +1924,87 @@ fn one_turn_joins_its_records_across_kinds() {
             "{kind} carries the turn it belongs to"
         );
     }
+}
+
+#[test]
+fn typed_records_reject_missing_and_invalid_values_before_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("typed.toml");
+    std::fs::write(
+        &plugin,
+        r#"
+[[kind]]
+name = "typed"
+version = 2
+fields = { name = { type = "string", required = true }, seconds = { type = "number", unit = "s" } }
+group_key = "name"
+measures = ["seconds"]
+"#,
+    )
+    .unwrap();
+    let cfg = config_in(dir.path(), vec![plugin]);
+    let reg = build_registry(&cfg).unwrap();
+    for payload in [
+        serde_json::json!({"seconds": 0}),
+        serde_json::json!({"name": "check", "seconds": "0"}),
+        serde_json::json!({"name": "check", "seconds": null}),
+    ] {
+        assert!(
+            make_envelope(
+                "typed",
+                serde_json::from_value(payload).unwrap(),
+                &reg,
+                true
+            )
+            .is_err()
+        );
+    }
+    for payload in [
+        serde_json::json!({"name": "check"}),
+        serde_json::json!({"name": "check", "seconds": 0}),
+    ] {
+        assert!(
+            make_envelope(
+                "typed",
+                serde_json::from_value(payload).unwrap(),
+                &reg,
+                true
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn receipts_follow_storage_and_metadata_survives_each_backend() {
+    for backend in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            sink: backend,
+            ..config_in(dir.path(), vec![])
+        };
+        let reg = build_registry(&cfg).unwrap();
+        let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+        env.apply_context(hatel_core::model::RecordContext {
+            occurred_at: Some("2026-01-01T00:00:00Z".into()),
+            run_id: Some("run".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let receipt = hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+        assert!(receipt.record_id.is_some());
+        let stored = hatel_core::sink::read_records(&cfg, "prompt", None);
+        assert_eq!(stored, vec![env]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let not_directory = dir.path().join("file");
+    std::fs::write(&not_directory, "occupied").unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        state_dir: not_directory,
+        ..config_in(dir.path(), vec![])
+    };
+    let reg = build_registry(&cfg).unwrap();
+    let env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+    assert!(hatel_core::build_sink(&cfg).write_record(&env).is_err());
 }

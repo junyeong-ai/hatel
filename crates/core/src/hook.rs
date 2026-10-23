@@ -80,11 +80,19 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
             );
         }
         match make_envelope(&binding.kind, payload, registry, cfg.strict) {
-            Ok(envelope) => sink.write_record(&envelope),
+            Ok(mut envelope) => {
+                envelope.metadata.project = project.clone();
+                envelope.metadata.source = Some("claude_code.hook".into());
+                if let Err(e) = sink.write_record(&envelope) {
+                    eprintln!("hatel hook: {e}");
+                }
+            }
             Err(e) => eprintln!("hatel hook: {e}"),
         }
     }
-    sink.flush();
+    if let Err(e) = sink.flush() {
+        eprintln!("hatel hook: {e}");
+    }
 }
 
 /// The session → project join goes to the sink-independent index (not a Kind), so

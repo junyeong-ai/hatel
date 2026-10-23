@@ -149,7 +149,15 @@ enum Command {
         /// A full JSON object payload (instead of field pairs or stdin).
         #[arg(long, conflicts_with = "fields")]
         json: Option<String>,
+        /// Print a JSON storage receipt.
+        #[arg(long)]
+        receipt: bool,
+        /// Common record context as JSON (occurred_at, source, run_id, correlation_id).
+        #[arg(long)]
+        context: Option<String>,
     },
+    /// Record a JSON array of {kind, payload, context?} from stdin; returns one result per item.
+    EmitBatch,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -219,7 +227,14 @@ fn run() -> i32 {
         Command::Doctor { json } => doctor::run(json),
         Command::Mcp => mcp::run(),
         Command::Kinds { json } => kinds_cmd(json),
-        Command::Emit { kind, fields, json } => emit_cmd(&kind, fields, json),
+        Command::Emit {
+            kind,
+            fields,
+            json,
+            receipt,
+            context,
+        } => emit_cmd(&kind, fields, json, receipt, context),
+        Command::EmitBatch => emit_batch_cmd(),
     }
 }
 
@@ -232,59 +247,52 @@ pub(crate) enum EmitError {
     Rejected(String),
 }
 
-/// Record one domain signal — the write path shared by the `emit` subcommand and the
-/// MCP `emit` tool. `payload` is built lazily, only after the Kind checks pass, so an
-/// unknown Kind never blocks on a payload source (the CLI may be reading stdin).
-/// `Ok` carries the dropped-fields warning, if any — the caller decides where it
-/// surfaces (stderr for the CLI, the result text for MCP). An IO write failure stays
-/// fail-open (the sink notes it to stderr).
 pub(crate) fn emit_record(
     kind: &str,
     payload: impl FnOnce() -> Result<Payload, String>,
-) -> Result<Option<String>, EmitError> {
+    context: hatel_core::model::RecordContext,
+) -> Result<hatel_core::record::Receipt, EmitError> {
     let cfg = Config::load().map_err(|e| EmitError::Registry(e.to_string()))?;
     let reg = build_registry(&cfg).map_err(|e| EmitError::Registry(e.to_string()))?;
     if reg.kind(kind).is_none() {
         return Err(EmitError::Rejected(unknown_kind(kind, &reg, &cfg)));
     }
-    let payload = payload().map_err(EmitError::Rejected)?;
-    // Warn loudly on a field the Kind doesn't accept — on the emit path the caller
-    // chose it, so a silent allow-list drop (correct for automatic hooks) would just
-    // hide a typo. The dropped field never reaches the sink either way.
-    let warning = reg.kind(kind).and_then(|spec| {
-        let unknown: Vec<&str> = payload
-            .keys()
-            .filter(|k| !spec.fields.contains(*k))
-            .map(String::as_str)
-            .collect();
-        if unknown.is_empty() {
-            return None;
-        }
-        let mut accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
-        accepted.sort_unstable();
-        Some(format!(
-            "{kind} does not accept {unknown:?} (dropped) — accepted fields: {}",
-            accepted.join(", ")
-        ))
-    });
-    match hatel_core::make_envelope(kind, payload, &reg, cfg.strict) {
-        Ok(env) => {
-            let mut sink = hatel_core::build_sink(&cfg);
-            sink.write_record(&env);
-            sink.flush();
-            Ok(warning)
-        }
-        Err(e) => Err(EmitError::Rejected(e.to_string())),
+    let input = hatel_core::record::RecordInput {
+        kind: kind.into(),
+        payload: payload().map_err(EmitError::Rejected)?,
+        context,
+    };
+    match hatel_core::record::Writer::new(&cfg, &reg).write(input) {
+        hatel_core::record::RecordResult::Stored { receipt } => Ok(receipt),
+        hatel_core::record::RecordResult::Rejected { error } => Err(EmitError::Rejected(error)),
+        hatel_core::record::RecordResult::Failed { error } => Err(EmitError::Registry(error)),
     }
 }
 
-/// The `emit` subcommand: `emit_record` with CLI surfaces — warnings and errors to
-/// stderr, outcomes as exit codes.
-fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
-    match emit_record(kind, || build_payload(fields, json)) {
-        Ok(warning) => {
-            if let Some(w) = warning {
+fn emit_cmd(
+    kind: &str,
+    fields: Vec<String>,
+    json: Option<String>,
+    receipt: bool,
+    context: Option<String>,
+) -> i32 {
+    let context = match context.map(|s| serde_json::from_str(&s)).transpose() {
+        Ok(c) => c.unwrap_or_default(),
+        Err(e) => {
+            eprintln!("emit: invalid context: {e}");
+            return 2;
+        }
+    };
+    match emit_record(kind, || build_payload(fields, json), context) {
+        Ok(result) => {
+            if let Some(w) = &result.warning {
                 eprintln!("emit: {w}");
+            }
+            if receipt {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).expect("receipt serializes")
+                );
             }
             0
         }
@@ -294,6 +302,61 @@ fn emit_cmd(kind: &str, fields: Vec<String>, json: Option<String>) -> i32 {
         }
         Err(EmitError::Rejected(e)) => {
             eprintln!("emit: {e}");
+            2
+        }
+    }
+}
+
+pub(crate) fn emit_batch(
+    items: Vec<serde_json::Value>,
+) -> Result<Vec<hatel_core::record::RecordResult>, String> {
+    if items.len() > 4096 {
+        return Err("batch exceeds 4096 records".into());
+    }
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    let reg = build_registry(&cfg).map_err(|e| e.to_string())?;
+    let mut writer = hatel_core::record::Writer::new(&cfg, &reg);
+    Ok(items
+        .into_iter()
+        .map(|item| match serde_json::from_value(item) {
+            Ok(input) => writer.write(input),
+            Err(e) => hatel_core::record::RecordResult::Rejected {
+                error: e.to_string(),
+            },
+        })
+        .collect())
+}
+
+fn emit_batch_cmd() -> i32 {
+    use std::io::Read as _;
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin()
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_string(&mut input)
+    {
+        eprintln!("emit-batch: {e}");
+        return 2;
+    }
+    if input.len() > 8 * 1024 * 1024 {
+        eprintln!("emit-batch: input exceeds 8 MiB");
+        return 2;
+    }
+    let result = serde_json::from_str::<Vec<serde_json::Value>>(&input)
+        .map_err(|e| e.to_string())
+        .and_then(emit_batch);
+    match result {
+        Ok(results) => {
+            let failed = results
+                .iter()
+                .any(|r| !matches!(r, hatel_core::record::RecordResult::Stored { .. }));
+            println!(
+                "{}",
+                serde_json::to_string(&results).expect("batch serializes")
+            );
+            if failed { 1 } else { 0 }
+        }
+        Err(e) => {
+            eprintln!("emit-batch: {e}");
             2
         }
     }
@@ -551,6 +614,8 @@ pub(crate) fn kinds_value(
             serde_json::json!({
                 "name": s.name,
                 "fields": s.fields,
+                "field_specs": s.field_specs,
+                "version": s.version,
                 "group_key": s.group_key,
                 "redact": s.redact,
                 "measures": s.measures,

@@ -17,6 +17,8 @@ pub struct KindSpec {
     pub name: String,
     /// Allow-list: the only keys that survive sanitization. Single source of truth.
     pub fields: BTreeSet<String>,
+    pub field_specs: BTreeMap<String, FieldSpec>,
+    pub version: u32,
     /// Field that identifies a record when aggregating in reports.
     pub group_key: String,
     /// Fields hashed before write (e.g. a raw user identifier).
@@ -36,7 +38,9 @@ pub struct KindSpec {
 #[serde(deny_unknown_fields)]
 pub struct KindSpecRaw {
     pub name: String,
-    pub fields: Vec<String>,
+    pub fields: Fields,
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub group_key: String,
     #[serde(default)]
     pub redact: Vec<String>,
@@ -44,6 +48,60 @@ pub struct KindSpecRaw {
     pub measures: Vec<String>,
     #[serde(default)]
     pub identity: Option<String>,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Array,
+    Object,
+    Any,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FieldSpec {
+    #[serde(rename = "type")]
+    pub field_type: FieldType,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Fields {
+    Names(Vec<String>),
+    Typed(BTreeMap<String, FieldSpec>),
+}
+
+impl From<Vec<String>> for Fields {
+    fn from(names: Vec<String>) -> Self {
+        Self::Names(names)
+    }
+}
+
+impl FieldType {
+    pub fn accepts(&self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.as_f64().is_some_and(f64::is_finite),
+            Self::Integer => value.is_i64() || value.is_u64(),
+            Self::Boolean => value.is_boolean(),
+            Self::Array => value.is_array(),
+            Self::Object => value.is_object(),
+            Self::Any => !value.is_null(),
+        }
+    }
 }
 
 /// A Kind name is also a JSONL filename component, so it is restricted to a safe
@@ -58,11 +116,35 @@ pub fn is_valid_kind_name(name: &str) -> bool {
 
 impl KindSpec {
     pub fn from_raw(raw: KindSpecRaw) -> Result<KindSpec> {
-        let fields: BTreeSet<String> = raw.fields.into_iter().collect();
+        let field_specs = match raw.fields {
+            Fields::Typed(fields) => fields,
+            Fields::Names(names) => names
+                .into_iter()
+                .map(|name| {
+                    let field_type = if raw.measures.contains(&name) {
+                        FieldType::Number
+                    } else {
+                        FieldType::Any
+                    };
+                    (
+                        name,
+                        FieldSpec {
+                            field_type,
+                            required: false,
+                            unit: None,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let fields: BTreeSet<String> = field_specs.keys().cloned().collect();
         let invalid = |reason: String| Error::InvalidSpec {
             name: raw.name.clone(),
             reason,
         };
+        if raw.version == 0 {
+            return Err(invalid("version must be positive".into()));
+        }
         if !is_valid_kind_name(&raw.name) {
             return Err(invalid(
                 "name must be non-empty and use only [A-Za-z0-9._-]".to_string(),
@@ -86,9 +168,19 @@ impl KindSpec {
         {
             return Err(invalid(format!("identity '{identity}' not in fields")));
         }
+        for measure in &raw.measures {
+            if !matches!(
+                field_specs[measure].field_type,
+                FieldType::Number | FieldType::Integer
+            ) {
+                return Err(invalid(format!("measure '{measure}' must be numeric")));
+            }
+        }
         Ok(KindSpec {
             name: raw.name,
             fields,
+            field_specs,
+            version: raw.version,
             group_key: raw.group_key,
             redact,
             measures: raw.measures,

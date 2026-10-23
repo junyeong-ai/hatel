@@ -55,8 +55,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   whose start it has not seen — the first is answered now, the second is the only one worth
   holding an egress batch back for. Collapsing those two states again silently restores
   a fabricated project, a saturated export park, or both.
-- **Fail-open on the local write path** (a write error is a stderr note, never a blocked
-  tool call); **fail-closed on egress privacy** (an unattributable batch is not forwarded
+- **Fail-open at the lifecycle hook boundary** (a write error is a stderr note, never a blocked
+  tool call). CLI/MCP writes return a storage receipt or an explicit failure. **Fail-closed on egress privacy** (an unattributable batch is not forwarded
   to a filtered destination).
 - `#[serde(deny_unknown_fields)]` on every config/schema surface — a misspelled key must
   fail loudly, never silently disable a feature. `config.toml` therefore has exactly one

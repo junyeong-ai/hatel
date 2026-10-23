@@ -11,6 +11,7 @@ pub mod hook;
 pub mod model;
 pub mod pii;
 pub mod project;
+pub mod record;
 pub mod registry;
 pub mod render;
 pub mod report;
@@ -35,6 +36,8 @@ pub use sink::{Sink, SinkKind, build_sink};
 /// surfaces these to the caller; the registry/schema paths fail loud at startup.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("invalid payload: {0}")]
+    InvalidPayload(String),
     #[error("unknown kind: {0}")]
     UnknownKind(String),
     #[error("duplicate kind: {0}")]

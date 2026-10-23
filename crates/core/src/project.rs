@@ -11,7 +11,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProjectRef {
     pub key: String,
     pub label: String,

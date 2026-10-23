@@ -29,14 +29,14 @@ counted_events = [
 # other tool's input is content and stays out.
 [[kind]]
 name = "tool"
-fields = ["session_id", "project", "prompt_id", "agent_id", "tool_name", "tool_use_id", "duration_ms", "ok", "skill"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, agent_id = { type = "string" }, tool_name = { type = "string" }, tool_use_id = { type = "string" }, duration_ms = { type = "number", unit = "ms" }, ok = { type = "integer" }, skill = { type = "string" } }
 group_key = "tool_name"
 identity = "tool_use_id"
 measures = ["duration_ms", "ok"]
 
 [[kind]]
 name = "prompt"
-fields = ["session_id", "project", "prompt_id", "prompt_len"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, prompt_len = { type = "integer" } }
 group_key = "session_id"
 
 # One record per instruction file entering context. `file_path` is the file as its repository names
@@ -48,12 +48,12 @@ group_key = "session_id"
 # prompt submitted when the load happened.
 [[kind]]
 name = "memory"
-fields = ["session_id", "project", "prompt_id", "file_path", "memory_type", "load_reason", "trigger_file_path", "parent_file_path"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, file_path = { type = "string" }, memory_type = { type = "string" }, load_reason = { type = "string" }, trigger_file_path = { type = "string" }, parent_file_path = { type = "string" } }
 group_key = "file_path"
 
 [[kind]]
 name = "subagent"
-fields = ["session_id", "project", "prompt_id", "agent_id", "agent"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, agent_id = { type = "string" }, agent = { type = "string" } }
 group_key = "agent"
 identity = "agent_id"
 
@@ -64,7 +64,7 @@ identity = "agent_id"
 # context to the cache; this is a forecast, not an amount to add to native-OTel spend.
 [[kind]]
 name = "session"
-fields = ["session_id", "project", "source", "context_tokens", "since_last_response_s", "estimated_cache_write_usd", "cache_likely_expired"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, source = { type = "string" }, context_tokens = { type = "integer" }, since_last_response_s = { type = "number", unit = "s" }, estimated_cache_write_usd = { type = "number", unit = "USD" }, cache_likely_expired = { type = "boolean" } }
 group_key = "source"
 measures = ["estimated_cache_write_usd", "context_tokens"]
 
@@ -73,12 +73,12 @@ measures = ["estimated_cache_write_usd", "context_tokens"]
 # ledger. A skill the model loads on its own expands nothing and is not counted here.
 [[kind]]
 name = "command"
-fields = ["session_id", "project", "prompt_id", "command_name"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, command_name = { type = "string" } }
 group_key = "command_name"
 
 [[kind]]
 name = "compaction"
-fields = ["session_id", "project", "prompt_id", "trigger"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, prompt_id = { type = "string" }, trigger = { type = "string" } }
 group_key = "session_id"
 
 # Native-OTel cost/tokens are a snapshot, not a hook event — they live in a

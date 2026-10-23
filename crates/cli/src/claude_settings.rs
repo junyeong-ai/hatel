@@ -1879,7 +1879,8 @@ mod tests {
         reg.add_kind(
             KindSpec::from_raw(KindSpecRaw {
                 name: "x".into(),
-                fields: vec!["session_id".into()],
+                fields: vec!["session_id".into()].into(),
+                version: 1,
                 group_key: "session_id".into(),
                 redact: vec![],
                 measures: vec![],

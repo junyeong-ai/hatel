@@ -22,6 +22,7 @@ unicode-width = "0.2"
 etcetera = "0.11"
 rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2.0"
+uuid = { version = "1.28", features = ["v4"] }
 clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1.53.3", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "signal", "time", "sync"] }
 axum = "0.8"

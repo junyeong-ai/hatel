@@ -1,8 +1,8 @@
 //! Pluggable storage. Both halves go through this module: emitters write via the
 //! `Sink` trait, and reports read via `read_records` — so swapping the backend
 //! (JSONL / SQLite / an external store) touches `Config` alone, and a report consumes
-//! whichever backend is configured. Every sink is fail-open: a write error degrades to
-//! a stderr notice and never propagates, so telemetry cannot block a tool call.
+//! whichever backend is configured. Writers return errors; only the lifecycle-hook
+//! boundary converts them to notices so telemetry cannot block a tool call.
 
 mod jsonl;
 mod sqlite;
@@ -15,9 +15,16 @@ use std::path::PathBuf;
 use crate::config::Retention;
 use crate::{Config, Envelope};
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WriteReceipt {
+    pub record_id: Option<String>,
+}
+
 pub trait Sink {
-    fn write_record(&mut self, env: &Envelope);
-    fn flush(&mut self) {}
+    fn write_record(&mut self, env: &Envelope) -> crate::Result<WriteReceipt>;
+    fn flush(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

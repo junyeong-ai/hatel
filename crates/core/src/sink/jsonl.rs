@@ -97,15 +97,17 @@ impl JsonlSink {
 }
 
 impl Sink for JsonlSink {
-    fn write_record(&mut self, env: &Envelope) {
-        if let Err(e) = rolling::append(
+    fn write_record(&mut self, env: &Envelope) -> crate::Result<super::WriteReceipt> {
+        rolling::append(
             &self.dir,
             &base(&env.kind),
             &env.to_json_line(),
             self.rotate_bytes,
-        ) {
-            eprintln!("hatel: jsonl write failed kind={}: {e}", env.kind);
-        }
+        )
+        .map_err(|e| crate::Error::Io(e.to_string()))?;
+        Ok(super::WriteReceipt {
+            record_id: env.metadata.record_id.clone(),
+        })
     }
 }
 
