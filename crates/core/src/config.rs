@@ -88,7 +88,12 @@ impl Config {
     /// file that cannot be parsed would otherwise silently yield no plugins, and so an
     /// under-reported answer that looks complete.
     pub fn load() -> Result<Self> {
-        let (cfg, invalid) = Self::from_settings(&Settings::load()?);
+        Self::try_from_settings(&Settings::load()?)
+    }
+
+    /// Resolve one settings observation with the same validation as [`Self::load`].
+    pub fn try_from_settings(settings: &Settings) -> Result<Self> {
+        let (cfg, invalid) = Self::from_settings(settings);
         if let Err(e) = &cfg.export {
             return Err(Error::InvalidExport(e.clone()));
         }

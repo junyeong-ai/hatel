@@ -1333,6 +1333,17 @@ fn sqlite_maintenance_rolls_back_invalid_times_and_refuses_future_schemas() {
             .unwrap(),
         "invalid"
     );
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let reg = load_core().unwrap();
+    assert!(
+        hatel_core::query::aggregate(&cfg, reg.kind("prompt").unwrap(), &legacy_query(0, 0, None))
+            .unwrap_err()
+            .to_string()
+            .contains("newer than supported")
+    );
 }
 
 #[test]
@@ -2389,6 +2400,11 @@ fn jsonl_import_is_atomic_repeatable_and_preserves_identical_legacy_events() {
     let path = source.join("prompt.jsonl");
     std::fs::write(&path, format!("{line}\n{line}\ninvalid\n")).unwrap();
     let db = dir.path().join("telemetry.db");
+    let preflight = hatel_core::migration::check(&config_in(dir.path(), vec![]))
+        .unwrap_err()
+        .to_string();
+    assert!(preflight.contains("prompt.jsonl:3: invalid or unsupported envelope"));
+    assert!(!db.exists());
     assert!(hatel_core::migration::import_jsonl(&source, &db).is_err());
     let conn = rusqlite::Connection::open(&db).unwrap();
     assert_eq!(

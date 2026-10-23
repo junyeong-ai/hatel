@@ -122,7 +122,10 @@ Find the actual path with `hatel doctor --local --json`. Shared settings belong 
 `config.toml` (`$HATEL_CONFIG`, otherwise the platform's `hatel/config.toml`). Per-process
 storage or plugin overrides can split writers from readers and services.
 Fresh stores use SQLite/WAL; existing JSONL is retained until explicit migration.
-Stop all writers before `hatel migrate --quiescent`; preserve the source and inspect results.
+Use `hatel migrate --check --json` for a read-only preflight. Stop all writers and configuration
+edits before `hatel migrate --quiescent --json`; preserve sources and inspect `stage`,
+`operation_committed` and errors. A committed import with failed configuration selection can
+be retried with the original storage settings and unchanged sources; it does not duplicate records.
 Existing SQLite stores can also require this explicit physical schema maintenance before writing.
 `doctor --local` and `/healthz` report this state; compatibility reads remain available.
 Restart the receiver after configuration changes. Do not migrate or restart a live service

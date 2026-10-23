@@ -124,7 +124,10 @@ and its CI check unless a deliberate compatibility change requires raising both.
   imports it and saves the selection. SQLite physical schema changes and time backfills also require
   explicit quiescent maintenance; hooks only initialize fresh stores. Preserve raw timestamps and
   normalized seconds/nanoseconds; compatibility reads parse only rows without normalized time. Stop its writers first; the command holds the receiver
-  lock, preserves sources, and records an atomic import manifest so retries do not duplicate rows. The receiver
+  lock, preserves sources, and records an atomic import manifest so retries do not duplicate rows.
+  `migrate --check --json` is read-only and uses the importer’s validation. Keep configuration
+  edits stopped too; reject changed configuration before selecting the migrated store and
+  report committed storage separately from configuration selection so recovery is explicit. The receiver
   reads the file when it starts, and again before it deletes anything, keeping the longer retention
   and deleting nothing while the file cannot be read. It reports that file and its store on
   `/healthz`; `doctor` names a receiver that reads another file or writes another store, and the

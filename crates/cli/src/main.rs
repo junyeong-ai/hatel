@@ -7,6 +7,7 @@ mod doctor;
 mod export;
 mod init;
 mod mcp;
+mod migrate;
 mod receiver;
 mod serve;
 mod service;
@@ -172,8 +173,14 @@ enum Command {
     /// Maintain a stopped SQLite store, or import JSONL and select SQLite in config.
     Migrate {
         /// Assert that hooks and receiver writing this ledger have been stopped.
-        #[arg(long, required = true)]
+        #[arg(long, required_unless_present = "check")]
         quiescent: bool,
+        /// Validate source records without changing storage or configuration.
+        #[arg(long)]
+        check: bool,
+        /// Print a structured result, including the phase on failure.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -255,7 +262,11 @@ fn run() -> i32 {
         } => emit_cmd(&kind, fields, json, receipt, context),
         Command::EmitBatch => emit_batch_cmd(),
         Command::Deliveries { json } => deliveries_cmd(json),
-        Command::Migrate { quiescent: _ } => migrate_cmd(),
+        Command::Migrate {
+            quiescent: _,
+            check,
+            json,
+        } => migrate::run(check, json),
     }
 }
 
@@ -428,55 +439,6 @@ fn deliveries_cmd(json: bool) -> i32 {
         }
         Err(error) => {
             eprintln!("deliveries: {error}");
-            1
-        }
-    }
-}
-
-fn migrate_cmd() -> i32 {
-    let result = (|| -> hatel_core::Result<(usize, bool)> {
-        for variable in ["HATEL_SINK", "HATEL_STATE_DIR"] {
-            if std::env::var_os(variable).is_some_and(|v| !v.is_empty()) {
-                return Err(hatel_core::Error::Io(format!(
-                    "unset {variable} before migrating; configure storage in config.toml"
-                )));
-            }
-        }
-        let cfg = Config::load()?;
-        let _lock = match serve::acquire_state_lock(&cfg.state_dir) {
-            serve::LockOutcome::Acquired(lock) => lock,
-            serve::LockOutcome::Held => {
-                return Err(hatel_core::Error::Io(
-                    "stop the receiver before migrating".into(),
-                ));
-            }
-            serve::LockOutcome::Failed(error) => return Err(hatel_core::Error::Io(error)),
-        };
-        if cfg.sink == hatel_core::SinkKind::Sqlite {
-            let normalized =
-                hatel_core::migration::upgrade_sqlite(&cfg.state_dir.join("telemetry.db"))?;
-            return Ok((normalized, false));
-        }
-        let imported = hatel_core::migration::import_jsonl(
-            &cfg.ledger_dir,
-            &cfg.state_dir.join("telemetry.db"),
-        )?;
-        let mut settings = hatel_core::Settings::load()?;
-        settings.storage.sink = Some(hatel_core::SinkKind::Sqlite);
-        settings.save()?;
-        Ok((imported, true))
-    })();
-    match result {
-        Ok((count, imported)) => {
-            if imported {
-                println!("imported {count} records; storage=sqlite; source files preserved");
-            } else {
-                println!("normalized {count} records; storage=sqlite");
-            }
-            0
-        }
-        Err(e) => {
-            eprintln!("migrate: {e}");
             1
         }
     }

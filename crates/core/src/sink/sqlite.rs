@@ -68,7 +68,7 @@ fn connect(path: &Path) -> crate::Result<Connection> {
     Ok(conn)
 }
 
-fn check_version(conn: &Connection) -> crate::Result<i64> {
+pub(crate) fn check_version(conn: &Connection) -> crate::Result<i64> {
     let version = conn
         .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
         .map_err(io)?;

@@ -109,6 +109,7 @@ fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
 }
 
 pub(crate) fn prepare_read(conn: &Connection) -> crate::Result<()> {
+    crate::sink::check_database_version(conn)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(io)?;
     conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")

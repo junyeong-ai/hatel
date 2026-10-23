@@ -10,6 +10,7 @@ mod sqlite;
 pub use jsonl::JsonlSink;
 pub use sqlite::{DATABASE_VERSION, SqliteSink, database_version, write_readiness};
 
+pub(crate) use sqlite::check_version as check_database_version;
 pub(crate) use sqlite::{record_by_id, upgrade_database};
 use std::path::PathBuf;
 

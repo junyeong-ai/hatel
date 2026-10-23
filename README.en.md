@@ -78,8 +78,11 @@ Hooks, CLI, MCP and receiver read the same configuration. Preserve existing plug
 To migrate JSONL, stop the receiver and all hook and record writers first. Import preserves the source and commits an import manifest transactionally. The operator must ensure writers are stopped.
 
 ```sh
-hatel migrate --quiescent
+hatel migrate --check --json
+hatel migrate --quiescent --json
 ```
+
+`--check` leaves ledgers and configuration unchanged while checking file/byte/record counts and contract summaries. Summaries allow up to 4096 contracts and fail explicitly beyond that limit. With active producers, results describe only the check observation. Stop configuration edits during migration too. On failure, inspect JSON `stage` and `operation_committed`. If records committed but saving configuration failed, retry with the same source and original storage settings without duplicating records. Preflight does not guarantee disk headroom. Offline backups preserve configuration, ledgers, costs and session state together; use the [backup API](https://www.sqlite.org/backup.html) for live SQLite.
 
 Use the same command for physical schema maintenance of existing SQLite stores. Time indexes preserve the original timestamp and nanosecond precision. Old stores remain readable but refuse writes until maintenance. Hooks never perform bulk conversion; `doctor --local` and `/healthz` report required maintenance.
 
