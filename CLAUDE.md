@@ -141,6 +141,10 @@ and its CI check unless a deliberate compatibility change requires raising both.
   the same functions — keep it that way). A missing group field is `key: null` (`—` in human
   output); an empty string is `key: ""` (`(empty)`). An exact empty-value filter selects only
   the latter. Keep that distinction in report explanations.
+- **Read failure is not an empty store.** Reports and Kind inventories carry `storage_error`;
+  reports carry `cost_error` when the native baseline cannot be read. CLI exit status and MCP
+  `isError` reflect those failures. An unreadable cost baseline disables only its persistence
+  until repair and receiver restart; it must never be rewritten from an empty baseline.
 - **Numbers need a measurement basis.** Read a measure with its valid/missing/invalid counts.
   Human reports distinguish no measurement from zero and show the measured fraction for partial
   sums. Native summaries count a metric only when `observed_metrics` explicitly names it; a

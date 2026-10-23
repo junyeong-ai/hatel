@@ -17,6 +17,58 @@ fn isolated(home: &std::path::Path) -> Command {
 }
 
 #[test]
+fn read_errors_are_machine_visible_and_do_not_disable_independent_recording() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            state.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    std::fs::write(state.join("telemetry.db"), "invalid database").unwrap();
+    let inventory = isolated(home.path())
+        .args(["kinds", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(inventory.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+    assert!(value["storage_error"].is_string());
+    std::fs::remove_file(state.join("telemetry.db")).unwrap();
+    let snapshot = state.join("cost_snapshot.jsonl");
+    std::fs::create_dir(&snapshot).unwrap();
+    let report = isolated(home.path())
+        .args(["report", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(report.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert!(value["cost_error"].is_string());
+    assert_eq!(value["cost"], serde_json::json!([]));
+    let record = isolated(home.path())
+        .args(["emit", "check", "name=lint", "outcome=passed", "--receipt"])
+        .output()
+        .unwrap();
+    assert!(
+        record.status.success(),
+        "{}",
+        String::from_utf8_lossy(&record.stderr)
+    );
+    let scoped = isolated(home.path())
+        .args(["report", "--kind", "check", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(scoped.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    assert!(value["cost_error"].is_null());
+    assert_eq!(value["kinds"][0]["groups"][0]["count"], 1);
+    assert!(snapshot.is_dir());
+}
+
+#[test]
 fn record_commands_reject_oversized_stdin_before_storing_records() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(

@@ -57,7 +57,7 @@ struct AppState {
     /// re-parsed on every batch. Taken before `acc` wherever both are held.
     index_cache: Arc<Mutex<SessionIndexCache>>,
     /// The persisted side of cost. Taken only by the flush and the sweep, ahead of `index_cache`.
-    costs: Arc<Mutex<Costs>>,
+    costs: Arc<Mutex<Result<Costs, String>>>,
     /// The current project's unique key (git-root path) — the default filter, so
     /// two same-named repositories are never conflated.
     current_key: Option<String>,
@@ -92,10 +92,10 @@ struct Costs {
 }
 
 impl Costs {
-    fn load(state_dir: &Path) -> Self {
-        let snapshot = cost::Snapshot::load(state_dir);
+    fn load(state_dir: &Path) -> Result<Self, String> {
+        let snapshot = cost::Snapshot::load(state_dir).map_err(|e| e.to_string())?;
         let baseline = snapshot.rows().clone();
-        Costs { snapshot, baseline }
+        Ok(Costs { snapshot, baseline })
     }
 }
 
@@ -395,7 +395,9 @@ fn ok() -> IngestResponse {
 /// Which build is answering here, and the store it writes — what `doctor` compares its own
 /// against.
 async fn identity(State(st): State<AppState>) -> Json<receiver::Identity> {
-    Json(receiver::Identity::of(&st.cfg))
+    let mut identity = receiver::Identity::of(&st.cfg);
+    identity.cost_error = lock(&st.costs).as_ref().err().cloned();
+    Json(identity)
 }
 
 async fn ingest_metrics(
@@ -858,10 +860,11 @@ fn sweep(st: &AppState) {
     let retention = cfg.retention(hatel_core::now_epoch());
     prune_ledger(&cfg, retention);
     let mut costs = lock(&st.costs);
-    let Costs { snapshot, baseline } = &mut *costs;
-    let checkpoint = snapshot.checkpoint(retention.cutoff);
-    note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
-    baseline.retain(|sid, _| snapshot.rows().contains_key(sid));
+    if let Ok(Costs { snapshot, baseline }) = &mut *costs {
+        let checkpoint = snapshot.checkpoint(retention.cutoff);
+        note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
+        baseline.retain(|sid, _| snapshot.rows().contains_key(sid));
+    }
     lock(&st.acc).forget_unheard_since(retention.cutoff);
 }
 
@@ -910,8 +913,10 @@ fn flush_on_stop(st: &AppState) {
         .map_or(i64::MIN, |cfg| {
             cfg.retention(hatel_core::now_epoch()).cutoff
         });
-    let checkpoint = lock(&st.costs).snapshot.checkpoint(retain_since);
-    note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
+    if let Ok(costs) = &mut *lock(&st.costs) {
+        let checkpoint = costs.snapshot.checkpoint(retain_since);
+        note_failed_write(&st.failed_writes.cost, "cost snapshot", checkpoint);
+    }
 }
 
 /// Renew the session-index attribution of every session this receiver has heard from long enough
@@ -939,6 +944,19 @@ fn renew_index(st: &AppState) {
 
 fn persist_cost(st: &AppState) {
     let mut costs = lock(&st.costs);
+    let costs = match costs.as_mut() {
+        Ok(costs) => costs,
+        Err(error) => {
+            note_failed_write(
+                &st.failed_writes.cost,
+                "cost snapshot",
+                Err(std::io::Error::other(format!(
+                    "baseline unreadable; repair it and restart the receiver: {error}"
+                ))),
+            );
+            return;
+        }
+    };
     let mut index = lock(&st.index_cache);
     index.refresh();
     let acc = lock(&st.acc);
@@ -1196,7 +1214,8 @@ mod tests {
             ts: hatel_core::now_iso_utc(),
             ..CostRow::default()
         };
-        lock(&st.costs).baseline = [("S1".to_string(), base_row)].into_iter().collect();
+        lock(&st.costs).as_mut().unwrap().baseline =
+            [("S1".to_string(), base_row)].into_iter().collect();
         // Post-restart delta points: more opus cacheRead tokens, and cost on a model
         // the baseline never saw.
         lock(&st.acc).update_metrics(
@@ -1224,7 +1243,7 @@ mod tests {
             jiff::Timestamp::now(),
         );
         persist_cost(&st);
-        let rows = cost::read_snapshot(&st.cfg.state_dir);
+        let rows = cost::read_snapshot(&st.cfg.state_dir).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.tokens, 150, "scalar baseline added to the delta total");
@@ -1351,6 +1370,7 @@ mod tests {
         persist_cost(&st);
         let project = |sid: &str| {
             cost::read_snapshot(dir.path())
+                .unwrap()
                 .into_iter()
                 .find(|r| r.session_id == sid)
                 .map(|r| r.project)
@@ -1368,7 +1388,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
-        let mut earlier = cost::Snapshot::load(dir.path());
+        let mut earlier = cost::Snapshot::load(dir.path()).unwrap();
         earlier
             .record([CostRow {
                 session_id: "S1".into(),
@@ -1394,12 +1414,12 @@ mod tests {
         tokens(10.0, long_ago);
         sweep(&st);
         assert!(
-            cost::read_snapshot(dir.path()).is_empty(),
+            cost::read_snapshot(dir.path()).unwrap().is_empty(),
             "the expired row is gone"
         );
         tokens(7.0, jiff::Timestamp::now());
         persist_cost(&st);
-        let rows = cost::read_snapshot(dir.path());
+        let rows = cost::read_snapshot(dir.path()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 7);
     }
@@ -1413,7 +1433,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
-        let mut earlier = cost::Snapshot::load(dir.path());
+        let mut earlier = cost::Snapshot::load(dir.path()).unwrap();
         earlier
             .record([CostRow {
                 session_id: "S1".into(),
@@ -1440,7 +1460,7 @@ mod tests {
         tokens(7.0);
         sweep(&st);
         tokens(3.0);
-        let rows = cost::read_snapshot(dir.path());
+        let rows = cost::read_snapshot(dir.path()).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tokens, 510);
     }
@@ -1478,6 +1498,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let long_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 100);
         cost::Snapshot::load(dir.path())
+            .unwrap()
             .record([CostRow {
                 session_id: "S1".into(),
                 tokens: 500,
@@ -1490,7 +1511,7 @@ mod tests {
         std::fs::write(&config, "[storage]\nretention_days = 365\n").unwrap();
         sweep(&st);
         assert_eq!(
-            cost::read_snapshot(dir.path()).len(),
+            cost::read_snapshot(dir.path()).unwrap().len(),
             1,
             "the file keeps a year"
         );
@@ -1498,14 +1519,14 @@ mod tests {
         sweep(&st);
         flush_on_stop(&st);
         assert_eq!(
-            cost::read_snapshot(dir.path()).len(),
+            cost::read_snapshot(dir.path()).unwrap().len(),
             1,
             "a file that cannot be read deletes nothing"
         );
         std::fs::remove_file(&config).unwrap();
         sweep(&st);
         assert!(
-            cost::read_snapshot(dir.path()).is_empty(),
+            cost::read_snapshot(dir.path()).unwrap().is_empty(),
             "the running 90 days apply once the file keeps no longer"
         );
     }
@@ -1545,8 +1566,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let changes = dir.path().join("cost_changes.jsonl");
-        std::fs::create_dir_all(changes.join("blocker")).unwrap();
         let st = test_state(dir.path());
+        std::fs::create_dir_all(changes.join("blocker")).unwrap();
         lock(&st.acc).update_metrics(
             vec![MetricPoint {
                 project: None,
@@ -1564,6 +1585,22 @@ mod tests {
         std::fs::remove_dir_all(&changes).unwrap();
         persist_cost(&st);
         assert!(changes.is_file());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_baseline_is_reported_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cost_snapshot.jsonl");
+        let original = "invalid snapshot\n";
+        std::fs::write(&path, original).unwrap();
+        let st = test_state(dir.path());
+        let health = identity(State(st.clone())).await.0;
+        assert!(health.cost_error.is_some());
+        sweep(&st);
+        flush_on_stop(&st);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), original);
+        assert!(!dir.path().join("cost_changes.jsonl").exists());
+        assert!(lock(&st.costs).is_err());
     }
 
     #[test]
@@ -1633,7 +1670,7 @@ mod tests {
         );
         persist_cost(&st);
         persist_cost(&st);
-        let rows = cost::read_snapshot(&st.cfg.state_dir);
+        let rows = cost::read_snapshot(&st.cfg.state_dir).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ts, heard.to_string());
     }
@@ -1648,7 +1685,7 @@ mod tests {
         let points = parse_metrics(&serde_json::to_vec(&body).unwrap(), &state.tracked).unwrap();
         lock(&state.acc).update_metrics(points, jiff::Timestamp::now());
         persist_cost(&state);
-        let rows = cost::read_snapshot(home.path());
+        let rows = cost::read_snapshot(home.path()).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.project == "repo"));
         assert_ne!(rows[0].project_key, rows[1].project_key);

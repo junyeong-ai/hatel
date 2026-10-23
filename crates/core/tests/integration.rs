@@ -771,6 +771,7 @@ fn cost_row(sid: &str, tokens: i64, ts: &str) -> hatel_core::cost::CostRow {
 
 fn tokens_by_session(dir: &std::path::Path) -> Vec<(String, i64)> {
     let mut rows: Vec<(String, i64)> = hatel_core::cost::read_snapshot(dir)
+        .unwrap()
         .into_iter()
         .map(|r| (r.session_id, r.tokens))
         .collect();
@@ -785,7 +786,7 @@ fn the_cost_snapshot_writes_only_what_changed_and_checkpoints_the_rest() {
     let dir = &cfg.state_dir;
     let changes = dir.join("cost_changes.jsonl");
     let at = "2026-01-01T00:00:00Z";
-    let mut snapshot = Snapshot::load(dir);
+    let mut snapshot = Snapshot::load(dir).unwrap();
     snapshot
         .record([cost_row("S1", 10, at), cost_row("S2", 5, at)])
         .unwrap();
@@ -817,7 +818,7 @@ fn a_checkpoint_drops_rows_past_retention_and_an_empty_snapshot_leaves_no_file()
     let cfg = test_config(vec![]);
     let dir = &cfg.state_dir;
     let now = hatel_core::now_iso_utc();
-    let mut snapshot = Snapshot::load(dir);
+    let mut snapshot = Snapshot::load(dir).unwrap();
     snapshot
         .record([
             cost_row("old", 1, "2000-01-01T00:00:00Z"),
@@ -840,9 +841,13 @@ fn a_restart_keeps_the_changes_no_checkpoint_has_taken() {
     let dir = &cfg.state_dir;
     let at = "2026-01-01T00:00:00Z";
     Snapshot::load(dir)
+        .unwrap()
         .record([cost_row("S1", 10, at)])
         .unwrap();
-    Snapshot::load(dir).record([cost_row("S2", 5, at)]).unwrap();
+    Snapshot::load(dir)
+        .unwrap()
+        .record([cost_row("S2", 5, at)])
+        .unwrap();
     assert_eq!(
         tokens_by_session(dir),
         [("S1".into(), 10), ("S2".into(), 5)]

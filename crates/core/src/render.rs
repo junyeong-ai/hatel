@@ -26,6 +26,12 @@ pub fn format_text(report: &Report) -> String {
     if let Some(unreadable) = &report.unreadable_kinds {
         out.push_str(&format!("  ({unreadable})\n"));
     }
+    if let Some(error) = &report.storage_error {
+        out.push_str(&format!("  (storage inspection failed: {error})\n"));
+    }
+    if let Some(error) = &report.cost_error {
+        out.push_str(&format!("  (cost read failed: {error})\n"));
+    }
     for section in &report.kinds {
         out.push('\n');
         out.push_str(&format!("{} — {}\n", section.kind, axes(section)));
@@ -60,6 +66,12 @@ pub fn format_markdown(report: &Report) -> String {
     let mut out = format!("# hatel — rolling {}{}\n", report.window, scope(report));
     if let Some(unreadable) = &report.unreadable_kinds {
         out.push_str(&format!("\n_{unreadable}_\n"));
+    }
+    if let Some(error) = &report.storage_error {
+        out.push_str(&format!("\nStorage inspection failed: {error}\n"));
+    }
+    if let Some(error) = &report.cost_error {
+        out.push_str(&format!("\nCost read failed: {error}\n"));
     }
     for section in &report.kinds {
         out.push_str(&format!("\n## {} — {}\n\n", section.kind, axes(section)));
@@ -416,6 +428,8 @@ mod tests {
 
     fn report(kinds: Vec<KindSection>) -> Report {
         Report {
+            cost_error: None,
+            storage_error: None,
             window: "30d".to_string(),
             project: None,
             filters: Vec::new(),

@@ -133,19 +133,6 @@ impl UnreadableKinds {
             expires_by,
         }))
     }
-
-    /// [`Self::detect`] for the paths whose job is to answer rather than to diagnose: an
-    /// unenumerable store is noted on stderr and read as no gap, the same fail-open the sink read
-    /// path takes, so one broken store does not turn every query into an error.
-    pub fn detect_resilient(reg: &Registry, cfg: &Config) -> Option<Self> {
-        match Self::detect(reg, cfg) {
-            Ok(found) => found,
-            Err(e) => {
-                eprintln!("hatel: cannot enumerate stored Kinds ({e})");
-                None
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for UnreadableKinds {

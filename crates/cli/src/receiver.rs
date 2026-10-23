@@ -39,6 +39,8 @@ pub struct Identity {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Capabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,6 +79,7 @@ impl Identity {
             service: "hatel".to_string(),
             storage: Some(Store::of(cfg)),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            cost_error: None,
             capabilities: Some(Capabilities {
                 local_decode_protocol: "http/json".into(),
                 local_metric_types: vec!["sum".into(), "gauge".into()],
@@ -211,6 +214,7 @@ mod tests {
                 storage: None,
                 version: "9.9.9".to_string(),
                 capabilities: None,
+                cost_error: None,
             }),
             "a build from before the store was reported still identifies"
         );

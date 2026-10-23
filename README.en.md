@@ -113,7 +113,7 @@ Measures include `sum`, `valid_count`, `missing_count`, `invalid_count`, `avg`, 
 
 Aggregates use SQLite REAL/f64; integers above 2^53 can lose precision. Record identifiers as strings.
 
-`retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies stored records without a loaded schema. Carry these limits and each Kind’s `error` into conclusions.
+`retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies missing schemas, `storage_error` a failed ledger inspection, and `cost_error` an unreadable cost baseline. Check these with each Kind’s `error`; an empty array after failure is not absence of records. A receiver with an unreadable cost baseline does not rewrite its files; repair the baseline and restart it.
 
 ## Custom Kinds
 

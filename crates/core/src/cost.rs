@@ -134,13 +134,13 @@ pub fn sweep_orphan_temps(state_dir: &Path) -> usize {
 /// Every session's row, for a reader. The changes are read before the snapshot: a checkpoint writes
 /// the snapshot before it removes the changes, so a read that races one finds each row in at least
 /// one of the two.
-pub fn read_snapshot(state_dir: &Path) -> Vec<CostRow> {
-    fold(
-        read_rows(&state_dir.join(CHANGES_NAME)),
-        read_rows(&snapshot_path(state_dir)),
+pub fn read_snapshot(state_dir: &Path) -> std::io::Result<Vec<CostRow>> {
+    Ok(fold(
+        read_rows(&state_dir.join(CHANGES_NAME))?,
+        read_rows(&snapshot_path(state_dir))?,
     )
     .into_values()
-    .collect()
+    .collect())
 }
 
 /// The cost snapshot as its one writer, the receiver, holds it: every session's latest row in
@@ -159,15 +159,15 @@ pub struct Snapshot {
 impl Snapshot {
     /// The snapshot as the files hold it. The rows only the changes file holds stay there until the
     /// next checkpoint, so a restart before it loses none of them.
-    pub fn load(state_dir: &Path) -> Self {
-        let changes = read_rows(&state_dir.join(CHANGES_NAME));
+    pub fn load(state_dir: &Path) -> std::io::Result<Self> {
+        let changes = read_rows(&state_dir.join(CHANGES_NAME))?;
         let changed = changes.iter().map(|r| r.session_id.clone()).collect();
-        Snapshot {
+        Ok(Snapshot {
             state_dir: state_dir.to_path_buf(),
-            rows: fold(changes, read_rows(&snapshot_path(state_dir))),
+            rows: fold(changes, read_rows(&snapshot_path(state_dir))?),
             changed,
             unsaved: false,
-        }
+        })
     }
 
     pub fn rows(&self) -> &BTreeMap<String, CostRow> {
@@ -229,14 +229,34 @@ fn fold(changes: Vec<CostRow>, snapshot: Vec<CostRow>) -> BTreeMap<String, CostR
     rows
 }
 
-/// The rows of one file, a malformed line dropped (fail-open on read); a missing file has none.
-fn read_rows(path: &Path) -> Vec<CostRow> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+/// A missing file is empty. An unreadable or malformed baseline must never be rewritten as empty.
+fn read_rows(path: &Path) -> std::io::Result<Vec<CostRow>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("{}: {e}", path.display()),
+            ));
+        }
     };
     text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<CostRow>(l).ok())
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let invalid = |reason: String| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}:{}: {reason}", path.display(), index + 1),
+                )
+            };
+            let row: CostRow = serde_json::from_str(line).map_err(|e| invalid(e.to_string()))?;
+            if crate::ts_epoch(&row.ts).is_none() {
+                return Err(invalid("invalid cost timestamp".into()));
+            }
+            Ok(row)
+        })
         .collect()
 }
 
@@ -353,8 +373,8 @@ mod tests {
         // A non-empty directory where the changes file goes makes its rename fail, whoever runs.
         let dir = tempfile::tempdir().unwrap();
         let changes = dir.path().join(CHANGES_NAME);
+        let mut snapshot = Snapshot::load(dir.path()).unwrap();
         std::fs::create_dir_all(changes.join("blocker")).unwrap();
-        let mut snapshot = Snapshot::load(dir.path());
         let failed = snapshot.record([CostRow {
             session_id: "S1".into(),
             ts: "2026-01-01T00:00:00Z".into(),
@@ -378,7 +398,7 @@ mod tests {
             ts: ts.into(),
             ..CostRow::default()
         };
-        let mut snapshot = Snapshot::load(dir.path());
+        let mut snapshot = Snapshot::load(dir.path()).unwrap();
         snapshot
             .record([row("kept", "2026-01-01T00:00:00Z")])
             .unwrap();
@@ -394,6 +414,7 @@ mod tests {
         snapshot.record([]).unwrap();
         assert!(!changes.exists());
         let sessions: Vec<_> = read_snapshot(dir.path())
+            .unwrap()
             .into_iter()
             .map(|r| r.session_id)
             .collect();

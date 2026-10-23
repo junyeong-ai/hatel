@@ -562,7 +562,7 @@ fn report_cmd(
         filters: &filters,
     };
     let report = report::Report::build(&reg, &cfg, window, &q);
-    let failed = report.kinds.iter().any(|kind| kind.error.is_some());
+    let failed = report.failed();
     match format {
         Format::Json => print!("{}", report_json(&report)),
         Format::Md => print!("{}", render::format_markdown(&report)),
@@ -576,7 +576,11 @@ fn report_cmd(
 /// alone would send someone reading this to `kinds`, which knows no more than the list does.
 fn unknown_kind(kind: &str, reg: &Registry, cfg: &Config) -> String {
     let known: Vec<&str> = reg.kinds().map(|s| s.name.as_str()).collect();
-    let stored = UnreadableKinds::detect_resilient(reg, cfg)
+    let inspection = UnreadableKinds::detect(reg, cfg);
+    let stored = inspection
+        .as_ref()
+        .ok()
+        .and_then(|found| found.as_ref())
         .filter(|u| u.names.iter().any(|n| n == kind))
         .map(|u| {
             format!(
@@ -586,8 +590,12 @@ fn unknown_kind(kind: &str, reg: &Registry, cfg: &Config) -> String {
             )
         })
         .unwrap_or_default();
+    let error = inspection
+        .err()
+        .map(|e| format!("; storage inspection failed: {e}"))
+        .unwrap_or_default();
     format!(
-        "unknown kind {kind:?} (registered: {}){stored}",
+        "unknown kind {kind:?} (registered: {}){stored}{error}",
         known.join(", ")
     )
 }
@@ -710,7 +718,7 @@ pub(crate) fn report_json(report: &report::Report) -> String {
 /// second half is what keeps a partial registry from answering as a complete one.
 pub(crate) fn kinds_value(
     reg: &Registry,
-    unreadable: Option<&UnreadableKinds>,
+    inspection: &std::io::Result<Option<UnreadableKinds>>,
 ) -> serde_json::Value {
     let kinds: Vec<serde_json::Value> = reg
         .kinds()
@@ -730,7 +738,9 @@ pub(crate) fn kinds_value(
             })
         })
         .collect();
-    serde_json::json!({ "kinds": kinds, "unreadable_kinds": unreadable })
+    serde_json::json!({ "kinds": kinds,
+        "unreadable_kinds": inspection.as_ref().ok().and_then(|found|found.as_ref()),
+        "storage_error": inspection.as_ref().err().map(ToString::to_string) })
 }
 
 fn kinds_cmd(json: bool) -> i32 {
@@ -744,12 +754,11 @@ fn kinds_cmd(json: bool) -> i32 {
             return 1;
         }
     };
-    let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
+    let inspection = UnreadableKinds::detect(&reg, &cfg);
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref()))
-                .unwrap_or_default()
+            serde_json::to_string_pretty(&kinds_value(&reg, &inspection)).unwrap_or_default()
         );
     } else {
         for s in reg.kinds() {
@@ -774,11 +783,14 @@ fn kinds_cmd(json: bool) -> i32 {
                 }
             );
         }
-        if let Some(unreadable) = &unreadable {
+        if let Ok(Some(unreadable)) = &inspection {
             println!("\n{unreadable}");
         }
+        if let Err(error) = &inspection {
+            println!("\nstorage inspection failed: {error}");
+        }
     }
-    0
+    i32::from(inspection.is_err())
 }
 
 #[cfg(test)]
@@ -1038,7 +1050,7 @@ mod tests {
         let reg = build_registry(&cfg).unwrap();
 
         let gap = UnreadableKinds::detect(&reg, &cfg).unwrap();
-        let value = kinds_value(&reg, gap.as_ref());
+        let value = kinds_value(&reg, &Ok(gap));
         let names: Vec<&str> = value["kinds"]
             .as_array()
             .unwrap()
@@ -1051,6 +1063,6 @@ mod tests {
             serde_json::json!(["ci_check"])
         );
         // One shape either way: no gap is `null`, never an absent key.
-        assert!(kinds_value(&reg, None)["unreadable_kinds"].is_null());
+        assert!(kinds_value(&reg, &Ok(None))["unreadable_kinds"].is_null());
     }
 }

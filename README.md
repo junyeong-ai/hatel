@@ -113,7 +113,7 @@ hatel report --project /absolute/repository/path --format json
 
 집계는 SQLite REAL/f64를 사용하므로 2^53을 넘는 정수는 정밀도가 손실될 수 있다. 식별자는 문자열로 기록한다.
 
-`retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `unreadable_kinds`가 있으면 현재 레지스트리로 읽지 못하는 기록이 있다는 뜻이다. Kind의 `error`와 함께 이 제한을 결과에 명시한다.
+`retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `unreadable_kinds`는 스키마 미등록, `storage_error`는 원장 검사 실패, `cost_error`는 비용 이력 읽기 실패를 뜻한다. Kind의 `error`와 함께 확인한다. 실패한 빈 배열을 기록 없음으로 해석하지 않는다. 비용 기준값을 읽지 못한 수신기는 해당 파일을 갱신하지 않으며, 복구 후 재시작이 필요하다.
 
 ## 커스텀 Kind
 

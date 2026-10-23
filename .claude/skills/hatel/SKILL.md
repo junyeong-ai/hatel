@@ -18,7 +18,7 @@ nor a receiver. `hatel-hook` runs through lifecycle wiring; do not invoke it man
 
 1. Inspect `hatel kinds --json` for loaded schemas, fields, mode, identity and measures.
 2. Choose Kind, project, window, filters and grouping. Use JSON for parsing or comparison.
-3. Check section `error`, `unreadable_kinds`, measurement counts and retention limits
+3. Check section `error`, `storage_error`, `cost_error`, `unreadable_kinds`, measurement counts and retention limits
    before interpreting totals. An empty answer does not establish zero activity.
 
 ```sh

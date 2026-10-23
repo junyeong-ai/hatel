@@ -189,19 +189,22 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
         sort_by: p.sort_by.as_deref(),
         filters: &filters,
     };
-    Ok(text_result(report_json(&report::Report::build(
-        &reg, &cfg, &window, &q,
-    ))))
+    let report = report::Report::build(&reg, &cfg, &window, &q);
+    let mut result = text_result(report_json(&report));
+    result.is_error = Some(report.failed());
+    Ok(result)
 }
 
 fn kinds_tool() -> Result<CallToolResult, McpError> {
     let cfg = Config::load().map_err(internal)?;
     let reg = build_registry(&cfg).map_err(internal)?;
-    let unreadable = UnreadableKinds::detect_resilient(&reg, &cfg);
-    let json =
-        serde_json::to_string_pretty(&kinds_value(&reg, unreadable.as_ref())).unwrap_or_default();
+    let inspection = UnreadableKinds::detect(&reg, &cfg);
+    let json = serde_json::to_string_pretty(&kinds_value(&reg, &inspection))
+        .expect("inventory serializes");
     // Trailing newline included, so the payload is byte-equal to the CLI's println!.
-    Ok(text_result(format!("{json}\n")))
+    let mut result = text_result(format!("{json}\n"));
+    result.is_error = Some(inspection.is_err());
+    Ok(result)
 }
 
 fn emit_tool(p: EmitParams) -> Result<CallToolResult, McpError> {

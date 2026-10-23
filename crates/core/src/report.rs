@@ -143,11 +143,13 @@ pub struct Report {
     /// join table a caller reaches for when relating spend to its own records — while
     /// [`cost_by_project`] provides the ranked rollup a summary shows.
     pub cost: Vec<CostRow>,
+    pub cost_error: Option<String>,
     pub cost_basis: &'static str,
     /// Kinds the ledger holds that this registry cannot read. A report answered over less than
     /// the store contains says so here, rather than presenting the part it could read as the
     /// whole.
     pub unreadable_kinds: Option<UnreadableKinds>,
+    pub storage_error: Option<String>,
 }
 
 impl Report {
@@ -180,6 +182,17 @@ impl Report {
                 }
             })
             .collect();
+        let (cost, cost_error) = match q.kind {
+            Some(_) => (Vec::new(), None),
+            None => match cost_rows(&cfg.state_dir, q) {
+                Ok(rows) => (rows, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            },
+        };
+        let (unreadable_kinds, storage_error) = match UnreadableKinds::detect(reg, cfg) {
+            Ok(found) => (found, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         Report {
             window: window.to_string(),
             project: q.project.map(str::to_string),
@@ -195,27 +208,32 @@ impl Report {
             kinds,
             // The cost snapshot is not a Kind, so a Kind-scoped report leaves it out entirely
             // rather than showing spend the scope did not ask about.
-            cost: match q.kind {
-                Some(_) => Vec::new(),
-                None => cost_rows(&cfg.state_dir, q),
-            },
+            cost,
+            cost_error,
             cost_basis: "session_lifetime_totals_selected_by_last_seen",
-            unreadable_kinds: UnreadableKinds::detect_resilient(reg, cfg),
+            unreadable_kinds,
+            storage_error,
         }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.storage_error.is_some()
+            || self.cost_error.is_some()
+            || self.kinds.iter().any(|kind| kind.error.is_some())
     }
 }
 
 /// Cost snapshot rows within the window, optionally restricted to one project — so the cost
 /// section honors `--window`/`--project` exactly as the Kind aggregation does.
-fn cost_rows(state_dir: &std::path::Path, q: &Query) -> Vec<CostRow> {
-    cost::read_snapshot(state_dir)
+fn cost_rows(state_dir: &std::path::Path, q: &Query) -> std::io::Result<Vec<CostRow>> {
+    Ok(cost::read_snapshot(state_dir)?
         .into_iter()
         .filter(|r| {
             q.project
                 .is_none_or(|p| r.project == p || r.project_key.as_deref() == Some(p))
         })
         .filter(|r| ts_epoch(&r.ts).is_some_and(|t| t >= q.since))
-        .collect()
+        .collect())
 }
 
 /// Roll cost rows up by project, ranked by spend and capped at `top_n` (0 = all). The group
