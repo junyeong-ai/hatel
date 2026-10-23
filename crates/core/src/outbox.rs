@@ -105,6 +105,7 @@ pub enum Outcome<'a> {
         error: &'a str,
     },
     Failed(&'a str),
+    FailedBeforeSend(&'a str),
     Expired,
     Cancelled(&'a str),
 }
@@ -123,6 +124,7 @@ pub fn finish(
             error,
         } => ("pending", next_attempt_at, 1, Some(error)),
         Outcome::Failed(error) => ("failed", now, 1, Some(error)),
+        Outcome::FailedBeforeSend(error) => ("failed", now, 0, Some(error)),
         Outcome::Expired => ("expired", now, 0, Some("maximum queue age exceeded")),
         Outcome::Cancelled(error) => ("cancelled", now, 0, Some(error)),
     };
@@ -154,6 +156,7 @@ pub fn cancel_destination(conn: &Connection, destination: &str, now: i64) -> cra
 pub struct DeliveryState {
     pub destination: String,
     pub status: String,
+    pub error: Option<String>,
     pub records: i64,
     pub bytes: i64,
     pub oldest_created_at: i64,
@@ -175,11 +178,12 @@ pub fn states(path: &std::path::Path) -> crate::Result<Vec<DeliveryState>> {
     if !exists {
         return Ok(Vec::new());
     }
-    let mut stmt = conn.prepare("SELECT destination,status,COUNT(*),SUM(size_bytes),MIN(created_at) FROM deliveries GROUP BY destination,status ORDER BY destination,status").map_err(io)?;
+    let mut stmt = conn.prepare("SELECT destination,status,COUNT(*),SUM(size_bytes),MIN(created_at),last_error FROM deliveries GROUP BY destination,status,last_error ORDER BY destination,status,last_error").map_err(io)?;
     stmt.query_map([], |r| {
         Ok(DeliveryState {
             destination: r.get(0)?,
             status: r.get(1)?,
+            error: r.get(5)?,
             records: r.get(2)?,
             bytes: r.get(3)?,
             oldest_created_at: r.get(4)?,

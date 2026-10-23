@@ -8,29 +8,37 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-fn value(value: &Value) -> Value {
-    match value {
+fn value(value: &Value) -> Result<Value, String> {
+    Ok(match value {
         Value::String(s) => json!({"stringValue":s}),
         Value::Bool(b) => json!({"boolValue":b}),
-        Value::Number(n) if n.is_i64() || n.is_u64() => json!({"intValue":n.to_string()}),
+        Value::Number(n) if n.is_i64() => json!({"intValue":n.to_string()}),
+        Value::Number(n) if n.is_u64() => {
+            return Err("OTLP intValue requires a signed 64-bit integer".into());
+        }
         Value::Number(n) => json!({"doubleValue":n}),
         Value::Array(items) => {
-            json!({"arrayValue":{"values":items.iter().map(self::value).collect::<Vec<_>>()}})
+            json!({"arrayValue":{"values":items.iter().map(self::value).collect::<Result<Vec<_>,_>>()?}})
         }
         Value::Object(fields) => {
-            json!({"kvlistValue":{"values":fields.iter().map(|(k,v)| json!({"key":k,"value":self::value(v)})).collect::<Vec<_>>()}})
+            json!({"kvlistValue":{"values":fields.iter().map(|(k,v)| Ok(json!({"key":k,"value":self::value(v)?}))).collect::<Result<Vec<Value>,String>>()?}})
         }
         Value::Null => json!({}),
-    }
+    })
 }
 
-fn nanos(ts: &str) -> Option<String> {
-    ts.parse::<jiff::Timestamp>()
+fn nanos(ts: &str) -> Result<String, String> {
+    let timestamp = ts
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| "invalid OTLP timestamp")?;
+    u64::try_from(timestamp.as_nanosecond())
         .ok()
-        .and_then(|t| (t.as_nanosecond() >= 0).then(|| t.as_nanosecond().to_string()))
+        .filter(|value| *value != 0)
+        .map(|value| value.to_string())
+        .ok_or_else(|| "OTLP timestamp must be a known positive 64-bit nanosecond value".into())
 }
 
-fn log(env: &Envelope, redact_project: bool) -> Value {
+fn log(env: &Envelope, redact_project: bool) -> Result<Value, String> {
     let project_label = env.metadata.project.as_ref().map(|p| {
         if redact_project {
             hatel_core::pii::redacted(&p.label)
@@ -54,20 +62,17 @@ fn log(env: &Envelope, redact_project: bool) -> Value {
         }
     }
     attributes.push(json!({"key":"hatel.kind.version","value":{"intValue":env.metadata.kind_version.unwrap_or(1).to_string()}}));
-    let mut record = json!({"eventName":env.kind,"body":value(&serde_json::to_value(&env.payload).expect("payload serializes")),"attributes":attributes});
-    if let Some(ts) = nanos(&env.ts) {
-        record["timeUnixNano"] = ts.into();
+    let mut record = json!({"eventName":env.kind,"body":value(&serde_json::to_value(&env.payload).expect("payload serializes"))?,"attributes":attributes,"timeUnixNano":nanos(&env.ts)?});
+    if let Some(timestamp) = env.metadata.observed_at.as_deref() {
+        record["observedTimeUnixNano"] = nanos(timestamp)?.into();
     }
-    if let Some(ts) = env.metadata.observed_at.as_deref().and_then(nanos) {
-        record["observedTimeUnixNano"] = ts.into();
-    }
-    record
+    Ok(record)
 }
 
-fn body(records: &[outbox::Pending], registry: &hatel_core::Registry) -> Vec<u8> {
+fn body(logs: Vec<Value>) -> Vec<u8> {
     serde_json::to_vec(&json!({"resourceLogs":[{
         "resource":{"attributes":[{"key":"service.name","value":{"stringValue":"hatel"}}]},
-        "scopeLogs":[{"scope":{"name":"hatel","version":env!("CARGO_PKG_VERSION")},"logRecords":records.iter().map(|p| log(&p.record,registry.kind(&p.record.kind).is_some_and(|s|s.redact.contains("project")))).collect::<Vec<_>>() }]
+        "scopeLogs":[{"scope":{"name":"hatel","version":env!("CARGO_PKG_VERSION")},"logRecords":logs}]
     }]})).expect("OTLP logs serialize")
 }
 
@@ -77,6 +82,29 @@ struct Policy {
 }
 
 impl Policy {
+    fn blocked(
+        &self,
+        target: &ExportTarget,
+        pending: &outbox::Pending,
+        now: i64,
+    ) -> Option<Outcome<'static>> {
+        if !self.schema_matches(&pending.record) {
+            Some(Outcome::Cancelled(
+                "record schema changed; explicit migration is required",
+            ))
+        } else if !target.allows_record(&pending.record) {
+            Some(Outcome::Cancelled(
+                "current kind or project policy excludes record",
+            ))
+        } else if now.saturating_sub(pending.created_at) >= i64::from(target.queue_days) * 86400 {
+            Some(Outcome::Expired)
+        } else if pending.attempts >= target.retry_attempts {
+            Some(Outcome::FailedBeforeSend("maximum attempts reached"))
+        } else {
+            None
+        }
+    }
+
     fn schema_matches(&self, record: &Envelope) -> bool {
         self.registry.kind(&record.kind).is_some_and(|spec| {
             record.metadata.schema_id.as_deref() == Some(spec.schema_id.as_str())
@@ -103,17 +131,12 @@ enum Delivery {
     Failed(String),
 }
 
-async fn send(
-    client: &reqwest::Client,
-    target: &ExportTarget,
-    records: &[outbox::Pending],
-    registry: &hatel_core::Registry,
-) -> Delivery {
+async fn send(client: &reqwest::Client, target: &ExportTarget, payload: Vec<u8>) -> Delivery {
     let mut request = client
         .post(format!("{}/v1/logs", target.endpoint))
         .header("content-type", "application/json")
         .timeout(Duration::from_millis(target.timeout_ms.unwrap_or(5000)))
-        .body(body(records, registry));
+        .body(payload);
     for (key, value) in &target.headers {
         request = request.header(key, value);
     }
@@ -212,62 +235,73 @@ pub(crate) async fn deliver(
     destination: &str,
     client: &reqwest::Client,
 ) -> Result<(), String> {
+    let conn = rusqlite_connection(state)?;
+    let now = hatel_core::now_epoch();
+    let pending = outbox::due(&conn, destination, now).map_err(|e| e.to_string())?;
+    drop(conn);
+    if pending.is_empty() {
+        return Ok(());
+    }
     let current = policy(path, state)?;
     let conn = rusqlite_connection(state)?;
     let Some(target) = current
         .export
         .targets
         .iter()
-        .find(|t| t.endpoint == destination && !t.kinds.is_empty())
+        .find(|target| target.endpoint == destination && !target.kinds.is_empty())
     else {
-        return outbox::cancel_destination(&conn, destination, hatel_core::now_epoch())
-            .map_err(|e| e.to_string());
+        return outbox::cancel_destination(&conn, destination, now).map_err(|e| e.to_string());
     };
-    let now = hatel_core::now_epoch();
     let mut records = Vec::new();
-    for pending in outbox::due(&conn, destination, now).map_err(|e| e.to_string())? {
+    let mut logs = Vec::new();
+    for pending in pending {
         let id = pending
             .record
             .metadata
             .record_id
             .as_deref()
             .ok_or("record has no id")?;
-        let outcome = if !current.schema_matches(&pending.record) {
-            Some(Outcome::Cancelled(
-                "record schema changed; explicit migration is required",
-            ))
-        } else if !target.allows_record(&pending.record) {
-            Some(Outcome::Cancelled(
-                "current kind or project policy excludes record",
-            ))
-        } else if now.saturating_sub(pending.created_at) >= i64::from(target.queue_days) * 86400 {
-            Some(Outcome::Expired)
-        } else if pending.attempts >= target.retry_attempts {
-            Some(Outcome::Failed("maximum attempts reached"))
-        } else {
-            None
-        };
+        let outcome = current.blocked(target, &pending, now);
         if let Some(outcome) = outcome {
             outbox::finish(&conn, destination, id, now, outcome).map_err(|e| e.to_string())?;
-        } else {
-            records.push(pending);
+            continue;
+        }
+        match log(
+            &pending.record,
+            current
+                .registry
+                .kind(&pending.record.kind)
+                .is_some_and(|spec| spec.redact.contains("project")),
+        ) {
+            Ok(log) => {
+                records.push(pending);
+                logs.push(log);
+            }
+            Err(error) => outbox::finish(
+                &conn,
+                destination,
+                id,
+                now,
+                Outcome::FailedBeforeSend(&error),
+            )
+            .map_err(|e| e.to_string())?,
         }
     }
     drop(conn);
     if records.is_empty() {
         return Ok(());
     }
-    // Policy is checked after loading the batch as well; an unreadable policy never authorizes egress.
     let latest = policy(path, state)?;
-    let Some(target) = latest.export.targets.iter().find(|t| {
-        t.endpoint == destination
+    let now = hatel_core::now_epoch();
+    let Some(target) = latest.export.targets.iter().find(|target| {
+        target.endpoint == destination
             && records
                 .iter()
-                .all(|p| t.allows_record(&p.record) && latest.schema_matches(&p.record))
+                .all(|record| latest.blocked(target, record, now).is_none())
     }) else {
         return Ok(());
     };
-    let delivery = send(client, target, &records, &latest.registry).await;
+    let delivery = send(client, target, body(logs)).await;
     let conn = rusqlite_connection(state)?;
     let now = hatel_core::now_epoch();
     for pending in records {
@@ -378,6 +412,167 @@ mod tests {
         let (cfg, invalid) = hatel_core::Config::from_settings_in(&settings, &|_| None);
         assert!(invalid.is_empty());
         (path, cfg)
+    }
+
+    #[test]
+    fn wire_numbers_and_timestamps_preserve_representable_boundaries() {
+        assert_eq!(
+            value(&json!(i64::MIN)).unwrap(),
+            json!({"intValue":i64::MIN.to_string()})
+        );
+        assert_eq!(
+            value(&json!(i64::MAX)).unwrap(),
+            json!({"intValue":i64::MAX.to_string()})
+        );
+        assert!(value(&json!({"nested":[u64::MAX]})).is_err());
+        assert_eq!(
+            value(&json!({"nested":[null,0]})).unwrap(),
+            json!({"kvlistValue":{"values":[{"key":"nested","value":{"arrayValue":{"values":[{}, {"intValue":"0"}]}}}]}})
+        );
+        for (timestamp, accepted) in [
+            (0, false),
+            (1, true),
+            (i128::from(u64::MAX), true),
+            (-1, false),
+            (i128::from(u64::MAX) + 1, false),
+        ] {
+            let timestamp = jiff::Timestamp::from_nanosecond(timestamp)
+                .unwrap()
+                .to_string();
+            assert_eq!(nanos(&timestamp).is_ok(), accepted);
+        }
+    }
+
+    #[tokio::test]
+    async fn unsendable_records_and_exhausted_policy_do_not_count_as_http_attempts() {
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = received.clone();
+        let app = axum::Router::new().route(
+            "/v1/logs",
+            axum::routing::post(move |bytes: bytes::Bytes| {
+                let requests = requests.clone();
+                async move {
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    let valid = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|record| {
+                            record["body"]["kvlistValue"]["values"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .filter(|field| field["key"] == "prompt_len")
+                                .all(|field| {
+                                    field["value"]["intValue"]
+                                        .as_str()
+                                        .is_some_and(|value| value.parse::<i64>().is_ok())
+                                })
+                        });
+                    requests.lock().unwrap().push(body);
+                    (
+                        if valid {
+                            axum::http::StatusCode::OK
+                        } else {
+                            axum::http::StatusCode::BAD_REQUEST
+                        },
+                        "{}",
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let home = tempfile::tempdir().unwrap();
+        let (path, cfg) = configure(home.path(), &endpoint, "");
+        let registry = hatel_core::schema::build_registry(&cfg).unwrap();
+        let valid = hatel_core::make_envelope(
+            "prompt",
+            [("prompt_len".into(), json!(7))].into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        let invalid = hatel_core::make_envelope(
+            "prompt",
+            [("prompt_len".into(), json!(u64::MAX))].into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        for record in [&invalid, &valid] {
+            hatel_core::build_sink(&cfg).write_record(record).unwrap();
+        }
+        let client = reqwest::Client::new();
+        deliver(&path, home.path(), &endpoint, &client)
+            .await
+            .unwrap();
+        let state = |id: &str| {
+            rusqlite_connection(home.path())
+                .unwrap()
+                .query_row(
+                    "SELECT status,attempts FROM deliveries WHERE record_id=?1",
+                    [id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            state(invalid.metadata.record_id.as_deref().unwrap()),
+            ("failed".into(), 0)
+        );
+        assert_eq!(
+            state(valid.metadata.record_id.as_deref().unwrap()),
+            ("delivered".into(), 1)
+        );
+        {
+            let requests = received.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0]["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let exhausted =
+            hatel_core::make_envelope("prompt", Default::default(), &registry, true).unwrap();
+        hatel_core::build_sink(&cfg)
+            .write_record(&exhausted)
+            .unwrap();
+        let conn = rusqlite_connection(home.path()).unwrap();
+        conn.execute(
+            "UPDATE deliveries SET attempts=5 WHERE record_id=?1",
+            [exhausted.metadata.record_id.as_deref().unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        configure(home.path(), &endpoint, "retry_attempts=1\n");
+        deliver(&path, home.path(), &endpoint, &client)
+            .await
+            .unwrap();
+        assert_eq!(
+            state(exhausted.metadata.record_id.as_deref().unwrap()),
+            ("failed".into(), 5)
+        );
+        assert_eq!(received.lock().unwrap().len(), 1);
+        let failures = outbox::states(&home.path().join("telemetry.db"))
+            .unwrap()
+            .into_iter()
+            .filter(|state| state.status == "failed")
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len(), 2);
+        assert!(failures.iter().any(|state| state.error.as_deref()
+            == Some("maximum attempts reached")
+            && state.records == 1));
+        assert!(failures.iter().any(|state| state.error.as_deref()
+            == Some("OTLP intValue requires a signed 64-bit integer")
+            && state.records == 1));
+        server.abort();
     }
 
     #[tokio::test]
