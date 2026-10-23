@@ -57,6 +57,15 @@ pub fn build_registry(cfg: &Config) -> Result<Registry> {
     for path in &cfg.plugins {
         load_plugin(&mut reg, path)?;
     }
+    if let Ok(export) = &cfg.export {
+        for target in &export.targets {
+            if let Some(kind) = target.kinds.iter().find(|kind| reg.kind(kind).is_none()) {
+                return Err(Error::InvalidExport(format!(
+                    "selected Kind {kind:?} is not registered"
+                )));
+            }
+        }
+    }
     Ok(reg)
 }
 

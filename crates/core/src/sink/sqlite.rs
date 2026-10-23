@@ -134,47 +134,77 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
     if !path.exists() {
         return 0;
     }
-    let conn = match Connection::open(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("hatel: sqlite prune open failed ({e})");
-            return 0;
-        }
-    };
-    // The sweep is the patient side: it waits out other writers rather than failing busy.
-    let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-    if crate::query::functions(&conn).is_err() {
-        return 0;
-    }
-    // `rowid IN (… LIMIT n)` rather than `DELETE … LIMIT`, which needs a non-default
-    // SQLite compile flag.
-    let mut total = 0;
-    loop {
-        match conn.execute(
-            "DELETE FROM records WHERE rowid IN \
-             (SELECT rowid FROM records WHERE hatel_epoch(ts) < ?1 LIMIT ?2)",
-            rusqlite::params![cutoff_epoch, PRUNE_BATCH],
-        ) {
-            Ok(0) => break,
-            Ok(n) => total += n,
-            Err(e) => {
-                eprintln!("hatel: sqlite prune failed ({e})");
+    let result = (|| -> rusqlite::Result<usize> {
+        let mut conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        crate::query::functions(&conn)?;
+        conn.execute_batch("CREATE TEMP TABLE prune_records (id INTEGER PRIMARY KEY);")?;
+        let has_deliveries: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='deliveries')",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut total = 0;
+        loop {
+            let tx = conn.transaction()?;
+            tx.execute("DELETE FROM prune_records", [])?;
+            let count = tx.execute("INSERT INTO prune_records SELECT rowid FROM records WHERE hatel_epoch(ts)<?1 LIMIT ?2",rusqlite::params![cutoff_epoch,PRUNE_BATCH])?;
+            if count == 0 {
+                tx.commit()?;
                 break;
             }
+            if has_deliveries {
+                let pending = {
+                    let mut stmt = tx.prepare("SELECT d.destination,COUNT(*),SUM(d.size_bytes) FROM deliveries d JOIN records r ON json_extract(r.metadata,'$.record_id')=d.record_id WHERE r.rowid IN (SELECT id FROM prune_records) AND d.status='pending' GROUP BY d.destination")?;
+                    stmt.query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for (destination, count, bytes) in pending {
+                    tx.execute("UPDATE delivery_queues SET pending_records=pending_records-?1,pending_bytes=pending_bytes-?2 WHERE destination=?3",rusqlite::params![count,bytes,destination])?;
+                }
+                tx.execute("DELETE FROM deliveries WHERE record_id IN (SELECT json_extract(metadata,'$.record_id') FROM records WHERE rowid IN (SELECT id FROM prune_records))",[])?;
+            }
+            tx.execute(
+                "DELETE FROM records WHERE rowid IN (SELECT id FROM prune_records)",
+                [],
+            )?;
+            tx.commit()?;
+            total += count;
+        }
+        Ok(total)
+    })();
+    match result {
+        Ok(count) => count,
+        Err(error) => {
+            eprintln!("hatel: sqlite retention failed: {error}");
+            0
         }
     }
-    total
 }
 
 pub struct SqliteSink {
     conn: Result<Connection, String>,
+    targets: Vec<crate::ExportTarget>,
 }
 
 impl SqliteSink {
     pub fn open(path: PathBuf) -> Self {
         Self {
             conn: Self::init(&path).map_err(|e| e.to_string()),
+            targets: Vec::new(),
         }
+    }
+
+    pub fn with_exports(path: PathBuf, targets: Vec<crate::ExportTarget>) -> Self {
+        let mut sink = Self::open(path);
+        sink.targets = targets;
+        sink
     }
 
     pub(crate) fn init(path: &PathBuf) -> rusqlite::Result<Connection> {
@@ -213,6 +243,7 @@ impl SqliteSink {
         }
         tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata, '$.record_id')) WHERE json_extract(metadata, '$.record_id') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_records_kind_occurred ON records(kind, occurred_seconds);")?;
+        tx.execute_batch(crate::outbox::SCHEMA)?;
         tx.commit()?;
         crate::query::functions(&conn)?;
         Ok(conn)
@@ -223,16 +254,23 @@ impl Sink for SqliteSink {
     fn write_record(&mut self, env: &Envelope) -> crate::Result<super::WriteReceipt> {
         let conn = self
             .conn
-            .as_ref()
+            .as_mut()
             .map_err(|e| crate::Error::Io(e.clone()))?;
         let payload =
             serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
-        conn.execute(
+        let tx = conn
+            .transaction()
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+        tx.execute(
             "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, crate::ts_epoch(&env.ts)],
         ).map_err(|e| crate::Error::Io(e.to_string()))?;
+        let delivery = crate::outbox::enqueue(&tx, env, &self.targets, crate::now_epoch())
+            .map_err(|e| crate::Error::Io(e.to_string()))?;
+        tx.commit().map_err(|e| crate::Error::Io(e.to_string()))?;
         Ok(super::WriteReceipt {
             record_id: env.metadata.record_id.clone(),
+            delivery,
         })
     }
 }

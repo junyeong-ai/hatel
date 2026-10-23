@@ -85,6 +85,23 @@ impl HatelMcp {
     }
 
     #[tool(
+        description = "Inspect durable local-record delivery states per destination. Same JSON as hatel deliveries --json. Native OTLP forwarding is best-effort and is not included."
+    )]
+    async fn deliveries(&self) -> Result<CallToolResult, McpError> {
+        blocking(|| {
+            crate::delivery_value()
+                .map(|value| {
+                    text_result(format!(
+                        "{}\n",
+                        serde_json::to_string_pretty(&value).expect("states serialize")
+                    ))
+                })
+                .map_err(internal)
+        })
+        .await?
+    }
+
+    #[tool(
         description = "Verify the Claude Code ↔ collector wiring. `ok: false` means a hard requirement failed; each section's findings carry a status (ok / fail / warn / note) and the message names the gap and its fix. `snippet` is the managed-settings paste block. Same JSON as `hatel doctor --json`."
     )]
     async fn doctor(&self) -> Result<CallToolResult, McpError> {

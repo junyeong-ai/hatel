@@ -60,6 +60,7 @@ fn config_in(dir: &Path, plugins: Vec<PathBuf>) -> Config {
         retention_days: 90,
         disabled: false,
         strict: true,
+        export: Ok(Default::default()),
     }
 }
 
@@ -379,6 +380,7 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
         retention_days: 90,
         disabled: false,
         strict: true,
+        export: Ok(Default::default()),
     };
     let reg = build_registry(&cfg).unwrap();
 
@@ -2097,4 +2099,147 @@ fn query_reports_zero_missing_invalid_and_duration_buckets_without_coercion() {
     assert_eq!(measure.max, Some(1000.0));
     assert_eq!(measure.buckets[0].count, 1);
     assert_eq!(measure.buckets[2].count, 2);
+}
+
+fn export_config(dir: &Path, policy: &str) -> hatel_core::ExportConfig {
+    let path = dir.join("exports.toml");
+    std::fs::write(&path, policy).unwrap();
+    hatel_core::ExportConfig::from_settings(&hatel_core::Settings::read(&path).unwrap()).unwrap()
+}
+
+#[test]
+fn selected_sanitized_records_and_pending_delivery_commit_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    cfg.export = Ok(export_config(
+        dir.path(),
+        "[[export]]\nendpoint='http://company:4318'\nmode='raw'\nsignals=['metrics']\nkinds=['prompt']\nprojects=['company']\n",
+    ));
+    let reg = build_registry(&cfg).unwrap();
+    let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+    let mut sink = hatel_core::build_sink(&cfg);
+    assert_eq!(sink.write_record(&env).unwrap().delivery.queued, 0);
+    env.metadata.record_id = Some("personal".into());
+    env.metadata.project = Some(hatel_core::ProjectRef {
+        key: "/personal".into(),
+        label: "personal".into(),
+    });
+    assert_eq!(sink.write_record(&env).unwrap().delivery.queued, 0);
+    env.metadata.record_id = Some("company".into());
+    env.metadata.project = Some(hatel_core::ProjectRef {
+        key: "/company".into(),
+        label: "company".into(),
+    });
+    assert_eq!(sink.write_record(&env).unwrap().delivery.queued, 1);
+    env.metadata.record_id = Some("projection".into());
+    env.metadata.projection = true;
+    assert_eq!(sink.write_record(&env).unwrap().delivery.queued, 0);
+    drop(sink);
+    let states = hatel_core::outbox::states(&dir.path().join("telemetry.db")).unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].records, 1);
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_delivery BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT,'delivery failed'); END;").unwrap();
+    env.metadata.projection = false;
+    env.metadata.record_id = Some("rolled-back".into());
+    assert!(hatel_core::build_sink(&cfg).write_record(&env).is_err());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM records WHERE json_extract(metadata,'$.record_id')='rolled-back'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    hatel_core::outbox::finish(
+        &conn,
+        "http://company:4318",
+        "company",
+        hatel_core::now_epoch(),
+        hatel_core::outbox::Outcome::Delivered,
+    )
+    .unwrap();
+    hatel_core::outbox::finish(
+        &conn,
+        "http://company:4318",
+        "company",
+        hatel_core::now_epoch(),
+        hatel_core::outbox::Outcome::Delivered,
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row("SELECT pending_records FROM delivery_queues", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn a_full_delivery_queue_keeps_the_local_record_and_exposes_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    cfg.export = Ok(export_config(
+        dir.path(),
+        "[[export]]\nendpoint='http://company:4318'\nmode='raw'\nsignals=[]\nkinds=['prompt']\nqueue_bytes=1024\n",
+    ));
+    let reg = build_registry(&cfg).unwrap();
+    let env = make_envelope(
+        "prompt",
+        [("session_id".into(), serde_json::json!("x".repeat(2048)))].into(),
+        &reg,
+        true,
+    )
+    .unwrap();
+    let receipt = hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+    assert_eq!(receipt.delivery.queued, 0);
+    assert_eq!(receipt.delivery.not_queued, 1);
+    assert_eq!(
+        hatel_core::sink::read_records(&cfg, "prompt", None).len(),
+        1
+    );
+    assert_eq!(
+        hatel_core::outbox::states(&dir.path().join("telemetry.db")).unwrap()[0].status,
+        "capacity"
+    );
+}
+
+#[test]
+fn retention_removes_pending_references_and_releases_queue_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    cfg.export = Ok(export_config(
+        dir.path(),
+        "[[export]]\nendpoint='http://company:4318'\nmode='raw'\nkinds=['prompt']\n",
+    ));
+    let reg = build_registry(&cfg).unwrap();
+    let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+    env.ts = "2026-01-01T00:00:00Z".into();
+    hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
+        1
+    );
+    assert!(
+        hatel_core::outbox::states(&dir.path().join("telemetry.db"))
+            .unwrap()
+            .is_empty()
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT pending_records FROM delivery_queues", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }

@@ -46,6 +46,13 @@ and its CI check unless a deliberate compatibility change requires raising both.
   instead of inventing fallbacks. New code follows this or doesn't merge.
 - **Estimates are separate from spend.** Session cache-write forecasts are not added to native
   OTel costs. A cost report window selects sessions by last activity; their totals are cumulative.
+- **Routing is destination-specific.** `signals` selects native OTLP input; `kinds` is an exact
+  opt-in allow-list for sanitized local records. Omitted keys preserve metrics+logs and no local
+  Kinds. A local record and its delivery rows commit together. Network work belongs to the
+  receiver; a durable retry reuses `record_id` and rechecks current policy. Native forwarding
+  stays best-effort. Vendor projections set `metadata.projection` so forwarding the original
+  signal cannot also export its local projection. Queue counters change in the same transaction
+  as delivery state; retention deletes delivery references and releases capacity with records.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

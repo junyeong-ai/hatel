@@ -31,6 +31,7 @@ pub struct Config {
     pub retention_days: i64,
     pub disabled: bool,
     pub strict: bool,
+    pub export: std::result::Result<crate::ExportConfig, String>,
 }
 
 /// Which surface supplied the plugin list. An override is worth naming: advice to edit the
@@ -88,6 +89,9 @@ impl Config {
     /// under-reported answer that looks complete.
     pub fn load() -> Result<Self> {
         let (cfg, invalid) = Self::from_settings(&Settings::load()?);
+        if let Err(e) = &cfg.export {
+            return Err(Error::InvalidExport(e.clone()));
+        }
         if invalid.is_empty() {
             Ok(cfg)
         } else {
@@ -108,6 +112,9 @@ impl Config {
             eprintln!("hatel: {e}");
             Settings::default()
         }));
+        if let Err(e) = &cfg.export {
+            eprintln!("hatel: local recording only: {e}");
+        }
         for var in invalid {
             eprintln!("hatel: ignoring {var}");
         }
@@ -177,6 +184,7 @@ impl Config {
             retention_days,
             disabled,
             strict,
+            export: crate::ExportConfig::from_settings(settings).map_err(|e| e.to_string()),
         };
         (cfg, invalid)
     }

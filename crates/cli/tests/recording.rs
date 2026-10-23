@@ -77,3 +77,87 @@ fn batch_returns_each_storage_outcome_and_only_stored_rows_are_queryable() {
     assert_eq!(failure.status.code(), Some(1));
     assert!(failure.stdout.is_empty());
 }
+
+struct Receiver(std::process::Child);
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_waits_without_a_receiver_and_delivery_resumes_after_restart() {
+    let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/v1/logs",
+        axum::routing::post(move |body: bytes::Bytes| {
+            let sent = sent.clone();
+            async move {
+                sent.send(serde_json::from_slice::<serde_json::Value>(&body).unwrap())
+                    .unwrap();
+                "{}"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"),format!("[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint={endpoint:?}\nmode='raw'\nsignals=[]\nkinds=['prompt']\n",home.path().join("state").to_string_lossy())).unwrap();
+    for _ in 0..2 {
+        let receipt = isolated(home.path())
+            .args(["emit", "prompt", "--json", "{}", "--receipt"])
+            .output()
+            .unwrap();
+        assert!(
+            receipt.status.success(),
+            "{}",
+            String::from_utf8_lossy(&receipt.stderr)
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(&receipt.stdout).unwrap();
+        assert_eq!(receipt["delivery"]["queued"], 1);
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reservation.local_addr().unwrap().port().to_string();
+        drop(reservation);
+        let receiver = Receiver(
+            isolated(home.path())
+                .args(["serve", "--all", "--port", &port])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let body = tokio::time::timeout(std::time::Duration::from_secs(8), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let attributes = body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"]
+            .as_array()
+            .unwrap();
+        assert!(
+            attributes.iter().any(|a| a["key"] == "log.record.uid"
+                && a["value"]["stringValue"] == receipt["record_id"])
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let states = isolated(home.path())
+                    .args(["deliveries", "--json"])
+                    .output()
+                    .unwrap();
+                let states: Vec<serde_json::Value> =
+                    serde_json::from_slice(&states.stdout).unwrap();
+                if states.iter().all(|s| s["status"] == "delivered") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(receiver);
+    }
+    server.abort();
+}

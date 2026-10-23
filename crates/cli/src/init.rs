@@ -345,6 +345,11 @@ pub fn insert(mode: InsertMode) -> i32 {
     export.upsert(ExportTarget {
         endpoint: endpoint.clone(),
         mode: mode.as_export(),
+        signals: hatel_core::export::default_signals(),
+        kinds: Default::default(),
+        retry_attempts: 8,
+        queue_days: 7,
+        queue_bytes: 64 * 1024 * 1024,
         // Insert forwards every project by default; a `projects`/`exclude_projects` filter is
         // added by editing config.toml when a destination should not see some projects.
         filter: ProjectFilter::All,

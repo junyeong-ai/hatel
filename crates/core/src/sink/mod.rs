@@ -18,6 +18,7 @@ use crate::{Config, Envelope};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteReceipt {
     pub record_id: Option<String>,
+    pub delivery: crate::outbox::Enqueued,
 }
 
 pub trait Sink {
@@ -51,7 +52,13 @@ fn sqlite_db_path(cfg: &Config) -> PathBuf {
 pub fn build_sink(cfg: &Config) -> Box<dyn Sink> {
     match cfg.sink {
         SinkKind::Jsonl => Box::new(JsonlSink::new(cfg.ledger_dir.clone(), cfg.rotate_bytes)),
-        SinkKind::Sqlite => Box::new(SqliteSink::open(sqlite_db_path(cfg))),
+        SinkKind::Sqlite => Box::new(SqliteSink::with_exports(
+            sqlite_db_path(cfg),
+            cfg.export
+                .as_ref()
+                .map(|e| e.targets.clone())
+                .unwrap_or_default(),
+        )),
     }
 }
 

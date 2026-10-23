@@ -199,6 +199,29 @@ fn build_report() -> Report {
         sections.push(export);
     }
 
+    match hatel_core::outbox::states(&cfg.state_dir.join("telemetry.db")) {
+        Ok(states) if !states.is_empty() => {
+            let mut deliveries = Section::new("deliveries", "durable local-record deliveries:");
+            for state in states {
+                let message = format!(
+                    "{}: {} {} record(s)",
+                    state.destination, state.status, state.records
+                );
+                if matches!(state.status.as_str(), "failed" | "expired" | "capacity") {
+                    deliveries.warn(message);
+                } else {
+                    deliveries.note(message);
+                }
+            }
+            sections.push(deliveries);
+        }
+        Err(error) => {
+            let mut deliveries = Section::new("deliveries", "durable local-record deliveries:");
+            deliveries.fail(error.to_string());
+            sections.push(deliveries);
+        }
+        _ => {}
+    }
     let ok = sections
         .iter()
         .flat_map(|s| &s.findings)
@@ -670,15 +693,19 @@ fn report_export(
             .map(|d| format!(", {d}"))
             .unwrap_or_default();
         sec.note(format!(
-            "{} ({}{}{})",
+            "{} ({}{}{}; signals={:?}; kinds={:?})",
             t.endpoint,
             t.mode.as_str(),
             filter,
-            headers
+            headers,
+            t.signals,
+            t.kinds
         ));
     }
     // Egress is the one place data leaves the host, and hatel does not redact the forwarded body.
-    sec.warn("egress forwards the raw OTLP stream off this host — hatel does not redact it");
+    if export.targets.iter().any(|t| !t.signals.is_empty()) {
+        sec.warn("egress forwards selected native OTLP signals off this host — hatel does not redact those bodies");
+    }
     // The config writer sets owner-only permissions (0o600) on Unix; Windows has no mode-bit
     // equivalent here, so a config holding auth headers deserves an honest heads-up.
     if cfg!(windows) && export.targets.iter().any(|t| !t.headers.is_empty()) {
@@ -688,13 +715,15 @@ fn report_export(
         );
     }
 
+    if export.targets.iter().all(|t| t.signals.is_empty()) {
+        return Some(sec);
+    }
     // Both enriching and filtering read the JSON body (to inject, or to resolve a batch's project
     // from its session.id); a non-JSON protocol makes an enriched target skip and a filtered target
     // fail closed (forward nothing). Flag the protocol that would do so.
-    let needs_json = export
-        .targets
-        .iter()
-        .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
+    let needs_json = export.targets.iter().any(|t| {
+        !t.signals.is_empty() && (t.mode == ExportMode::Enriched || t.filter.is_filtered())
+    });
     if needs_json {
         let mut checked = std::collections::BTreeSet::new();
         for signal in [
@@ -727,7 +756,13 @@ fn report_export(
         (None, None) => true,
         _ => false,
     };
-    if same_destination {
+    let metrics_selected = export.targets.iter().any(|t| t.signals.contains("metrics"));
+    let logs_selected = export.targets.iter().any(|t| t.signals.contains("logs"));
+    if metrics_selected && !logs_selected {
+        report_route(&mut sec, Some("metrics"), metrics);
+    } else if logs_selected && !metrics_selected {
+        report_route(&mut sec, Some("logs"), logs);
+    } else if same_destination {
         report_route(&mut sec, None, metrics); // one effective endpoint for both signals (the common case)
     } else {
         report_route(&mut sec, Some("metrics"), metrics);

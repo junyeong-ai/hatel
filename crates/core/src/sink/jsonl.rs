@@ -107,6 +107,7 @@ impl Sink for JsonlSink {
         .map_err(|e| crate::Error::Io(e.to_string()))?;
         Ok(super::WriteReceipt {
             record_id: env.metadata.record_id.clone(),
+            delivery: Default::default(),
         })
     }
 }

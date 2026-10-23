@@ -20,6 +20,8 @@ etcetera.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+http.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

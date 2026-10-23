@@ -83,8 +83,13 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
             Ok(mut envelope) => {
                 envelope.metadata.project = project.clone();
                 envelope.metadata.source = Some("claude_code.hook".into());
-                if let Err(e) = sink.write_record(&envelope) {
-                    eprintln!("hatel hook: {e}");
+                match sink.write_record(&envelope) {
+                    Ok(receipt) if receipt.delivery.not_queued > 0 => eprintln!(
+                        "hatel hook: {} delivery queue(s) at capacity",
+                        receipt.delivery.not_queued
+                    ),
+                    Err(e) => eprintln!("hatel hook: {e}"),
+                    _ => {}
                 }
             }
             Err(e) => eprintln!("hatel hook: {e}"),

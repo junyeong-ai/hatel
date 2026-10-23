@@ -21,6 +21,8 @@ tokio.workspace = true
 axum.workspace = true
 reqwest.workspace = true
 bytes.workspace = true
+httpdate.workspace = true
+rusqlite.workspace = true
 rmcp.workspace = true
 
 [target.'cfg(unix)'.dependencies]

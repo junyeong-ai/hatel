@@ -27,6 +27,8 @@ pub struct Envelope {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecordMetadata {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub projection: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -41,6 +43,10 @@ pub struct RecordMetadata {
     pub correlation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind_version: Option<u32>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -100,6 +106,15 @@ pub fn make_envelope(
         .kind(kind)
         .ok_or_else(|| crate::Error::UnknownKind(kind.to_string()))?;
     let payload = pii::sanitize(spec, payload, strict)?;
+    if serde_json::to_vec(&payload)
+        .map_err(|e| crate::Error::InvalidPayload(e.to_string()))?
+        .len()
+        > 256 * 1024
+    {
+        return Err(crate::Error::InvalidPayload(
+            "payload exceeds 256 KiB".into(),
+        ));
+    }
     Ok(Envelope {
         ts: now_iso_utc(),
         kind: kind.to_string(),

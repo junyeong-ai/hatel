@@ -148,7 +148,14 @@ pub(crate) fn startup() -> Result<Startup, String> {
     let registry = build_registry(&cfg).map_err(|e| e.to_string())?;
     // A misconfigured export file is fatal (like a bad registry) — fail fast rather than silently
     // drop a destination the operator asked for. Never reached by the hook.
-    let export = ExportConfig::load().map_err(|e| e.to_string())?;
+    let export = cfg.export.as_ref().map_err(Clone::clone)?.clone();
+    if cfg.sink != hatel_core::SinkKind::Sqlite
+        && export.targets.iter().any(|t| !t.kinds.is_empty())
+    {
+        return Err(
+            "custom delivery requires SQLite; migrate --quiescent after stopping writers".into(),
+        );
+    }
     Ok(Startup {
         cfg,
         registry,
@@ -234,8 +241,17 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     let (exporter, export_handle) = if export_cfg.targets.is_empty() {
         (None, None)
     } else {
-        let (e, h) = Exporter::spawn(export_cfg.targets.clone(), cfg.state_dir.clone());
+        let (e, h) = Exporter::spawn_with_policy(
+            export_cfg.targets.clone(),
+            cfg.state_dir.clone(),
+            Settings::path(),
+        );
         (Some(e), Some(h))
+    };
+    let durable = if cfg.sink == hatel_core::SinkKind::Sqlite {
+        Settings::path().map(|path| crate::export::durable::spawn(path, cfg.state_dir.clone()))
+    } else {
+        None
     };
     let state = AppState {
         ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_REQUESTS)),
@@ -321,6 +337,10 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     });
     if let Err(e) = server.await {
         eprintln!("serve: {e}");
+    }
+    if let Some((stop, task)) = durable {
+        let _ = stop.send(());
+        let _ = task.await;
     }
     // A disconnected request can leave its blocking decoder running. Its permit is released
     // only after aggregation, so the final snapshot must wait for all permits to return.
@@ -959,6 +979,7 @@ mod tests {
             retention_days: 90,
             disabled: false,
             strict: false,
+            export: Ok(Default::default()),
         };
         let registry = Arc::new(build_registry(&cfg).unwrap());
         AppState {

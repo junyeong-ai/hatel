@@ -1,9 +1,5 @@
-//! The export runtime: a bounded queue, a single drain task, and an HTTP client that forwards
-//! each received OTLP body to every configured destination. Best-effort and fail-open — a slow
-//! or unreachable downstream never blocks ingestion (the queue drops and counts under pressure)
-//! and is never retried (a retry would inflate downstream delta counters). The API takes only
-//! `bytes::Bytes` + `OtlpSignal`, never an axum type, so a future ledger→OTLP-logs exporter can
-//! reuse the same `enqueue`.
+//! Bounded native OTLP forwarding with one independent queue and worker per destination.
+//! Native batches remain best-effort without retries; local records use the durable outbox.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -62,6 +58,7 @@ impl OtlpSignal {
 /// One received body queued for forwarding. `content_type`/`content_encoding` are the inbound
 /// headers, preserved for raw forwarding (so a compressed or protobuf tee stays byte-faithful);
 /// enriched re-sends uncompressed `application/json`.
+#[derive(Clone)]
 struct Outbound {
     signal: OtlpSignal,
     body: Bytes,
@@ -73,29 +70,71 @@ struct Outbound {
 /// state; dropping all clones (or calling `shutdown`) ends the drain task.
 #[derive(Clone)]
 pub struct Exporter {
-    tx: mpsc::Sender<Outbound>,
+    routes: Vec<Route>,
     tallies: Arc<Tallies>,
-    /// Bytes currently queued (added on enqueue, subtracted as the drain task consumes), so the
-    /// queue is memory-bounded, not just slot-bounded.
-    queued_bytes: Arc<AtomicUsize>,
     shutdown: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct Route {
+    tx: mpsc::Sender<Outbound>,
+    queued_bytes: Arc<AtomicUsize>,
+    signals: BTreeSet<String>,
 }
 
 impl Exporter {
     /// Build the client, channel, and drain task. Returns the handle plus the task's
     /// `JoinHandle` so the receiver can await a bounded drain on shutdown.
+    #[cfg(test)]
     pub fn spawn(targets: Vec<ExportTarget>, state_dir: PathBuf) -> (Exporter, JoinHandle<()>) {
-        let (tx, rx) = mpsc::channel(EXPORT_QUEUE_CAP);
-        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        Self::spawn_with_policy(targets, state_dir, None)
+    }
+
+    pub fn spawn_with_policy(
+        targets: Vec<ExportTarget>,
+        state_dir: PathBuf,
+        policy_file: Option<PathBuf>,
+    ) -> (Exporter, JoinHandle<()>) {
         let shutdown = Arc::new(Notify::new());
-        let worker = Worker::new(targets, state_dir, queued_bytes.clone());
-        let tallies = worker.tallies.clone();
-        let handle = tokio::spawn(worker.run(rx, shutdown.clone()));
+        let tallies = Arc::new(Tallies::new(&targets));
+        let mut routes = Vec::new();
+        let mut stops = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        for target in targets.into_iter().filter(|t| !t.signals.is_empty()) {
+            let (tx, rx) = mpsc::channel(EXPORT_QUEUE_CAP);
+            let queued_bytes = Arc::new(AtomicUsize::new(0));
+            let stopped = Arc::new(Notify::new());
+            routes.push(Route {
+                tx,
+                queued_bytes: queued_bytes.clone(),
+                signals: target.signals.clone(),
+            });
+            let mut worker = Worker::new(vec![target], state_dir.clone(), queued_bytes);
+            worker.tallies = tallies.clone();
+            worker.policy = policy_file.clone().map(|path| {
+                (
+                    path,
+                    worker.targets.iter().map(|t| t.endpoint.clone()).collect(),
+                )
+            });
+            tasks.spawn(worker.run(rx, stopped.clone()));
+            stops.push(stopped);
+        }
+        let stop = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop.notified() => { for stopped in &stops { stopped.notify_one(); } break; },
+                    Some(_) = tasks.join_next(), if !tasks.is_empty() => { if tasks.is_empty() { return; } },
+                    else => return,
+                }
+            }
+            while tasks.join_next().await.is_some() {}
+        });
         (
             Exporter {
-                tx,
+                routes,
                 tallies,
-                queued_bytes,
                 shutdown,
             },
             handle,
@@ -112,27 +151,37 @@ impl Exporter {
         content_type: Option<String>,
         content_encoding: Option<String>,
     ) {
-        let len = body.len();
-        // Atomically reserve the bytes, or drop if it would breach the memory ceiling — a hard
-        // bound even under concurrent enqueues (no check-then-add race).
-        let reserved = self
-            .queued_bytes
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                (cur.saturating_add(len) <= MAX_QUEUED_BYTES).then(|| cur + len)
-            });
-        if reserved.is_err() {
-            self.record_drop();
-            return;
-        }
+        let signal_name = match signal {
+            OtlpSignal::Metrics => "metrics",
+            OtlpSignal::Logs => "logs",
+        };
+        let per_target_bytes = MAX_QUEUED_BYTES / self.routes.len().max(1);
         let out = Outbound {
             signal,
             body,
             content_type,
             content_encoding,
         };
-        if self.tx.try_send(out).is_err() {
-            self.queued_bytes.fetch_sub(len, Ordering::Relaxed); // release: nothing was queued
-            self.record_drop();
+        for route in self
+            .routes
+            .iter()
+            .filter(|r| r.signals.contains(signal_name))
+        {
+            let len = out.body.len();
+            let reserved =
+                route
+                    .queued_bytes
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                        (cur.saturating_add(len) <= per_target_bytes).then(|| cur + len)
+                    });
+            if reserved.is_err() {
+                self.record_drop();
+                continue;
+            }
+            if route.tx.try_send(out.clone()).is_err() {
+                route.queued_bytes.fetch_sub(len, Ordering::Relaxed);
+                self.record_drop();
+            }
         }
     }
 
@@ -232,6 +281,7 @@ enum TargetSet {
 }
 
 struct Worker {
+    policy: Option<(PathBuf, BTreeSet<String>)>,
     targets: Vec<ExportTarget>,
     client: reqwest::Client,
     index: SessionIndexCache,
@@ -261,6 +311,7 @@ impl Worker {
             .iter()
             .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
         Worker {
+            policy: None,
             client,
             index: SessionIndexCache::new(state_dir),
             queued_bytes,
@@ -318,6 +369,29 @@ impl Worker {
     /// index doesn't know *yet*. Bytes are released only on final disposition (forwarded/dropped),
     /// never while parked, so the queue's memory ceiling stays a hard bound.
     async fn handle(&mut self, out: Outbound) {
+        if let Some((path, endpoints)) = &self.policy {
+            match hatel_core::Settings::read(path)
+                .and_then(|s| hatel_core::ExportConfig::from_settings(&s))
+            {
+                Ok(config) => {
+                    self.targets = config
+                        .targets
+                        .into_iter()
+                        .filter(|t| endpoints.contains(&t.endpoint))
+                        .collect()
+                }
+                Err(error) => {
+                    self.targets.clear();
+                    if self.enrich_skip_warned.insert("policy".into()) {
+                        eprintln!("hatel: native forwarding stopped: {error}");
+                    }
+                }
+            }
+            self.index_needed = self
+                .targets
+                .iter()
+                .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
+        }
         // Refresh the session→project map only when something actually enriches or filters, and
         // only when the index file changed since last load (mtime-gated) — no per-batch file read,
         // no read storm on a session that never appears in the index.
@@ -412,6 +486,13 @@ impl Worker {
         projects: Option<&BTreeSet<(String, String)>>,
     ) {
         // Disjoint field borrows: the loop reads targets/client/index and mutates the warned set.
+        let policy = self.policy.as_ref().map(|(path, _)| {
+            hatel_core::Settings::read(path)
+                .and_then(|s| hatel_core::ExportConfig::from_settings(&s))
+        });
+        if matches!(&policy, Some(Err(_))) {
+            return;
+        }
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
@@ -420,7 +501,26 @@ impl Worker {
         // The enriched body is identical for every enriched target — the project label is resolved
         // from the index, not the target — so it is built at most once per forward and reused.
         let mut enriched: Option<Result<Bytes, String>> = None;
-        for target in targets {
+        for original in targets {
+            let target = if let Some(Ok(policy)) = &policy {
+                let Some(target) = policy
+                    .targets
+                    .iter()
+                    .find(|t| t.endpoint == original.endpoint)
+                else {
+                    continue;
+                };
+                target
+            } else {
+                original
+            };
+            let signal = match out.signal {
+                OtlpSignal::Metrics => "metrics",
+                OtlpSignal::Logs => "logs",
+            };
+            if !target.signals.contains(signal) {
+                continue;
+            }
             let filtered = target.filter.is_filtered();
             let addressed = match set {
                 TargetSet::All => true,
@@ -596,9 +696,12 @@ mod tests {
         // enqueue is dropped and counted — and none of them block.
         let (tx, _rx) = mpsc::channel::<Outbound>(2);
         let exp = Exporter {
-            tx,
+            routes: vec![Route {
+                tx,
+                queued_bytes: Arc::new(AtomicUsize::new(0)),
+                signals: hatel_core::export::default_signals(),
+            }],
             tallies: Arc::default(),
-            queued_bytes: Arc::new(AtomicUsize::new(0)),
             shutdown: Arc::new(Notify::new()),
         };
         for _ in 0..10 {
@@ -773,6 +876,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
@@ -812,6 +920,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
@@ -865,6 +978,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::Only(allow),
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
@@ -926,6 +1044,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: "http://127.0.0.1:9".to_string(), // never contacted
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
@@ -938,14 +1061,14 @@ mod tests {
             None,
         );
         assert!(
-            exporter.queued_bytes.load(Ordering::Relaxed) > 0,
+            exporter.routes[0].queued_bytes.load(Ordering::Relaxed) > 0,
             "bytes reserved on enqueue"
         );
         // Cross the deadline; then poll briefly for the worker's own wakeup to release.
         tokio::time::sleep(DEFER_TIMEOUT + Duration::from_secs(2)).await;
         let mut released = false;
         for _ in 0..50 {
-            if exporter.queued_bytes.load(Ordering::Relaxed) == 0 {
+            if exporter.routes[0].queued_bytes.load(Ordering::Relaxed) == 0 {
                 released = true;
                 break;
             }
@@ -965,6 +1088,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: endpoint.clone(),
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
@@ -993,6 +1121,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: "http://127.0.0.1:9".to_string(),
             mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
@@ -1052,6 +1185,11 @@ mod tests {
         let target = ExportTarget {
             endpoint: format!("http://{addr}"),
             mode: ExportMode::Enriched,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: hatel_core::ProjectFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
@@ -1096,5 +1234,43 @@ mod tests {
             Some("alpha"),
             "downstream got the project-enriched body"
         );
+    }
+    #[tokio::test]
+    async fn a_slow_destination_does_not_hold_another_destinations_queue() {
+        let (fast, received, fast_server) = stub_collector().await;
+        let slow_app = axum::Router::new().route(
+            "/v1/metrics",
+            axum::routing::post(|| async {
+                std::future::pending::<()>().await;
+                "{}"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow = listener.local_addr().unwrap();
+        let slow_server = tokio::spawn(async move {
+            axum::serve(listener, slow_app).await.unwrap();
+        });
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path,format!("[[export]]\nendpoint='http://{slow}'\nmode='raw'\ntimeout_ms=10000\nsignals=['metrics']\n[[export]]\nendpoint='http://{fast}'\nmode='raw'\nsignals=['metrics']\n")).unwrap();
+        let config =
+            hatel_core::ExportConfig::from_settings(&hatel_core::Settings::read(&path).unwrap())
+                .unwrap();
+        let (exporter, handle) = Exporter::spawn(config.targets, home.path().to_path_buf());
+        exporter.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
+        exporter.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
+        exporter.enqueue(OtlpSignal::Logs, Bytes::from_static(b"{}"), None, None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while received.lock().unwrap().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fast destination drains independently");
+        assert_eq!(exporter.routes[0].signals, ["metrics".into()].into());
+        assert_eq!(received.lock().unwrap().len(), 2);
+        handle.abort();
+        slow_server.abort();
+        fast_server.abort();
     }
 }

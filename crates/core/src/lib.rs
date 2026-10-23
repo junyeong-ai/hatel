@@ -10,6 +10,7 @@ pub mod export;
 pub mod hook;
 pub mod migration;
 pub mod model;
+pub mod outbox;
 pub mod pii;
 pub mod project;
 pub mod query;

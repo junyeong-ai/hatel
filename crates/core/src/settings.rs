@@ -120,6 +120,16 @@ pub struct ExportTargetRaw {
     pub endpoint: String,
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signals: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub kinds: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projects: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_projects: Option<BTreeSet<String>>,

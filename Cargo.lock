@@ -683,10 +683,12 @@ dependencies = [
  "bytes",
  "clap",
  "hatel-core",
+ "httpdate",
  "jiff",
  "libc",
  "reqwest",
  "rmcp",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -699,6 +701,7 @@ version = "0.21.0"
 dependencies = [
  "blake3",
  "etcetera",
+ "http",
  "jiff",
  "regex",
  "rusqlite",
@@ -708,6 +711,7 @@ dependencies = [
  "thiserror",
  "toml",
  "unicode-width",
+ "url",
  "uuid",
 ]
 

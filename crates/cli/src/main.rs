@@ -158,6 +158,11 @@ enum Command {
     },
     /// Record a JSON array of {kind, payload, context?} from stdin; returns one result per item.
     EmitBatch,
+    /// Show durable local-record delivery states.
+    Deliveries {
+        #[arg(long)]
+        json: bool,
+    },
     /// Import a stopped JSONL ledger without changing its files, then select SQLite in config.
     Migrate {
         /// Assert that hooks and receiver writing this ledger have been stopped.
@@ -241,6 +246,7 @@ fn run() -> i32 {
             context,
         } => emit_cmd(&kind, fields, json, receipt, context),
         Command::EmitBatch => emit_batch_cmd(),
+        Command::Deliveries { json } => deliveries_cmd(json),
         Command::Migrate { quiescent: _ } => migrate_cmd(),
     }
 }
@@ -294,6 +300,12 @@ fn emit_cmd(
         Ok(result) => {
             if let Some(w) = &result.warning {
                 eprintln!("emit: {w}");
+            }
+            if result.delivery.not_queued > 0 {
+                eprintln!(
+                    "emit: stored locally; {} delivery queue(s) at capacity",
+                    result.delivery.not_queued
+                );
             }
             if receipt {
                 println!(
@@ -365,6 +377,41 @@ fn emit_batch_cmd() -> i32 {
         Err(e) => {
             eprintln!("emit-batch: {e}");
             2
+        }
+    }
+}
+
+pub(crate) fn delivery_value() -> Result<serde_json::Value, String> {
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    hatel_core::outbox::states(&cfg.state_dir.join("telemetry.db"))
+        .map_err(|e| e.to_string())
+        .and_then(|states| serde_json::to_value(states).map_err(|e| e.to_string()))
+}
+
+fn deliveries_cmd(json: bool) -> i32 {
+    match delivery_value() {
+        Ok(value) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("states serialize")
+                );
+            } else if let Some(states) = value.as_array() {
+                for state in states {
+                    println!(
+                        "{} — {}: {} records, {} bytes",
+                        state["destination"].as_str().unwrap_or(""),
+                        state["status"].as_str().unwrap_or(""),
+                        state["records"],
+                        state["bytes"]
+                    );
+                }
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("deliveries: {error}");
+            1
         }
     }
 }
@@ -823,6 +870,7 @@ mod tests {
                 retention_days: 90,
                 disabled: false,
                 strict: false,
+                export: Ok(Default::default()),
             },
             _dir: dir,
         }

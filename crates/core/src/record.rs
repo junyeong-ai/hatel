@@ -17,6 +17,7 @@ pub struct RecordInput {
 pub struct Receipt {
     pub record_id: Option<String>,
     pub warning: Option<String>,
+    pub delivery: crate::outbox::Enqueued,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,6 +53,15 @@ impl<'a> Writer<'a> {
             return RecordResult::Rejected {
                 error: "recording is disabled".into(),
             };
+        }
+        if self.config.sink == crate::SinkKind::Jsonl
+            && self
+                .config
+                .export
+                .as_ref()
+                .is_ok_and(|e| e.targets.iter().any(|t| !t.kinds.is_empty()))
+        {
+            return RecordResult::Failed { error: "custom delivery requires SQLite; run migrate --quiescent after stopping writers".into() };
         }
         let Some(spec) = self.registry.kind(&input.kind) else {
             return RecordResult::Rejected {
@@ -94,6 +104,7 @@ impl<'a> Writer<'a> {
                 receipt: Receipt {
                     record_id: receipt.record_id,
                     warning,
+                    delivery: receipt.delivery,
                 },
             },
             Err(e) => RecordResult::Failed {

@@ -102,6 +102,11 @@ pub struct ExportTarget {
     /// OTLP/HTTP base endpoint; `/v1/metrics` and `/v1/logs` are appended per signal.
     pub endpoint: String,
     pub mode: ExportMode,
+    pub signals: BTreeSet<String>,
+    pub kinds: BTreeSet<String>,
+    pub retry_attempts: u32,
+    pub queue_days: u32,
+    pub queue_bytes: u64,
     /// Which projects reach this destination (default `All`).
     pub filter: ProjectFilter,
     /// Extra request headers (e.g. a downstream's `authorization`). Never logged by value.
@@ -133,6 +138,11 @@ impl ExportConfig {
     /// Turn file entries into destinations. Validation is loud: an empty endpoint, an unknown
     /// mode, or a duplicate endpoint (which would double-count) is rejected here.
     fn validate(raws: Vec<ExportTargetRaw>) -> Result<ExportConfig> {
+        if raws.len() > 32 {
+            return Err(Error::InvalidExport(
+                "at most 32 destinations are supported".into(),
+            ));
+        }
         let mut targets = Vec::with_capacity(raws.len());
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for raw in raws {
@@ -141,6 +151,27 @@ impl ExportConfig {
                 return Err(Error::InvalidExport(
                     "an [[export]] target has an empty endpoint".to_string(),
                 ));
+            }
+            let parsed = url::Url::parse(&endpoint).map_err(|_| {
+                Error::InvalidExport("endpoint must be an absolute HTTP(S) URL".into())
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(Error::InvalidExport("endpoint must be HTTP(S), without userinfo, query or fragment; use headers for credentials".into()));
+            }
+            if raw.timeout_ms == Some(0) || raw.timeout_ms.is_some_and(|t| t > 300000) {
+                return Err(Error::InvalidExport("timeout_ms must be 1..300000".into()));
+            }
+            for (name, value) in &raw.headers {
+                http::HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|_| Error::InvalidExport("invalid HTTP header name".into()))?;
+                http::HeaderValue::from_str(value)
+                    .map_err(|_| Error::InvalidExport("invalid HTTP header value".into()))?;
             }
             let mode = ExportMode::parse(&raw.mode).ok_or_else(|| {
                 Error::InvalidExport(format!(
@@ -184,9 +215,46 @@ impl ExportConfig {
                     )));
                 }
             };
+            let signals = raw.signals.unwrap_or_else(default_signals);
+            if signals
+                .iter()
+                .any(|s| !matches!(s.as_str(), "metrics" | "logs"))
+            {
+                return Err(Error::InvalidExport(
+                    "signals must contain only metrics or logs".into(),
+                ));
+            }
+            if raw
+                .kinds
+                .iter()
+                .any(|k| !crate::registry::is_valid_kind_name(k))
+            {
+                return Err(Error::InvalidExport(
+                    "kinds must be exact registered names".into(),
+                ));
+            }
+            if signals.is_empty() && raw.kinds.is_empty() {
+                return Err(Error::InvalidExport(
+                    "target selects no signals or kinds".into(),
+                ));
+            }
+            let retry_attempts = raw.retry_attempts.unwrap_or(8);
+            let queue_days = raw.queue_days.unwrap_or(7);
+            let queue_bytes = raw.queue_bytes.unwrap_or(64 * 1024 * 1024);
+            if !(1..=100).contains(&retry_attempts)
+                || !(1..=90).contains(&queue_days)
+                || !(1024..=1024 * 1024 * 1024).contains(&queue_bytes)
+            {
+                return Err(Error::InvalidExport("retry_attempts must be 1..100, queue_days 1..90 and queue_bytes 1024..1073741824".into()));
+            }
             targets.push(ExportTarget {
                 endpoint,
                 mode,
+                signals,
+                kinds: raw.kinds,
+                retry_attempts,
+                queue_days,
+                queue_bytes,
                 filter,
                 headers: raw.headers,
                 timeout_ms: raw.timeout_ms,
@@ -244,6 +312,11 @@ impl ExportConfig {
                 ExportTargetRaw {
                     endpoint: t.endpoint.clone(),
                     mode: t.mode.as_str().to_string(),
+                    signals: (t.signals != default_signals()).then(|| t.signals.clone()),
+                    kinds: t.kinds.clone(),
+                    retry_attempts: (t.retry_attempts != 8).then_some(t.retry_attempts),
+                    queue_days: (t.queue_days != 7).then_some(t.queue_days),
+                    queue_bytes: (t.queue_bytes != 64 * 1024 * 1024).then_some(t.queue_bytes),
                     projects,
                     exclude_projects,
                     timeout_ms: t.timeout_ms,
@@ -251,6 +324,21 @@ impl ExportConfig {
                 }
             })
             .collect()
+    }
+}
+
+pub fn default_signals() -> BTreeSet<String> {
+    ["metrics".into(), "logs".into()].into()
+}
+
+impl ExportTarget {
+    pub fn allows_record(&self, env: &crate::Envelope) -> bool {
+        self.kinds.contains(&env.kind)
+            && !env.metadata.projection
+            && match &env.metadata.project {
+                Some(project) => self.filter.allows(&project.label, &project.key),
+                None => !self.filter.is_filtered(),
+            }
     }
 }
 
@@ -295,6 +383,11 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://corp:4318".into(),
             mode: ExportMode::Enriched,
+            signals: crate::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: ProjectFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
@@ -386,6 +479,11 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://x:4318".into(),
             mode: ExportMode::Raw,
+            signals: crate::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: ProjectFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
@@ -393,6 +491,11 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://x:4318".into(),
             mode: ExportMode::Enriched,
+            signals: crate::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: ProjectFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
@@ -407,6 +510,11 @@ mod tests {
         cfg.upsert(ExportTarget {
             endpoint: "http://corp:4318".into(),
             mode: ExportMode::Enriched,
+            signals: crate::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
             filter: ProjectFilter::All,
             headers: parse_otlp_headers("authorization=tok, x-team=core"),
             timeout_ms: Some(3000),
@@ -537,5 +645,37 @@ mod tests {
         assert_eq!(h.get("authorization").unwrap(), "Bearer abc");
         assert_eq!(h.get("tenant").unwrap(), "acme");
         assert!(!h.contains_key("broken"), "a pair without `=` is skipped");
+    }
+    #[test]
+    fn signal_and_kind_selection_are_explicit_and_invalid_routes_are_rejected() {
+        let selected = parse(
+            "[[export]]\nendpoint='https://company'\nmode='raw'\nsignals=['metrics']\nkinds=[]\n",
+        )
+        .unwrap();
+        assert_eq!(selected.targets[0].signals, ["metrics".into()].into());
+        assert!(selected.targets[0].kinds.is_empty());
+        for entry in [
+            "signals=['metricz']",
+            "signals=[]",
+            "kinds=['*']",
+            "timeout_ms=0",
+            "retry_attempts=0",
+        ] {
+            assert!(
+                parse(&format!(
+                    "[[export]]\nendpoint='https://company'\nmode='raw'\n{entry}\n"
+                ))
+                .is_err(),
+                "{entry}"
+            );
+        }
+        for endpoint in [
+            "file:///tmp/out",
+            "https://user:secret@company",
+            "https://company?token=secret",
+            "relative",
+        ] {
+            assert!(parse(&format!("[[export]]\nendpoint={endpoint:?}\nmode='raw'\n")).is_err());
+        }
     }
 }

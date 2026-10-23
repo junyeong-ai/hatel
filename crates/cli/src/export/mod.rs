@@ -2,6 +2,7 @@
 //! body with the project label; `exporter` owns the bounded queue, drain task, and HTTP client.
 //! This is the receiver's exporter half of a receiver → processor → exporter pipeline.
 
+pub mod durable;
 pub mod exporter;
 pub mod transform;
 
