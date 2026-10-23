@@ -24,7 +24,7 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                 };
                 let timestamp = if let Some(timestamp) = attribute("event.timestamp") {
                     timestamp
-                        .as_string()
+                        .as_string()?
                         .parse::<jiff::Timestamp>()
                         .map_err(|_| "invalid event.timestamp")?
                 } else if let Some(timestamp) = record.time_unix_nano.as_ref().and_then(|v| {
@@ -35,6 +35,9 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                     let nanos = timestamp
                         .parse::<u64>()
                         .map_err(|_| "invalid timeUnixNano")?;
+                    if nanos == 0 {
+                        return Err(format!("{kind} has no occurrence timestamp"));
+                    }
                     jiff::Timestamp::from_nanosecond(i128::from(nanos))
                         .map_err(|_| "invalid timeUnixNano")?
                 } else {
@@ -78,7 +81,7 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                 };
                 for (field, key) in string_fields {
                     if let Some(value) = attribute(key) {
-                        payload.insert((*field).into(), value.as_string().into());
+                        payload.insert((*field).into(), value.as_string()?.into());
                     }
                 }
                 for (field, key) in number_fields {
@@ -103,8 +106,11 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                 env.metadata.projection = true;
                 env.metadata.project =
                     repository(&resource.resource.attributes, &record.attributes)?;
-                env.metadata.correlation_id = attribute("prompt.id").map(|v| v.as_string());
-                env.metadata.run_id = attribute("workflow.run_id").map(|v| v.as_string());
+                env.metadata.correlation_id =
+                    attribute("prompt.id").map(|v| v.as_string()).transpose()?;
+                env.metadata.run_id = attribute("workflow.run_id")
+                    .map(|v| v.as_string())
+                    .transpose()?;
                 if kind == "claude.api_request"
                     && let (Some(session), Some(request)) = (
                         env.payload.get("session_id").and_then(|v| v.as_str()),

@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use hatel_core::cost::Spend;
 
-use super::decode::MetricPoint;
+use super::decode::{MetricPoint, ScalarValue};
 
 /// The bucket label for a series that does not carry the dimension being folded —
 /// recorded as such, never guessed into a real bucket. One spelling, shared by every
@@ -30,7 +30,7 @@ const COST: &str = "cost.usage";
 const ACTIVE_TIME: &str = "active_time.total";
 const LINES: &str = "lines_of_code.count";
 
-type SeriesKey = (String, Vec<(String, String)>);
+type SeriesKey = (String, Vec<(String, ScalarValue)>);
 
 #[derive(Debug, Default, Clone)]
 enum Attribution {
@@ -162,7 +162,10 @@ impl SessionTotals {
 
     /// Tokens + cost summed per `label` bucket over each contributing series — the
     /// shared fold behind every spend breakdown.
-    fn spend_by(&self, label: impl Fn(&[(String, String)]) -> String) -> BTreeMap<String, Spend> {
+    fn spend_by(
+        &self,
+        label: impl Fn(&[(String, ScalarValue)]) -> String,
+    ) -> BTreeMap<String, Spend> {
         let mut out: BTreeMap<String, Spend> = BTreeMap::new();
         for ((metric, series), value) in &self.metric_series {
             if metric != TOKENS && metric != COST {
@@ -180,11 +183,14 @@ impl SessionTotals {
 }
 
 /// The value of `key` on a series' attribute list.
-fn attr(series: &[(String, String)], key: &str) -> Option<String> {
+fn attr(series: &[(String, ScalarValue)], key: &str) -> Option<String> {
     series
         .iter()
         .find(|(k, _)| k == key)
-        .map(|(_, v)| v.clone())
+        .and_then(|(_, v)| match v {
+            ScalarValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
 }
 
 #[derive(Debug, Default)]
@@ -254,7 +260,7 @@ mod tests {
             project: None,
             series: series
                 .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), ScalarValue::String(v.to_string())))
                 .collect(),
             delta,
         }

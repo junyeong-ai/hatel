@@ -14,7 +14,7 @@ pub struct MetricPoint {
     pub value: f64,
     pub session_id: String,
     /// All attributes except `session.id`, sorted — the series within a session.
-    pub series: Vec<(String, String)>,
+    pub series: Vec<(String, ScalarValue)>,
     /// True when the datapoint is a per-interval increment to accumulate; false
     /// when it is a running total (cumulative sum or gauge) that replaces.
     pub delta: bool,
@@ -45,12 +45,19 @@ pub fn parse_metrics(bytes: &[u8], tracked: &BTreeSet<String>) -> Result<Vec<Met
                     (Some(_), Some(_)) => return Err("metric contains both sum and gauge".into()),
                 };
                 for dp in points {
-                    let mut attrs: Vec<(String, String)> = dp
+                    let session_id = dp
                         .attributes
                         .iter()
-                        .map(|kv| (kv.key.clone(), kv.value.as_string()))
-                        .collect();
-                    let session_id = take(&mut attrs, super::SESSION_ID);
+                        .find(|kv| kv.key == super::SESSION_ID)
+                        .map(|kv| kv.value.as_string())
+                        .transpose()?
+                        .unwrap_or_default();
+                    let mut attrs: Vec<(String, ScalarValue)> = dp
+                        .attributes
+                        .iter()
+                        .filter(|kv| kv.key != super::SESSION_ID)
+                        .map(|kv| Ok((kv.key.clone(), kv.value.scalar()?)))
+                        .collect::<Result<_, String>>()?;
                     if session_id.is_empty() {
                         continue;
                     }
@@ -90,7 +97,7 @@ pub fn parse_logs(
                 for kv in &record.attributes {
                     match kv.key.as_str() {
                         "event.name" => {}
-                        super::SESSION_ID => session = kv.value.as_string(),
+                        super::SESSION_ID => session = kv.value.as_string()?,
                         _ => {}
                     }
                 }
@@ -108,14 +115,6 @@ pub fn parse_logs(
 }
 pub fn normalize(event: &str) -> &str {
     event.strip_prefix("claude_code.").unwrap_or(event)
-}
-
-fn take(attrs: &mut Vec<(String, String)>, key: &str) -> String {
-    if let Some(i) = attrs.iter().position(|(k, _)| k == key) {
-        attrs.remove(i).1
-    } else {
-        String::new()
-    }
 }
 
 fn is_delta(v: &serde_json::Value) -> Result<bool, String> {
@@ -143,6 +142,15 @@ fn json_to_f64(v: &serde_json::Value) -> Result<f64, String> {
         .ok_or_else(|| "expected a finite OTLP number".into())
 }
 
+fn integer(v: &serde_json::Value) -> Result<i64, String> {
+    match v {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_i64(),
+        _ => None,
+    }
+    .ok_or_else(|| "expected a signed 64-bit OTLP integer".into())
+}
+
 pub(super) fn repository(
     resource: &[KeyValue],
     attributes: &[KeyValue],
@@ -151,11 +159,13 @@ pub(super) fn repository(
         let resource = resource
             .iter()
             .find(|kv| kv.key == name)
-            .map(|kv| kv.value.as_string());
+            .map(|kv| kv.value.as_string())
+            .transpose()?;
         let point = attributes
             .iter()
             .find(|kv| kv.key == name)
-            .map(|kv| kv.value.as_string());
+            .map(|kv| kv.value.as_string())
+            .transpose()?;
         if matches!((&resource,&point),(Some(a),Some(b)) if a!=b) {
             return Err(format!("conflicting repository attribute: {name}"));
         }
@@ -189,7 +199,8 @@ pub fn repository_projects(
         let session = attrs
             .iter()
             .find(|a| a.key == super::SESSION_ID)
-            .map(|a| a.value.as_string());
+            .map(|a| a.value.as_string())
+            .transpose()?;
         if let (Some(session), Some(project)) = (session, repository(resource, attrs)?) {
             if projects
                 .get(&session)
@@ -244,7 +255,7 @@ pub fn repository_projects(
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct Resource {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "attributes")]
     pub attributes: Vec<KeyValue>,
 }
 
@@ -300,7 +311,7 @@ struct Gauge {
 
 #[derive(Debug, Default, Deserialize)]
 struct DataPoint {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "attributes")]
     attributes: Vec<KeyValue>,
     #[serde(default, rename = "asInt")]
     as_int: Option<serde_json::Value>,
@@ -311,7 +322,7 @@ struct DataPoint {
 impl DataPoint {
     fn value(&self) -> Result<f64, String> {
         match (&self.as_int, self.as_double) {
-            (Some(i), None) => json_to_f64(i),
+            (Some(i), None) => integer(i).map(|n| n as f64),
             (None, Some(value)) if value.is_finite() => Ok(value),
             _ => Err("datapoint must contain exactly one finite asInt or asDouble".into()),
         }
@@ -344,7 +355,7 @@ pub(super) struct LogRecord {
     pub time_unix_nano: Option<serde_json::Value>,
     #[serde(default, rename = "eventName")]
     pub event_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "attributes")]
     pub attributes: Vec<KeyValue>,
 }
 
@@ -354,7 +365,8 @@ impl LogRecord {
             .attributes
             .iter()
             .find(|kv| kv.key == "event.name")
-            .map(|kv| kv.value.as_string());
+            .map(|kv| kv.value.as_string())
+            .transpose()?;
         if let (Some(event), Some(attribute)) = (&self.event_name, &attribute)
             && normalize(event) != normalize(attribute)
         {
@@ -375,8 +387,37 @@ pub(super) struct KeyValue {
     pub value: AnyValue,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(try_from = "RawAnyValue")]
 pub(super) struct AnyValue {
+    scalar: Option<ScalarValue>,
+}
+
+impl Default for AnyValue {
+    fn default() -> Self {
+        Self {
+            scalar: Some(ScalarValue::Empty),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ScalarValue {
+    Empty,
+    String(String),
+    Integer(i64),
+    Double(String),
+    Boolean(bool),
+}
+
+impl From<&str> for ScalarValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.into())
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAnyValue {
     #[serde(default, rename = "stringValue")]
     string_value: Option<String>,
     #[serde(default, rename = "intValue")]
@@ -385,41 +426,102 @@ pub(super) struct AnyValue {
     double_value: Option<f64>,
     #[serde(default, rename = "boolValue")]
     bool_value: Option<bool>,
+    #[serde(default, rename = "arrayValue")]
+    array_value: Option<serde_json::Value>,
+    #[serde(default, rename = "kvlistValue")]
+    kvlist_value: Option<serde_json::Value>,
+    #[serde(default, rename = "bytesValue")]
+    bytes_value: Option<String>,
+}
+
+impl TryFrom<RawAnyValue> for AnyValue {
+    type Error = String;
+
+    fn try_from(raw: RawAnyValue) -> Result<Self, String> {
+        let present = [
+            raw.string_value.is_some(),
+            raw.int_value.is_some(),
+            raw.double_value.is_some(),
+            raw.bool_value.is_some(),
+            raw.array_value.is_some(),
+            raw.kvlist_value.is_some(),
+            raw.bytes_value.is_some(),
+        ];
+        if present.into_iter().filter(|p| *p).count() > 1 {
+            return Err("OTLP AnyValue must contain at most one value".into());
+        }
+        let scalar = if let Some(s) = raw.string_value {
+            Some(ScalarValue::String(s))
+        } else if let Some(i) = raw.int_value {
+            Some(ScalarValue::Integer(integer(&i)?))
+        } else if let Some(d) = raw.double_value {
+            if !d.is_finite() {
+                return Err("expected a finite OTLP double".into());
+            }
+            Some(ScalarValue::Double(if d == 0.0 {
+                "0".into()
+            } else {
+                d.to_string()
+            }))
+        } else if let Some(b) = raw.bool_value {
+            Some(ScalarValue::Boolean(b))
+        } else if raw.array_value.is_some()
+            || raw.kvlist_value.is_some()
+            || raw.bytes_value.is_some()
+        {
+            None
+        } else {
+            Some(ScalarValue::Empty)
+        };
+        Ok(Self { scalar })
+    }
 }
 
 impl AnyValue {
-    pub(super) fn number(&self) -> Result<serde_json::Value, String> {
-        let raw = self.as_string();
-        if let Ok(number) = raw.parse::<i64>() {
-            return Ok(number.into());
-        }
-        if let Ok(number) = raw.parse::<u64>() {
-            return Ok(number.into());
-        }
-        let parsed = json_to_f64(&serde_json::Value::String(raw))?;
-        serde_json::Number::from_f64(parsed)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| "invalid number".into())
+    fn scalar(&self) -> Result<ScalarValue, String> {
+        self.scalar
+            .clone()
+            .ok_or_else(|| "local Claude metric attributes support scalar values only".into())
     }
 
-    pub(super) fn as_string(&self) -> String {
-        if let Some(s) = &self.string_value {
-            return s.clone();
+    pub(super) fn number(&self) -> Result<serde_json::Value, String> {
+        match &self.scalar {
+            Some(ScalarValue::Integer(n)) => Ok((*n).into()),
+            Some(ScalarValue::String(s)) => {
+                if let Ok(n) = s.parse::<i64>() {
+                    return Ok(n.into());
+                }
+                let n = json_to_f64(&serde_json::Value::String(s.clone()))?;
+                Ok(serde_json::json!(n))
+            }
+            Some(ScalarValue::Double(s)) => Ok(serde_json::json!(json_to_f64(
+                &serde_json::Value::String(s.clone())
+            )?)),
+            _ => Err("expected a numeric Claude event attribute".into()),
         }
-        if let Some(i) = &self.int_value {
-            return match i {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-        }
-        if let Some(d) = self.double_value {
-            return d.to_string();
-        }
-        if let Some(b) = self.bool_value {
-            return b.to_string();
-        }
-        String::new()
     }
+
+    pub(super) fn as_string(&self) -> Result<String, String> {
+        match &self.scalar {
+            Some(ScalarValue::String(s)) => Ok(s.clone()),
+            _ => Err("expected a string Claude attribute".into()),
+        }
+    }
+}
+
+fn attributes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<KeyValue>, D::Error> {
+    let attributes = Vec::<KeyValue>::deserialize(deserializer)?;
+    let mut keys = BTreeSet::new();
+    for attribute in &attributes {
+        if attribute.key.is_empty() || !keys.insert(&attribute.key) {
+            return Err(serde::de::Error::custom(
+                "OTLP attribute keys must be non-empty and unique",
+            ));
+        }
+    }
+    Ok(attributes)
 }
 
 #[cfg(test)]
@@ -455,7 +557,7 @@ mod tests {
         assert!(points[0].delta);
         assert_eq!(
             points[0].series,
-            vec![("type".to_string(), "output".to_string())]
+            vec![("type".to_string(), "output".into())]
         );
     }
 
@@ -544,9 +646,6 @@ mod tests {
 
     #[test]
     fn malformed_body_is_an_error_not_an_empty_batch() {
-        // A non-JSON / wrong-protocol body must stay distinguishable from a valid empty batch: the
-        // receiver always answers 200 (the status means "received"), so this distinction drives the
-        // stderr note for an undecodable body, not a status code.
         assert!(parse_metrics(b"not json", &tracked()).is_err());
         assert!(parse_logs(b"\x00\x01protobuf", &BTreeSet::new()).is_err());
         // a valid-but-empty OTLP body is Ok(empty), not an error.
@@ -555,5 +654,77 @@ mod tests {
             parse_logs(b"{}", &BTreeSet::new()).unwrap(),
             Vec::<(String, String)>::new()
         );
+    }
+
+    #[test]
+    fn ambiguous_or_invalid_native_attributes_are_rejected() {
+        let metric = |attributes: serde_json::Value, value: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({"resourceMetrics":[{"scopeMetrics":[{"metrics":[{
+                "name":"claude_code.token.usage", "gauge":{"dataPoints":[{"attributes":attributes,"asInt":value}]}
+            }]}]}]})).unwrap()
+        };
+        let session = serde_json::json!({"key":"session.id","value":{"stringValue":"S"}});
+        for attributes in [
+            serde_json::json!([session, session]),
+            serde_json::json!([{"key":"session.id","value":{"intValue":"1"}}]),
+            serde_json::json!([{"key":"session.id","value":{"stringValue":"S","boolValue":true}}]),
+            serde_json::json!([session,{"key":"x","value":{"intValue":"9223372036854775808"}}]),
+            serde_json::json!([session,{"key":"","value":{"stringValue":"x"}}]),
+        ] {
+            assert!(
+                parse_metrics(
+                    &metric(attributes.clone(), serde_json::json!(1)),
+                    &tracked()
+                )
+                .is_err(),
+                "{attributes}"
+            );
+        }
+        for value in [
+            serde_json::json!(1.5),
+            serde_json::json!("9223372036854775808"),
+        ] {
+            assert!(
+                parse_metrics(
+                    &metric(serde_json::json!([session]), value.clone()),
+                    &tracked()
+                )
+                .is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse_metrics(
+                &metric(serde_json::json!([session]), serde_json::json!("0")),
+                &tracked()
+            )
+            .unwrap()[0]
+                .value,
+            0.0
+        );
+    }
+
+    #[test]
+    fn cumulative_series_keep_attribute_types_and_reject_unsupported_dimensions() {
+        let mut points = Vec::new();
+        for value in [
+            serde_json::json!({"stringValue":"1"}),
+            serde_json::json!({"intValue":"1"}),
+            serde_json::json!({"boolValue":true}),
+            serde_json::json!({}),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({"resourceMetrics":[{"scopeMetrics":[{"metrics":[{
+                "name":"claude_code.token.usage", "gauge":{"dataPoints":[{"attributes":[
+                    {"key":"session.id","value":{"stringValue":"S"}}, {"key":"dimension","value":value}
+                ],"asInt":"2"}]}
+            }]}]}]})).unwrap();
+            points.extend(parse_metrics(&body, &tracked()).unwrap());
+        }
+        let mut accumulator = super::super::accumulator::Accumulator::default();
+        accumulator.update_metrics(points, jiff::Timestamp::UNIX_EPOCH);
+        assert_eq!(accumulator.sessions()["S"].tokens(), 8);
+        let compound: AnyValue =
+            serde_json::from_value(serde_json::json!({"arrayValue":{"values":[]}})).unwrap();
+        assert!(compound.scalar().is_err());
     }
 }
