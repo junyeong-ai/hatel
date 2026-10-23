@@ -202,4 +202,25 @@ mod tests {
         let no_time = json!([{"key":"session.id","value":{"stringValue":"session"}}]);
         assert!(records(&event(no_time), &registry).is_err());
     }
+
+    #[test]
+    fn zero_wire_time_is_unknown_and_one_nanosecond_is_a_known_occurrence() {
+        let registry = hatel_core::schema::load_core().unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&event(json!([
+            {"key":"session.id","value":{"stringValue":"session"}}
+        ])))
+        .unwrap();
+        body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] = json!("0");
+        assert!(records(&serde_json::to_vec(&body).unwrap(), &registry).is_err());
+        body["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["timeUnixNano"] = json!("1");
+        let projected = records(&serde_json::to_vec(&body).unwrap(), &registry).unwrap();
+        assert_eq!(
+            projected[0]
+                .ts
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_nanosecond(),
+            1
+        );
+    }
 }
