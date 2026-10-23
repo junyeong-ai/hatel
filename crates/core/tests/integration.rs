@@ -1244,6 +1244,42 @@ fn duplicate_event_kind_binding_is_rejected() {
 }
 
 #[test]
+fn a_contended_sqlite_write_fails_without_receipt_and_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = Config {
+        sink: SinkKind::Sqlite,
+        ..config_in(dir.path(), vec![])
+    };
+    let reg = load_core().unwrap();
+    let env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
+    let mut sink = hatel_core::build_sink(&cfg, &reg);
+    let blocker = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(sink.write_record(&env).is_err());
+    assert_eq!(
+        blocker
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        blocker
+            .query_row("SELECT COUNT(*) FROM contracts", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    blocker.execute_batch("ROLLBACK").unwrap();
+    let receipt = sink.write_record(&env).unwrap();
+    assert_eq!(receipt.record_id, env.metadata.record_id);
+    assert_eq!(
+        blocker
+            .query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn sqlite_maintenance_is_explicit_and_preserves_exact_occurrence_times() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("telemetry.db");
