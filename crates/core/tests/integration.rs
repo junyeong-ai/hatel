@@ -2481,6 +2481,60 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
 }
 
 #[test]
+fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_legacy_payloads() {
+    for backend in [SinkKind::Jsonl, SinkKind::Sqlite] {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("private.toml");
+        std::fs::write(&plugin,"[[kind]]\nname='private'\nfields=['project']\ngroup_key='project'\nredact=['project']\n").unwrap();
+        let cfg = Config {
+            sink: backend,
+            ..config_in(dir.path(), vec![plugin])
+        };
+        let registry = build_registry(&cfg).unwrap();
+        let mut sink = hatel_core::build_sink(&cfg);
+        for canonical in [true, false] {
+            let mut record = make_envelope(
+                "private",
+                [("project".into(), serde_json::json!("repo"))].into(),
+                &registry,
+                true,
+            )
+            .unwrap();
+            if canonical {
+                record.metadata.project = Some(hatel_core::ProjectRef {
+                    key: "/team/repo".into(),
+                    label: "repo".into(),
+                });
+            }
+            sink.write_record(&record).unwrap();
+        }
+        let spec = registry.kind("private").unwrap();
+        let result = hatel_core::query::section(&cfg, spec, &query(0, 0, Some("repo"))).unwrap();
+        assert_eq!(
+            result.groups.iter().map(|group| group.count).sum::<i64>(),
+            2
+        );
+        assert!(result.retained_since.is_some());
+        for (project, expected) in [("/team/repo", 1), ("repo", 1), ("other", 0)] {
+            let filters = [("project".into(), project.into())];
+            let groups = hatel_core::query::aggregate(
+                &cfg,
+                spec,
+                &report::Query {
+                    filters: &filters,
+                    ..query(0, 0, None)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                groups.iter().map(|group| group.count).sum::<i64>(),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
 fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config {

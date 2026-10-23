@@ -231,3 +231,64 @@ fn local_diagnosis_does_not_require_claude_code_settings() {
             .all(|s| s["name"] != "hooks" && s["name"] != "native_telemetry")
     );
 }
+
+#[test]
+fn a_redacted_payload_project_does_not_change_the_canonical_metadata_filter() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        home.path().join("plugin.toml"),
+        "[[kind]]\nname='private'\nfields=['project']\ngroup_key='project'\nredact=['project']\n",
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "plugins=['plugin.toml']\n[storage]\nstate_dir={:?}\n",
+            home.path().join("state").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let write = isolated(home.path())
+        .current_dir(&repo)
+        .args(["emit", "private", "project=repo"])
+        .output()
+        .unwrap();
+    assert!(write.status.success());
+    let query = |filter: Option<&str>| {
+        let mut command = isolated(home.path());
+        command.args(["report", "--kind", "private", "--format", "json"]);
+        if let Some(filter) = filter {
+            command.args(["--filter", filter]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let all = query(None);
+    let key = all["kinds"][0]["groups"][0]["key"].as_str().unwrap();
+    assert_eq!(key, repo.canonicalize().unwrap().to_str().unwrap());
+    assert_eq!(
+        query(Some(&format!("project={key}")))["kinds"][0]["groups"][0]["count"],
+        1
+    );
+    assert!(
+        query(Some("project=/other/repo"))["kinds"][0]["groups"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

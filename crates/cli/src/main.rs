@@ -52,7 +52,7 @@ enum Command {
         window: String,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
-        /// Restrict to one project (its label); default is all projects.
+        /// Restrict to one project by canonical key or label; default is all projects.
         #[arg(long)]
         project: Option<String>,
         /// Restrict to one registered Kind (e.g. `ci_check`); default is every Kind.
@@ -685,7 +685,7 @@ pub(crate) fn parse_filters(
                 accepted.join(", ")
             ));
         }
-        let value = if spec.redact.contains(field) {
+        let value = if field != "project" && spec.redact.contains(field) {
             hatel_core::pii::redacted(value)
         } else {
             value.to_string()

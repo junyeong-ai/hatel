@@ -148,12 +148,21 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
     use rusqlite::OptionalExtension;
     let mut conn = connection(cfg, &spec.name)?;
     let transaction = conn.transaction().map_err(io)?;
-    let retained_since = transaction.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?2)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project],|r|r.get(0)).optional().map_err(io)?;
+    let legacy_project = q.project.map(|project| payload_project(spec, project));
+    let retained_since = transaction.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?3)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project,legacy_project],|r|r.get(0)).optional().map_err(io)?;
     let groups = aggregate_connection(&transaction, spec, q)?;
     Ok(SectionResult {
         groups,
         retained_since,
     })
+}
+
+fn payload_project(spec: &KindSpec, project: &str) -> String {
+    if spec.redact.contains("project") {
+        crate::pii::redacted(project)
+    } else {
+        project.into()
+    }
 }
 
 fn parameter(args: &mut Vec<Value>, value: String) -> String {
@@ -188,7 +197,8 @@ fn aggregate_connection(
     ];
     if let Some(project) = q.project {
         let p = parameter(&mut args, project.into());
-        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={p}))"));
+        let legacy = parameter(&mut args, payload_project(spec, project));
+        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={legacy}))"));
     }
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
@@ -250,8 +260,9 @@ fn aggregate_connection(
     let mut filters = Vec::new();
     for (field, value) in q.filters {
         if field == "project" {
+            let legacy = parameter(&mut args, payload_project(spec, value));
             let value = parameter(&mut args, value.clone());
-            filters.push(format!("COALESCE(json_extract(metadata,'$.project.key'),json_extract(payload,'$.project'))={value}"));
+            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={legacy}))"));
             continue;
         }
         let (filter_document, filter_path) = selector(field);
