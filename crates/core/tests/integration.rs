@@ -94,6 +94,90 @@ fn core_registry_is_self_consistent() {
 }
 
 #[test]
+fn contracts_survive_plugin_changes_and_commit_atomically_with_records() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = home.path().join("plugin.toml");
+    let write_schema = |version: u32, unit: &str| {
+        std::fs::write(&plugin, format!("[[kind]]\nname='sample.duration'\nversion={version}\nfields={{ name={{type='string',required=true}}, duration={{type='number',unit='{unit}'}} }}\ngroup_key='name'\nmeasures=['duration']\n")).unwrap();
+    };
+    let mut cfg = config_in(home.path(), vec![plugin.clone()]);
+    cfg.sink = SinkKind::Sqlite;
+    write_schema(1, "ms");
+    let reg = build_registry(&cfg).unwrap();
+    let first = make_envelope(
+        "sample.duration",
+        [
+            ("name".into(), "lint".into()),
+            ("duration".into(), 1.into()),
+        ]
+        .into(),
+        &reg,
+        true,
+    )
+    .unwrap();
+    hatel_core::build_sink(&cfg, &reg)
+        .write_record(&first)
+        .unwrap();
+    write_schema(2, "s");
+    let reg = build_registry(&cfg).unwrap();
+    let spec = reg.kind("sample.duration").unwrap();
+    let mut second = first.clone();
+    second.metadata.kind_version = Some(spec.version);
+    second.metadata.schema_id = Some(spec.schema_id.clone());
+    let mut sink = hatel_core::build_sink(&cfg, &reg);
+    assert!(
+        sink.write_record(&second).is_err(),
+        "one ID cannot change its contract"
+    );
+    assert_eq!(
+        hatel_core::catalog::stored(&cfg).unwrap().len(),
+        1,
+        "a rejected record must not commit its definition"
+    );
+    second.metadata.record_id = Some("second".into());
+    sink.write_record(&second).unwrap();
+    assert_eq!(hatel_core::catalog::stored(&cfg).unwrap().len(), 2);
+    std::fs::remove_file(plugin).unwrap();
+    cfg.plugins.clear();
+    let old = hatel_core::catalog::select(
+        &cfg,
+        "sample.duration",
+        first.metadata.schema_id.as_deref().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(old.version, 1);
+    assert_eq!(old.field_specs["duration"].unit.as_deref(), Some("ms"));
+    assert!(
+        build_registry(&cfg)
+            .unwrap()
+            .kind("sample.duration")
+            .is_none()
+    );
+}
+
+#[test]
+fn contract_identity_changes_are_distinct_from_query_defaults() {
+    let schema = "name='sample'\nfields=['one','two']\ngroup_key='one'\nidentity='one'\n";
+    let a = hatel_core::KindSpec::from_raw(toml::from_str(schema).unwrap()).unwrap();
+    let b = hatel_core::KindSpec::from_raw(
+        toml::from_str(&schema.replace("identity='one'", "identity='two'")).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(a.schema_id, b.schema_id);
+    let c = hatel_core::KindSpec::from_raw(
+        toml::from_str(&schema.replace("group_key='one'", "group_key='two'")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(a.schema_id, c.schema_id);
+    assert_eq!(
+        hatel_core::KindSpec::from_raw(a.definition())
+            .unwrap()
+            .schema_id,
+        a.schema_id
+    );
+}
+
+#[test]
 fn example_plugin_merges_cleanly() {
     let reg = build_registry(&test_config(vec![example_plugin()])).expect("example plugin loads");
     assert!(reg.kind("branch_work").is_some());
@@ -505,7 +589,7 @@ fn a_redacted_field_is_filterable_by_its_stored_form() {
     payload.insert("check".into(), "lint".into());
     payload.insert("actor".into(), "alice@example.com".into());
     let env = make_envelope("ci_check", payload, &reg, false).unwrap();
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     sink.write_record(&env).unwrap();
     sink.flush().unwrap();
     let stored = vec![(
@@ -660,7 +744,7 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
     let mut payload = Payload::new();
     payload.insert("tool_name".into(), "Bash".into());
     let env = make_envelope("tool", payload, &reg, false).unwrap();
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     sink.write_record(&env).unwrap();
     sink.flush().unwrap();
     // …and an ancient row inserted directly.
@@ -725,7 +809,7 @@ fn an_undeclared_kind_says_when_retention_removes_it() {
         sink: SinkKind::Sqlite,
         ..config_in(dir.path(), vec![])
     };
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     sink.flush().unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
     for (kind, ts) in [
@@ -1277,7 +1361,7 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
                 .unwrap();
             }
             SinkKind::Sqlite => {
-                let mut s = hatel_core::sink::build_sink(&cfg);
+                let mut s = hatel_core::sink::build_sink(&cfg, &build_registry(&cfg).unwrap());
                 for (ts, project) in [
                     ("2026-02-01T00:00:00Z", None),
                     ("2026-03-01T00:00:00Z", Some("p")),
@@ -1604,7 +1688,7 @@ measures = ["ms"]
             payload.insert("job_id".into(), job.into());
             payload.insert("stage".into(), stage.into());
             payload.insert("ms".into(), ms.into());
-            let mut out = hatel_core::build_sink(&cfg);
+            let mut out = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
             out.write_record(&make_envelope("ord.job", payload, &reg, true).unwrap())
                 .unwrap();
             out.flush().unwrap();
@@ -1643,7 +1727,7 @@ measures = ["value"]
         cfg.rotate_bytes = 1;
         let registry = build_registry(&cfg).unwrap();
         let spec = registry.kind("state.job").unwrap();
-        let mut out = hatel_core::build_sink(&cfg);
+        let mut out = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
         for (project, id, status, value, seconds) in [
             ("A", "j1", "open", 2, "00"),
             ("A", "j1", "closed", 7, "02"),
@@ -2151,7 +2235,9 @@ fn receipts_follow_storage_and_metadata_survives_each_backend() {
             ..Default::default()
         })
         .unwrap();
-        let receipt = hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+        let receipt = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+            .write_record(&env)
+            .unwrap();
         assert!(receipt.record_id.is_some());
         let stored = hatel_core::sink::read_records(&cfg, "prompt", None);
         assert_eq!(stored, vec![env]);
@@ -2166,7 +2252,11 @@ fn receipts_follow_storage_and_metadata_survives_each_backend() {
     };
     let reg = build_registry(&cfg).unwrap();
     let env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
-    assert!(hatel_core::build_sink(&cfg).write_record(&env).is_err());
+    assert!(
+        hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+            .write_record(&env)
+            .is_err()
+    );
 }
 
 #[test]
@@ -2221,7 +2311,9 @@ fn query_reports_zero_missing_invalid_and_duration_buckets_without_coercion() {
         sink: SinkKind::Sqlite,
         ..config_in(dir.path(), vec![])
     };
-    hatel_core::build_sink(&cfg).flush().unwrap();
+    hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+        .flush()
+        .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
     for payload in [
         serde_json::json!({"duration_ms": 0}),
@@ -2263,7 +2355,9 @@ fn numeric_aggregation_reports_overflow_and_accepts_the_signed_integer_minimum()
         sink: SinkKind::Sqlite,
         ..config_in(dir.path(), vec![])
     };
-    hatel_core::build_sink(&cfg).flush().unwrap();
+    hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+        .flush()
+        .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("telemetry.db")).unwrap();
     let registry = build_registry(&cfg).unwrap();
     for value in [f64::MAX, f64::MAX] {
@@ -2301,7 +2395,7 @@ fn selected_sanitized_records_and_pending_delivery_commit_together() {
     ));
     let reg = build_registry(&cfg).unwrap();
     let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     assert_eq!(sink.write_record(&env).unwrap().delivery.queued, 0);
     env.metadata.record_id = Some("personal".into());
     env.metadata.project = Some(hatel_core::ProjectRef {
@@ -2326,7 +2420,11 @@ fn selected_sanitized_records_and_pending_delivery_commit_together() {
     conn.execute_batch("CREATE TRIGGER reject_delivery BEFORE INSERT ON deliveries BEGIN SELECT RAISE(ABORT,'delivery failed'); END;").unwrap();
     env.metadata.projection = false;
     env.metadata.record_id = Some("rolled-back".into());
-    assert!(hatel_core::build_sink(&cfg).write_record(&env).is_err());
+    assert!(
+        hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+            .write_record(&env)
+            .is_err()
+    );
     assert_eq!(
         conn.query_row(
             "SELECT COUNT(*) FROM records WHERE json_extract(metadata,'$.record_id')='rolled-back'",
@@ -2379,7 +2477,9 @@ fn a_full_delivery_queue_keeps_the_local_record_and_exposes_capacity() {
         true,
     )
     .unwrap();
-    let receipt = hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+    let receipt = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+        .write_record(&env)
+        .unwrap();
     assert_eq!(receipt.delivery.queued, 0);
     assert_eq!(receipt.delivery.not_queued, 1);
     assert_eq!(
@@ -2406,7 +2506,9 @@ fn retention_removes_pending_references_and_releases_queue_capacity() {
     let reg = build_registry(&cfg).unwrap();
     let mut env = make_envelope("prompt", Payload::new(), &reg, true).unwrap();
     env.ts = "2026-01-01T00:00:00Z".into();
-    hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+    hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap())
+        .write_record(&env)
+        .unwrap();
     assert_eq!(
         hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
         1
@@ -2433,7 +2535,7 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
         ..config_in(dir.path(), vec![])
     };
     let registry = build_registry(&cfg).unwrap();
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     for (key, run) in [("/team-one/repo", "first"), ("/team-two/repo", "second")] {
         let mut record = make_envelope("prompt", Payload::new(), &registry, true).unwrap();
         record.metadata.project = Some(hatel_core::ProjectRef {
@@ -2496,7 +2598,7 @@ fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_lega
             ..config_in(dir.path(), vec![plugin])
         };
         let registry = build_registry(&cfg).unwrap();
-        let mut sink = hatel_core::build_sink(&cfg);
+        let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
         for canonical in [true, false] {
             let mut record = make_envelope(
                 "private",
@@ -2548,7 +2650,7 @@ fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snap
     };
     let registry = build_registry(&cfg).unwrap();
     let now = hatel_core::now_epoch();
-    let mut sink = hatel_core::build_sink(&cfg);
+    let mut sink = hatel_core::build_sink(&cfg, &build_registry(&cfg).unwrap());
     for (request, age, cost) in [("old", 14 * 86400, 99.0), ("recent", 0, 0.02)] {
         let mut env = make_envelope(
             "claude.api_request",

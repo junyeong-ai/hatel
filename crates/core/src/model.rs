@@ -82,6 +82,19 @@ fn schema_v1() -> u32 {
 }
 
 impl Envelope {
+    /// Re-observing one event may change its observation time, never its meaning or attribution.
+    pub(crate) fn same_record(&self, other: &Self) -> bool {
+        let mut ours = self.metadata.clone();
+        let mut theirs = other.metadata.clone();
+        ours.observed_at = None;
+        theirs.observed_at = None;
+        self.kind == other.kind
+            && self.ts == other.ts
+            && self.schema_version == other.schema_version
+            && self.payload == other.payload
+            && ours == theirs
+    }
+
     pub fn to_json_line(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
     }

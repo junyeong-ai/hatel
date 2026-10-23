@@ -43,7 +43,7 @@ impl<'a> Writer<'a> {
         Self {
             config,
             registry,
-            sink: crate::build_sink(config),
+            sink: crate::build_sink(config, registry),
             project,
         }
     }

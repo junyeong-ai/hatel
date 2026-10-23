@@ -504,7 +504,9 @@ mod tests {
         )
         .unwrap();
         for record in [&invalid, &valid] {
-            hatel_core::build_sink(&cfg).write_record(record).unwrap();
+            hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
+                .write_record(record)
+                .unwrap();
         }
         let client = reqwest::Client::new();
         deliver(&path, home.path(), &endpoint, &client)
@@ -541,7 +543,7 @@ mod tests {
         }
         let exhausted =
             hatel_core::make_envelope("prompt", Default::default(), &registry, true).unwrap();
-        hatel_core::build_sink(&cfg)
+        hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
             .write_record(&exhausted)
             .unwrap();
         let conn = rusqlite_connection(home.path()).unwrap();
@@ -607,7 +609,7 @@ mod tests {
         let reg = hatel_core::schema::build_registry(&cfg).unwrap();
         let env = hatel_core::make_envelope("prompt", Default::default(), &reg, true).unwrap();
         assert_eq!(
-            hatel_core::build_sink(&cfg)
+            hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
                 .write_record(&env)
                 .unwrap()
                 .delivery
@@ -642,7 +644,9 @@ mod tests {
             assert!(!requests[0].to_string().contains("project.key"));
         }
         let env = hatel_core::make_envelope("prompt", Default::default(), &reg, true).unwrap();
-        hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+        hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
+            .write_record(&env)
+            .unwrap();
         configure(home.path(), &endpoint, "projects=['company']\n");
         deliver(&path, home.path(), &endpoint, &client)
             .await
@@ -681,7 +685,9 @@ mod tests {
             true,
         )
         .unwrap();
-        hatel_core::build_sink(&cfg).write_record(&env).unwrap();
+        hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
+            .write_record(&env)
+            .unwrap();
         std::fs::write(&plugin,"[[kind]]\nname='secret'\nfields=['label','secret']\ngroup_key='label'\nredact=['secret']\n").unwrap();
         deliver(
             &path,

@@ -67,6 +67,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   as delivery state; retention deletes delivery references and releases capacity with records.
   A Kind data-contract fingerprint accompanies each record. A changed contract cancels pending
   records rather than interpreting them under new redaction or field rules.
+  Identity is part of that contract; query defaults are not. SQLite records and their validated
+  definitions commit together in `contracts`. Imports never invent definitions for old fingerprints.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

@@ -58,7 +58,7 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
         return;
     }
     let project_label = project.as_ref().map_or("", |p| p.label.as_str());
-    let mut sink = build_sink(cfg);
+    let mut sink = build_sink(cfg, registry);
     for binding in bindings {
         let mut payload = Payload::new();
         for (field, mapping) in &binding.map {

@@ -501,7 +501,7 @@ async fn ingest(
                     }
                 }
                 drop(index);
-                let mut sink = hatel_core::build_sink(&st.cfg);
+                let mut sink = hatel_core::build_sink(&st.cfg, &st.registry);
                 for record in records {
                     note_failed_write(
                         &st.failed_writes.records,

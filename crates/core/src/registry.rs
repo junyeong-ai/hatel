@@ -56,7 +56,7 @@ pub enum KindMode {
 }
 
 /// The raw, deserialized form of a `[[kind]]` table before validation.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct KindSpecRaw {
     pub name: String,
@@ -101,7 +101,7 @@ pub struct FieldSpec {
     pub unit: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 #[serde(untagged)]
 pub enum Fields {
     Names(Vec<String>),
@@ -214,7 +214,10 @@ impl KindSpec {
         if raw.measures.iter().any(|measure| redact.contains(measure)) {
             return Err(invalid("numeric measures cannot be redacted".into()));
         }
-        let contract = serde_json::json!({"kind":raw.name,"mode":raw.mode,"version":raw.version,"fields":field_specs,"redact":redact});
+        let mut contract = serde_json::json!({"kind":raw.name,"mode":raw.mode,"version":raw.version,"fields":field_specs,"redact":redact});
+        if let Some(identity) = &raw.identity {
+            contract["identity"] = identity.clone().into();
+        }
         let schema_id = blake3::hash(
             serde_json::to_string(&contract)
                 .expect("schema serializes")
@@ -242,6 +245,19 @@ impl KindSpec {
             measures: raw.measures,
             identity: raw.identity,
         })
+    }
+
+    pub fn definition(&self) -> KindSpecRaw {
+        KindSpecRaw {
+            name: self.name.clone(),
+            mode: self.mode,
+            fields: Fields::Typed(self.field_specs.clone()),
+            version: self.version,
+            group_key: self.group_key.clone(),
+            redact: self.redact.iter().cloned().collect(),
+            measures: self.measures.clone(),
+            identity: self.identity.clone(),
+        }
     }
 }
 

@@ -168,7 +168,8 @@ mod tests {
         assert!(first.metadata.projection);
         assert!(!first.to_json_line().contains("sensitive"));
         let home = tempfile::tempdir().unwrap();
-        let mut sink = hatel_core::sink::SqliteSink::open(home.path().join("telemetry.db"));
+        let mut sink =
+            hatel_core::sink::SqliteSink::open(home.path().join("telemetry.db"), &registry);
         sink.write_record(&first).unwrap();
         sink.write_record(&second).unwrap();
         let conn = rusqlite::Connection::open(home.path().join("telemetry.db")).unwrap();

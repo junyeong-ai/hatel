@@ -8,6 +8,21 @@ use rusqlite::{Connection, OpenFlags};
 use super::Sink;
 use crate::Envelope;
 
+pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelope> {
+    let io = |e: rusqlite::Error| crate::Error::Io(e.to_string());
+    let (ts, kind, schema_version, payload, metadata): (String, String, u32, String, String) = conn.query_row(
+        "SELECT ts,kind,schema_version,payload,metadata FROM records WHERE json_extract(metadata,'$.record_id')=?1",
+        [id], |r|Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).map_err(io)?;
+    Ok(Envelope {
+        ts,
+        kind,
+        schema_version,
+        payload: serde_json::from_str(&payload).map_err(|e| crate::Error::Io(e.to_string()))?,
+        metadata: serde_json::from_str(&metadata).map_err(|e| crate::Error::Io(e.to_string()))?,
+    })
+}
+
 /// Every Kind the table holds records for.
 pub fn stored_kinds(path: &Path) -> std::io::Result<Vec<String>> {
     // No database file means nothing has ever been written through this sink, which is an empty
@@ -189,18 +204,24 @@ pub fn prune_records(path: &Path, cutoff_epoch: i64) -> usize {
 pub struct SqliteSink {
     conn: Result<Connection, String>,
     targets: Vec<crate::ExportTarget>,
+    registry: crate::Registry,
 }
 
 impl SqliteSink {
-    pub fn open(path: PathBuf) -> Self {
+    pub fn open(path: PathBuf, registry: &crate::Registry) -> Self {
         Self {
             conn: Self::init(&path).map_err(|e| e.to_string()),
             targets: Vec::new(),
+            registry: registry.clone(),
         }
     }
 
-    pub fn with_exports(path: PathBuf, targets: Vec<crate::ExportTarget>) -> Self {
-        let mut sink = Self::open(path);
+    pub fn with_exports(
+        path: PathBuf,
+        targets: Vec<crate::ExportTarget>,
+        registry: &crate::Registry,
+    ) -> Self {
+        let mut sink = Self::open(path, registry);
         sink.targets = targets;
         sink
     }
@@ -242,6 +263,7 @@ impl SqliteSink {
         tx.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata, '$.record_id')) WHERE json_extract(metadata, '$.record_id') IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_records_kind_occurred ON records(kind, occurred_seconds);")?;
         tx.execute_batch(crate::outbox::SCHEMA)?;
+        tx.execute_batch(crate::catalog::SCHEMA)?;
         tx.commit()?;
         crate::query::functions(&conn)?;
         Ok(conn)
@@ -259,6 +281,11 @@ impl Sink for SqliteSink {
         let tx = conn
             .transaction()
             .map_err(|e| crate::Error::Io(e.to_string()))?;
+        if let Some(spec) = self.registry.kind(&env.kind)
+            && env.metadata.schema_id.as_deref() == Some(spec.schema_id.as_str())
+        {
+            crate::catalog::save(&tx, spec)?;
+        }
         let inserted = tx.execute(
             "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT DO NOTHING",
             rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, crate::ts_epoch(&env.ts)],
@@ -267,12 +294,13 @@ impl Sink for SqliteSink {
             let id = env.metadata.record_id.as_deref().ok_or_else(|| {
                 crate::Error::InvalidPayload("duplicate record without id".into())
             })?;
-            let stored: (String,String,String) = tx.query_row("SELECT kind,ts,payload FROM records WHERE json_extract(metadata,'$.record_id')=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|crate::Error::Io(e.to_string()))?;
-            if stored != (env.kind.clone(), env.ts.clone(), payload) {
+            let stored = record_by_id(&tx, id)?;
+            if !env.same_record(&stored) {
                 return Err(crate::Error::InvalidPayload(
                     "record id already describes different data".into(),
                 ));
             }
+            tx.commit().map_err(|e| crate::Error::Io(e.to_string()))?;
             return Ok(super::WriteReceipt {
                 record_id: Some(id.into()),
                 delivery: Default::default(),

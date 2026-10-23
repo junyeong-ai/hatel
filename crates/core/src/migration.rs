@@ -112,14 +112,8 @@ pub fn import_jsonl(source: &Path, database: &Path) -> crate::Result<usize> {
                         .record_id
                         .as_deref()
                         .ok_or_else(|| io("duplicate without record id"))?;
-                    let stored: (String,String,String) = tx.query_row("SELECT kind,ts,payload FROM records WHERE json_extract(metadata,'$.record_id')=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(io)?;
-                    if stored
-                        != (
-                            env.kind,
-                            env.ts,
-                            serde_json::to_string(&env.payload).map_err(io)?,
-                        )
-                    {
+                    let stored = crate::sink::record_by_id(&tx, id)?;
+                    if !env.same_record(&stored) {
                         return Err(io("one record id describes different imported data"));
                     }
                 }
