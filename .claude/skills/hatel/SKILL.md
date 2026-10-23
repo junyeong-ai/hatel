@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.22.0
+version: 0.23.0
 description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code usage, instruction loads, storage diagnosis, and selective downstream delivery. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
 allowed-tools: Bash, Read, Edit
 ---
@@ -8,7 +8,7 @@ allowed-tools: Bash, Read, Edit
 # Hatel
 
 Use the installed contract: `hatel --version`, `hatel <command> --help`, and
-`hatel kinds --json`. This skill targets 0.22.0. A running receiver or MCP session
+`hatel kinds --json`. This skill targets 0.23.0. A running receiver or MCP session
 keeps the build it started; restart it after upgrading before relying on new features.
 
 Choose the relevant operation below. Local domain records need neither Claude Code
