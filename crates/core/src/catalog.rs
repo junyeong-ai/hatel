@@ -61,21 +61,40 @@ pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
         .map_err(io)?;
     rows.map(|row| {
         let (schema_id, kind, json) = row.map_err(io)?;
-        let definition: KindSpecRaw = serde_json::from_str(&json).map_err(io)?;
-        let spec = KindSpec::from_raw(definition.clone())?;
-        if spec.schema_id != schema_id || spec.name != kind {
-            return Err(io("stored contract definition does not match its identity"));
-        }
-        Ok(StoredContract {
-            schema_id,
-            definition,
-        })
+        decode(schema_id, kind, json)
     })
     .collect()
 }
 
 pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSpec> {
-    let stored = stored(cfg)?.into_iter().find(|entry| entry.schema_id==schema_id && entry.definition.name==kind)
-        .ok_or_else(||io(format!("no stored definition for {kind} contract {schema_id}; load its exact schema explicitly")))?;
+    use rusqlite::OptionalExtension;
+    let missing = || {
+        io(format!(
+            "no stored definition for {kind} contract {schema_id}; load its exact schema explicitly"
+        ))
+    };
+    let conn = connection(cfg)?.ok_or_else(missing)?;
+    let json: String = conn
+        .query_row(
+            "SELECT definition FROM contracts WHERE schema_id=?1 AND kind=?2",
+            [schema_id, kind],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(io)?
+        .ok_or_else(missing)?;
+    let stored = decode(schema_id.into(), kind.into(), json)?;
     KindSpec::from_raw(stored.definition)
+}
+
+fn decode(schema_id: String, kind: String, json: String) -> crate::Result<StoredContract> {
+    let definition: KindSpecRaw = serde_json::from_str(&json).map_err(io)?;
+    let spec = KindSpec::from_raw(definition.clone())?;
+    if spec.schema_id != schema_id || spec.name != kind {
+        return Err(io("stored contract definition does not match its identity"));
+    }
+    Ok(StoredContract {
+        schema_id,
+        definition,
+    })
 }

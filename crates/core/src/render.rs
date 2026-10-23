@@ -118,8 +118,13 @@ fn scope(report: &Report) -> String {
 /// A section's axes in the terms the query used, so a reader knows which question was answered.
 fn axes(section: &KindSection) -> String {
     let rank = section.sort_by.as_deref().unwrap_or("count");
+    let basis = if section.contract == "legacy" {
+        ", unverified legacy contract"
+    } else {
+        ""
+    };
     format!(
-        "by {}, ranked by {}",
+        "by {}, ranked by {}{basis}",
         inline(&section.group_by),
         inline(rank)
     )
@@ -401,6 +406,8 @@ mod tests {
 
     fn section(kind: &str, groups: Vec<GroupAgg>) -> KindSection {
         KindSection {
+            contract: "current".into(),
+            contracts: Vec::new(),
             kind: kind.to_string(),
             mode: Default::default(),
             group_by: "tool_name".to_string(),

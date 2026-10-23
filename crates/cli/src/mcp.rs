@@ -13,7 +13,7 @@ use rmcp::{
     transport::stdio,
 };
 
-use hatel_core::schema::{UnreadableKinds, build_registry};
+use hatel_core::schema::{Inventory, build_query_registry, build_registry};
 use hatel_core::{Config, Payload, report};
 
 use crate::{EmitError, doctor, emit_record, kinds_value, parse_query, report_json};
@@ -33,6 +33,10 @@ pub struct ReportParams {
         description = "Restrict to one registered Kind; scopes the rollup to it and drops the cost section"
     )]
     pub kind: Option<String>,
+    #[schemars(
+        description = "Select an exact stored schema ID or an explicit unverified legacy interpretation. Requires kind."
+    )]
+    pub contract: Option<String>,
     #[schemars(
         description = "Exact-match restrictions, each \"field=value\" (every one must match). Requires `kind`; the field must be in that Kind's allow-list. A redacted field is matched by its original value."
     )]
@@ -164,7 +168,8 @@ async fn blocking<T: Send + 'static>(
 fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
     let window = p.window.unwrap_or_else(|| "30d".to_string());
     let cfg = Config::load().map_err(internal)?;
-    let reg = build_registry(&cfg).map_err(internal)?;
+    let reg =
+        build_query_registry(&cfg, p.kind.as_deref(), p.contract.as_deref()).map_err(internal)?;
     let filters = parse_query(
         &reg,
         &cfg,
@@ -185,6 +190,7 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
         top_n: p.top.unwrap_or(report::TOP_N),
         project: p.project.as_deref(),
         kind: p.kind.as_deref(),
+        contract: p.contract.as_deref(),
         group_by: p.group_by.as_deref(),
         sort_by: p.sort_by.as_deref(),
         filters: &filters,
@@ -198,12 +204,12 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
 fn kinds_tool() -> Result<CallToolResult, McpError> {
     let cfg = Config::load().map_err(internal)?;
     let reg = build_registry(&cfg).map_err(internal)?;
-    let inspection = UnreadableKinds::detect(&reg, &cfg);
+    let inspection = Inventory::inspect(&reg, &cfg);
     let json = serde_json::to_string_pretty(&kinds_value(&reg, &inspection))
         .expect("inventory serializes");
     // Trailing newline included, so the payload is byte-equal to the CLI's println!.
     let mut result = text_result(format!("{json}\n"));
-    result.is_error = Some(inspection.is_err());
+    result.is_error = Some(inspection.storage_error.is_some());
     Ok(result)
 }
 

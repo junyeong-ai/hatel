@@ -72,6 +72,62 @@ pub fn build_registry(cfg: &Config) -> Result<Registry> {
     Ok(reg)
 }
 
+/// Historical selection affects only readers; it never replaces the recording registry.
+pub fn build_query_registry(
+    cfg: &Config,
+    kind: Option<&str>,
+    contract: Option<&str>,
+) -> Result<Registry> {
+    let reg = build_registry(cfg)?;
+    let Some(contract) = contract else {
+        return Ok(reg);
+    };
+    let kind =
+        kind.ok_or_else(|| Error::InvalidPayload("contract selection requires a Kind".into()))?;
+    if contract == "legacy"
+        || reg
+            .kind(kind)
+            .is_some_and(|spec| spec.schema_id == contract)
+    {
+        return Ok(reg);
+    }
+    let historical = crate::catalog::select(cfg, kind, contract)?;
+    let mut selected = Registry::new();
+    for spec in reg.kinds().filter(|spec| spec.name != kind) {
+        selected.add_kind(spec.clone())?;
+    }
+    selected.add_kind(historical)?;
+    Ok(selected)
+}
+
+#[derive(Debug, Serialize)]
+pub struct Inventory {
+    pub unreadable_kinds: Option<UnreadableKinds>,
+    pub stored_contracts: Vec<crate::catalog::StoredContract>,
+    pub storage_error: Option<String>,
+}
+
+impl Inventory {
+    pub fn inspect(reg: &Registry, cfg: &Config) -> Self {
+        let (unreadable_kinds, mut storage_error) = match UnreadableKinds::detect(reg, cfg) {
+            Ok(found) => (found, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let stored_contracts = match crate::catalog::stored(cfg) {
+            Ok(contracts) => contracts,
+            Err(error) => {
+                storage_error.get_or_insert_with(|| error.to_string());
+                Vec::new()
+            }
+        };
+        Self {
+            unreadable_kinds,
+            stored_contracts,
+            storage_error,
+        }
+    }
+}
+
 /// Resilient build for the hook: core must load, then each plugin is merged into a
 /// throwaway copy first — a bad plugin is logged and skipped (never silencing core or
 /// the other plugins, and never leaving a half-merged registry), the rest still load.
@@ -142,7 +198,8 @@ impl std::fmt::Display for UnreadableKinds {
         write!(
             f,
             "the ledger holds {}, which no loaded schema declares — those records stay \
-             uncountable until a plugin that declares them is listed in {}",
+             outside this registry; load their plugin in {} or explicitly select an available \
+             stored definition with --contract",
             self.names.join(", "),
             self.plugin_source
         )?;

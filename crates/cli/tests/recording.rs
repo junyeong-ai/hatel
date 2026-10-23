@@ -17,6 +17,160 @@ fn isolated(home: &std::path::Path) -> Command {
 }
 
 #[test]
+fn mixed_contracts_fail_and_selected_history_uses_its_saved_definition() {
+    let home = tempfile::tempdir().unwrap();
+    let plugin = home.path().join("plugin.toml");
+    let config = home.path().join("config.toml");
+    let storage = format!(
+        "[storage]\nsink='sqlite'\nstate_dir={:?}\n",
+        home.path().join("state").to_string_lossy()
+    );
+    std::fs::write(
+        &config,
+        format!("plugins=[{:?}]\n{storage}", plugin.to_string_lossy()),
+    )
+    .unwrap();
+    let schema = |version, unit| {
+        format!(
+            "[[kind]]\nname='sample.duration'\nversion={version}\nfields={{name={{type='string',required=true}},duration={{type='number',unit='{unit}'}}}}\ngroup_key='name'\nmeasures=['duration']\n"
+        )
+    };
+    let mut ids = Vec::new();
+    for (version, unit, value) in [(1, "ms", "duration:=1000"), (2, "s", "duration:=1")] {
+        std::fs::write(&plugin, schema(version, unit)).unwrap();
+        let emitted = isolated(home.path())
+            .args(["emit", "sample.duration", "name=lint", value, "--receipt"])
+            .output()
+            .unwrap();
+        assert!(
+            emitted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&emitted.stderr)
+        );
+        let inventory = isolated(home.path())
+            .args(["kinds", "--json"])
+            .output()
+            .unwrap();
+        assert!(inventory.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
+        let spec = value["kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["name"] == "sample.duration")
+            .unwrap();
+        ids.push(spec["schema_id"].as_str().unwrap().to_string());
+        assert_eq!(value["stored_contracts"].as_array().unwrap().len(), version);
+    }
+    let mixed = isolated(home.path())
+        .args(["report", "--kind", "sample.duration", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(mixed.status.code(), Some(1));
+    let value: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
+    assert!(value["kinds"][0]["error"].is_string());
+    assert_eq!(value["kinds"][0]["groups"], serde_json::json!([]));
+    assert_eq!(value["kinds"][0]["contracts"].as_array().unwrap().len(), 2);
+    std::fs::remove_file(&plugin).unwrap();
+    std::fs::write(&config, storage).unwrap();
+    for ((id, unit), expected) in ids.iter().zip(["ms", "s"]).zip([1000.0, 1.0]) {
+        let selected = isolated(home.path())
+            .args([
+                "report",
+                "--kind",
+                "sample.duration",
+                "--contract",
+                id,
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&selected.stdout).unwrap();
+        assert!(value["kinds"][0]["error"].is_null());
+        assert_eq!(value["kinds"][0]["contract"], *id);
+        assert_eq!(value["kinds"][0]["groups"][0]["sums"][0]["unit"], unit);
+        assert_eq!(value["kinds"][0]["groups"][0]["sums"][0]["sum"], expected);
+    }
+}
+
+#[test]
+fn unknown_contracts_require_explicit_and_homogeneous_legacy_selection() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir_all(state.join("ledger")).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nsink='jsonl'\nstate_dir={:?}\n",
+            state.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let ts = hatel_core::now_iso_utc();
+    let legacy = serde_json::json!({"ts":ts,"kind":"prompt","payload":{"prompt_len":5}});
+    let mut old = legacy.clone();
+    old["metadata"] = serde_json::json!({"schema_id":"old-contract","kind_version":1});
+    let ledger = state.join("ledger/prompt.jsonl");
+    std::fs::write(&ledger, format!("{legacy}\n{old}\n")).unwrap();
+    let report = isolated(home.path())
+        .args(["report", "--kind", "prompt", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(report.status.code(), Some(1));
+    for filter in [None, Some("metadata.schema_id=old-contract")] {
+        let mut command = isolated(home.path());
+        command.args([
+            "report",
+            "--kind",
+            "prompt",
+            "--contract",
+            "legacy",
+            "--format",
+            "json",
+        ]);
+        if let Some(filter) = filter {
+            command.args(["--filter", filter]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["kinds"][0]["contract"], "legacy");
+        assert_eq!(value["kinds"][0]["groups"][0]["count"], 1);
+    }
+    old["metadata"]["kind_version"] = 2.into();
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(ledger)
+        .unwrap();
+    writeln!(file, "{old}").unwrap();
+    let mixed = isolated(home.path())
+        .args([
+            "report",
+            "--kind",
+            "prompt",
+            "--contract",
+            "legacy",
+            "--filter",
+            "metadata.schema_id=old-contract",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mixed.status.code(), Some(1));
+}
+
+#[test]
 fn read_errors_are_machine_visible_and_do_not_disable_independent_recording() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");

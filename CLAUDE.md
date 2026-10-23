@@ -69,6 +69,10 @@ and its CI check unless a deliberate compatibility change requires raising both.
   records rather than interpreting them under new redaction or field rules.
   Identity is part of that contract; query defaults are not. SQLite records and their validated
   definitions commit together in `contracts`. Imports never invent definitions for old fingerprints.
+  Fingerprint format `v2:` includes entity identity. Default queries reject mixed or unverified
+  contracts and retain counts in `KindSection.contracts`; explicit selection uses saved definitions.
+  `contract=legacy` is an operator-selected unverified interpretation with an exact historical
+  schema, never an automatic compatibility claim. Historical query registries never record data.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

@@ -38,6 +38,12 @@ from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
 `project` grouping and filtering prefer the common key, using payload attribution only
 for legacy records. Use `metadata.project.key` to address that common field explicitly.
 
+Mixed or unverified contracts fail a section and expose per-contract counts. Inspect
+`stored_contracts` in `kinds --json`; `report --kind KIND --contract SCHEMA_ID` uses its saved
+definition, including retired Kinds. Without a definition, load the exact historical schema and
+explicitly select `--contract legacy`; use `--filter metadata.schema_id=OLD_ID` for a retained
+old fingerprint. This basis is unverified: never infer missing identities, units or semantics.
+
 Report interpretation:
 
 - `sum` requires its `valid_count`; `missing_count` and `invalid_count` name what was
@@ -97,7 +103,7 @@ measures = ["duration_s"]
 Typed fields support `string`, `number`, `integer`, `boolean`, `array`, `object`, `any`,
 requiredness and units. `redact` hashes selected payload fields before storage.
 For state, add `mode = "snapshot"` and `identity` naming a required non-empty string field.
-A data contract's `schema_id` changes with field, redaction or mode changes; pending old
+A data contract's opaque `schema_id` changes with field, unit, identity, redaction or mode changes; pending old
 contracts cancel. Semantic/unit changes require an explicit Kind/version and history decision.
 
 Use hook bindings only for facts present in lifecycle input. Producers own domain meaning.

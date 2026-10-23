@@ -136,25 +136,147 @@ fn scratch() -> crate::Result<Connection> {
 }
 
 pub struct SectionResult {
-    pub groups: Vec<GroupAgg>,
+    pub groups: crate::Result<Vec<GroupAgg>>,
     pub retained_since: Option<String>,
+    pub contracts: Vec<ContractCount>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContractCount {
+    pub schema_id: Option<String>,
+    pub kind_version: Option<u32>,
+    pub count: i64,
 }
 
 pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
-    section(cfg, spec, q).map(|result| result.groups)
+    section(cfg, spec, q).and_then(|result| result.groups)
 }
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
     use rusqlite::OptionalExtension;
     let mut conn = connection(cfg, &spec.name)?;
     let transaction = conn.transaction().map_err(io)?;
-    let legacy_project = q.project.map(|project| payload_project(spec, project));
-    let retained_since = transaction.query_row("SELECT ts FROM records_read WHERE kind=?1 AND hatel_epoch(ts) IS NOT NULL AND (?2 IS NULL OR json_extract(metadata,'$.project.key')=?2 OR json_extract(metadata,'$.project.label')=?2 OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')=?3)) ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",rusqlite::params![spec.name,q.project,legacy_project],|r|r.get(0)).optional().map_err(io)?;
-    let groups = aggregate_connection(&transaction, spec, q)?;
+    let oldest = Query {
+        since: i64::MIN,
+        ..*q
+    };
+    let mut oldest_args = vec![
+        spec.name.clone().into(),
+        oldest.since.into(),
+        i64::from(crate::SCHEMA_VERSION).into(),
+    ];
+    let mut oldest_scope = scope(spec, &oldest, &mut oldest_args);
+    oldest_scope.push("hatel_epoch(ts) IS NOT NULL".into());
+    let retained_since=transaction.query_row(&format!("SELECT ts FROM records_read WHERE {} ORDER BY hatel_epoch(ts),hatel_nanos(ts),sequence LIMIT 1",oldest_scope.join(" AND ")),rusqlite::params_from_iter(oldest_args),|r|r.get(0)).optional().map_err(io)?;
+    let contracts = contract_counts(&transaction, spec, q)?;
+    let groups = validate_contracts(spec, q, &contracts)
+        .and_then(|()| aggregate_connection(&transaction, spec, q));
     Ok(SectionResult {
         groups,
         retained_since,
+        contracts,
     })
+}
+
+fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
+    let mut conditions = vec![
+        "kind=?1".into(),
+        "(occurred_seconds>=?2 OR (occurred_seconds IS NULL AND hatel_epoch(ts)>=?2))".into(),
+        "schema_version<=?3".into(),
+    ];
+    if let Some(project) = q.project {
+        let p = parameter(args, project.into());
+        let legacy = parameter(args, payload_project(spec, project));
+        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={legacy}))"));
+    }
+    if let Some(contract) = q.contract {
+        if contract == "legacy" {
+            if let Some((_, id)) = q
+                .filters
+                .iter()
+                .find(|(field, _)| field == "metadata.schema_id")
+            {
+                let p = parameter(args, id.clone());
+                conditions.push(format!("json_extract(metadata,'$.schema_id')={p}"));
+            } else {
+                conditions.push("json_extract(metadata,'$.schema_id') IS NULL".into());
+            }
+        } else {
+            let p = parameter(args, contract.into());
+            conditions.push(format!("json_extract(metadata,'$.schema_id')={p}"));
+        }
+    }
+    conditions
+}
+
+fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
+    let mut filters = Vec::new();
+    for (field, value) in q.filters {
+        if field == "project" {
+            let legacy = parameter(args, payload_project(spec, value));
+            let value = parameter(args, value.clone());
+            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={legacy}))"));
+        } else {
+            let (document, path) = selector(field);
+            let path = parameter(args, path);
+            let value = parameter(args, value.clone());
+            filters.push(format!(
+                "json_type({document},{path}) IS NOT NULL AND {}={value}",
+                label_in(document, &path)
+            ));
+        }
+    }
+    filters
+}
+
+fn contract_counts(
+    conn: &Connection,
+    spec: &KindSpec,
+    q: &Query,
+) -> crate::Result<Vec<ContractCount>> {
+    let mut args = vec![
+        spec.name.clone().into(),
+        q.since.into(),
+        i64::from(crate::SCHEMA_VERSION).into(),
+    ];
+    let mut conditions = scope(spec, q, &mut args);
+    if spec.mode == crate::registry::KindMode::Event {
+        conditions.extend(filter_conditions(spec, q, &mut args));
+    }
+    let mut stmt=conn.prepare(&format!("SELECT json_extract(metadata,'$.schema_id'),json_extract(metadata,'$.kind_version'),COUNT(*) FROM records_read WHERE {} GROUP BY 1,2 ORDER BY 1,2",conditions.join(" AND "))).map_err(io)?;
+    stmt.query_map(rusqlite::params_from_iter(args), |r| {
+        Ok(ContractCount {
+            schema_id: r.get(0)?,
+            kind_version: r.get(1)?,
+            count: r.get(2)?,
+        })
+    })
+    .map_err(io)?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(io)
+}
+
+fn validate_contracts(
+    spec: &KindSpec,
+    q: &Query,
+    contracts: &[ContractCount],
+) -> crate::Result<()> {
+    let valid = if q.contract == Some("legacy") {
+        contracts.len() <= 1
+    } else {
+        contracts.iter().all(|c| {
+            c.schema_id.as_deref() == Some(spec.schema_id.as_str())
+                && c.kind_version.is_none_or(|v| v == spec.version)
+        })
+    };
+    if valid {
+        return Ok(());
+    }
+    Err(crate::Error::InvalidPayload(format!(
+        "{} contains mixed or unverified contracts {}; select one with --contract <schema_id>, or explicitly interpret one legacy contract with --contract legacy and its exact historical schema",
+        spec.name,
+        serde_json::to_string(contracts).expect("contract counts serialize")
+    )))
 }
 
 fn payload_project(spec: &KindSpec, project: &str) -> String {
@@ -190,16 +312,7 @@ fn aggregate_connection(
     } else {
         label_in(document, &dimension)
     };
-    let mut conditions = vec![
-        "kind=?1".to_string(),
-        "(occurred_seconds>=?2 OR (occurred_seconds IS NULL AND hatel_epoch(ts)>=?2))".into(),
-        "schema_version<=?3".into(),
-    ];
-    if let Some(project) = q.project {
-        let p = parameter(&mut args, project.into());
-        let legacy = parameter(&mut args, payload_project(spec, project));
-        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={legacy}))"));
-    }
+    let conditions = scope(spec, q, &mut args);
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
             "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"
@@ -257,22 +370,7 @@ fn aggregate_connection(
     } else {
         "scoped"
     };
-    let mut filters = Vec::new();
-    for (field, value) in q.filters {
-        if field == "project" {
-            let legacy = parameter(&mut args, payload_project(spec, value));
-            let value = parameter(&mut args, value.clone());
-            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={legacy}))"));
-            continue;
-        }
-        let (filter_document, filter_path) = selector(field);
-        let field_path = parameter(&mut args, filter_path);
-        let value_param = parameter(&mut args, value.clone());
-        filters.push(format!(
-            "json_type({filter_document}, {field_path}) IS NOT NULL AND {}={value_param}",
-            label_in(filter_document, &field_path)
-        ));
-    }
+    let filters = filter_conditions(spec, q, &mut args);
     sql.push_str(&format!(
         ", matching AS (SELECT * FROM {selected} WHERE {})",
         if filters.is_empty() {

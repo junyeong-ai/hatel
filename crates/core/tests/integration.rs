@@ -42,10 +42,27 @@ fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
         top_n,
         project,
         kind: None,
+        contract: None,
         group_by: None,
         sort_by: None,
         filters: &[],
     }
+}
+
+fn legacy_query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
+    report::Query {
+        contract: Some("legacy"),
+        ..query(since, top_n, project)
+    }
+}
+
+fn aggregate(
+    reg: &hatel_core::Registry,
+    cfg: &Config,
+    kind: &str,
+    q: &report::Query,
+) -> Vec<report::GroupAgg> {
+    report::aggregate(reg, cfg, kind, q).unwrap()
 }
 
 /// A config rooted at an explicit dir, so a test can write a plugin file into it.
@@ -147,6 +164,21 @@ fn contracts_survive_plugin_changes_and_commit_atomically_with_records() {
     .unwrap();
     assert_eq!(old.version, 1);
     assert_eq!(old.field_specs["duration"].unit.as_deref(), Some("ms"));
+    let conn = rusqlite::Connection::open(home.path().join("telemetry.db")).unwrap();
+    conn.execute(
+        "INSERT INTO contracts(schema_id,kind,definition) VALUES ('broken','other','{}')",
+        [],
+    )
+    .unwrap();
+    assert!(hatel_core::catalog::stored(&cfg).is_err());
+    assert!(
+        hatel_core::catalog::select(
+            &cfg,
+            "sample.duration",
+            first.metadata.schema_id.as_deref().unwrap()
+        )
+        .is_ok()
+    );
     assert!(
         build_registry(&cfg)
             .unwrap()
@@ -551,9 +583,9 @@ fn report_filter_restricts_to_matching_records() {
     let filters = vec![("tool_name".to_string(), "Bash".to_string())];
     let q = report::Query {
         filters: &filters,
-        ..query(0, 0, None)
+        ..legacy_query(0, 0, None)
     };
-    let groups = report::aggregate(&reg, &cfg, "tool", &q);
+    let groups = aggregate(&reg, &cfg, "tool", &q);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key.as_deref(), Some("Bash"));
     assert_eq!(groups[0].count, 2);
@@ -564,18 +596,18 @@ fn report_filter_restricts_to_matching_records() {
     ];
     let q = report::Query {
         filters: &filters,
-        ..query(0, 0, None)
+        ..legacy_query(0, 0, None)
     };
-    let groups = report::aggregate(&reg, &cfg, "tool", &q);
+    let groups = aggregate(&reg, &cfg, "tool", &q);
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].count, 1, "both filters must match");
     // A value matching nothing yields an empty report — not an error, not all rows.
     let filters = vec![("tool_name".to_string(), "Nope".to_string())];
     let q = report::Query {
         filters: &filters,
-        ..query(0, 0, None)
+        ..legacy_query(0, 0, None)
     };
-    assert!(report::aggregate(&reg, &cfg, "tool", &q).is_empty());
+    assert!(aggregate(&reg, &cfg, "tool", &q).is_empty());
 }
 
 #[test]
@@ -600,7 +632,7 @@ fn a_redacted_field_is_filterable_by_its_stored_form() {
         filters: &stored,
         ..query(0, 0, None)
     };
-    let groups = report::aggregate(&reg, &cfg, "ci_check", &q);
+    let groups = aggregate(&reg, &cfg, "ci_check", &q);
     assert_eq!(
         groups.iter().map(|g| g.count).sum::<i64>(),
         1,
@@ -612,7 +644,7 @@ fn a_redacted_field_is_filterable_by_its_stored_form() {
         ..query(0, 0, None)
     };
     assert!(
-        report::aggregate(&reg, &cfg, "ci_check", &q).is_empty(),
+        aggregate(&reg, &cfg, "ci_check", &q).is_empty(),
         "the raw value never exists on disk, so it matches nothing"
     );
 }
@@ -1057,7 +1089,7 @@ fn report_separates_legacy_invalid_measures_from_real_numbers() {
         ),
     )
     .unwrap();
-    let groups = report::aggregate(&reg, &cfg, "ci_check", &query(0, 5, None));
+    let groups = aggregate(&reg, &cfg, "ci_check", &legacy_query(0, 5, None));
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key.as_deref(), Some("lint"));
     assert_eq!(groups[0].count, 2);
@@ -1094,7 +1126,7 @@ fn report_filters_by_project() {
     )
     .unwrap();
     let total = |p: Option<&str>| -> i64 {
-        report::aggregate(&reg, &cfg, "tool", &query(0, 5, p))
+        aggregate(&reg, &cfg, "tool", &legacy_query(0, 5, p))
             .iter()
             .map(|g| g.count)
             .sum()
@@ -1188,7 +1220,7 @@ fn measures_reject_non_finite_values() {
         ),
     )
     .unwrap();
-    let groups = report::aggregate(&reg, &cfg, "ci_check", &query(0, 5, None));
+    let groups = aggregate(&reg, &cfg, "ci_check", &legacy_query(0, 5, None));
     assert_eq!(groups[0].sums[0].sum, 50.0, "inf rejected, only 50 summed");
 }
 
@@ -1294,7 +1326,7 @@ fn sqlite_sink_round_trips_through_report() {
         recs[0].payload.get("prompt_len").and_then(|v| v.as_i64()),
         Some(2)
     );
-    let groups = report::aggregate(&reg, &cfg, "prompt", &query(0, 5, None));
+    let groups = aggregate(&reg, &cfg, "prompt", &query(0, 5, None));
     assert_eq!(
         groups.iter().map(|g| g.count).sum::<i64>(),
         1,
@@ -1414,12 +1446,12 @@ fn top_zero_means_all_groups() {
         .collect();
     std::fs::write(cfg.ledger_dir.join("tool.jsonl"), body).unwrap();
     assert_eq!(
-        report::aggregate(&reg, &cfg, "tool", &query(0, 3, None)).len(),
+        aggregate(&reg, &cfg, "tool", &legacy_query(0, 3, None)).len(),
         3,
         "capped at 3"
     );
     assert_eq!(
-        report::aggregate(&reg, &cfg, "tool", &query(0, 0, None)).len(),
+        aggregate(&reg, &cfg, "tool", &legacy_query(0, 0, None)).len(),
         6,
         "0 = all 6"
     );
@@ -1508,7 +1540,7 @@ fn a_resumed_agent_counts_once_however_many_turns_it_stops_on() {
         });
         hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key.as_deref(), Some("general-purpose"));
     assert_eq!(groups[0].count, 1, "four stops, one agent");
@@ -1534,7 +1566,7 @@ fn agents_without_an_identity_never_merge_into_one() {
         });
         hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups[0].count, 3);
 }
 
@@ -1553,7 +1585,7 @@ fn an_identity_is_scoped_to_the_group_it_is_counted_in() {
         });
         hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "subagent", &query(0, 0, None));
     assert_eq!(groups.len(), 2);
     assert!(groups.iter().all(|g| g.count == 1));
 }
@@ -1600,7 +1632,7 @@ fn each_start_of_one_session_counts_its_own_resume_cost() {
         });
         hatel_core::claude::hook::process_event(&mut resumed, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "session", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "session", &query(0, 0, None));
     let resume = groups
         .iter()
         .find(|g| g.key.as_deref() == Some("resume"))
@@ -1693,7 +1725,7 @@ measures = ["ms"]
                 .unwrap();
             out.flush().unwrap();
         }
-        report::aggregate(&reg, &cfg, "ord.job", &query(0, 0, None))
+        aggregate(&reg, &cfg, "ord.job", &query(0, 0, None))
     };
     let jsonl = answer(SinkKind::Jsonl);
     let sqlite = answer(SinkKind::Sqlite);
@@ -1875,7 +1907,7 @@ fn a_tool_call_is_attributed_to_the_agent_that_made_it() {
     call("t1", None);
     call("t2", Some("a9"));
     call("t3", Some("a9"));
-    let groups = report::aggregate(
+    let groups = aggregate(
         &reg,
         &cfg,
         "tool",
@@ -1954,7 +1986,7 @@ fn a_skill_the_model_invoked_is_named_and_no_other_tool_input_is_kept() {
         "a source that is not one value is not stored"
     );
     let filters = [("tool_name".to_string(), "Skill".to_string())];
-    let groups = report::aggregate(
+    let groups = aggregate(
         &reg,
         &cfg,
         "tool",
@@ -1991,7 +2023,7 @@ fn a_failed_call_and_a_returning_one_land_in_the_same_kind() {
         });
         hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "tool", &query(0, 0, None));
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].key.as_deref(), Some("Bash"));
     assert_eq!(groups[0].count, 3, "three calls");
@@ -2012,7 +2044,7 @@ fn one_call_delivered_twice_counts_once() {
         });
         hatel_core::claude::hook::process_event(&mut event, &cfg, &reg);
     }
-    let groups = report::aggregate(&reg, &cfg, "tool", &query(0, 0, None));
+    let groups = aggregate(&reg, &cfg, "tool", &query(0, 0, None));
     assert_eq!(groups[0].count, 1);
     let ms = groups[0]
         .sums
@@ -2149,7 +2181,7 @@ fn one_turn_joins_its_records_across_kinds() {
     });
     hatel_core::claude::hook::process_event(&mut agent, &cfg, &reg);
     let turn = |kind: &str| {
-        report::aggregate(
+        aggregate(
             &reg,
             &cfg,
             kind,
@@ -2329,7 +2361,8 @@ fn query_reports_zero_missing_invalid_and_duration_buckets_without_coercion() {
     }
     let reg = build_registry(&cfg).unwrap();
     let groups =
-        hatel_core::query::aggregate(&cfg, reg.kind("tool").unwrap(), &query(0, 0, None)).unwrap();
+        hatel_core::query::aggregate(&cfg, reg.kind("tool").unwrap(), &legacy_query(0, 0, None))
+            .unwrap();
     let measure = &groups[0].sums[0];
     assert_eq!(groups[0].key, None);
     assert_eq!(
@@ -2364,14 +2397,21 @@ fn numeric_aggregation_reports_overflow_and_accepts_the_signed_integer_minimum()
         conn.execute("INSERT INTO records(ts,kind,schema_version,payload) VALUES ('2026-01-01T00:00:00Z','tool',1,?1)", [serde_json::json!({"duration_ms":value}).to_string()]).unwrap();
     }
     assert!(
-        hatel_core::query::aggregate(&cfg, registry.kind("tool").unwrap(), &query(0, 0, None))
-            .is_err()
+        hatel_core::query::aggregate(
+            &cfg,
+            registry.kind("tool").unwrap(),
+            &legacy_query(0, 0, None)
+        )
+        .is_err()
     );
     conn.execute("DELETE FROM records", []).unwrap();
     conn.execute("INSERT INTO records(ts,kind,schema_version,payload) VALUES ('2026-01-01T00:00:00Z','tool',1,?1)", [serde_json::json!({"duration_ms":i64::MIN}).to_string()]).unwrap();
-    let groups =
-        hatel_core::query::aggregate(&cfg, registry.kind("tool").unwrap(), &query(0, 0, None))
-            .unwrap();
+    let groups = hatel_core::query::aggregate(
+        &cfg,
+        registry.kind("tool").unwrap(),
+        &legacy_query(0, 0, None),
+    )
+    .unwrap();
     assert_eq!(groups[0].sums[0].valid_count, 1);
     assert_eq!(groups[0].sums[0].sum, i64::MIN as f64);
 }
@@ -2559,8 +2599,11 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
         ..query(0, 0, Some("/team-one/repo"))
     };
     let result = hatel_core::query::section(&cfg, spec, &q).unwrap();
-    assert_eq!(result.groups.len(), 1);
-    assert_eq!(result.groups[0].key.as_deref(), Some("/team-one/repo"));
+    assert_eq!(result.groups.as_ref().unwrap().len(), 1);
+    assert_eq!(
+        result.groups.as_ref().unwrap()[0].key.as_deref(),
+        Some("/team-one/repo")
+    );
     assert!(result.retained_since.is_some());
     let filters = [("metadata.schema_id".into(), spec.schema_id.clone())];
     let q = report::Query {
@@ -2618,7 +2661,13 @@ fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_lega
         let spec = registry.kind("private").unwrap();
         let result = hatel_core::query::section(&cfg, spec, &query(0, 0, Some("repo"))).unwrap();
         assert_eq!(
-            result.groups.iter().map(|group| group.count).sum::<i64>(),
+            result
+                .groups
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|group| group.count)
+                .sum::<i64>(),
             2
         );
         assert!(result.retained_since.is_some());

@@ -14,7 +14,7 @@ mod throttle;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use hatel_core::schema::{UnreadableKinds, build_registry};
+use hatel_core::schema::{Inventory, UnreadableKinds, build_query_registry, build_registry};
 use hatel_core::{Config, Payload, Registry, render, report};
 
 #[derive(Parser)]
@@ -59,6 +59,9 @@ enum Command {
         /// Scopes the rollup to that Kind and drops the native cost section.
         #[arg(long)]
         kind: Option<String>,
+        /// Select an exact stored schema ID, or explicitly interpret one legacy contract.
+        #[arg(long, requires = "kind")]
+        contract: Option<String>,
         /// How many groups to show per Kind (0 = all).
         #[arg(long, default_value_t = report::TOP_N)]
         top: usize,
@@ -198,6 +201,7 @@ fn run() -> i32 {
             format,
             project,
             kind,
+            contract,
             top,
             group_by,
             sort_by,
@@ -208,6 +212,7 @@ fn run() -> i32 {
             top,
             project.as_deref(),
             kind.as_deref(),
+            contract.as_deref(),
             group_by.as_deref(),
             sort_by.as_deref(),
             &filter,
@@ -521,6 +526,7 @@ fn report_cmd(
     top: usize,
     project: Option<&str>,
     kind: Option<&str>,
+    contract: Option<&str>,
     group_by: Option<&str>,
     sort_by: Option<&str>,
     filter: &[String],
@@ -532,7 +538,7 @@ fn report_cmd(
             return 1;
         }
     };
-    let reg = match build_registry(&cfg) {
+    let reg = match build_query_registry(&cfg, kind, contract) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("report: {e}");
@@ -557,6 +563,7 @@ fn report_cmd(
         top_n: top,
         project,
         kind,
+        contract,
         group_by,
         sort_by,
         filters: &filters,
@@ -716,10 +723,7 @@ pub(crate) fn report_json(report: &report::Report) -> String {
 /// The `kinds --json` payload, shared by the CLI flag and the MCP tool: what this registry can
 /// query, and — as `null` when there is none — the gap between that and what the store holds. The
 /// second half is what keeps a partial registry from answering as a complete one.
-pub(crate) fn kinds_value(
-    reg: &Registry,
-    inspection: &std::io::Result<Option<UnreadableKinds>>,
-) -> serde_json::Value {
+pub(crate) fn kinds_value(reg: &Registry, inspection: &Inventory) -> serde_json::Value {
     let kinds: Vec<serde_json::Value> = reg
         .kinds()
         .map(|s| {
@@ -739,8 +743,9 @@ pub(crate) fn kinds_value(
         })
         .collect();
     serde_json::json!({ "kinds": kinds,
-        "unreadable_kinds": inspection.as_ref().ok().and_then(|found|found.as_ref()),
-        "storage_error": inspection.as_ref().err().map(ToString::to_string) })
+        "unreadable_kinds": inspection.unreadable_kinds,
+        "stored_contracts": inspection.stored_contracts,
+        "storage_error": inspection.storage_error })
 }
 
 fn kinds_cmd(json: bool) -> i32 {
@@ -754,7 +759,7 @@ fn kinds_cmd(json: bool) -> i32 {
             return 1;
         }
     };
-    let inspection = UnreadableKinds::detect(&reg, &cfg);
+    let inspection = Inventory::inspect(&reg, &cfg);
     if json {
         println!(
             "{}",
@@ -783,14 +788,20 @@ fn kinds_cmd(json: bool) -> i32 {
                 }
             );
         }
-        if let Ok(Some(unreadable)) = &inspection {
+        for contract in &inspection.stored_contracts {
+            println!(
+                "contract {} kind={} version={}",
+                contract.schema_id, contract.definition.name, contract.definition.version
+            );
+        }
+        if let Some(unreadable) = &inspection.unreadable_kinds {
             println!("\n{unreadable}");
         }
-        if let Err(error) = &inspection {
+        if let Some(error) = &inspection.storage_error {
             println!("\nstorage inspection failed: {error}");
         }
     }
-    i32::from(inspection.is_err())
+    i32::from(inspection.storage_error.is_some())
 }
 
 #[cfg(test)]
@@ -829,6 +840,7 @@ mod tests {
                     top_n: 0,
                     project,
                     kind: None,
+                    contract: None,
                     group_by: None,
                     sort_by: None,
                     filters: &[],
@@ -971,6 +983,7 @@ mod tests {
             top_n: 0,
             project: None,
             kind,
+            contract: None,
             group_by: None,
             sort_by: None,
             filters: &[],
@@ -1049,8 +1062,7 @@ mod tests {
         std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
         let reg = build_registry(&cfg).unwrap();
 
-        let gap = UnreadableKinds::detect(&reg, &cfg).unwrap();
-        let value = kinds_value(&reg, &Ok(gap));
+        let value = kinds_value(&reg, &Inventory::inspect(&reg, &cfg));
         let names: Vec<&str> = value["kinds"]
             .as_array()
             .unwrap()
@@ -1063,6 +1075,10 @@ mod tests {
             serde_json::json!(["ci_check"])
         );
         // One shape either way: no gap is `null`, never an absent key.
-        assert!(kinds_value(&reg, &Ok(None))["unreadable_kinds"].is_null());
+        assert!(
+            Inventory::inspect(&reg, &test_cfg(vec![]))
+                .unreadable_kinds
+                .is_none()
+        );
     }
 }

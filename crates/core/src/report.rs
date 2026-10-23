@@ -91,6 +91,8 @@ pub struct Query<'a> {
     pub project: Option<&'a str>,
     /// Restrict to one registered Kind.
     pub kind: Option<&'a str>,
+    /// An exact stored contract, or an explicit unverified interpretation of legacy records.
+    pub contract: Option<&'a str>,
     /// Dimension to group by, overriding the Kind's declared default. Validated against that
     /// Kind's allow-list by the caller, so a dimension that reaches here is one the Kind records.
     pub group_by: Option<&'a str>,
@@ -126,6 +128,8 @@ pub struct KindSection {
     pub identity: Option<String>,
     pub project_scope: ProjectScope,
     pub retained_since: Option<String>,
+    pub contract: String,
+    pub contracts: Vec<crate::query::ContractCount>,
     pub groups: Vec<GroupAgg>,
     pub error: Option<String>,
 }
@@ -165,9 +169,17 @@ impl Report {
                 let group_by = q.group_by.unwrap_or(&spec.group_key);
                 let sort_by = q.sort_by.or(spec.measures.first().map(String::as_str));
                 let result = crate::query::section(cfg, spec, q);
-                let (groups, retained_since, error) = match result {
-                    Ok(result) => (result.groups, result.retained_since, None),
-                    Err(e) => (Vec::new(), None, Some(e.to_string())),
+                let (groups, retained_since, contracts, error) = match result {
+                    Ok(result) => match result.groups {
+                        Ok(groups) => (groups, result.retained_since, result.contracts, None),
+                        Err(error) => (
+                            Vec::new(),
+                            result.retained_since,
+                            result.contracts,
+                            Some(error.to_string()),
+                        ),
+                    },
+                    Err(e) => (Vec::new(), None, Vec::new(), Some(e.to_string())),
                 };
                 KindSection {
                     kind: spec.name.clone(),
@@ -177,6 +189,8 @@ impl Report {
                     identity: spec.identity.clone(),
                     project_scope,
                     retained_since,
+                    contract: q.contract.unwrap_or(&spec.schema_id).into(),
+                    contracts,
                     groups,
                     error,
                 }
@@ -303,19 +317,17 @@ pub fn cost_axes() -> (&'static str, &'static str) {
     (COST_DIMENSION, COST_RANK)
 }
 
-/// Aggregate one Kind through the shared SQL engine. Reports retain query failures in their
-/// section; this convenience API also reports them on stderr.
-pub fn aggregate(reg: &Registry, cfg: &Config, kind: &str, q: &Query) -> Vec<GroupAgg> {
+/// Aggregate one Kind through the shared SQL engine without discarding query failures.
+pub fn aggregate(
+    reg: &Registry,
+    cfg: &Config,
+    kind: &str,
+    q: &Query,
+) -> crate::Result<Vec<GroupAgg>> {
     let Some(spec) = reg.kind(kind) else {
-        return Vec::new();
+        return Err(crate::Error::UnknownKind(kind.into()));
     };
-    match crate::query::aggregate(cfg, spec, q) {
-        Ok(groups) => groups,
-        Err(e) => {
-            eprintln!("hatel report: {kind}: {e}");
-            Vec::new()
-        }
-    }
+    crate::query::aggregate(cfg, spec, q)
 }
 
 /// The value a group is ranked by: its sum of `measure`, or its record count when the Kind

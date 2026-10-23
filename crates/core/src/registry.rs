@@ -218,13 +218,15 @@ impl KindSpec {
         if let Some(identity) = &raw.identity {
             contract["identity"] = identity.clone().into();
         }
-        let schema_id = blake3::hash(
-            serde_json::to_string(&contract)
-                .expect("schema serializes")
-                .as_bytes(),
-        )
-        .to_hex()
-        .to_string();
+        let schema_id = format!(
+            "v2:{}",
+            blake3::hash(
+                serde_json::to_string(&contract)
+                    .expect("schema serializes")
+                    .as_bytes(),
+            )
+            .to_hex()
+        );
         for measure in &raw.measures {
             if !matches!(
                 field_specs[measure].field_type,

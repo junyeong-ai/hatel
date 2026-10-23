@@ -115,6 +115,8 @@ Aggregates use SQLite REAL/f64; integers above 2^53 can lose precision. Record i
 
 `retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies missing schemas, `storage_error` a failed ledger inspection, and `cost_error` an unreadable cost baseline. Check these with each Kind’s `error`; an empty array after failure is not absence of records. A receiver with an unreadable cost baseline does not rewrite its files; repair the baseline and restart it.
 
+Default queries refuse to combine different or unverified contracts and expose counts in `contracts`. Inspect definitions in `kinds --json` under `stored_contracts`, then select `report --kind KIND --contract SCHEMA_ID`. For history without a definition, load its exact historical schema and explicitly use `--contract legacy`; select one retained fingerprint with `--filter metadata.schema_id=OLD_ID`. `contract=legacy` is an unverified interpretation, not automatic unit conversion or recovery of historical meaning.
+
 ## Custom Kinds
 
 Schema TOML defines a data contract. Producers that know the facts record execution outcomes and decisions. Namespace names, such as `team.deploy`. Reuse the built-in `check` for ordinary executions; add a Kind when it carries domain-specific meaning.
@@ -159,7 +161,7 @@ measures = ["unresolved"]
 
 Snapshots select the latest occurrence per project and ID inside the requested project and window before filters and grouping. Filtering unresolved items cannot resurrect an older unresolved state after resolution. Observation time breaks equal occurrences; contradictory states tied on both times fail. IDs must be required non-empty strings; legacy records without observation time cannot be reinterpreted. Unchanged items outside the window are absent, so this is not a complete current inventory.
 
-Manage Kind names or versions explicitly when meaning or units change. `schema_id` fingerprints fields, units, redaction, mode and identity. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. Pending records under a changed contract are cancelled rather than reinterpreted. Historical local data needs a separate migration decision when semantics change.
+Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque contract identifier covering fields, units, redaction, mode and identity. Current identifiers use `v2:`; old fingerprints are preserved. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. A fingerprint-format change can also cancel pending deliveries. Historical local records are preserved, never automatically reinterpreted.
 
 ### Hook bindings
 
