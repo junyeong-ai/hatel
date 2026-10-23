@@ -43,6 +43,7 @@ Report interpretation:
 - `sum` requires its `valid_count`; `missing_count` and `invalid_count` name what was
   excluded. Human `—` means unmeasured, `7 (1/3)` a sum over one measured record of three.
   A measured zero remains zero. Numeric strings are not coerced into measures.
+  Aggregates use f64; integers above 2^53 can lose precision. Record identifiers as strings.
 - `retained_since` is the oldest retained record, not proof of continuous collection.
   `unreadable_kinds` means some stored records have no loaded schema.
 - Event mode counts records, or the earliest matching identity per group when declared.

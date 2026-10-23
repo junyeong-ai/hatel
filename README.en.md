@@ -111,6 +111,8 @@ Ordinary Kind `count` counts records. With event-mode `identity`, each group use
 
 Measures include `sum`, `valid_count`, `missing_count`, `invalid_count`, `avg`, `min`, `max`, `unit` and `buckets`. Numeric strings are not guessed into numbers. Human tables use `—` for unmeasured values; `7 (1/3)` means a sum of 7 over the one measured record out of three. Measured zero stays `0`. Interpret JSON sums with `valid_count`. Duration fields in `s` or `ms` provide fixed cumulative buckets, not estimated percentiles. An aggregate outside the finite numeric range fails that Kind section.
 
+Aggregates use SQLite REAL/f64; integers above 2^53 can lose precision. Record identifiers as strings.
+
 `retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies stored records without a loaded schema. Carry these limits and each Kind’s `error` into conclusions.
 
 ## Custom Kinds

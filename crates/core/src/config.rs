@@ -26,8 +26,8 @@ pub struct Config {
     pub plugin_source: PluginSource,
     /// JSONL ledger rotation threshold in bytes (high-volume collectors raise this).
     pub rotate_bytes: u64,
-    /// Days of history every store retains — see [`Config::retention`]. Generous so any
-    /// realistic report window is fully covered.
+    /// Retention horizon in days — see [`Config::retention`]. This does not establish
+    /// collection coverage inside the horizon.
     pub retention_days: i64,
     pub disabled: bool,
     pub strict: bool,

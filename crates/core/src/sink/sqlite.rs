@@ -26,8 +26,7 @@ pub fn stored_kinds(path: &Path) -> std::io::Result<Vec<String>> {
     rows.collect::<rusqlite::Result<Vec<String>>>().map_err(io)
 }
 
-/// The newest `ts` of `kind`. `MAX` compares the RFC 3339 text, which can misorder records within
-/// one second (a fraction sorts before `Z`); no caller needs that precision.
+/// The newest occurrence of `kind`, ordered by the parsed timestamp.
 pub fn last_written(path: &Path, kind: &str) -> Option<i64> {
     if !path.exists() {
         return None;
@@ -46,8 +45,7 @@ pub fn last_written(path: &Path, kind: &str) -> Option<i64> {
 
 /// Read records for `kind` back as envelopes — the read half of the storage
 /// abstraction, so a report consumes the SQLite sink exactly as it does JSONL. The
-/// time window is pushed into SQL (`ts >= since`) so the indexed backend isn't forced
-/// to scan its whole history. A missing DB reads empty (no telemetry yet); a DB that
+/// time window is filtered in SQL. A missing DB reads empty (no telemetry yet); a DB that
 /// exists but can't be read is logged rather than silently treated as empty.
 pub fn read_records(path: &Path, kind: &str, since: Option<i64>) -> Vec<Envelope> {
     if !path.exists() {

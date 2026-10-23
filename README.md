@@ -111,6 +111,8 @@ hatel report --project /absolute/repository/path --format json
 
 수치에는 `sum`, `valid_count`, `missing_count`, `invalid_count`, `avg`, `min`, `max`, `unit`, `buckets`가 있다. 숫자 문자열은 수치로 추측하지 않는다. 사람이 읽는 표에서 `—`는 미측정이고 `7 (1/3)`은 기록 3개 중 수치가 있는 1개의 합계가 7이라는 뜻이다. 실제 측정된 0은 `0`이다. JSON의 수치는 `valid_count`와 함께 해석한다. `s`·`ms` 기간 필드는 고정 경계의 누적 버킷을 제공하며 백분위수를 추정하지 않는다. 합계가 유한수 범위를 넘으면 해당 Kind가 오류를 반환한다.
 
+집계는 SQLite REAL/f64를 사용하므로 2^53을 넘는 정수는 정밀도가 손실될 수 있다. 식별자는 문자열로 기록한다.
+
 `retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `unreadable_kinds`가 있으면 현재 레지스트리로 읽지 못하는 기록이 있다는 뜻이다. Kind의 `error`와 함께 이 제한을 결과에 명시한다.
 
 ## 커스텀 Kind
