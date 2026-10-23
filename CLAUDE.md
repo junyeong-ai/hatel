@@ -65,14 +65,16 @@ and its CI check unless a deliberate compatibility change requires raising both.
   stays best-effort. Vendor projections set `metadata.projection` so forwarding the original
   signal cannot also export its local projection. Queue counters change in the same transaction
   as delivery state; retention deletes delivery references and releases capacity with records.
-  A Kind data-contract fingerprint accompanies each record. A changed contract cancels pending
-  records rather than interpreting them under new redaction or field rules.
-  Identity is part of that contract; query defaults are not. SQLite records and their validated
-  definitions commit together in `contracts`. Imports never invent definitions for old fingerprints.
-  Fingerprint format `v2:` includes entity identity. Default queries reject mixed or unverified
-  contracts and retain counts in `KindSection.contracts`; explicit selection uses saved definitions.
-  `contract=legacy` is an operator-selected unverified interpretation with an exact historical
-  schema, never an automatic compatibility claim. Historical query registries never record data.
+  A Kind data-contract fingerprint accompanies each record; identity is part of it, query
+  defaults are not. SQLite records and their validated definitions commit together in
+  `contracts`. Readers resolve each stored contract against the answered definition
+  (`KindSpec::reads`, `catalog::Contracts`): same name, version and mode, and every declared field
+  keeps its type, unit, redaction and requiredness. Compatible records answer with the selected
+  ones, and a pending delivery stays deliverable only under a definition that reads it. Incompatible records and records without a
+  known definition are excluded and counted per `resolution` in `KindSection.contracts`, never
+  reinterpreted. Imports never invent definitions for old fingerprints. `contract=legacy` is an
+  operator-selected unverified interpretation with an exact historical schema. Historical query
+  registries never record data.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

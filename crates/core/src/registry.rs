@@ -214,18 +214,16 @@ impl KindSpec {
         if raw.measures.iter().any(|measure| redact.contains(measure)) {
             return Err(invalid("numeric measures cannot be redacted".into()));
         }
-        let mut contract = serde_json::json!({"kind":raw.name,"mode":raw.mode,"version":raw.version,"fields":field_specs,"redact":redact});
-        if let Some(identity) = &raw.identity {
-            contract["identity"] = identity.clone().into();
-        }
         let schema_id = format!(
             "v2:{}",
-            blake3::hash(
-                serde_json::to_string(&contract)
-                    .expect("schema serializes")
-                    .as_bytes(),
+            fingerprint(
+                &raw.name,
+                raw.mode,
+                raw.version,
+                &field_specs,
+                &redact,
+                raw.identity.as_deref()
             )
-            .to_hex()
         );
         for measure in &raw.measures {
             if !matches!(
@@ -261,6 +259,52 @@ impl KindSpec {
             identity: self.identity.clone(),
         }
     }
+
+    /// Whether records written under `writer` keep their meaning when read under this definition.
+    /// Each field declared here must have the same type, unit and redaction in the writer, and a
+    /// required one must have been required there; a field only the writer declared is outside
+    /// this allow-list. Name, version and mode must match: a version is the declared marker of a
+    /// change in meaning, and the mode decides whether a record is an occurrence or a state.
+    /// Identity is not compared because it is applied when reading and never shapes what is stored.
+    pub fn reads(&self, writer: &KindSpec) -> bool {
+        self.name == writer.name
+            && self.version == writer.version
+            && self.mode == writer.mode
+            && self.field_specs.iter().all(|(name, field)| {
+                writer
+                    .field_specs
+                    .get(name)
+                    .map_or(!field.required, |written| {
+                        written.field_type == field.field_type
+                            && written.unit == field.unit
+                            && (written.required || !field.required)
+                            && writer.redact.contains(name) == self.redact.contains(name)
+                    })
+            })
+    }
+}
+
+/// The digest of everything that fixes what a stored record means. Its serialization is part of
+/// every identifier already stamped, so changing it requires a new format prefix.
+fn fingerprint(
+    name: &str,
+    mode: KindMode,
+    version: u32,
+    fields: &BTreeMap<String, FieldSpec>,
+    redact: &BTreeSet<String>,
+    identity: Option<&str>,
+) -> String {
+    let mut contract = serde_json::json!({"kind":name,"mode":mode,"version":version,"fields":fields,"redact":redact});
+    if let Some(identity) = identity {
+        contract["identity"] = identity.into();
+    }
+    blake3::hash(
+        serde_json::to_string(&contract)
+            .expect("schema serializes")
+            .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
 }
 
 /// The source field(s) a `FieldMap` reads. A single key, or several tried in
@@ -596,6 +640,65 @@ mod tests {
         let r: std::result::Result<HookBinding, _> =
             toml::from_str("event = \"E\"\nkind = \"k\"\nkindd = \"typo\"");
         assert!(r.is_err(), "unknown HookBinding key must be rejected");
+    }
+
+    #[test]
+    fn a_definition_reads_another_only_when_stored_meaning_is_unchanged() {
+        let spec = |extra: &str, duration: &str| {
+            KindSpec::from_raw(
+                toml::from_str(&format!(
+                    "name = \"k\"\ngroup_key = \"service\"\n{extra}\n[fields]\nservice = {{ type = \"string\", required = true }}\nduration = {duration}\n"
+                ))
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let current = spec("", "{ type = \"number\", unit = \"s\" }");
+        for (writer, reads) in [
+            (
+                spec(
+                    "measures = [\"duration\"]",
+                    "{ type = \"number\", unit = \"s\" }",
+                ),
+                true,
+            ),
+            (
+                spec(
+                    "identity = \"service\"",
+                    "{ type = \"number\", unit = \"s\" }",
+                ),
+                true,
+            ),
+            (
+                spec("", "{ type = \"number\", unit = \"s\", required = true }"),
+                true,
+            ),
+            (spec("", "{ type = \"number\", unit = \"ms\" }"), false),
+            (spec("", "{ type = \"integer\", unit = \"s\" }"), false),
+            (
+                spec(
+                    "redact = [\"service\"]",
+                    "{ type = \"number\", unit = \"s\" }",
+                ),
+                false,
+            ),
+            (
+                spec("version = 2", "{ type = \"number\", unit = \"s\" }"),
+                false,
+            ),
+        ] {
+            assert_eq!(current.reads(&writer), reads, "{:?}", writer.definition());
+        }
+        let required = spec("", "{ type = \"number\", unit = \"s\", required = true }");
+        assert!(
+            !required.reads(&current),
+            "a newly required field was optional"
+        );
+        let added = spec(
+            "",
+            "{ type = \"number\", unit = \"s\" }\noutcome = { type = \"string\" }",
+        );
+        assert!(added.reads(&current) && current.reads(&added));
     }
 
     fn reg_with_kind() -> Registry {

@@ -120,7 +120,7 @@ Aggregates use SQLite REAL/f64; integers above 2^53 can lose precision. Record i
 
 `retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies missing schemas, `storage_error` a failed ledger inspection, and `cost_error` an unreadable cost baseline. Check these with each Kind’s `error`; an empty array after failure is not absence of records. A receiver with an unreadable cost baseline does not rewrite its files; repair the baseline and restart it.
 
-Default queries refuse to combine different or unverified contracts and expose counts in `contracts`. Inspect definitions in `kinds --json` under `stored_contracts`, then select `report --kind KIND --contract SCHEMA_ID`. For history without a definition, load its exact historical schema and explicitly use `--contract legacy`; select one retained fingerprint with `--filter metadata.schema_id=OLD_ID`. `contract=legacy` is an unverified interpretation, not automatic unit conversion or recovery of historical meaning.
+Each section answers under the Kind's current contract, or the one `--contract SCHEMA_ID` selects. Records of another stored contract join it when name, version and mode match and every declared field keeps its type, unit, redaction and requiredness. `contracts` counts records per contract with a `resolution`: `selected` and `compatible` records are answered, while `incompatible` records and `undefined` ones without a known definition are excluded. `retained_since` covers answered records only. Inspect definitions in `kinds --json` under `stored_contracts`, then select `report --kind KIND --contract SCHEMA_ID`. For history without a definition, load its exact historical schema and explicitly use `--contract legacy`; select one retained fingerprint with `--filter metadata.schema_id=OLD_ID`. `contract=legacy` is an unverified interpretation, not automatic unit conversion or recovery of historical meaning.
 
 ## Custom Kinds
 
@@ -166,7 +166,7 @@ measures = ["unresolved"]
 
 Snapshots select the latest occurrence per project and ID inside the requested project and window before filters and grouping. Filtering unresolved items cannot resurrect an older unresolved state after resolution. Observation time breaks equal occurrences; contradictory states tied on both times fail. IDs must be required non-empty strings; legacy records without observation time cannot be reinterpreted. Unchanged items outside the window are absent, so this is not a complete current inventory.
 
-Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque contract identifier covering fields, units, redaction, mode and identity. Current identifiers use `v2:`; old fingerprints are preserved. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. A fingerprint-format change can also cancel pending deliveries. Historical local records are preserved, never automatically reinterpreted.
+Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque `v2:` contract identifier covering fields, units, redaction, mode and identity. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. Pending deliveries continue under a compatible contract and are cancelled under an incompatible one. Historical local records are preserved, never automatically reinterpreted.
 
 ### Hook bindings
 
@@ -203,7 +203,7 @@ Omitted `signals` means native metrics and logs; omitted `kinds` means no local 
 
 Native OTLP forwarding uses a best-effort memory queue. `raw` relays the body; `enriched` adds a project label to JSON. Native bodies do not pass through the local payload allow-list or hashing. If content capture is enabled upstream, that content may leave the machine.
 
-Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits or contract changes may prevent delivery. Lost acknowledgements can cause duplicate delivery. Migrate JSONL to SQLite before enabling custom delivery.
+Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits or incompatible contract changes may prevent delivery. Lost acknowledgements can cause duplicate delivery. Migrate JSONL to SQLite before enabling custom delivery.
 
 ```sh
 hatel deliveries --json

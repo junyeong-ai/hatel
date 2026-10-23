@@ -1,5 +1,6 @@
 //! One bounded-memory aggregation engine for the runtime ledger and legacy imports.
 
+use crate::catalog::{Contracts, Resolution};
 use crate::report::{GroupAgg, Measure, Query};
 use crate::{Config, Envelope, KindSpec, SinkKind};
 use rusqlite::{Connection, functions::FunctionFlags, types::Value};
@@ -167,6 +168,44 @@ pub struct ContractCount {
     pub schema_id: Option<String>,
     pub kind_version: Option<u32>,
     pub count: i64,
+    pub resolution: Resolution,
+}
+
+/// The records a section answers from: every contract its definition reads, or the legacy records
+/// an operator explicitly chose to interpret under the loaded schema.
+enum Selection<'a> {
+    Contracts(&'a Contracts),
+    Legacy(Option<&'a str>),
+}
+
+impl Selection<'_> {
+    fn condition(&self, args: &mut Vec<Value>) -> String {
+        match self {
+            Selection::Contracts(contracts) => {
+                let ids: Vec<String> = contracts
+                    .readable()
+                    .iter()
+                    .map(|id| parameter(args, id.clone()))
+                    .collect();
+                format!(
+                    "json_extract(metadata,'$.schema_id') IN ({})",
+                    ids.join(",")
+                )
+            }
+            Selection::Legacy(Some(id)) => {
+                let p = parameter(args, (*id).into());
+                format!("json_extract(metadata,'$.schema_id')={p}")
+            }
+            Selection::Legacy(None) => "json_extract(metadata,'$.schema_id') IS NULL".into(),
+        }
+    }
+
+    fn resolution(&self, schema_id: Option<&str>) -> Resolution {
+        match self {
+            Selection::Contracts(contracts) => contracts.resolution(schema_id),
+            Selection::Legacy(_) => Resolution::Selected,
+        }
+    }
 }
 
 pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
@@ -177,9 +216,18 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
     use rusqlite::OptionalExtension;
     let mut conn = connection(cfg, &spec.name)?;
     let transaction = conn.transaction().map_err(io)?;
+    let contracts = Contracts::resolve(&transaction, spec)?;
+    let selection = match q.contract {
+        Some("legacy") => Selection::Legacy(
+            q.filters
+                .iter()
+                .find(|(field, _)| field == "metadata.schema_id")
+                .map(|(_, id)| id.as_str()),
+        ),
+        _ => Selection::Contracts(&contracts),
+    };
     let oldest = Query {
         since: i64::MIN,
-        contract: q.contract.or(Some(&spec.schema_id)),
         ..*q
     };
     let mut oldest_args = vec![
@@ -187,11 +235,12 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
         oldest.since.into(),
         i64::from(crate::SCHEMA_VERSION).into(),
     ];
-    let oldest_scope = scope(spec, &oldest, &mut oldest_args);
+    let mut oldest_scope = scope(spec, &oldest, &mut oldest_args);
+    oldest_scope.push(selection.condition(&mut oldest_args));
     let retained_since=transaction.query_row(&format!("SELECT ts FROM records_read WHERE {} ORDER BY occurred_seconds,occurred_nanos,sequence LIMIT 1",oldest_scope.join(" AND ")),rusqlite::params_from_iter(oldest_args),|r|r.get(0)).optional().map_err(io)?;
-    let contracts = contract_counts(&transaction, spec, q)?;
-    let groups = validate_contracts(spec, q, &contracts)
-        .and_then(|()| aggregate_connection(&transaction, spec, q));
+    let contracts = contract_counts(&transaction, spec, q, &selection)?;
+    let groups = validate_selection(spec, &selection, &contracts)
+        .and_then(|()| aggregate_connection(&transaction, spec, q, &selection));
     Ok(SectionResult {
         groups,
         retained_since,
@@ -209,23 +258,6 @@ fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
         let p = parameter(args, project.into());
         let legacy = parameter(args, payload_project(spec, project));
         conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={legacy}))"));
-    }
-    if let Some(contract) = q.contract {
-        if contract == "legacy" {
-            if let Some((_, id)) = q
-                .filters
-                .iter()
-                .find(|(field, _)| field == "metadata.schema_id")
-            {
-                let p = parameter(args, id.clone());
-                conditions.push(format!("json_extract(metadata,'$.schema_id')={p}"));
-            } else {
-                conditions.push("json_extract(metadata,'$.schema_id') IS NULL".into());
-            }
-        } else {
-            let p = parameter(args, contract.into());
-            conditions.push(format!("json_extract(metadata,'$.schema_id')={p}"));
-        }
     }
     conditions
 }
@@ -250,10 +282,13 @@ fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<S
     filters
 }
 
+/// Records per stored contract in the window, each with how it resolves against the answered
+/// definition, so what a section left out is counted rather than silently missing.
 fn contract_counts(
     conn: &Connection,
     spec: &KindSpec,
     q: &Query,
+    selection: &Selection,
 ) -> crate::Result<Vec<ContractCount>> {
     let mut args = vec![
         spec.name.clone().into(),
@@ -261,13 +296,18 @@ fn contract_counts(
         i64::from(crate::SCHEMA_VERSION).into(),
     ];
     let mut conditions = scope(spec, q, &mut args);
+    if let Selection::Legacy(_) = selection {
+        conditions.push(selection.condition(&mut args));
+    }
     if spec.mode == crate::registry::KindMode::Event {
         conditions.extend(filter_conditions(spec, q, &mut args));
     }
     let mut stmt=conn.prepare(&format!("SELECT json_extract(metadata,'$.schema_id'),json_extract(metadata,'$.kind_version'),COUNT(*) FROM records_read WHERE {} GROUP BY 1,2 ORDER BY 1,2",conditions.join(" AND "))).map_err(io)?;
     stmt.query_map(rusqlite::params_from_iter(args), |r| {
+        let schema_id: Option<String> = r.get(0)?;
         Ok(ContractCount {
-            schema_id: r.get(0)?,
+            resolution: selection.resolution(schema_id.as_deref()),
+            schema_id,
             kind_version: r.get(1)?,
             count: r.get(2)?,
         })
@@ -277,27 +317,21 @@ fn contract_counts(
     .map_err(io)
 }
 
-fn validate_contracts(
+/// An explicit legacy interpretation applies one historical schema, so it must cover records of
+/// one contract only.
+fn validate_selection(
     spec: &KindSpec,
-    q: &Query,
+    selection: &Selection,
     contracts: &[ContractCount],
 ) -> crate::Result<()> {
-    let valid = if q.contract == Some("legacy") {
-        contracts.len() <= 1
-    } else {
-        contracts.iter().all(|c| {
-            c.schema_id.as_deref() == Some(spec.schema_id.as_str())
-                && c.kind_version.is_none_or(|v| v == spec.version)
-        })
-    };
-    if valid {
-        return Ok(());
+    if matches!(selection, Selection::Legacy(_)) && contracts.len() > 1 {
+        return Err(crate::Error::InvalidPayload(format!(
+            "{} legacy selection spans several contracts {}; select one with --filter metadata.schema_id=<id>",
+            spec.name,
+            serde_json::to_string(contracts).expect("contract counts serialize")
+        )));
     }
-    Err(crate::Error::InvalidPayload(format!(
-        "{} contains mixed or unverified contracts {}; select one with --contract <schema_id>, or explicitly interpret one legacy contract with --contract legacy and its exact historical schema",
-        spec.name,
-        serde_json::to_string(contracts).expect("contract counts serialize")
-    )))
+    Ok(())
 }
 
 fn payload_project(spec: &KindSpec, project: &str) -> String {
@@ -317,6 +351,7 @@ fn aggregate_connection(
     conn: &Connection,
     spec: &KindSpec,
     q: &Query,
+    selection: &Selection,
 ) -> crate::Result<Vec<GroupAgg>> {
     let mut args: Vec<Value> = vec![
         spec.name.clone().into(),
@@ -333,7 +368,8 @@ fn aggregate_connection(
     } else {
         label_in(document, &dimension)
     };
-    let conditions = scope(spec, q, &mut args);
+    let mut conditions = scope(spec, q, &mut args);
+    conditions.push(selection.condition(&mut args));
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
             "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"

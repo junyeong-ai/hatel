@@ -4,6 +4,7 @@
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::catalog::Resolution;
 use crate::report::{GroupAgg, KindSection, Report, cost_axes, cost_by_project, rank_value};
 
 /// Width of the magnitude bar that prefixes a terminal row. Fixed, so rows stay aligned across
@@ -38,6 +39,9 @@ pub fn format_text(report: &Report) -> String {
         if let Some(error) = &section.error {
             out.push_str(&format!("  (query failed: {error})\n"));
             continue;
+        }
+        if let Some(excluded) = exclusions(section) {
+            out.push_str(&format!("  ({excluded})\n"));
         }
         out.push_str(&text_table(
             &section.group_by,
@@ -78,6 +82,9 @@ pub fn format_markdown(report: &Report) -> String {
         if let Some(error) = &section.error {
             out.push_str(&format!("Query failed: {error}\n"));
             continue;
+        }
+        if let Some(excluded) = exclusions(section) {
+            out.push_str(&format!("_{excluded}_\n\n"));
         }
         out.push_str(&markdown_table(
             &section.group_by,
@@ -144,7 +151,39 @@ fn note(section: &KindSection) -> Option<&'static str> {
     section
         .groups
         .is_empty()
-        .then_some("no records in this window")
+        .then_some(match exclusions(section) {
+            Some(_) => "no readable records in this window",
+            None => "no records in this window",
+        })
+}
+
+/// The records a section could not read, by the reason that decides how a reader reaches them:
+/// another known definition is selected by its ID, and records without one only by an explicit
+/// legacy interpretation.
+fn exclusions(section: &KindSection) -> Option<String> {
+    let count = |resolution| -> i64 {
+        section
+            .contracts
+            .iter()
+            .filter(|c| c.resolution == resolution)
+            .map(|c| c.count)
+            .sum()
+    };
+    let parts: Vec<String> = [
+        (
+            count(Resolution::Incompatible),
+            "under an incompatible contract (--contract <schema_id>)",
+        ),
+        (
+            count(Resolution::Undefined),
+            "without a known definition (--contract legacy)",
+        ),
+    ]
+    .into_iter()
+    .filter(|(records, _)| *records > 0)
+    .map(|(records, reason)| format!("{records} records {reason}"))
+    .collect();
+    (!parts.is_empty()).then(|| format!("excluded {}", parts.join("; ")))
 }
 
 fn text_table(

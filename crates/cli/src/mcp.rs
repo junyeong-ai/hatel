@@ -34,7 +34,7 @@ pub struct ReportParams {
     )]
     pub kind: Option<String>,
     #[schemars(
-        description = "Select an exact stored schema ID or an explicit unverified legacy interpretation. Requires kind."
+        description = "Answer under this stored schema ID instead of the current contract, or \"legacy\" for an explicit unverified interpretation of records without a known definition. Requires kind."
     )]
     pub contract: Option<String>,
     #[schemars(
@@ -77,7 +77,7 @@ pub struct BatchParams {
 #[tool_router]
 impl HatelMcp {
     #[tool(
-        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
+        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
     )]
     async fn report(
         &self,

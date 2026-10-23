@@ -19,8 +19,8 @@ nor a receiver. `hatel-hook` runs through lifecycle wiring; do not invoke it man
 
 1. Inspect `hatel kinds --json` for loaded schemas, fields, mode, identity and measures.
 2. Choose Kind, project, window, filters and grouping. Use JSON for parsing or comparison.
-3. Check section `error`, `storage_error`, `cost_error`, `unreadable_kinds`, measurement counts and retention limits
-   before interpreting totals. An empty answer does not establish zero activity.
+3. Check section `error`, excluded `contracts`, `storage_error`, `cost_error`, `unreadable_kinds`, measurement
+   counts and retention limits before interpreting totals. An empty answer does not establish zero activity.
 
 ```sh
 hatel report --kind check --window 7d --format json
@@ -39,7 +39,10 @@ from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
 `project` grouping and filtering prefer the common key, using payload attribution only
 for legacy records. Use `metadata.project.key` to address that common field explicitly.
 
-Mixed or unverified contracts fail a section and expose per-contract counts. Inspect
+A section answers under the current contract plus stored contracts it reads unchanged: same name,
+version and mode, and every declared field keeps type, unit, redaction and requiredness.
+`contracts[].resolution` is `selected`, `compatible`, `incompatible` or `undefined`; only the first two
+are aggregated and covered by `retained_since`. State excluded counts with the answer. Inspect
 `stored_contracts` in `kinds --json`; `report --kind KIND --contract SCHEMA_ID` uses its saved
 definition, including retired Kinds. Without a definition, load the exact historical schema and
 explicitly select `--contract legacy`; use `--filter metadata.schema_id=OLD_ID` for a retained
@@ -104,8 +107,9 @@ measures = ["duration_s"]
 Typed fields support `string`, `number`, `integer`, `boolean`, `array`, `object`, `any`,
 requiredness and units. `redact` hashes selected payload fields before storage.
 For state, add `mode = "snapshot"` and `identity` naming a required non-empty string field.
-A data contract's opaque `schema_id` changes with field, unit, identity, redaction or mode changes; pending old
-contracts cancel. Semantic/unit changes require an explicit Kind/version and history decision.
+A data contract's opaque `schema_id` changes with field, unit, identity, redaction or mode changes. Adding an
+optional field stays compatible; a type, unit, redaction or requiredness change does not, and pending records of
+an incompatible contract cancel. Semantic changes require an explicit Kind/version and history decision.
 
 Use hook bindings only for facts present in lifecycle input. Producers own domain meaning.
 Keep one writer for each fact. Check `hatel kinds --json` and exercise a real receipt/query

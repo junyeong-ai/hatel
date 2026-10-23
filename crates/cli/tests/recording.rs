@@ -152,7 +152,7 @@ fn sqlite_cli_maintenance_is_reported_by_doctor_and_normalized_explicitly() {
 }
 
 #[test]
-fn mixed_contracts_fail_and_selected_history_uses_its_saved_definition() {
+fn incompatible_contracts_are_excluded_and_selected_history_uses_its_saved_definition() {
     let home = tempfile::tempdir().unwrap();
     let plugin = home.path().join("plugin.toml");
     let config = home.path().join("config.toml");
@@ -197,15 +197,29 @@ fn mixed_contracts_fail_and_selected_history_uses_its_saved_definition() {
         ids.push(spec["schema_id"].as_str().unwrap().to_string());
         assert_eq!(value["stored_contracts"].as_array().unwrap().len(), version);
     }
-    let mixed = isolated(home.path())
+    let current = isolated(home.path())
         .args(["report", "--kind", "sample.duration", "--format", "json"])
         .output()
         .unwrap();
-    assert_eq!(mixed.status.code(), Some(1));
-    let value: serde_json::Value = serde_json::from_slice(&mixed.stdout).unwrap();
-    assert!(value["kinds"][0]["error"].is_string());
-    assert_eq!(value["kinds"][0]["groups"], serde_json::json!([]));
-    assert_eq!(value["kinds"][0]["contracts"].as_array().unwrap().len(), 2);
+    assert!(current.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&current.stdout).unwrap();
+    let section = &value["kinds"][0];
+    assert!(section["error"].is_null());
+    assert_eq!(section["contract"], ids[1].as_str());
+    assert_eq!(section["groups"][0]["sums"][0]["sum"], 1.0);
+    let resolutions: Vec<_> = section["contracts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["schema_id"].as_str().unwrap(),
+                c["resolution"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(resolutions.contains(&(ids[0].as_str(), "incompatible")));
+    assert!(resolutions.contains(&(ids[1].as_str(), "selected")));
     std::fs::remove_file(&plugin).unwrap();
     std::fs::write(&config, storage).unwrap();
     for ((id, unit), expected) in ids.iter().zip(["ms", "s"]).zip([1000.0, 1.0]) {
@@ -235,7 +249,7 @@ fn mixed_contracts_fail_and_selected_history_uses_its_saved_definition() {
 }
 
 #[test]
-fn unknown_contracts_require_explicit_and_homogeneous_legacy_selection() {
+fn records_without_a_known_definition_are_excluded_until_explicitly_interpreted() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");
     std::fs::create_dir_all(state.join("ledger")).unwrap();
@@ -257,7 +271,16 @@ fn unknown_contracts_require_explicit_and_homogeneous_legacy_selection() {
         .args(["report", "--kind", "prompt", "--format", "json"])
         .output()
         .unwrap();
-    assert_eq!(report.status.code(), Some(1));
+    assert!(report.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(value["kinds"][0]["groups"], serde_json::json!([]));
+    assert!(
+        value["kinds"][0]["contracts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["resolution"] == "undefined" && c["count"] == 1)
+    );
     for filter in [None, Some("metadata.schema_id=old-contract")] {
         let mut command = isolated(home.path());
         command.args([
@@ -303,6 +326,61 @@ fn unknown_contracts_require_explicit_and_homogeneous_legacy_selection() {
         .output()
         .unwrap();
     assert_eq!(mixed.status.code(), Some(1));
+}
+
+#[test]
+fn a_compatible_schema_change_answers_with_earlier_records() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let plugin = home.path().join("plugin.toml");
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "plugins=[{:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n",
+            plugin.to_string_lossy(),
+            state.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let kind = "[[kind]]\nname='team.deploy'\nfields={service={type='string',required=true},duration_s={type='number',unit='s'}}\ngroup_key='service'\nmeasures=['duration_s']\n";
+    std::fs::write(&plugin, kind).unwrap();
+    let emit = |duration: &str| {
+        let output = isolated(home.path())
+            .args(["emit", "team.deploy", "service=api", duration])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    emit("duration_s:=1");
+    emit("duration_s:=2");
+    std::fs::write(
+        &plugin,
+        kind.replace("unit='s'}", "unit='s'},outcome={type='string'}"),
+    )
+    .unwrap();
+    emit("duration_s:=4");
+    let output = isolated(home.path())
+        .args(["report", "--kind", "team.deploy", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let section = &value["kinds"][0];
+    assert_eq!(section["groups"][0]["count"], 3);
+    assert_eq!(section["groups"][0]["sums"][0]["sum"], 7.0);
+    let mut resolutions: Vec<_> = section["contracts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["resolution"].as_str().unwrap())
+        .collect();
+    resolutions.sort();
+    assert_eq!(resolutions, ["compatible", "selected"]);
 }
 
 #[test]

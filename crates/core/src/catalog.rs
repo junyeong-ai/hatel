@@ -1,8 +1,10 @@
-//! Immutable registered definitions kept beside SQLite records, including retired Kinds.
+//! Immutable registered definitions kept beside SQLite records, including retired Kinds, and the
+//! resolution of each stored contract against the definition a reader answers under.
 
-use crate::{Config, KindSpec, SinkKind, registry::KindSpecRaw};
+use crate::{Config, KindSpec, Registry, SinkKind, registry::KindSpecRaw};
 use rusqlite::{Connection, OpenFlags, Transaction};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS contracts (
     schema_id TEXT PRIMARY KEY, kind TEXT NOT NULL, definition TEXT NOT NULL
@@ -33,14 +35,7 @@ fn connection(cfg: &Config) -> crate::Result<Option<Connection>> {
         return Ok(None);
     }
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='contracts')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(io)?;
-    Ok(exists.then_some(conn))
+    Ok(has_catalog(&conn)?.then_some(conn))
 }
 
 pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
@@ -85,6 +80,108 @@ pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSp
         .ok_or_else(missing)?;
     let stored = decode(schema_id.into(), kind.into(), json)?;
     KindSpec::from_raw(stored.definition)
+}
+
+/// How records stamped with one contract identifier relate to the definition a reader answers
+/// under. Only `selected` and `compatible` records are read; the others are excluded and counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Resolution {
+    Selected,
+    Compatible,
+    Incompatible,
+    Undefined,
+}
+
+/// The contract identifiers one definition reads, resolved from every definition known for its
+/// Kind: itself and those stored beside the records.
+#[derive(Debug, Clone)]
+pub struct Contracts {
+    selected: String,
+    readable: BTreeSet<String>,
+    known: BTreeSet<String>,
+}
+
+impl Contracts {
+    fn new(spec: &KindSpec, stored: impl IntoIterator<Item = KindSpec>) -> Self {
+        let mut contracts = Self {
+            selected: spec.schema_id.clone(),
+            readable: BTreeSet::new(),
+            known: BTreeSet::new(),
+        };
+        for writer in std::iter::once(spec.clone()).chain(stored) {
+            if spec.reads(&writer) {
+                contracts.readable.insert(writer.schema_id.clone());
+            }
+            contracts.known.insert(writer.schema_id);
+        }
+        contracts
+    }
+
+    /// Resolve `spec` against the definitions stored in an open ledger, if it keeps them.
+    pub(crate) fn resolve(conn: &Connection, spec: &KindSpec) -> crate::Result<Self> {
+        if !has_catalog(conn)? {
+            return Ok(Self::new(spec, []));
+        }
+        let mut stmt = conn
+            .prepare("SELECT schema_id,definition FROM contracts WHERE kind=?1")
+            .map_err(io)?;
+        let stored = stmt
+            .query_map([&spec.name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map_err(io)?
+            .map(|row| {
+                let (schema_id, json) = row.map_err(io)?;
+                KindSpec::from_raw(decode(schema_id, spec.name.clone(), json)?.definition)
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+        Ok(Self::new(spec, stored))
+    }
+
+    /// Resolve every registered Kind against the configured store's definitions.
+    pub fn for_registry(cfg: &Config, reg: &Registry) -> crate::Result<BTreeMap<String, Self>> {
+        let mut stored: BTreeMap<String, Vec<KindSpec>> = BTreeMap::new();
+        for contract in self::stored(cfg)? {
+            stored
+                .entry(contract.definition.name.clone())
+                .or_default()
+                .push(KindSpec::from_raw(contract.definition)?);
+        }
+        Ok(reg
+            .kinds()
+            .map(|spec| {
+                let writers = stored.remove(&spec.name).unwrap_or_default();
+                (spec.name.clone(), Self::new(spec, writers))
+            })
+            .collect())
+    }
+
+    pub fn resolution(&self, schema_id: Option<&str>) -> Resolution {
+        match schema_id {
+            Some(id) if id == self.selected => Resolution::Selected,
+            Some(id) if self.readable.contains(id) => Resolution::Compatible,
+            Some(id) if self.known.contains(id) => Resolution::Incompatible,
+            _ => Resolution::Undefined,
+        }
+    }
+
+    pub fn reads(&self, schema_id: Option<&str>) -> bool {
+        schema_id.is_some_and(|id| self.readable.contains(id))
+    }
+
+    pub(crate) fn readable(&self) -> &BTreeSet<String> {
+        &self.readable
+    }
+}
+
+fn has_catalog(conn: &Connection) -> crate::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='contracts')",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(io)
 }
 
 fn decode(schema_id: String, kind: String, json: String) -> crate::Result<StoredContract> {

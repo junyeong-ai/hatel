@@ -2,9 +2,11 @@
 
 use hatel_core::{
     Envelope, ExportConfig, ExportTarget, Settings,
+    catalog::Contracts,
     outbox::{self, Outcome},
 };
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -79,6 +81,7 @@ fn body(logs: Vec<Value>) -> Vec<u8> {
 struct Policy {
     export: ExportConfig,
     registry: hatel_core::Registry,
+    contracts: BTreeMap<String, Contracts>,
 }
 
 impl Policy {
@@ -88,9 +91,9 @@ impl Policy {
         pending: &outbox::Pending,
         now: i64,
     ) -> Option<Outcome<'static>> {
-        if !self.schema_matches(&pending.record) {
+        if !self.reads(&pending.record) {
             Some(Outcome::Cancelled(
-                "record schema changed; explicit migration is required",
+                "record contract is incompatible with the current definition",
             ))
         } else if !target.allows_record(&pending.record) {
             Some(Outcome::Cancelled(
@@ -105,10 +108,10 @@ impl Policy {
         }
     }
 
-    fn schema_matches(&self, record: &Envelope) -> bool {
-        self.registry.kind(&record.kind).is_some_and(|spec| {
-            record.metadata.schema_id.as_deref() == Some(spec.schema_id.as_str())
-        })
+    fn reads(&self, record: &Envelope) -> bool {
+        self.contracts
+            .get(&record.kind)
+            .is_some_and(|contracts| contracts.reads(record.metadata.schema_id.as_deref()))
     }
 }
 
@@ -120,6 +123,7 @@ fn policy(path: &Path, state: &Path) -> Result<Policy, String> {
     }
     let registry = hatel_core::schema::build_registry(&cfg).map_err(|e| e.to_string())?;
     Ok(Policy {
+        contracts: Contracts::for_registry(&cfg, &registry).map_err(|e| e.to_string())?,
         registry,
         export: ExportConfig::from_settings(&settings).map_err(|e| e.to_string())?,
     })
@@ -700,6 +704,46 @@ mod tests {
         assert_eq!(
             outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
             "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_compatible_contract_change_keeps_pending_data_deliverable() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join("plugin.toml");
+        let kind = "[[kind]]\nname='team.deploy'\nfields={service={type='string',required=true}}\ngroup_key='service'\n";
+        std::fs::write(&plugin, kind).unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['team.deploy']\n",home.path().to_string_lossy())).unwrap();
+        let (cfg, _) =
+            hatel_core::Config::from_settings_in(&Settings::read(&path).unwrap(), &|_| None);
+        let registry = hatel_core::schema::build_registry(&cfg).unwrap();
+        let env = hatel_core::make_envelope(
+            "team.deploy",
+            [("service".into(), json!("api"))].into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        hatel_core::build_sink(&cfg, &registry)
+            .write_record(&env)
+            .unwrap();
+        std::fs::write(
+            &plugin,
+            kind.replace("required=true}}", "required=true},outcome={type='string'}}"),
+        )
+        .unwrap();
+        deliver(
+            &path,
+            home.path(),
+            "http://127.0.0.1:1",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
+            "pending"
         );
     }
 }
