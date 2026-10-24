@@ -134,8 +134,8 @@ Find the actual path with `hatel doctor --local --json`. Shared settings belong 
 `config.toml` (`$HATEL_CONFIG`, otherwise the platform's `hatel/config.toml`). Per-process
 storage or plugin overrides can split writers from readers and services.
 The store is one SQLite/WAL database (`telemetry.db`) in the state directory. A store at a
-schema this build did not create refuses writes and is never altered; `doctor --local` and
-`/healthz` report it. Restart the receiver after configuration changes. Do not restart a live
+schema this build did not create refuses reads and writes and is never altered; `doctor --local`
+and `/healthz` report it, and moving `telemetry.db` aside starts a new store. Restart the receiver after configuration changes. Do not restart a live
 service just to test an integration.
 
 Each destination is `[[export]]`. Native metrics only, with no logs or local Kinds:

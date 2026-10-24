@@ -68,7 +68,7 @@ pub(crate) fn read(path: &Path) -> crate::Result<Connection> {
 
 fn unsupported(version: i64) -> crate::Error {
     io(format!(
-        "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION})"
+        "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION}); move telemetry.db aside to start a new store"
     ))
 }
 

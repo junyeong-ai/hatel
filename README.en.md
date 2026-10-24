@@ -74,7 +74,7 @@ The ledger is one SQLite/WAL database, `telemetry.db`, in the state directory. R
 
 Hooks, CLI, MCP and receiver read the same configuration. Preserve existing plugin entries. A project script overriding `HATEL_PLUGINS` can hide other producers’ schemas. Restart the receiver after configuration changes. Before deletion it rereads retention and deletes nothing if that read fails.
 
-A store holding records at a schema this build did not create refuses writes and is never altered; `doctor --local` and `/healthz` report it. Offline backups preserve configuration, ledger, costs and session state together; use the [backup API](https://www.sqlite.org/backup.html) for live SQLite.
+A store holding records at a schema this build did not create refuses reads and writes and is never altered; `doctor --local` and `/healthz` report it. Move `telemetry.db` aside to start a new store. Offline backups preserve configuration, ledger, costs and session state together; use the [backup API](https://www.sqlite.org/backup.html) for live SQLite.
 
 | Variable | Purpose |
 |---|---|
