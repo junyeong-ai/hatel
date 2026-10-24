@@ -1,5 +1,5 @@
 //! The collector's own configuration file — `$HATEL_CONFIG`, else `<config-dir>/hatel/config.toml`.
-//! Distinct from the *state* dir (the ledger/db live there) and from Claude Code's
+//! Distinct from the *state* dir (the ledger database lives there) and from Claude Code's
 //! `settings.json` (which carries only the native `OTEL_*` block the agent reads at startup).
 //!
 //! Every section the file may hold is declared on one type. That is what lets
@@ -15,7 +15,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::MAX_RETENTION_DAYS;
-use crate::sink::SinkKind;
 use crate::{Error, Result};
 
 /// The parsed configuration file. An absent file is `default()` — running without one is the
@@ -50,8 +49,6 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Storage {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sink: Option<SinkKind>,
     /// As the file spells it; [`Settings::state_dir`] anchors it.
     #[serde(
         default,
@@ -276,7 +273,6 @@ mod tests {
     #[test]
     fn a_storage_value_that_names_no_usable_store_is_rejected() {
         for text in [
-            "sink = \"sqllite\"",
             "state_dir = \"\"",
             "state_dir = \"~/data\"",
             "state_dir = \"~you/data\"",
@@ -345,7 +341,7 @@ mod tests {
         // manage must come back byte-for-byte in meaning, or the write silently drops config.
         let original = Settings::parse(
             "plugins = [\"/p/a.toml\"]\n\
-             [storage]\nsink = \"sqlite\"\nstate_dir = \"/s\"\nretention_days = 30\nrotate_bytes = 1024\n\
+             [storage]\nstate_dir = \"/s\"\nretention_days = 30\nrotate_bytes = 1024\n\
              [[export]]\nendpoint = \"http://h:4318\"\nmode = \"enriched\"\ntimeout_ms = 900\n\
              [export.headers]\nauthorization = \"t\"\n",
             Path::new("/c/config.toml"),

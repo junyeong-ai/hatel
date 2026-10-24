@@ -168,16 +168,6 @@ pub fn states(path: &std::path::Path) -> crate::Result<Vec<DeliveryState>> {
     }
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(io)?;
-    let exists: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='deliveries')",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(io)?;
-    if !exists {
-        return Ok(Vec::new());
-    }
     let mut stmt = conn.prepare("SELECT destination,status,COUNT(*),SUM(size_bytes),MIN(created_at),last_error FROM deliveries GROUP BY destination,status,last_error ORDER BY destination,status,last_error").map_err(io)?;
     stmt.query_map([], |r| {
         Ok(DeliveryState {

@@ -7,7 +7,6 @@ mod doctor;
 mod export;
 mod init;
 mod mcp;
-mod migrate;
 mod receiver;
 mod serve;
 mod service;
@@ -170,18 +169,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Maintain a stopped SQLite store, or import JSONL and select SQLite in config.
-    Migrate {
-        /// Assert that hooks and receiver writing this ledger have been stopped.
-        #[arg(long, required_unless_present = "check")]
-        quiescent: bool,
-        /// Validate source records without changing storage or configuration.
-        #[arg(long)]
-        check: bool,
-        /// Print a structured result, including the phase on failure.
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -262,11 +249,6 @@ fn run() -> i32 {
         } => emit_cmd(&kind, fields, json, receipt, context),
         Command::EmitBatch => emit_batch_cmd(),
         Command::Deliveries { json } => deliveries_cmd(json),
-        Command::Migrate {
-            quiescent: _,
-            check,
-            json,
-        } => migrate::run(check, json),
     }
 }
 
@@ -405,7 +387,7 @@ fn emit_batch_cmd() -> i32 {
 
 pub(crate) fn delivery_value() -> Result<serde_json::Value, String> {
     let cfg = Config::load().map_err(|e| e.to_string())?;
-    hatel_core::outbox::states(&cfg.state_dir.join("telemetry.db"))
+    hatel_core::outbox::states(&cfg.database())
         .map_err(|e| e.to_string())
         .and_then(|states| serde_json::to_value(states).map_err(|e| e.to_string()))
 }
@@ -871,12 +853,24 @@ mod tests {
         }
     }
 
+    /// A record of a Kind no loaded schema declares, as one a removed plugin left behind.
+    fn store_unregistered(cfg: &Config, reg: &Registry, kind: &str) {
+        let env = hatel_core::Envelope {
+            ts: hatel_core::now_iso_utc(),
+            kind: kind.into(),
+            schema_version: hatel_core::SCHEMA_VERSION,
+            payload: Default::default(),
+            metadata: Default::default(),
+        };
+        hatel_core::SqliteSink::open(cfg.database(), reg)
+            .write_record(&env)
+            .unwrap();
+    }
+
     fn test_cfg(plugins: Vec<std::path::PathBuf>) -> TestConfig {
         let dir = tempfile::tempdir().unwrap();
         TestConfig {
             cfg: Config {
-                sink: hatel_core::SinkKind::Jsonl,
-                ledger_dir: dir.path().join("ledger"),
                 state_dir: dir.path().to_path_buf(),
                 plugins,
                 plugin_source: hatel_core::config::PluginSource::ConfigFile,
@@ -995,9 +989,8 @@ mod tests {
         // registered list alone sends whoever reads the error to `kinds`, which knows no more
         // than that list does — the loop closes only where the schema would be listed.
         let cfg = test_cfg(vec![]);
-        std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
-        std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
         let reg = build_registry(&cfg).unwrap();
+        store_unregistered(&cfg, &reg, "ci_check");
 
         let stored = unknown_kind("ci_check", &reg, &cfg);
         assert!(stored.contains("records in the ledger"), "got: {stored}");
@@ -1016,9 +1009,8 @@ mod tests {
         // `kinds` answers "what can I query"; a registry missing a schema the store has records
         // for would answer it as if the partial list were the whole one.
         let cfg = test_cfg(vec![]);
-        std::fs::create_dir_all(&cfg.ledger_dir).unwrap();
-        std::fs::write(cfg.ledger_dir.join("ci_check.jsonl"), "").unwrap();
         let reg = build_registry(&cfg).unwrap();
+        store_unregistered(&cfg, &reg, "ci_check");
 
         let value = kinds_value(&reg, &Inventory::inspect(&reg, &cfg));
         let names: Vec<&str> = value["kinds"]

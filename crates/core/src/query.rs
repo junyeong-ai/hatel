@@ -1,10 +1,10 @@
-//! One bounded-memory aggregation engine for the runtime ledger and legacy imports.
+//! The aggregation engine: every report section is answered by SQL over the ledger, so memory
+//! stays bounded however large the store grows.
 
 use crate::catalog::{Contracts, Resolution};
 use crate::report::{GroupAgg, Measure, Query};
-use crate::{Config, Envelope, KindSpec, SinkKind};
+use crate::{Config, KindSpec};
 use rusqlite::{Connection, functions::FunctionFlags, types::Value};
-use std::io::BufRead;
 
 fn io(e: impl std::fmt::Display) -> crate::Error {
     crate::Error::Io(e.to_string())
@@ -57,102 +57,19 @@ fn selector(field: &str) -> (&'static str, String) {
     }
 }
 
-fn connection(cfg: &Config, kind: &str) -> crate::Result<Connection> {
-    let conn = if cfg.sink == SinkKind::Sqlite {
-        let db = cfg.state_dir.join("telemetry.db");
-        if !db.exists() {
-            scratch()?
-        } else {
-            Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .map_err(io)?
-        }
+/// The ledger opened for reading, or an empty one when nothing has been written yet.
+fn connection(cfg: &Config) -> crate::Result<Connection> {
+    let db = cfg.database();
+    let conn = if db.exists() {
+        Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?
     } else {
-        let mut conn = scratch()?;
-        let tx = conn.transaction().map_err(io)?;
-        {
-            let mut insert = tx
-                .prepare(
-                    "INSERT INTO records (ts, kind, schema_version, payload, metadata,occurred_seconds,occurred_nanos) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                )
-                .map_err(io)?;
-            for (_, file) in
-                crate::rolling::open_snapshot(&cfg.ledger_dir, &format!("{kind}.jsonl"))
-                    .map_err(io)?
-            {
-                for line in std::io::BufReader::new(file).lines() {
-                    let line = line.map_err(io)?;
-                    let Some(env) = Envelope::from_json_line(&line) else {
-                        continue;
-                    };
-                    if env.kind != kind {
-                        continue;
-                    }
-                    let occurred = env
-                        .ts
-                        .parse::<jiff::Timestamp>()
-                        .ok()
-                        .map(crate::model::timestamp_parts);
-                    insert
-                        .execute(rusqlite::params![
-                            env.ts,
-                            env.kind,
-                            env.schema_version,
-                            serde_json::to_string(&env.payload).map_err(io)?,
-                            serde_json::to_string(&env.metadata).map_err(io)?,
-                            occurred.map(|t| t.0),
-                            occurred.map(|t| t.1)
-                        ])
-                        .map_err(io)?;
-                }
-            }
-        }
-        tx.commit().map_err(io)?;
-        conn
+        crate::sink::empty()?
     };
-    prepare_read(&conn)?;
-    Ok(conn)
-}
-
-pub(crate) fn prepare_read(conn: &Connection) -> crate::Result<()> {
-    crate::sink::check_database_version(conn)?;
+    crate::sink::check_version(&conn)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(io)?;
     conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")
         .map_err(io)?;
-    functions(conn).map_err(io)?;
-    let columns = conn
-        .prepare("PRAGMA table_info(records)")
-        .map_err(io)?
-        .query_map([], |r| r.get::<_, String>(1))
-        .map_err(io)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(io)?;
-    let metadata = if columns.iter().any(|c| c == "metadata") {
-        "metadata"
-    } else {
-        "'{}'"
-    };
-    let seconds = if columns.iter().any(|c| c == "occurred_seconds") {
-        "occurred_seconds"
-    } else {
-        "NULL"
-    };
-    let nanos = if columns.iter().any(|c| c == "occurred_nanos") {
-        "occurred_nanos"
-    } else {
-        "NULL"
-    };
-    conn.execute_batch(&format!("CREATE TEMP VIEW records_read AS
-        SELECT rowid AS sequence,ts,kind,schema_version,payload,{metadata} AS metadata,{seconds} AS occurred_seconds,{nanos} AS occurred_nanos FROM records WHERE {seconds} IS NOT NULL AND {nanos} IS NOT NULL
-        UNION ALL SELECT rowid,ts,kind,schema_version,payload,{metadata},hatel_epoch(ts),hatel_nanos(ts) FROM records WHERE {seconds} IS NOT NULL AND {nanos} IS NULL
-        UNION ALL SELECT rowid,ts,kind,schema_version,payload,{metadata},hatel_epoch(ts),hatel_nanos(ts) FROM records WHERE {seconds} IS NULL;")).map_err(io)?;
-    Ok(())
-}
-
-fn scratch() -> crate::Result<Connection> {
-    let conn = Connection::open("").map_err(io)?;
-    conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;
-        CREATE TABLE records (ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}',occurred_seconds INTEGER,occurred_nanos INTEGER);").map_err(io)?;
     functions(&conn).map_err(io)?;
     Ok(conn)
 }
@@ -220,7 +137,7 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
     use rusqlite::OptionalExtension;
-    let mut conn = connection(cfg, &spec.name)?;
+    let mut conn = connection(cfg)?;
     let transaction = conn.transaction().map_err(io)?;
     let contracts = Contracts::resolve(&transaction, spec)?;
     let selection = match q.contract {
@@ -243,7 +160,7 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
     ];
     let mut oldest_scope = scope(spec, &oldest, &mut oldest_args);
     oldest_scope.push(selection.condition(&mut oldest_args));
-    let retained_since=transaction.query_row(&format!("SELECT ts FROM records_read WHERE {} ORDER BY occurred_seconds,occurred_nanos,sequence LIMIT 1",oldest_scope.join(" AND ")),rusqlite::params_from_iter(oldest_args),|r|r.get(0)).optional().map_err(io)?;
+    let retained_since=transaction.query_row(&format!("SELECT ts FROM records WHERE {} ORDER BY occurred_seconds,occurred_nanos,rowid LIMIT 1",oldest_scope.join(" AND ")),rusqlite::params_from_iter(oldest_args),|r|r.get(0)).optional().map_err(io)?;
     let contracts = contract_counts(&transaction, spec, q, &selection)?;
     let groups = validate_selection(spec, &selection, &contracts)
         .and_then(|()| aggregate_connection(&transaction, spec, q, &selection));
@@ -308,7 +225,7 @@ fn contract_counts(
     if spec.mode == crate::registry::KindMode::Event {
         conditions.extend(filter_conditions(spec, q, &mut args));
     }
-    let mut stmt=conn.prepare(&format!("SELECT json_extract(metadata,'$.schema_id'),json_extract(metadata,'$.kind_version'),COUNT(*) FROM records_read WHERE {} GROUP BY 1,2 ORDER BY 1,2",conditions.join(" AND "))).map_err(io)?;
+    let mut stmt=conn.prepare(&format!("SELECT json_extract(metadata,'$.schema_id'),json_extract(metadata,'$.kind_version'),COUNT(*) FROM records WHERE {} GROUP BY 1,2 ORDER BY 1,2",conditions.join(" AND "))).map_err(io)?;
     stmt.query_map(rusqlite::params_from_iter(args), |r| {
         let schema_id: Option<String> = r.get(0)?;
         Ok(ContractCount {
@@ -397,7 +314,7 @@ fn aggregate_connection(
         }
     });
     let mut sql = format!(
-        "WITH scoped AS (SELECT sequence, ts,occurred_seconds,occurred_nanos, payload, metadata, {key} AS key {} FROM records_read WHERE {})",
+        "WITH scoped AS (SELECT rowid AS sequence, ts,occurred_seconds,occurred_nanos, payload, metadata, {key} AS key {} FROM records WHERE {})",
         identity
             .as_ref()
             .map(|i| format!(", {i} AS identity"))
@@ -568,41 +485,11 @@ fn aggregate_connection(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
     #[test]
-    fn normalized_time_queries_use_the_index_without_parsing_timestamps() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("telemetry.db");
-        let (conn, _) = crate::sink::upgrade_database(&path).unwrap();
-        conn.execute("INSERT INTO records(ts,kind,schema_version,payload,occurred_seconds,occurred_nanos) VALUES ('2026-01-01T00:00:00Z','prompt',1,'{}',1767225600,0)",[]).unwrap();
-        prepare_read(&conn).unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
-        for name in ["hatel_epoch", "hatel_nanos"] {
-            let calls = Arc::clone(&calls);
-            conn.create_scalar_function(
-                name,
-                1,
-                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-                move |_| {
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    Ok(0i64)
-                },
-            )
-            .unwrap();
-        }
-        let sql = "SELECT ts FROM records_read WHERE kind='prompt' AND occurred_seconds>=0 ORDER BY occurred_seconds,occurred_nanos,sequence LIMIT 1";
-        assert_eq!(
-            conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap(),
-            "2026-01-01T00:00:00Z"
-        );
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    fn window_queries_use_the_kind_and_time_index() {
+        let conn = crate::sink::empty().unwrap();
         let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .prepare("EXPLAIN QUERY PLAN SELECT ts FROM records WHERE kind='prompt' AND occurred_seconds>=0 ORDER BY occurred_seconds,occurred_nanos,rowid LIMIT 1")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
             .unwrap()

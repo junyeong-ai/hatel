@@ -197,9 +197,7 @@ fn build_report_for(local: bool) -> Report {
     report_invalid_variables(&mut storage, &invalid, &settings_env);
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
-    if cfg.sink == hatel_core::SinkKind::Sqlite
-        && let Err(error) = hatel_core::sink::write_readiness(&cfg.state_dir.join("telemetry.db"))
-    {
+    if let Err(error) = hatel_core::sink::write_readiness(&cfg.database()) {
         storage.fail(format!("SQLite is not ready for writes: {error}"));
     }
     if let Err(error) = hatel_core::cost::read_snapshot(&cfg.state_dir) {
@@ -218,7 +216,7 @@ fn build_report_for(local: bool) -> Report {
         sections.push(export);
     }
 
-    match hatel_core::outbox::states(&cfg.state_dir.join("telemetry.db")) {
+    match hatel_core::outbox::states(&cfg.database()) {
         Ok(states) if !states.is_empty() => {
             let mut deliveries = Section::new("deliveries", "durable local-record deliveries:");
             for state in states {
@@ -481,9 +479,7 @@ fn advise_dormant_bindings(
         }
     }
     for (kind, evs) in bound_kinds {
-        let active = hatel_core::sink::read_records(cfg, kind, Some(since))
-            .iter()
-            .any(|r| hatel_core::ts_epoch(&r.ts).is_some_and(|t| t >= since));
+        let active = hatel_core::sink::last_written(cfg, kind).is_some_and(|t| t >= since);
         if !active {
             sec.note(format!(
                 "{} → {kind}: wired, but no records in the last {DORMANT_WINDOW_DAYS}d — \
@@ -665,13 +661,9 @@ const DEFAULT_CONFIG_VAR: &str = "APPDATA";
 #[cfg(windows)]
 const DEFAULT_STATE_VAR: &str = "APPDATA";
 
-/// Which store: its backend and where it lives.
+/// Which store: where it lives.
 fn describe(store: &receiver::Store) -> String {
-    let sink = match store.sink {
-        hatel_core::SinkKind::Jsonl => "jsonl",
-        hatel_core::SinkKind::Sqlite => "sqlite",
-    };
-    format!("{sink} at {}", store.state_dir.display())
+    format!("the store at {}", store.state_dir.display())
 }
 
 /// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
@@ -1289,7 +1281,7 @@ mod tests {
     #[test]
     fn a_variable_set_to_a_value_it_cannot_read_is_named_where_it_is_set() {
         let here = hatel_core::config::invalid_variables(&|key: &str| {
-            (key == "HATEL_SINK").then(|| "sqllite".into())
+            (key == "HATEL_RETENTION_DAYS").then(|| "365d".into())
         });
         let hooks: cs::Env = [("HATEL_DISABLED".to_string(), ("true".to_string(), "user"))]
             .into_iter()
@@ -1298,11 +1290,9 @@ mod tests {
         report_invalid_variables(&mut sec, &here, &hooks);
         assert_eq!(sec.findings.len(), 2);
         assert!(sec.findings.iter().all(|f| f.status == Status::Fail));
-        assert!(
-            sec.findings[0]
-                .message
-                .starts_with(r#"HATEL_SINK="sqllite" in this process: must be jsonl or sqlite;"#)
-        );
+        assert!(sec.findings[0].message.starts_with(
+            r#"HATEL_RETENTION_DAYS="365d" in this process: must be a whole number of days"#
+        ));
         assert!(sec.findings[1].message.starts_with(
             r#"HATEL_DISABLED="true" in the user settings.json env: must be 1 or 0;"#
         ));
@@ -1321,7 +1311,7 @@ mod tests {
         let unset = |_: &str| None;
         assert!(notes(&unset, &cs::Env::new()).is_empty());
 
-        let shell = |key: &str| (key == "HATEL_SINK").then(|| "sqlite".into());
+        let shell = |key: &str| (key == "HATEL_RETENTION_DAYS").then(|| "30".into());
         let hooks: cs::Env = [
             (
                 "HATEL_STATE_DIR".to_string(),
@@ -1340,10 +1330,9 @@ mod tests {
         .collect();
         let found = notes(&shell, &hooks);
         assert_eq!(found.len(), 4);
-        assert!(
-            found[0]
-                .starts_with("HATEL_SINK replaces config.toml's [storage] value in this process")
-        );
+        assert!(found[0].starts_with(
+            "HATEL_RETENTION_DAYS replaces config.toml's [storage] value in this process"
+        ));
         assert!(found[1].starts_with("HATEL_STATE_DIR in the user settings.json env"));
         assert!(
             found[2]

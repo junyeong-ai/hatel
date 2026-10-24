@@ -151,13 +151,6 @@ pub(crate) fn startup() -> Result<Startup, String> {
     // A misconfigured export file is fatal (like a bad registry) — fail fast rather than silently
     // drop a destination the operator asked for. Never reached by the hook.
     let export = cfg.export.as_ref().map_err(Clone::clone)?.clone();
-    if cfg.sink != hatel_core::SinkKind::Sqlite
-        && export.targets.iter().any(|t| !t.kinds.is_empty())
-    {
-        return Err(
-            "custom delivery requires SQLite; migrate --quiescent after stopping writers".into(),
-        );
-    }
     Ok(Startup {
         cfg,
         registry,
@@ -250,11 +243,8 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
         );
         (Some(e), Some(h))
     };
-    let durable = if cfg.sink == hatel_core::SinkKind::Sqlite {
-        Settings::path().map(|path| crate::export::durable::spawn(path, cfg.state_dir.clone()))
-    } else {
-        None
-    };
+    let durable =
+        Settings::path().map(|path| crate::export::durable::spawn(path, cfg.state_dir.clone()));
     let state = AppState {
         ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_REQUESTS)),
         acc: Arc::new(Mutex::new(Accumulator::default())),
@@ -882,17 +872,11 @@ fn sweep(st: &AppState) {
 fn prune_ledger(cfg: &Config, retention: Retention) {
     let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
-        let unit = match cfg.sink {
-            hatel_core::SinkKind::Jsonl => "archived ledger file(s)",
-            hatel_core::SinkKind::Sqlite => "ledger row(s)",
-        };
         eprintln!(
-            "hatel: retention — removed {removed} {unit} older than {} days",
+            "hatel: retention — removed {removed} ledger row(s) older than {} days",
             cfg.retention_days
         );
     }
-    // The session index is sink-independent, so it is pruned on the same horizon regardless of
-    // which sink holds the records.
     let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(retention);
     if index_removed > 0 {
         eprintln!(
@@ -1068,9 +1052,7 @@ mod tests {
     /// A minimal receiver state over a scratch dir — just enough for the persist path.
     fn test_state(dir: &Path) -> AppState {
         let cfg = Config {
-            sink: hatel_core::SinkKind::Jsonl,
             state_dir: dir.to_path_buf(),
-            ledger_dir: dir.join("ledger"),
             plugins: vec![],
             plugin_source: hatel_core::config::PluginSource::ConfigFile,
             rotate_bytes: 10 * 1024 * 1024,

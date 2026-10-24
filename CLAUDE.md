@@ -30,12 +30,12 @@ and its CI check unless a deliberate compatibility change requires raising both.
 ## Layout
 
 - `crates/core` — async-free library: registry/schema (Kind definitions, `core.toml`),
-  settings (`config.toml`) and the resolved runtime config, SQLite/WAL ledger, JSONL compatibility/import, sessions,
+  settings (`config.toml`) and the resolved runtime config, SQLite/WAL ledger, sessions,
   cost snapshot, report aggregation and its render, PII. `claude/` owns lifecycle interpretation.
 - `crates/hook` — the hook binary; depends on core only, no async runtime (spawned on
   every lifecycle event — cold-start is a design constraint).
 - `crates/cli` — the `hatel` binary: `serve` (receiver), `report`, `init`, `service`,
-  `doctor`, `kinds`, `emit`, `emit-batch`, `deliveries`, `migrate`,
+  `doctor`, `kinds`, `emit`, `emit-batch`, `deliveries`,
   `mcp` (stdio MCP server via the official `rmcp` SDK).
 - `.claude/skills/hatel/SKILL.md` — the Claude Code skill; packaged into every release
   archive and installed by `scripts/install.sh`.
@@ -116,22 +116,18 @@ and its CI check unless a deliberate compatibility change requires raising both.
   missing durations or exit codes stay absent. It implies no defect, flakiness or saved time.
 - **Typed records and explicit missingness.** A Kind's field declarations own types, requiredness
   and units. Numbers are JSON numbers; invalid legacy values remain visible as `invalid_count`.
-  Reports aggregate inside SQLite with bounded caches, including when reading a legacy JSONL
-  store. A field's duration buckets are cumulative and use its declared `s` or `ms` unit.
+  Reports aggregate inside SQLite with bounded caches. A field's duration buckets are cumulative and use its declared `s` or `ms` unit.
 - **One registry and one store for the write and read paths.** Plugins and `[storage]` live in
   `config.toml`, which the hook, the service's receiver and `report` all read however each was
   started, so a Kind the hook can record is one `report` can read, in the store it reads;
-  `HATEL_PLUGINS` and the storage variables override them for a single process only. Fresh stores
-  default to SQLite; an existing JSONL ledger keeps its backend until `migrate --quiescent`
-  imports it and saves the selection. Quiescence includes MCP writers; Claude Code conversations
-  can stay open while their Hatel servers are stopped and reconnected through `/mcp` afterward.
-  SQLite physical schema changes and time backfills also require
-  explicit quiescent maintenance; hooks only initialize fresh stores. Preserve raw timestamps and
-  normalized seconds/nanoseconds; compatibility reads parse only rows without normalized time. Stop its writers first; the command holds the receiver
-  lock, preserves sources, and records an atomic import manifest so retries do not duplicate rows.
-  `migrate --check --json` is read-only and uses the importer’s validation. Keep configuration
-  edits stopped too; reject changed configuration before selecting the migrated store and
-  report committed storage separately from configuration selection so recovery is explicit. The receiver
+  `HATEL_PLUGINS` and the storage variables override them for a single process only. The ledger
+  is one SQLite database created at its current schema with raw timestamps beside normalized
+  seconds/nanoseconds. Hooks never convert data: a store at another schema version is refused
+  (`sink::write_readiness`), never altered. A future physical schema change ships with explicit
+  maintenance that runs while every writer — hooks, receiver and MCP servers (Claude Code
+  conversations can stay open and reconnect through `/mcp`) — is stopped. A fingerprint format
+  change re-stamps records from their stored definitions in that maintenance; the product never
+  keeps a decoder for an earlier format. The receiver
   reads the file when it starts, and again before it deletes anything, keeping the longer retention
   and deleting nothing while the file cannot be read. It reports that file and its store on
   `/healthz`; `doctor` names a receiver that reads another file or writes another store, and the

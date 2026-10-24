@@ -1,7 +1,7 @@
 //! Validated local recording shared by command-line and protocol clients.
 
 use crate::model::RecordContext;
-use crate::{Config, Payload, Registry, Sink, make_envelope};
+use crate::{Config, Payload, Registry, SqliteSink, make_envelope};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
@@ -31,7 +31,7 @@ pub enum RecordResult {
 pub struct Writer<'a> {
     config: &'a Config,
     registry: &'a Registry,
-    sink: Box<dyn Sink>,
+    sink: SqliteSink,
     project: Option<crate::ProjectRef>,
 }
 
@@ -53,15 +53,6 @@ impl<'a> Writer<'a> {
             return RecordResult::Rejected {
                 error: "recording is disabled".into(),
             };
-        }
-        if self.config.sink == crate::SinkKind::Jsonl
-            && self
-                .config
-                .export
-                .as_ref()
-                .is_ok_and(|e| e.targets.iter().any(|t| !t.kinds.is_empty()))
-        {
-            return RecordResult::Failed { error: "custom delivery requires SQLite; run migrate --quiescent after stopping writers".into() };
         }
         let Some(spec) = self.registry.kind(&input.kind) else {
             return RecordResult::Rejected {
@@ -95,11 +86,7 @@ impl<'a> Writer<'a> {
                 };
             }
         };
-        match self
-            .sink
-            .write_record(&env)
-            .and_then(|receipt| self.sink.flush().map(|()| receipt))
-        {
+        match self.sink.write_record(&env) {
             Ok(receipt) => RecordResult::Stored {
                 receipt: Receipt {
                     record_id: receipt.record_id,

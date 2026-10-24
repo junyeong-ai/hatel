@@ -118,7 +118,7 @@ impl Policy {
 fn policy(path: &Path, state: &Path) -> Result<Policy, String> {
     let settings = Settings::read(path).map_err(|e| e.to_string())?;
     let (cfg, invalid) = hatel_core::Config::from_settings(&settings);
-    if !invalid.is_empty() || cfg.state_dir != state || cfg.sink != hatel_core::SinkKind::Sqlite {
+    if !invalid.is_empty() || cfg.state_dir != state {
         return Err("running store differs from current configuration".into());
     }
     let registry = hatel_core::schema::build_registry(&cfg).map_err(|e| e.to_string())?;
@@ -411,7 +411,7 @@ mod tests {
 
     fn configure(home: &Path, endpoint: &str, extra: &str) -> (PathBuf, hatel_core::Config) {
         let path = home.join("config.toml");
-        std::fs::write(&path, format!("[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint={endpoint:?}\nmode='raw'\nsignals=[]\nkinds=['prompt']\n{extra}", home.to_string_lossy())).unwrap();
+        std::fs::write(&path, format!("[storage]\nstate_dir={:?}\n[[export]]\nendpoint={endpoint:?}\nmode='raw'\nsignals=[]\nkinds=['prompt']\n{extra}", home.to_string_lossy())).unwrap();
         let settings = Settings::read(&path).unwrap();
         let (cfg, invalid) = hatel_core::Config::from_settings_in(&settings, &|_| None);
         assert!(invalid.is_empty());
@@ -674,7 +674,7 @@ mod tests {
         )
         .unwrap();
         let path = home.path().join("config.toml");
-        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['secret']\n",home.path().to_string_lossy())).unwrap();
+        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['secret']\n",home.path().to_string_lossy())).unwrap();
         let settings = Settings::read(&path).unwrap();
         let (cfg, _) = hatel_core::Config::from_settings_in(&settings, &|_| None);
         let registry = hatel_core::schema::build_registry(&cfg).unwrap();
@@ -714,7 +714,7 @@ mod tests {
         let kind = "[[kind]]\nname='team.deploy'\nfields={service={type='string',required=true}}\ngroup_key='service'\n";
         std::fs::write(&plugin, kind).unwrap();
         let path = home.path().join("config.toml");
-        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['team.deploy']\n",home.path().to_string_lossy())).unwrap();
+        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['team.deploy']\n",home.path().to_string_lossy())).unwrap();
         let (cfg, _) =
             hatel_core::Config::from_settings_in(&Settings::read(&path).unwrap(), &|_| None);
         let registry = hatel_core::schema::build_registry(&cfg).unwrap();

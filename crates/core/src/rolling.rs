@@ -3,8 +3,7 @@
 //!
 //! Appends are one `write_all` of a full line through an `O_APPEND` descriptor — the kernel
 //! serializes same-file appends per write call, so concurrent processes interleave cleanly at the
-//! line level. Records are small and bounded (a `~150`-byte index line; an allow-list-bounded ledger
-//! record), so the write completes in a single syscall on a regular file — `PIPE_BUF` bounds atomic
+//! line level. Records are small and bounded (a `~150`-byte index line), so the write completes in a single syscall on a regular file — `PIPE_BUF` bounds atomic
 //! appends to PIPES, not to regular files, where a small write is not split. The only way to leave a
 //! partial line is a short write under disk-full/`EINTR`, which the reader drops as unparseable
 //! together with the record the next append joins onto it — an undercount, never a crash or a
@@ -12,13 +11,12 @@
 //! listing when a concurrent rotation or prune changes the matching set, so a rotation never drops
 //! a line from a read. Only archives are deleted, whole and by mtime, so the sweep also archives an
 //! active file once it holds a record past its rotation horizon — a log that stays small or stops
-//! being written would otherwise keep its first line forever. Both the per-Kind ledger and the
-//! session index are built on this one primitive.
+//! being written would otherwise keep its first line forever. The session index is built on this
+//! primitive.
 //!
-//! A base name is the active file's full name (e.g. `tool.jsonl` or `session_index.jsonl`); an
-//! archive is that name with a `.YYYYMMDD.<pid>[.N]` suffix. The active file is matched by exact
-//! name and an archive by that precise suffix, so the two are never confused — no name a Kind can
-//! produce collides with the archive form.
+//! A base name is the active file's full name (e.g. `session_index.jsonl`); an archive is that name
+//! with a `.YYYYMMDD.<pid>[.N]` suffix. The active file is matched by exact name and an archive by
+//! that precise suffix, so the two are never confused.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -34,10 +32,6 @@ use std::time::SystemTime;
 /// ends in its non-numeric extension).
 static ARCHIVE_SUFFIX: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\.\d{8}\.\d+(?:\.\d+)*$").unwrap());
-
-pub(crate) fn is_archive_name(name: &str) -> bool {
-    ARCHIVE_SUFFIX.is_match(name)
-}
 
 /// The base an archive belongs to: its name without the rotation suffix, or `None` for a name that
 /// is not an archive. A base ends in its non-numeric extension, so the suffix never reaches into it
@@ -149,17 +143,6 @@ fn text_lines(bytes: &[u8]) -> impl Iterator<Item = &str> {
         .filter_map(|line| std::str::from_utf8(line).ok())
 }
 
-/// The first parsable line of the active file and of every archive of `base`. A file is appended
-/// in time order, so its first line is its oldest record and the set is what a reader needs to
-/// know how far back the store reaches — without reading the store.
-pub fn first_parsed<R>(dir: &Path, base: &str, parse: impl Fn(&str) -> Option<R>) -> Vec<R> {
-    matching_files(dir, base)
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|path| first_record(&path, &parse))
-        .collect()
-}
-
 /// The first line of the file at `path` that `parse` accepts.
 fn first_record<R>(path: &Path, parse: impl Fn(&str) -> Option<R>) -> Option<R> {
     let file = fs::File::open(path).ok()?;
@@ -189,29 +172,6 @@ fn matching_files(dir: &Path, base: &str) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
-/// Open one stable file set before streaming. Renames after opening do not invalidate handles.
-pub(crate) fn open_snapshot(dir: &Path, base: &str) -> std::io::Result<Vec<(PathBuf, fs::File)>> {
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    for _ in 0..4 {
-        let before =
-            matching_files(dir, base).ok_or_else(|| std::io::Error::other("cannot list ledger"))?;
-        let opened: std::io::Result<Vec<_>> = before
-            .iter()
-            .map(|p| fs::File::open(p).map(|f| (p.clone(), f)))
-            .collect();
-        match opened {
-            Ok(files) if matching_files(dir, base).as_ref() == Some(&before) => return Ok(files),
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
-    }
-    Err(std::io::Error::other(
-        "ledger changed while opening; retry after writers settle",
-    ))
-}
-
 /// A cheap change signature over `base`'s files — `(file count, total bytes, newest mtime)` — for a
 /// reader that caches the folded contents and only re-reads when this changes. Total bytes strictly
 /// increases on append and falls on a prune, so it catches a change the 1-second mtime granularity
@@ -230,13 +190,6 @@ pub fn fingerprint(dir: &Path, base: &str) -> Option<(usize, u64, Option<SystemT
         }
     }
     Some((files.len(), total, newest))
-}
-
-/// Delete archives of *any* base in `dir` older than `cutoff_epoch` — for the ledger, which owns its
-/// directory and holds one rolling log per Kind, so a removed plugin's orphaned archives are swept
-/// too. The active file is never touched.
-pub fn prune_archives(dir: &Path, cutoff_epoch: i64) -> usize {
-    prune_matching(dir, cutoff_epoch, is_archive_name)
 }
 
 /// Delete archives of `base` specifically — for a rolling log that shares its directory with other
@@ -377,7 +330,7 @@ mod tests {
         let archives = std::fs::read_dir(dir.path())
             .unwrap()
             .flatten()
-            .filter(|e| is_archive_name(&e.file_name().to_string_lossy()))
+            .filter(|e| archive_base(&e.file_name().to_string_lossy()).is_some())
             .count();
         assert_eq!(archives, 1, "exactly one archive after one rotation");
     }
@@ -404,15 +357,22 @@ mod tests {
     #[test]
     fn the_active_file_is_never_matched_as_an_archive() {
         // Even a base whose own name contains digits and dots must not look like an archive.
-        assert!(!is_archive_name("session_index.jsonl"));
-        assert!(!is_archive_name("v2.jsonl"));
-        assert!(!is_archive_name("cost_snapshot.jsonl.12345.6.tmp")); // a temp file, not an archive
-        assert!(
-            !is_archive_name("tool.jsonl.20240101"),
+        assert_eq!(archive_base("session_index.jsonl"), None);
+        assert_eq!(archive_base("v2.jsonl"), None);
+        assert_eq!(archive_base("cost_snapshot.jsonl.12345.6.tmp"), None); // a temp file, not an archive
+        assert_eq!(
+            archive_base("tool.jsonl.20240101"),
+            None,
             "a bare date with no pid is not the rotation format"
         );
-        assert!(is_archive_name("session_index.jsonl.20260613.1071"));
-        assert!(is_archive_name("tool.jsonl.20260613.1071.2"));
+        assert_eq!(
+            archive_base("session_index.jsonl.20260613.1071"),
+            Some("session_index.jsonl")
+        );
+        assert_eq!(
+            archive_base("tool.jsonl.20260613.1071.2"),
+            Some("tool.jsonl")
+        );
     }
 
     #[test]
@@ -426,7 +386,7 @@ mod tests {
         let mut before = lines(dir.path(), "log.jsonl");
         before.sort();
         assert_eq!(before, vec!["a", "b", "c"]);
-        let removed = prune_archives(dir.path(), i64::MAX); // cutoff in the far future → all archives old
+        let removed = prune_archives_of(dir.path(), "log.jsonl", i64::MAX); // every archive is old
         assert_eq!(removed, 2, "both archives pruned, active kept");
         assert_eq!(
             lines(dir.path(), "log.jsonl"),

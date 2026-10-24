@@ -2,14 +2,13 @@
 //!
 //! Everything here is runtime-agnostic (no async, no HTTP) so the hook binary can
 //! link it without pulling in the receiver's async stack. The receiver (in the
-//! `cli` crate) reuses the same model, registry, sinks, and session index.
+//! `cli` crate) reuses the same model, registry, ledger, and session index.
 
 pub mod catalog;
 pub mod claude;
 pub mod config;
 pub mod cost;
 pub mod export;
-pub mod migration;
 pub mod model;
 pub mod outbox;
 pub mod pii;
@@ -34,7 +33,7 @@ pub use project::{ProjectRef, resolve_project};
 pub use registry::{FieldMap, HookBinding, KindSpec, Registry};
 pub use session::{SessionIndex, SessionIndexCache, SessionRow};
 pub use settings::Settings;
-pub use sink::{Sink, SinkKind, build_sink};
+pub use sink::{SqliteSink, build_sink};
 
 /// One error type for the whole core crate. The hook path is fail-open and never
 /// surfaces these to the caller; the registry/schema paths fail loud at startup.

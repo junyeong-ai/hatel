@@ -128,15 +128,10 @@ Detached best-effort producers cannot claim acknowledged storage or exactly-once
 Find the actual path with `hatel doctor --local --json`. Shared settings belong in
 `config.toml` (`$HATEL_CONFIG`, otherwise the platform's `hatel/config.toml`). Per-process
 storage or plugin overrides can split writers from readers and services.
-Fresh stores use SQLite/WAL; existing JSONL is retained until explicit migration.
-Use `hatel migrate --check --json` for a read-only preflight. Stop all writers and configuration
-edits before `hatel migrate --quiescent --json`; preserve sources and inspect `stage`,
-`operation_committed` and errors. A committed import with failed configuration selection can
-be retried with the original storage settings and unchanged sources; it does not duplicate records.
-Existing SQLite stores can also require this explicit physical schema maintenance before writing.
-`doctor --local` and `/healthz` report this state; compatibility reads remain available.
-Restart the receiver after configuration changes. Do not migrate or restart a live service
-just to test an integration.
+The ledger is one SQLite/WAL database (`telemetry.db`) in the state directory. A store at a
+schema this build did not create refuses writes and is never altered; `doctor --local` and
+`/healthz` report it. Restart the receiver after configuration changes. Do not restart a live
+service just to test an integration.
 
 Each destination is `[[export]]`. Native metrics only, with no logs or local Kinds:
 
@@ -154,7 +149,7 @@ is independent. Omitted `signals` means metrics+logs, omitted `kinds` means no l
 unresolved attribution fails closed for filtered targets. Duplicate endpoints are rejected.
 
 Native forwarding is best-effort and carries the full body without local payload redaction.
-Local record delivery requires SQLite and commits an outbox with the record. The receiver
+Local record delivery commits an outbox row with the record. The receiver
 retries the same ID under current policy, bounded by capacity, age, attempts and retention.
 Queue refusal does not undo local storage. Inspect `hatel deliveries --json`: grouped by
 destination/status/error reason. Failed delivery differs from failed storage; pre-send

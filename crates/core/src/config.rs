@@ -8,23 +8,19 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 use crate::settings::Settings;
-use crate::sink::SinkKind;
 use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub sink: SinkKind,
-    /// Root for sink-independent state (the session index, the sqlite db).
+    /// Root for all local state: the ledger database, the session index and the cost snapshot.
     pub state_dir: PathBuf,
-    /// Where the JSONL sink writes per-kind ledgers.
-    pub ledger_dir: PathBuf,
     /// Plugin schema files merged onto the core registry. Read from the configuration file so
     /// every command resolves the same Kinds — a registry that depended on a process's ambient
     /// environment would let the write path record Kinds the read path cannot see.
     pub plugins: Vec<PathBuf>,
     /// Where `plugins` came from, so a diagnostic can name the thing that would have to change.
     pub plugin_source: PluginSource,
-    /// JSONL ledger rotation threshold in bytes (high-volume collectors raise this).
+    /// Session index rotation threshold in bytes.
     pub rotate_bytes: u64,
     /// Retention horizon in days — see [`Config::retention`]. This does not establish
     /// collection coverage inside the horizon.
@@ -55,7 +51,7 @@ impl PluginSource {
     }
 }
 
-/// Default JSONL rotation threshold.
+/// Default session index rotation threshold.
 pub const DEFAULT_ROTATE_BYTES: u64 = 10 * 1024 * 1024;
 /// Default retention (≫ the default 30-day report window).
 pub const DEFAULT_RETENTION_DAYS: i64 = 90;
@@ -153,10 +149,6 @@ impl Config {
         } else {
             state_dir
         };
-        let ledger_dir = state_dir.join("ledger");
-        let sink = valid(env.sink(), &mut invalid)
-            .or(settings.storage.sink)
-            .unwrap_or_else(|| crate::sink::default_kind(&state_dir));
         // `HATEL_PLUGINS` replaces the file's list rather than adding to it, so a shell can pin a
         // registry exactly. An empty value is treated as unset — as `HATEL_CONFIG` is — so an
         // exported-but-blank variable cannot silently unregister every Kind. Split on the OS
@@ -180,9 +172,7 @@ impl Config {
         let disabled = valid(env.flag("HATEL_DISABLED"), &mut invalid).unwrap_or(false);
         let strict = valid(env.flag("HATEL_STRICT"), &mut invalid).unwrap_or(false);
         let cfg = Config {
-            sink,
             state_dir,
-            ledger_dir,
             plugins,
             plugin_source,
             rotate_bytes,
@@ -192,6 +182,11 @@ impl Config {
             export: crate::ExportConfig::from_settings(settings).map_err(|e| e.to_string()),
         };
         (cfg, invalid)
+    }
+
+    /// The ledger database every writer and reader of this configuration shares.
+    pub fn database(&self) -> PathBuf {
+        self.state_dir.join("telemetry.db")
     }
 
     /// The retention horizon as of `now_epoch`, one for every store. `retention_days` is capped at
@@ -312,10 +307,6 @@ impl Env<'_> {
         })
     }
 
-    fn sink(&self) -> std::result::Result<Option<SinkKind>, InvalidVariable> {
-        self.text("HATEL_SINK", "jsonl or sqlite", SinkKind::parse)
-    }
-
     /// A leading `~` is refused, as the configuration file's `state_dir` refuses it: a shell
     /// expands one before this process starts, so one that arrives here never will be.
     fn state_dir(&self) -> std::result::Result<Option<PathBuf>, InvalidVariable> {
@@ -348,7 +339,6 @@ impl Env<'_> {
 
     fn storage_overrides(&self) -> Vec<&'static str> {
         [
-            ("HATEL_SINK", self.sink().is_ok_and(|v| v.is_some())),
             (
                 "HATEL_STATE_DIR",
                 self.state_dir().is_ok_and(|v| v.is_some()),
@@ -401,13 +391,12 @@ mod tests {
 
     #[test]
     fn storage_comes_from_a_variable_then_the_file_then_the_default() {
-        let file = "[storage]\nsink = \"sqlite\"\nstate_dir = \"data\"\nretention_days = 30\nrotate_bytes = 1024";
+        let file = "[storage]\nstate_dir = \"data\"\nretention_days = 30\nrotate_bytes = 1024";
         let from_file = resolved(file, &[]);
-        assert_eq!(from_file.sink, SinkKind::Sqlite);
         assert_eq!(from_file.state_dir, Path::new("/home/u/.config/hatel/data"));
         assert_eq!(
-            from_file.ledger_dir,
-            Path::new("/home/u/.config/hatel/data/ledger")
+            from_file.database(),
+            Path::new("/home/u/.config/hatel/data/telemetry.db")
         );
         assert_eq!(from_file.retention_days, 30);
         assert_eq!(from_file.rotate_bytes, 1024);
@@ -420,13 +409,11 @@ mod tests {
             "/elsewhere"
         };
         let vars = [
-            ("HATEL_SINK", "jsonl"),
             ("HATEL_STATE_DIR", elsewhere),
             ("HATEL_RETENTION_DAYS", "7"),
             ("HATEL_ROTATE_BYTES", "2048"),
         ];
         let overridden = resolved(file, &vars);
-        assert_eq!(overridden.sink, SinkKind::Jsonl);
         assert_eq!(overridden.state_dir, Path::new(elsewhere));
         assert_eq!(
             resolved(file, &[("HATEL_STATE_DIR", "relative")]).state_dir,
@@ -437,11 +424,6 @@ mod tests {
         assert_eq!(overridden.rotate_bytes, 2048);
 
         let defaults = resolved("", &[]);
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            resolved("", &[("HATEL_STATE_DIR", dir.path().to_str().unwrap())]).sink,
-            SinkKind::Sqlite
-        );
         assert_eq!(defaults.state_dir, xdg_state_dir());
         assert_eq!(defaults.retention_days, DEFAULT_RETENTION_DAYS);
         assert_eq!(defaults.rotate_bytes, DEFAULT_ROTATE_BYTES);
@@ -452,7 +434,7 @@ mod tests {
         let vars: &[(&str, &str)] = &[
             ("HATEL_STATE_DIR", "/elsewhere"),
             ("HATEL_RETENTION_DAYS", "0"),
-            ("HATEL_SINK", ""),
+            ("HATEL_ROTATE_BYTES", ""),
         ];
         let lookup = |key: &str| {
             vars.iter()
@@ -467,19 +449,17 @@ mod tests {
 
     #[test]
     fn a_variable_set_to_a_value_it_cannot_read_is_named_and_leaves_the_file_in_force() {
-        let file = "[storage]\nsink = \"sqlite\"\nretention_days = 30\nrotate_bytes = 1024";
+        let file = "[storage]\nretention_days = 30\nrotate_bytes = 1024";
         for days in ["365d", "0", "100001"] {
             let (cfg, invalid) = resolution(
                 file,
                 &[
-                    ("HATEL_SINK", "sqllite"),
                     ("HATEL_STATE_DIR", "~/data"),
                     ("HATEL_RETENTION_DAYS", days),
                     ("HATEL_ROTATE_BYTES", "10MB"),
                     ("HATEL_DISABLED", "true"),
                 ],
             );
-            assert_eq!(cfg.sink, SinkKind::Sqlite);
             assert_eq!(cfg.state_dir, xdg_state_dir());
             assert_eq!(cfg.retention_days, 30);
             assert_eq!(cfg.rotate_bytes, 1024);
@@ -492,15 +472,14 @@ mod tests {
                     "HATEL_DISABLED",
                     "HATEL_RETENTION_DAYS",
                     "HATEL_ROTATE_BYTES",
-                    "HATEL_SINK",
                     "HATEL_STATE_DIR"
                 ]
             );
         }
-        let (_, invalid) = resolution("", &[("HATEL_SINK", "sqllite")]);
+        let (_, invalid) = resolution("", &[("HATEL_ROTATE_BYTES", "10MB")]);
         assert_eq!(
             invalid[0].to_string(),
-            r#"HATEL_SINK="sqllite": must be jsonl or sqlite"#
+            r#"HATEL_ROTATE_BYTES="10MB": must be a whole number of bytes above 0"#
         );
     }
 

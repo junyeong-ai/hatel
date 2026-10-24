@@ -1,7 +1,7 @@
 //! Immutable registered definitions kept beside SQLite records, including retired Kinds, and the
 //! resolution of each stored contract against the definition a reader answers under.
 
-use crate::{Config, KindSpec, Registry, SinkKind, registry::KindSpecRaw};
+use crate::{Config, KindSpec, Registry, registry::KindSpecRaw};
 use rusqlite::{Connection, OpenFlags, Transaction};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,15 +27,13 @@ pub struct StoredContract {
 }
 
 fn connection(cfg: &Config) -> crate::Result<Option<Connection>> {
-    if cfg.sink != SinkKind::Sqlite {
-        return Ok(None);
-    }
-    let path = cfg.state_dir.join("telemetry.db");
+    let path = cfg.database();
     if !path.try_exists().map_err(io)? {
         return Ok(None);
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
-    Ok(has_catalog(&conn)?.then_some(conn))
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map(Some)
+        .map_err(io)
 }
 
 pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
@@ -118,11 +116,8 @@ impl Contracts {
         contracts
     }
 
-    /// Resolve `spec` against the definitions stored in an open ledger, if it keeps them.
+    /// Resolve `spec` against the definitions stored in an open ledger.
     pub(crate) fn resolve(conn: &Connection, spec: &KindSpec) -> crate::Result<Self> {
-        if !has_catalog(conn)? {
-            return Ok(Self::new(spec, []));
-        }
         let mut stmt = conn
             .prepare("SELECT schema_id,definition FROM contracts WHERE kind=?1")
             .map_err(io)?;
@@ -173,15 +168,6 @@ impl Contracts {
     pub(crate) fn readable(&self) -> &BTreeSet<String> {
         &self.readable
     }
-}
-
-fn has_catalog(conn: &Connection) -> crate::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='contracts')",
-        [],
-        |r| r.get(0),
-    )
-    .map_err(io)
 }
 
 fn decode(schema_id: String, kind: String, json: String) -> crate::Result<StoredContract> {

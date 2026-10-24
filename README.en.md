@@ -66,36 +66,26 @@ Configuration is `$HATEL_CONFIG`, otherwise the platform’s `hatel/config.toml`
 plugins = ["schemas/team.toml"]
 
 [storage]
-sink = "sqlite"
 # state_dir = "/data/hatel"
 retention_days = 90
 ```
 
-Fresh stores default to SQLite/WAL. Existing JSONL ledgers keep their backend. Relative paths resolve against the configuration file; `~` is not expanded. Default state lives under the platform’s state directory in `hatel`.
+The ledger is one SQLite/WAL database, `telemetry.db`, in the state directory. Relative paths resolve against the configuration file; `~` is not expanded. Default state lives under the platform’s state directory in `hatel`.
 
 Hooks, CLI, MCP and receiver read the same configuration. Preserve existing plugin entries. A project script overriding `HATEL_PLUGINS` can hide other producers’ schemas. Restart the receiver after configuration changes. Before deletion it rereads retention and deletes nothing if that read fails.
 
-To migrate JSONL, stop the receiver and all hook and record writers first. Import preserves the source and commits an import manifest transactionally. The operator must ensure writers are stopped.
-
-```sh
-hatel migrate --check --json
-hatel migrate --quiescent --json
-```
-
-`--check` leaves ledgers and configuration unchanged while checking file/byte/record counts and contract summaries. Summaries allow up to 4096 contracts and fail explicitly beyond that limit. With active producers, results describe only the check observation. Stop configuration edits during migration too. On failure, inspect JSON `stage` and `operation_committed`. If records committed but saving configuration failed, retry with the same source and original storage settings without duplicating records. Preflight does not guarantee disk headroom. Offline backups preserve configuration, ledgers, costs and session state together; use the [backup API](https://www.sqlite.org/backup.html) for live SQLite.
-
-Use the same command for physical schema maintenance of existing SQLite stores. Time indexes preserve the original timestamp and nanosecond precision. Old stores remain readable but refuse writes until maintenance. Hooks never perform bulk conversion; `doctor --local` and `/healthz` report required maintenance.
+A store holding records at a schema this build did not create refuses writes and is never altered; `doctor --local` and `/healthz` report it. Offline backups preserve configuration, ledger, costs and session state together; use the [backup API](https://www.sqlite.org/backup.html) for live SQLite.
 
 | Variable | Purpose |
 |---|---|
 | `HATEL_CONFIG` | Select configuration file |
 | `HATEL_PLUGINS` | Replace plugins for one process; `:` on Unix, `;` on Windows |
-| `HATEL_SINK`, `HATEL_STATE_DIR`, `HATEL_RETENTION_DAYS`, `HATEL_ROTATE_BYTES` | Override the corresponding storage setting |
+| `HATEL_STATE_DIR`, `HATEL_RETENTION_DAYS`, `HATEL_ROTATE_BYTES` | Override the corresponding storage setting |
 | `HATEL_DISABLED=1` | Disable local recording |
 | `HATEL_STRICT=1` | Reject payload fields outside the allow-list |
 | `HATEL_TESTING=1` | Separate state under `_test/` |
 
-Storage overrides inherited only by hooks split the store from the service. Put shared settings in `config.toml`. Invalid settings and variable values are reported as errors. `rotate_bytes` limits JSONL segment size, not total disk usage. Retention runs in the receiver; a stopped receiver performs no automatic pruning.
+Storage overrides inherited only by hooks split the store from the service. Put shared settings in `config.toml`. Invalid settings and variable values are reported as errors. `rotate_bytes` limits session index segment size, not total disk usage. Retention runs in the receiver; a stopped receiver performs no automatic pruning.
 
 ## Query and interpret
 
@@ -203,7 +193,7 @@ Omitted `signals` means native metrics and logs; omitted `kinds` means no local 
 
 Native OTLP forwarding uses a best-effort memory queue. `raw` relays the body; `enriched` adds a project label to JSON. Native bodies do not pass through the local payload allow-list or hashing. If content capture is enabled upstream, that content may leave the machine.
 
-Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits or incompatible contract changes may prevent delivery. Lost acknowledgements can cause duplicate delivery. Migrate JSONL to SQLite before enabling custom delivery.
+Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits or incompatible contract changes may prevent delivery. Lost acknowledgements can cause duplicate delivery.
 
 ```sh
 hatel deliveries --json

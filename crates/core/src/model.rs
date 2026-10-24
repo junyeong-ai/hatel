@@ -1,4 +1,4 @@
-//! The telemetry envelope — one record on the wire / one JSONL line.
+//! The telemetry envelope — one stored record.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -13,14 +13,12 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// serialized line is deterministic.
 pub type Payload = BTreeMap<String, serde_json::Value>;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Envelope {
     pub ts: String,
     pub kind: String,
-    #[serde(rename = "_schema_version", default = "schema_v1")]
     pub schema_version: u32,
     pub payload: Payload,
-    #[serde(default)]
     pub metadata: RecordMetadata,
 }
 
@@ -75,12 +73,6 @@ impl Envelope {
     }
 }
 
-/// A line written by an older or foreign producer defaults to v1 rather than
-/// silently claiming the current version.
-fn schema_v1() -> u32 {
-    1
-}
-
 impl Envelope {
     /// Re-observing one event may change its observation time, never its meaning or attribution.
     pub(crate) fn same_record(&self, other: &Self) -> bool {
@@ -97,15 +89,6 @@ impl Envelope {
 
     pub fn to_json_line(&self) -> String {
         serde_json::to_string(self).unwrap_or_default()
-    }
-
-    /// Parse one JSONL line. A record stamped with a schema version newer than this
-    /// build understands is skipped rather than mis-interpreted — the version stamp is
-    /// load-bearing on read, so a future format bump degrades safely instead of
-    /// silently aggregating an incompatible shape.
-    pub fn from_json_line(line: &str) -> Option<Self> {
-        let env: Self = serde_json::from_str(line).ok()?;
-        (env.schema_version <= SCHEMA_VERSION).then_some(env)
     }
 }
 

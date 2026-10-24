@@ -132,7 +132,6 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hatel_core::Sink;
     use serde_json::json;
 
     fn event(attributes: serde_json::Value) -> Vec<u8> {

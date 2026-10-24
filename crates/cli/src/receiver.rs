@@ -11,7 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs as _};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use hatel_core::{Config, Settings, SinkKind};
+use hatel_core::{Config, Settings};
 use serde::{Deserialize, Serialize};
 
 pub const IDENTITY_PATH: &str = "/healthz";
@@ -54,12 +54,11 @@ pub struct Capabilities {
     pub traces: bool,
 }
 
-/// The settings that decide which records a store holds: where it is, which backend, and how long
-/// it keeps them. Two processes that differ in any of these read and write different data.
+/// The settings that decide which records a store holds: where it is and how long it keeps them.
+/// Two processes that differ in either read and write different data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Store {
     pub retention_days: i64,
-    pub sink: SinkKind,
     pub state_dir: PathBuf,
 }
 
@@ -67,7 +66,6 @@ impl Store {
     pub fn of(cfg: &Config) -> Self {
         Self {
             retention_days: cfg.retention_days,
-            sink: cfg.sink,
             state_dir: cfg.state_dir.clone(),
         }
     }
@@ -82,13 +80,9 @@ impl Identity {
             storage: Some(Store::of(cfg)),
             version: env!("CARGO_PKG_VERSION").to_string(),
             cost_error: None,
-            storage_error: (cfg.sink == SinkKind::Sqlite)
-                .then(|| {
-                    hatel_core::sink::write_readiness(&cfg.state_dir.join("telemetry.db"))
-                        .err()
-                        .map(|e| e.to_string())
-                })
-                .flatten(),
+            storage_error: hatel_core::sink::write_readiness(&cfg.database())
+                .err()
+                .map(|e| e.to_string()),
             capabilities: Some(Capabilities {
                 local_decode_protocol: "http/json".into(),
                 local_metric_types: vec!["sum".into(), "gauge".into()],

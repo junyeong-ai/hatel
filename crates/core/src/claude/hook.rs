@@ -1,6 +1,6 @@
 //! The hook entrypoint. Reads one Claude Code lifecycle event as stdin JSON, maps
-//! it to records through the registry's declarative bindings, and writes them via
-//! the active sink. It ALWAYS returns 0 — telemetry never blocks a tool call — and
+//! it to records through the registry's declarative bindings, and writes them to
+//! the ledger. It ALWAYS returns 0 — telemetry never blocks a tool call — and
 //! every failure degrades to a stderr notice (an honest gap, never a fabricated value).
 
 use crate::registry::Registry;
@@ -95,14 +95,11 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
             Err(e) => eprintln!("hatel hook: {e}"),
         }
     }
-    if let Err(e) = sink.flush() {
-        eprintln!("hatel hook: {e}");
-    }
 }
 
-/// The session → project join goes to the sink-independent index (not a Kind), so
-/// the receiver can attribute project-less OTel data regardless of the sink. Only the
-/// session start establishes it; that is all the receiver needs.
+/// The session → project join goes to the session index (not a Kind), so the receiver can
+/// attribute project-less OTel data. Only the session start establishes it; that is all the
+/// receiver needs.
 fn record_session(cfg: &Config, event_name: &str, session_id: &str, project: Option<&ProjectRef>) {
     // Every identified session start is recorded, with its project or without one. What the
     // receiver has to tell apart is a session that has no project from one whose start it has not

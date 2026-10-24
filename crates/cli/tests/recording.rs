@@ -17,138 +17,38 @@ fn isolated(home: &std::path::Path) -> Command {
 }
 
 #[test]
-#[cfg(unix)]
-fn migration_preflight_is_read_only_and_import_is_retryable_after_config_failure() {
-    let home = tempfile::tempdir().unwrap();
-    let state = home.path().join("state");
-    let ledger = state.join("ledger");
-    std::fs::create_dir_all(&ledger).unwrap();
-    let config = home.path().join("config.toml");
-    let config_text = format!(
-        "[storage]\nsink='jsonl'\nstate_dir={:?}\n",
-        state.to_string_lossy()
-    );
-    std::fs::write(&config, &config_text).unwrap();
-    let source = ledger.join("prompt.jsonl");
-    let row =
-        "{\"ts\":\"2026-01-01T09:00:00.000000001+09:00\",\"kind\":\"prompt\",\"payload\":{}}\n";
-    std::fs::write(&source, row).unwrap();
-    let check = isolated(home.path())
-        .args(["migrate", "--check", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "{}",
-        String::from_utf8_lossy(&check.stdout)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
-    assert_eq!(value["preflight"]["records"], 1);
-    assert_eq!(value["preflight"]["source_files"], 1);
-    assert_eq!(value["operation_committed"], false);
-    assert!(!state.join("telemetry.db").exists());
-    assert!(!state.join("serve.lock").exists());
-    assert_eq!(std::fs::read_to_string(&config).unwrap(), config_text);
-    assert_eq!(std::fs::read_to_string(&source).unwrap(), row);
-    assert_eq!(
-        isolated(home.path())
-            .arg("migrate")
-            .output()
-            .unwrap()
-            .status
-            .code(),
-        Some(2)
-    );
-
-    let mut command = isolated(home.path());
-    command.args(["migrate", "--quiescent", "--json"]);
-    // Keep the ledger writable while refusing the atomic configuration replacement.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
-    }
-    let first = command.output().unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    assert_eq!(first.status.code(), Some(1));
-    let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(value["stage"], "configuration_selection");
-    assert_eq!(value["operation_committed"], true);
-    assert_eq!(value["config_updated"], false);
-    assert_eq!(value["imported_records"], 1);
-    let retry = isolated(home.path())
-        .args(["migrate", "--quiescent", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        retry.status.success(),
-        "{}",
-        String::from_utf8_lossy(&retry.stdout)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
-    assert_eq!(value["imported_records"], 0);
-    assert_eq!(value["config_updated"], true);
-    assert_eq!(std::fs::read_to_string(&source).unwrap(), row);
-    let db = rusqlite::Connection::open(state.join("telemetry.db")).unwrap();
-    assert_eq!(
-        db.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0))
-            .unwrap(),
-        1
-    );
-}
-
-#[test]
-fn sqlite_cli_maintenance_is_reported_by_doctor_and_normalized_explicitly() {
+fn a_store_this_build_did_not_create_is_reported_and_left_unchanged() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");
     std::fs::create_dir(&state).unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        format!(
-            "[storage]\nsink='sqlite'\nstate_dir={:?}\n",
-            state.to_string_lossy()
-        ),
+        format!("[storage]\nstate_dir={:?}\n", state.to_string_lossy()),
     )
     .unwrap();
     let conn = rusqlite::Connection::open(state.join("telemetry.db")).unwrap();
     conn.execute_batch("CREATE TABLE records(ts TEXT NOT NULL,kind TEXT NOT NULL,schema_version INTEGER NOT NULL,payload TEXT NOT NULL); INSERT INTO records VALUES ('2026-01-01T00:00:00Z','prompt',1,'{}');").unwrap();
+    drop(conn);
     let doctor = isolated(home.path())
         .args(["doctor", "--local", "--json"])
         .output()
         .unwrap();
     assert_eq!(doctor.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&doctor.stdout).contains("migrate --quiescent"));
-    let check = isolated(home.path())
-        .args(["migrate", "--check", "--json"])
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("not one this build created"));
+    let emitted = isolated(home.path())
+        .args(["emit", "check", "name=lint", "outcome=passed"])
         .output()
         .unwrap();
-    assert!(check.status.success());
-    let result = isolated(home.path())
-        .args(["migrate", "--quiescent", "--json"])
-        .output()
+    assert_eq!(emitted.status.code(), Some(1));
+    let conn = rusqlite::Connection::open(state.join("telemetry.db")).unwrap();
+    let columns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('records')",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stdout)
-    );
-    let value: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-    assert_eq!(value["normalized_records"], 1);
-    assert_eq!(value["imported_records"], serde_json::Value::Null);
-    assert_eq!(value["config_updated"], false);
-    let doctor = isolated(home.path())
-        .args(["doctor", "--local", "--json"])
-        .output()
-        .unwrap();
-    assert!(
-        doctor.status.success(),
-        "{}",
-        String::from_utf8_lossy(&doctor.stdout)
-    );
+    assert_eq!(columns, 4, "a refused store is never altered");
 }
 
 #[test]
@@ -157,7 +57,7 @@ fn incompatible_contracts_are_excluded_and_selected_history_uses_its_saved_defin
     let plugin = home.path().join("plugin.toml");
     let config = home.path().join("config.toml");
     let storage = format!(
-        "[storage]\nsink='sqlite'\nstate_dir={:?}\n",
+        "[storage]\nstate_dir={:?}\n",
         home.path().join("state").to_string_lossy()
     );
     std::fs::write(
@@ -252,21 +152,30 @@ fn incompatible_contracts_are_excluded_and_selected_history_uses_its_saved_defin
 fn records_without_a_known_definition_are_excluded_until_explicitly_interpreted() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");
-    std::fs::create_dir_all(state.join("ledger")).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        format!(
-            "[storage]\nsink='jsonl'\nstate_dir={:?}\n",
-            state.to_string_lossy()
-        ),
+        format!("[storage]\nstate_dir={:?}\n", state.to_string_lossy()),
     )
     .unwrap();
-    let ts = hatel_core::now_iso_utc();
-    let legacy = serde_json::json!({"ts":ts,"kind":"prompt","payload":{"prompt_len":5}});
-    let mut old = legacy.clone();
-    old["metadata"] = serde_json::json!({"schema_id":"old-contract","kind_version":1});
-    let ledger = state.join("ledger/prompt.jsonl");
-    std::fs::write(&ledger, format!("{legacy}\n{old}\n")).unwrap();
+    let database = state.join("telemetry.db");
+    let registry = hatel_core::schema::load_core().unwrap();
+    drop(hatel_core::SqliteSink::open(database.clone(), &registry));
+    let insert = |metadata: serde_json::Value| {
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "INSERT INTO records VALUES (?1,'prompt',1,'{\"prompt_len\":5}',?2,?3,0)",
+                rusqlite::params![
+                    hatel_core::now_iso_utc(),
+                    metadata.to_string(),
+                    hatel_core::now_epoch()
+                ],
+            )
+            .unwrap();
+    };
+    insert(serde_json::json!({}));
+    insert(serde_json::json!({"schema_id":"old-contract","kind_version":1}));
     let report = isolated(home.path())
         .args(["report", "--kind", "prompt", "--format", "json"])
         .output()
@@ -305,12 +214,7 @@ fn records_without_a_known_definition_are_excluded_until_explicitly_interpreted(
         assert_eq!(value["kinds"][0]["contract"], "legacy");
         assert_eq!(value["kinds"][0]["groups"][0]["count"], 1);
     }
-    old["metadata"]["kind_version"] = 2.into();
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(ledger)
-        .unwrap();
-    writeln!(file, "{old}").unwrap();
+    insert(serde_json::json!({"schema_id":"old-contract","kind_version":2}));
     let mixed = isolated(home.path())
         .args([
             "report",
@@ -337,7 +241,7 @@ fn a_compatible_schema_change_answers_with_earlier_records() {
     std::fs::write(
         home.path().join("config.toml"),
         format!(
-            "plugins=[{:?}]\n[storage]\nsink='sqlite'\nstate_dir={:?}\n",
+            "plugins=[{:?}]\n[storage]\nstate_dir={:?}\n",
             plugin.to_string_lossy(),
             state.to_string_lossy()
         ),
@@ -390,10 +294,7 @@ fn read_errors_are_machine_visible_and_do_not_disable_independent_recording() {
     std::fs::create_dir(&state).unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        format!(
-            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
-            state.to_string_lossy()
-        ),
+        format!("[storage]\nstate_dir = {:?}\n", state.to_string_lossy()),
     )
     .unwrap();
     std::fs::write(state.join("telemetry.db"), "invalid database").unwrap();
@@ -442,10 +343,7 @@ fn the_cost_section_follows_top_and_states_its_totals() {
     std::fs::create_dir(&state).unwrap();
     std::fs::write(
         home.path().join("config.toml"),
-        format!(
-            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
-            state.to_string_lossy()
-        ),
+        format!("[storage]\nstate_dir = {:?}\n", state.to_string_lossy()),
     )
     .unwrap();
     let ts = hatel_core::now_iso_utc();
@@ -489,7 +387,7 @@ fn record_commands_reject_oversized_stdin_before_storing_records() {
     std::fs::write(
         home.path().join("config.toml"),
         format!(
-            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            "[storage]\nstate_dir = {:?}\n",
             home.path().join("state").to_string_lossy()
         ),
     )
@@ -527,7 +425,7 @@ fn batch_returns_each_storage_outcome_and_only_stored_rows_are_queryable() {
     std::fs::write(
         home.path().join("config.toml"),
         format!(
-            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            "[storage]\nstate_dir = {:?}\n",
             home.path().join("state").to_string_lossy()
         ),
     )
@@ -570,7 +468,7 @@ fn batch_returns_each_storage_outcome_and_only_stored_rows_are_queryable() {
     std::fs::write(
         home.path().join("config.toml"),
         format!(
-            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            "[storage]\nstate_dir = {:?}\n",
             home.path().join("occupied").to_string_lossy()
         ),
     )
@@ -611,7 +509,7 @@ async fn a_record_waits_without_a_receiver_and_delivery_resumes_after_restart() 
         axum::serve(listener, app).await.unwrap();
     });
     let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.toml"),format!("[storage]\nsink='sqlite'\nstate_dir={:?}\n[[export]]\nendpoint={endpoint:?}\nmode='raw'\nsignals=[]\nkinds=['prompt']\n",home.path().join("state").to_string_lossy())).unwrap();
+    std::fs::write(home.path().join("config.toml"),format!("[storage]\nstate_dir={:?}\n[[export]]\nendpoint={endpoint:?}\nmode='raw'\nsignals=[]\nkinds=['prompt']\n",home.path().join("state").to_string_lossy())).unwrap();
     for _ in 0..2 {
         let receipt = isolated(home.path())
             .args(["emit", "prompt", "--json", "{}", "--receipt"])
