@@ -40,6 +40,28 @@ fn a_store_this_build_did_not_create_is_reported_and_left_unchanged() {
         .output()
         .unwrap();
     assert_eq!(emitted.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&emitted.stderr)
+            .starts_with("emit: io error: SQLite schema 0 is not one this build created")
+    );
+    for args in [
+        vec!["report", "--format", "json"],
+        vec!["kinds", "--json"],
+        vec!["deliveries", "--json"],
+    ] {
+        let output = isolated(home.path()).args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            text.contains("not one this build created"),
+            "{args:?}: {text}"
+        );
+        assert!(!text.contains("no such table"), "{args:?}: {text}");
+    }
     let conn = rusqlite::Connection::open(state.join("telemetry.db")).unwrap();
     let columns: i64 = conn
         .query_row(
@@ -49,6 +71,34 @@ fn a_store_this_build_did_not_create_is_reported_and_left_unchanged() {
         )
         .unwrap();
     assert_eq!(columns, 4, "a refused store is never altered");
+}
+
+#[test]
+fn a_store_its_first_writer_has_not_initialized_reads_as_empty() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[storage]\nstate_dir={:?}\n", state.to_string_lossy()),
+    )
+    .unwrap();
+    std::fs::write(state.join("telemetry.db"), "").unwrap();
+    for args in [
+        vec!["report", "--format", "json"],
+        vec!["kinds", "--json"],
+        vec!["deliveries", "--json"],
+        vec!["doctor", "--local", "--json"],
+    ] {
+        let output = isolated(home.path()).args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

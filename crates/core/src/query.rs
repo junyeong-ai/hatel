@@ -57,15 +57,8 @@ fn selector(field: &str) -> (&'static str, String) {
     }
 }
 
-/// The ledger opened for reading, or an empty one when nothing has been written yet.
 fn connection(cfg: &Config) -> crate::Result<Connection> {
-    let db = cfg.database();
-    let conn = if db.exists() {
-        Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?
-    } else {
-        crate::sink::empty()?
-    };
-    crate::sink::check_version(&conn)?;
+    let conn = crate::sink::read(&cfg.database())?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(io)?;
     conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")

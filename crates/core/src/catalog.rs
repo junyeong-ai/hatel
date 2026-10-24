@@ -2,7 +2,7 @@
 //! resolution of each stored contract against the definition a reader answers under.
 
 use crate::{Config, KindSpec, Registry, registry::KindSpecRaw};
-use rusqlite::{Connection, OpenFlags, Transaction};
+use rusqlite::{Connection, Transaction};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -26,20 +26,8 @@ pub struct StoredContract {
     pub definition: KindSpecRaw,
 }
 
-fn connection(cfg: &Config) -> crate::Result<Option<Connection>> {
-    let path = cfg.database();
-    if !path.try_exists().map_err(io)? {
-        return Ok(None);
-    }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map(Some)
-        .map_err(io)
-}
-
 pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
-    let Some(conn) = connection(cfg)? else {
-        return Ok(Vec::new());
-    };
+    let conn = crate::sink::read(&cfg.database())?;
     let mut stmt = conn
         .prepare("SELECT schema_id,kind,definition FROM contracts ORDER BY kind,schema_id")
         .map_err(io)?;
@@ -66,7 +54,7 @@ pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSp
             "no stored definition for {kind} contract {schema_id}; load its exact schema explicitly"
         ))
     };
-    let conn = connection(cfg)?.ok_or_else(missing)?;
+    let conn = crate::sink::read(&cfg.database())?;
     let json: String = conn
         .query_row(
             "SELECT definition FROM contracts WHERE schema_id=?1 AND kind=?2",

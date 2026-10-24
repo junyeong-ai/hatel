@@ -41,17 +41,29 @@ pub fn build_sink(cfg: &Config, registry: &crate::Registry) -> SqliteSink {
     )
 }
 
-/// Whether a store this build can write: absent (created on first write) or at its schema.
+/// Whether a store this build can write: one [`read`] accepts, since the first write creates the
+/// schema in a store that has none.
 pub fn write_readiness(path: &Path) -> crate::Result<()> {
-    if !path.try_exists().map_err(io)? {
-        return Ok(());
+    read(path).map(drop)
+}
+
+/// The ledger opened read-only at this build's schema. A store without a records table — absent,
+/// or created and not yet initialized by its first writer — reads as the empty ledger, as a fresh
+/// file would; one holding records under another schema is refused with the error a write gets.
+pub(crate) fn read(path: &Path) -> crate::Result<Connection> {
+    if path.try_exists().map_err(io)? {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
+        let version = check_version(&conn)?;
+        if has_records(&conn)? {
+            return if version == DATABASE_VERSION {
+                Ok(conn)
+            } else {
+                Err(unsupported(version))
+            };
+        }
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
-    let version = check_version(&conn)?;
-    if has_records(&conn)? && version != DATABASE_VERSION {
-        return Err(unsupported(version));
-    }
-    Ok(())
+    empty()
 }
 
 fn unsupported(version: i64) -> crate::Error {
@@ -155,12 +167,8 @@ pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelop
 /// error, because "nothing was collected" and "nothing could be looked at" are the two answers a
 /// diagnostic must never confuse.
 pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
-    let path = cfg.database();
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
+    let conn = read(&cfg.database()).map_err(std::io::Error::other)?;
     let io = |e: rusqlite::Error| std::io::Error::other(e.to_string());
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
     let mut stmt = conn
         .prepare("SELECT DISTINCT kind FROM records ORDER BY kind")
         .map_err(io)?;
@@ -174,11 +182,7 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
 /// none or cannot say. How long a kind nothing writes any more is kept follows from it
 /// ([`Config::stored_until`]).
 pub fn last_written(cfg: &Config, kind: &str) -> Option<i64> {
-    let path = cfg.database();
-    if !path.exists() {
-        return None;
-    }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = read(&cfg.database()).ok()?;
     conn.query_row(
         "SELECT occurred_seconds FROM records WHERE kind=?1 ORDER BY occurred_seconds DESC LIMIT 1",
         [kind],
@@ -255,7 +259,7 @@ pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
 }
 
 pub struct SqliteSink {
-    conn: Result<Connection, String>,
+    conn: crate::Result<Connection>,
     targets: Vec<crate::ExportTarget>,
     registry: crate::Registry,
 }
@@ -263,7 +267,7 @@ pub struct SqliteSink {
 impl SqliteSink {
     pub fn open(path: PathBuf, registry: &crate::Registry) -> Self {
         Self {
-            conn: Self::init(&path).map_err(|e| e.to_string()),
+            conn: Self::init(&path),
             targets: Vec::new(),
             registry: registry.clone(),
         }
@@ -288,10 +292,7 @@ impl SqliteSink {
     }
 
     pub fn write_record(&mut self, env: &Envelope) -> crate::Result<WriteReceipt> {
-        let conn = self
-            .conn
-            .as_mut()
-            .map_err(|e| crate::Error::Io(e.clone()))?;
+        let conn = self.conn.as_mut().map_err(|e| e.clone())?;
         let payload =
             serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
         let occurred = env

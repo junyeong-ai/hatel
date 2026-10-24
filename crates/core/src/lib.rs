@@ -37,7 +37,7 @@ pub use sink::{SqliteSink, build_sink};
 
 /// One error type for the whole core crate. The hook path is fail-open and never
 /// surfaces these to the caller; the registry/schema paths fail loud at startup.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("invalid payload: {0}")]
     InvalidPayload(String),

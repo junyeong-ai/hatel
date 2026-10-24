@@ -101,7 +101,7 @@ group_key = "hook_name"
 measures = ["duration_ms", "num_hooks", "num_success", "num_blocking", "num_non_blocking_error", "num_cancelled"]
 
 # Native-OTel cost/tokens are a snapshot, not a hook event — they live in a
-# rewritten snapshot file (see cost.rs), not as a Kind in the append-only sink.
+# rewritten snapshot file (see cost.rs), not as a Kind in the ledger.
 
 # ── Hook bindings (event → kind, with declarative field maps) ──
 # `project` is injected by the hook from the cwd; it is never mapped here. `prompt_id` names the

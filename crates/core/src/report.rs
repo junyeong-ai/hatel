@@ -1,5 +1,4 @@
-//! Windowed aggregation over the configured storage backend (read via the sink abstraction),
-//! and the report model every output format renders.
+//! Windowed aggregation over the ledger, and the report model every output format renders.
 //!
 //! A Kind declares its data — an allow-list of fields, which of them are numeric measures, and
 //! which dimension and measure a report defaults to. A query asks a question of that data: over

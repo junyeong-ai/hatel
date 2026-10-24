@@ -115,9 +115,8 @@ impl FieldType {
     }
 }
 
-/// A Kind name is also a JSONL filename component, so it is restricted to a safe
-/// character set — no path separators, no whitespace — which makes traversal impossible.
-/// The restriction is what lets the JSONL sink recover a Kind name from a file name exactly.
+/// A Kind name is an identifier people and tools type and match exactly — `--kind`, report
+/// sections, exported event names — so it is ASCII letters, digits and `.` `_` `-` only.
 pub fn is_valid_kind_name(name: &str) -> bool {
     !name.is_empty()
         && name
