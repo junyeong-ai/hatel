@@ -130,9 +130,9 @@ enum Command {
         #[arg(long)]
         local: bool,
     },
-    /// Serve `report` / `kinds` / `doctor` / `emit` as typed MCP tools over stdio —
-    /// the programmatic surface for agents (`claude mcp add hatel -- hatel mcp`).
-    /// The read tools return exactly the JSON their CLI counterparts print.
+    /// Serve `report` / `kinds` / `doctor` / `deliveries` / `emit` / `emit_batch` as typed MCP
+    /// tools over stdio — the programmatic surface for agents (`claude mcp add hatel -- hatel mcp`).
+    /// Every tool returns exactly the JSON its CLI counterpart prints.
     Mcp,
     /// List the registered Kinds (core + plugins).
     Kinds {
@@ -274,7 +274,7 @@ fn end_quietly_on_closed_stdout() {}
 /// Why an emit was refused: `Registry` is an environment problem (the registry itself
 /// failed to load); `Rejected` is a caller problem (unknown Kind,
 /// malformed input, or — in strict mode — disallowed keys). The CLI maps them to exit
-/// codes 1 / 2, MCP to internal / invalid-params errors.
+/// codes 1 / 2; MCP returns either as an `isError` result the model can act on.
 pub(crate) enum EmitError {
     Registry(String),
     Rejected(String),

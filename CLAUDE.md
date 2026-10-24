@@ -67,12 +67,13 @@ and its CI check unless a deliberate compatibility change requires raising both.
   as delivery state; retention deletes delivery references and releases capacity with records.
   A Kind data-contract fingerprint accompanies each record; identity is part of it, query
   defaults are not. SQLite records and their validated definitions commit together in
-  `contracts`. Readers resolve each stored contract against the answered definition
-  (`KindSpec::reads`, `catalog::Contracts`): same name, version and mode, and every declared field
-  keeps its type, unit, redaction and requiredness. Compatible records answer with the selected
-  ones, and a pending delivery stays deliverable only under a definition that reads it. Incompatible records and records without a
-  known definition are excluded and counted per `resolution` in `KindSection.contracts`, never
-  reinterpreted. Historical query registries never record data.
+  `contracts`. Readers resolve each stored contract against the answering definition
+  (`KindSpec::reads`, `catalog::Contracts`): same name, version and mode; every field it declares
+  keeps its type, unit and redaction; every field it requires was required when written.
+  Compatible records answer with the selected ones, and a pending delivery stays deliverable only
+  under a definition that reads it. Incompatible records and records without a known definition
+  are excluded and counted per `resolution` in `KindSection.contracts`, never reinterpreted.
+  Historical query registries never record data.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.
@@ -83,8 +84,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   holding an egress batch back for. Collapsing those two states again silently restores
   a fabricated project, a saturated export park, or both.
 - **Fail-open at the lifecycle hook boundary** (a write error is a stderr note, never a blocked
-  tool call). CLI/MCP writes return a storage receipt or an explicit failure. **Fail-closed on egress privacy** (an unattributable batch is not forwarded
-  to a filtered destination).
+  tool call). CLI/MCP writes return a storage receipt or an explicit failure. **Fail-closed on
+  egress privacy** (an unattributable batch is not forwarded to a filtered destination).
 - `#[serde(deny_unknown_fields)]` on every config/schema surface — a misspelled key must
   fail loudly, never silently disable a feature. `config.toml` therefore has exactly one
   typed shape (`settings.rs`) covering every section: a second parser over the same file
@@ -101,7 +102,7 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **Snapshots describe state rather than repeated events.** A Kind with `mode = "snapshot"`
   requires a non-empty string `identity`. Reports select the latest occurrence per project and
   identity within the requested window, under every stored contract, before filtering or grouping;
-  an entity whose latest occurrence is under a contract the answered definition cannot read is
+  an entity whose latest occurrence is under a contract the answering definition cannot read is
   left out rather than shown in an older readable state. Equal occurrences use observation
   time; conflicting states tied on both times fail the section, as do readable records missing
   their identity or observation time. Event mode remains the default and
@@ -148,24 +149,25 @@ and its CI check unless a deliberate compatibility change requires raising both.
   check the move, and without it every installed unit reads as hand-edited.
 - **Machine outputs are one shape per question**: `--json`, `--format json` and receipts are
   one line of JSON with alphabetical keys (`machine_json`), and every MCP tool returns exactly
-  the JSON its CLI counterpart prints. Changing one means changing both (they share
-  the same functions — keep it that way). Every list a report cuts at `top_n` states its total. A missing group field is `key: null` (`—` in human
-  output); an empty string is `key: ""` (`(empty)`). An exact empty-value filter selects only
-  the latter. Keep that distinction in report explanations.
+  the JSON its CLI counterpart prints. Changing one means changing both (they share the same
+  functions — keep it that way). Every list a report cuts at `top_n` states its total. A missing
+  group field is `key: null` (`—` in human output); an empty string is `key: ""` (`(empty)`). An
+  exact empty-value filter selects only the latter. Keep that distinction in report explanations.
 - **Read failure is not an empty store.** Reports and Kind inventories carry `storage_error`;
   reports carry `cost_error` when the native baseline cannot be read. CLI exit status and MCP
   `isError` reflect those failures; invalid arguments and unreadable configuration are `isError`
-  tool results too, so a model can correct the call, never protocol errors. An unreadable cost baseline disables only its persistence
-  until repair and receiver restart; it must never be rewritten from an empty baseline.
+  tool results too, so a model can correct the call, never protocol errors. An unreadable cost
+  baseline disables only its persistence until repair and receiver restart; it must never be
+  rewritten from an empty baseline.
 - **Numbers need a measurement basis.** Read a measure with its valid/missing/invalid counts.
   Human reports distinguish no measurement from zero and show the measured fraction for partial
   sums. Native summaries count a metric only when `observed_metrics` explicitly names it; a
   legacy row has unknown coverage. Aggregate overflow is a section error. Native Claude metric
   dimensions keep scalar types distinct; compound dimensions are unsupported locally rather than
   converted to empty labels. Attribute keys are unique and known identifiers are strings.
-- **README samples are real output.** Human-facing CLI output is quoted verbatim in both
-  READMEs; changing output text means updating `README.md` and `README.en.md` together
-  (they are maintained line-for-line parallel, ko/en).
+- **The READMEs are one document in two languages.** `README.md` (ko) and `README.en.md` (en)
+  stay line-for-line parallel, and every command, flag and configuration key they show runs as
+  written; changing one means changing both.
 - `SKILL.md` frontmatter keeps a `version` field tracking the workspace version. It is not
   part of the official skill spec — it exists so an installed skill can be matched to its
   binaries — keep it when editing frontmatter, and bump it with `workspace.package.version`.

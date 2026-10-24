@@ -158,7 +158,7 @@ impl HatelMcp {
 
     #[tool(
         title = "Record one signal",
-        description = "Record one domain signal for a registered Kind — the programmatic path for project metrics that aren't derived from a Claude Code hook (a gate decision, a check rollup, a deploy outcome). The payload is allow-list-filtered and redacted like any other record; include attribution (e.g. `project`) as fields. Returns the storage receipt.",
+        description = "Record one domain signal for a registered Kind — the programmatic path for project metrics that aren't derived from a Claude Code hook (a gate decision, a check rollup, a deploy outcome). The payload is allow-list-filtered and redacted like any other record; `metadata.project` comes from the Git repository the server runs in. Returns the storage receipt.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
