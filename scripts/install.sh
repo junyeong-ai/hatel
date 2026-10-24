@@ -263,12 +263,12 @@ if [ "$MCP" = true ]; then
         rc=1
     fi
 else
-    echo "To give agents typed MCP tools (report / kinds / doctor / emit):"
+    echo "To give agents typed MCP tools (report / kinds / doctor / deliveries / emit / emit_batch):"
     echo "  claude mcp add hatel -- $BIN_DIR/hatel mcp     # or re-run with --mcp"
 fi
 
 echo
 echo "Claude Code sessions already open keep the MCP server (hatel mcp) they started with;"
-echo "restart them to use this build."
+echo "reconnect it with /mcp → hatel → Reconnect to use this build (the conversation stays open)."
 echo "Check the wiring anytime: hatel doctor"
 exit "$rc"
