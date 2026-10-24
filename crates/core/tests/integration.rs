@@ -1556,6 +1556,40 @@ fn a_fresh_start_carries_no_resume_cost_rather_than_a_zero() {
 }
 
 #[test]
+fn a_session_start_names_the_branch_its_tree_had_checked_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for head in [
+        "ref: refs/heads/feature/x\n",
+        "0123456789abcdef0123456789abcdef01234567\n",
+    ] {
+        std::fs::write(repo.join(".git").join("HEAD"), head).unwrap();
+        let mut start = serde_json::json!({
+            "hook_event_name": "SessionStart", "session_id": "S", "cwd": repo.to_str().unwrap(),
+            "source": "startup",
+        });
+        hatel_core::claude::hook::process_event(&mut start, &cfg, &reg);
+    }
+    let branches: Vec<_> = records_of(&cfg, "session")
+        .iter()
+        .map(|r| {
+            r.payload
+                .get("branch")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        branches,
+        [Some("feature/x".to_owned()), None],
+        "a detached HEAD leaves the branch absent"
+    );
+}
+
+#[test]
 fn an_entity_is_represented_by_its_earliest_record() {
     // An identity Kind reports each entity once, carrying that entity's earliest record — measures
     // included. Storage order does not supply that: the entity's earliest occurrence is written

@@ -1,7 +1,8 @@
 # Built-in, domain-agnostic telemetry schema. Plugins merge additional `[[kind]]`
 # and `[[binding]]` tables through the same loader (see schema.rs). Every field a
-# binding can write is present in the matching hook's documented stdin — no field
-# is ever fabricated.
+# binding can write is present in the matching hook's documented stdin, or is the
+# `git_branch` the hook reads from the session's working tree — no field is ever
+# fabricated.
 
 # Native OpenTelemetry signals the receiver folds (metrics) and counts (events).
 # Only metrics the live view surfaces are tracked — adding one here without a
@@ -60,11 +61,13 @@ identity = "agent_id"
 # One record per session start. A session starts more than once: `resume`, `fork`, `clear` and
 # `compact` each fire `SessionStart` again on an existing conversation, so the record counts starts
 # rather than sessions and carries no identity — a start has no identifier of its own. `source`
-# names what began it. Resume/fork can carry the estimated cost of writing the next request's
-# context to the cache; this is a forecast, not an amount to add to native-OTel spend.
+# names what began it, and `branch` the branch its working tree had checked out, absent on a
+# detached HEAD. A session's native cost rows give a branch's spend only as whole-session totals,
+# and a switch inside a session shows only at its next start. Resume/fork can carry the estimated cost of writing the next
+# request's context to the cache; this is a forecast, not an amount to add to native-OTel spend.
 [[kind]]
 name = "session"
-fields = { session_id = { type = "string" }, project = { type = "string" }, source = { type = "string" }, context_tokens = { type = "integer" }, since_last_response_s = { type = "number", unit = "s" }, estimated_cache_write_usd = { type = "number", unit = "USD" }, cache_likely_expired = { type = "boolean" } }
+fields = { session_id = { type = "string" }, project = { type = "string" }, source = { type = "string" }, branch = { type = "string" }, context_tokens = { type = "integer" }, since_last_response_s = { type = "number", unit = "s" }, estimated_cache_write_usd = { type = "number", unit = "USD" }, cache_likely_expired = { type = "boolean" } }
 group_key = "source"
 measures = ["estimated_cache_write_usd", "context_tokens"]
 
@@ -143,6 +146,7 @@ event = "SessionStart"
 kind = "session"
 map.session_id = { from = "session_id" }
 map.source = { from = "source" }
+map.branch = { from = "git_branch" }
 map.context_tokens = { from = "context_tokens" }
 map.since_last_response_s = { from = "seconds_since_last_response" }
 map.estimated_cache_write_usd = { from = "estimated_cache_write_usd" }

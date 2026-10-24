@@ -30,6 +30,7 @@ hatel report --kind check --group-by metadata.source --sort-by duration_s
 hatel report --kind claude.api_request --window 7d --group-by model --format json
 hatel report --kind memory --group-by file_path --format json
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
+hatel report --kind session --filter branch=main --group-by session_id --top 0 --format json
 hatel report --project "$PWD" --format json
 ```
 
@@ -71,6 +72,9 @@ Report interpretation:
 - Native `cost` is lifetime session totals selected by last activity, as `cost_basis`
   states. Use `claude.api_request` for occurrence-window request cost estimates.
   Neither is an invoice. `observed_metrics` absent means measurement coverage is unknown.
+- A `session` start records the branch its working tree had checked out. A branch's spend is the
+  `cost` rows of its sessions: whole-session totals, so a session that switched branches is not
+  apportioned. An absent branch means none was read (detached HEAD, reftable repository, no Git).
 - Session cache-write estimates forecast a later request; never add them to native costs.
   Never subtract active time from wall time to invent idle time or infer saved time/ROI.
 - Subagent labels can include internal agents. A missing memory-load announcement does

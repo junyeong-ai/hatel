@@ -126,11 +126,20 @@ fn anchored(path: &str, tree: Option<&Path>, home: Option<&Path>) -> String {
 
 /// Current git branch for `cwd`, read from the containing working tree's own `HEAD` (no
 /// subprocess), so a linked worktree reports the branch it is on rather than the main
-/// checkout's. `None` on a detached HEAD or outside a repo — never a guessed value.
+/// checkout's. `None` on a detached HEAD or outside a repo — never a guessed value. A reftable
+/// repository keeps its `HEAD` in the tables and leaves `refs/heads/.invalid` in the file for
+/// older tools; no ref component begins with a dot, so that file names no branch.
 pub fn git_branch(cwd: &str) -> Option<String> {
     let git_dir = git_dir(&git_root(Path::new(cwd))?)?;
     let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    Some(head.trim().strip_prefix("ref: refs/heads/")?.to_string())
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    if branch
+        .split('/')
+        .any(|component| component.starts_with('.'))
+    {
+        return None;
+    }
+    Some(branch.to_string())
 }
 
 /// The git directory serving the working tree at `root`: `.git` itself, or — where `.git` is a
@@ -338,6 +347,14 @@ mod tests {
         std::fs::write(repo.path().join(".git/HEAD"), "a1b2c3d4e5f6\n").unwrap(); // detached
         assert_eq!(git_branch(repo.path().to_str().unwrap()), None);
         assert_eq!(git_branch("/tmp/definitely-not-a-repo-xyz"), None);
+    }
+
+    #[test]
+    fn a_reftable_head_stub_names_no_branch() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(repo.path().join(".git/HEAD"), "ref: refs/heads/.invalid\n").unwrap();
+        assert_eq!(git_branch(repo.path().to_str().unwrap()), None);
     }
 
     #[test]

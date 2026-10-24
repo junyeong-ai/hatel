@@ -217,7 +217,7 @@ hatel deliveries --json
 
 저장소 귀속은 관찰한 훅의 세션 인덱스를 우선한다. 시작을 아직 보지 못했으면 명시적인 `vcs.repository.url.full`을 사용할 수 있다. 이는 브라우저 URL 기반 식별자이며 로컬 Git 경로와 자동 병합하지 않는다. 관찰된 저장소 밖 세션을 URL로 덮어쓰지 않는다.
 
-`cost`는 마지막 활동 시각으로 선택한 세션의 누적값이다(`cost_basis=session_lifetime_totals_selected_by_last_seen`). `--window 7d`가 지난 7일에 발생한 비용을 뜻하지 않는다. 기간 내 요청 비용은 `claude.api_request`를 조회한다. `observed_metrics`가 없는 이전 비용 행은 측정 근거를 알 수 없다. `session`의 캐시 쓰기 예상 비용은 별도의 예측이며 실제 비용에 더하지 않는다. 활동 시간과 벽시계 시간의 차이를 유휴 시간으로 계산하지 않는다.
+`cost`는 마지막 활동 시각으로 선택한 세션의 누적값이다(`cost_basis=session_lifetime_totals_selected_by_last_seen`). `--window 7d`가 지난 7일에 발생한 비용을 뜻하지 않는다. 기간 내 요청 비용은 `claude.api_request`를 조회한다. `observed_metrics`가 없는 이전 비용 행은 측정 근거를 알 수 없다. `session`의 캐시 쓰기 예상 비용은 별도의 예측이며 실제 비용에 더하지 않는다. 활동 시간과 벽시계 시간의 차이를 유휴 시간으로 계산하지 않는다. `session`의 시작 기록은 작업 트리가 그때 체크아웃한 브랜치를 담는다. `--kind session --filter branch=<name> --group-by session_id`로 그 브랜치에서 시작한 세션을 찾으면, 그 세션들의 `cost` 행이 브랜치의 비용을 세션 전체 누적값으로 보여 준다.
 
 `subagent`는 그룹별 `agent_id`를 세고 ID가 없으면 각 기록을 센다. 내부 에이전트도 이벤트를 만들 수 있어 이름만으로 사용자 생성 에이전트를 구분하지 않는다. `tool`의 기간은 호출이 반환될 때까지이며 백그라운드 작업 전체 시간일 수 없다. 메모리 로드 누락은 문서가 컨텍스트에 없었다는 증거가 아니다.
 
