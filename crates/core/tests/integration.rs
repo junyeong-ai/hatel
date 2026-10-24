@@ -237,7 +237,7 @@ fn contracts_survive_plugin_changes_and_commit_atomically_with_records() {
 
 #[test]
 fn contract_identity_changes_are_distinct_from_query_defaults() {
-    let schema = "name='sample'\nfields=['one','two']\ngroup_key='one'\nidentity='one'\n";
+    let schema = "name='sample'\nfields={ one = { type = 'any' }, two = { type = 'any' } }\ngroup_key='one'\nidentity='one'\n";
     let a = hatel_core::KindSpec::from_raw(toml::from_str(schema).unwrap()).unwrap();
     let b = hatel_core::KindSpec::from_raw(
         toml::from_str(&schema.replace("identity='one'", "identity='two'")).unwrap(),
@@ -320,7 +320,7 @@ fn bound_events_surfaces_an_out_of_vocabulary_binding() {
     let plugin = dir.path().join("oov.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname = \"team.pre\"\nfields = [\"session_id\"]\ngroup_key = \"session_id\"\n\
+        "[[kind]]\nname = \"team.pre\"\nfields = { session_id = { type = \"any\" } }\ngroup_key = \"session_id\"\n\
          [[binding]]\nevent = \"PreToolUse\"\nkind = \"team.pre\"\nmap.session_id = { from = \"session_id\" }\n",
     )
     .unwrap();
@@ -517,7 +517,7 @@ fn git_branch_is_injected_only_when_a_binding_uses_it() {
         r#"
 [[kind]]
 name = "work"
-fields = ["session_id", "project", "spec_slug"]
+fields = { session_id = { type = "any" }, project = { type = "any" }, spec_slug = { type = "any" } }
 group_key = "spec_slug"
 [[binding]]
 event = "SessionEnd"
@@ -872,7 +872,7 @@ fn binding_writing_a_non_allowlisted_field_is_rejected_at_build() {
     let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, spec = { type = \"any\" } }\ngroup_key=\"spec\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.typo={ from=\"session_id\" }\n",
     )
     .unwrap();
@@ -889,7 +889,7 @@ fn invalid_capture_regex_is_rejected_at_build() {
     let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, spec = { type = \"any\" } }\ngroup_key=\"spec\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\n\
          map.spec={ from=\"git_branch\", capture=\"([\" }\n",
     )
@@ -907,7 +907,7 @@ fn unsafe_kind_name_is_rejected() {
     let plugin = dir.path().join("bad.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"../escape\"\nfields=[\"a\"]\ngroup_key=\"a\"\n",
+        "[[kind]]\nname=\"../escape\"\nfields={ a = { type = \"any\" } }\ngroup_key=\"a\"\n",
     )
     .unwrap();
     let err = build_registry(&config_in(dir.path(), vec![plugin])).unwrap_err();
@@ -984,7 +984,7 @@ fn binding_mapping_project_is_rejected() {
     let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"project\"]\ngroup_key=\"session_id\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, project = { type = \"any\" } }\ngroup_key=\"session_id\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.project={ from=\"session_id\" }\n",
     )
     .unwrap();
@@ -1001,7 +1001,7 @@ fn field_map_with_two_transforms_is_rejected() {
     let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"n\"]\ngroup_key=\"session_id\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, n = { type = \"any\" } }\ngroup_key=\"session_id\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\n\
          map.session_id={ from=\"session_id\" }\nmap.n={ from=\"p\", len=true, basename=true }\n",
     )
@@ -1016,7 +1016,7 @@ fn field_map_transform_without_source_is_rejected() {
     let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"n\"]\ngroup_key=\"session_id\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, n = { type = \"any\" } }\ngroup_key=\"session_id\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\n\
          map.session_id={ from=\"session_id\" }\nmap.n={ len=true }\n",
     )
@@ -1031,7 +1031,7 @@ fn capture_regex_without_a_group_is_rejected() {
     let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\",\"spec\"]\ngroup_key=\"spec\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" }, spec = { type = \"any\" } }\ngroup_key=\"spec\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\n\
          map.spec={ from=\"git_branch\", capture=\"spec/.+\" }\n",
     )
@@ -1069,7 +1069,7 @@ fn duplicate_event_kind_binding_is_rejected() {
     let plugin = dir.path().join("p.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname=\"x\"\nfields=[\"session_id\"]\ngroup_key=\"session_id\"\n\
+        "[[kind]]\nname=\"x\"\nfields={ session_id = { type = \"any\" } }\ngroup_key=\"session_id\"\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.session_id={ from=\"session_id\" }\n\
          [[binding]]\nevent=\"SessionEnd\"\nkind=\"x\"\nmap.session_id={ from=\"session_id\" }\n",
     )
@@ -1457,11 +1457,21 @@ fn an_identity_is_scoped_to_the_group_it_is_counted_in() {
 
 #[test]
 fn an_identity_must_name_a_field_of_its_kind() {
-    use hatel_core::registry::{KindSpec, KindSpecRaw};
+    use hatel_core::registry::{FieldSpec, FieldType, KindSpec, KindSpecRaw};
+    let field = |field_type| FieldSpec {
+        field_type,
+        required: false,
+        unit: None,
+    };
     let raw = |identity: Option<&str>| KindSpecRaw {
         name: "k".into(),
         mode: Default::default(),
-        fields: vec!["id".into(), "label".into(), "ms".into()].into(),
+        fields: [
+            ("id".to_string(), field(FieldType::Any)),
+            ("label".to_string(), field(FieldType::Any)),
+            ("ms".to_string(), field(FieldType::Number)),
+        ]
+        .into(),
         version: 1,
         group_key: "label".into(),
         redact: vec![],
@@ -1557,7 +1567,7 @@ fn an_entity_is_represented_by_its_earliest_record() {
         r#"
 [[kind]]
 name = "ord.job"
-fields = ["job_id", "stage", "ms"]
+fields = { job_id = { type = "any" }, stage = { type = "any" }, ms = { type = "number" } }
 group_key = "stage"
 identity = "job_id"
 measures = ["ms"]
@@ -2441,7 +2451,7 @@ fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_lega
     let plugin = dir.path().join("private.toml");
     std::fs::write(
         &plugin,
-        "[[kind]]\nname='private'\nfields=['project']\ngroup_key='project'\nredact=['project']\n",
+        "[[kind]]\nname='private'\nfields={ project = { type = 'any' } }\ngroup_key='project'\nredact=['project']\n",
     )
     .unwrap();
     let cfg = config_in(dir.path(), vec![plugin]);

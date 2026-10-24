@@ -597,7 +597,7 @@ fn a_redacted_payload_project_does_not_change_the_canonical_metadata_filter() {
     );
     std::fs::write(
         home.path().join("plugin.toml"),
-        "[[kind]]\nname='private'\nfields=['project']\ngroup_key='project'\nredact=['project']\n",
+        "[[kind]]\nname='private'\nfields={ project = { type = 'any' } }\ngroup_key='project'\nredact=['project']\n",
     )
     .unwrap();
     std::fs::write(

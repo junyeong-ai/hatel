@@ -126,7 +126,7 @@ measures = ["duration_s"]
 redact = ["actor"]
 ```
 
-Field types are `string`, `number`, `integer`, `boolean`, `array`, `object` and `any`, with optional requiredness and units. Legacy string-array `fields` remains supported; prefer explicit types for new contracts. Invalid types and missing required fields are rejected before storage. Unknown configuration and schema keys are rejected. Unknown payload fields are dropped with a warning by default, or rejected in strict mode.
+Field types are `string`, `number`, `integer`, `boolean`, `array`, `object` and `any`, with optional requiredness and units. Invalid types and missing required fields are rejected before storage. Unknown configuration and schema keys are rejected. Unknown payload fields are dropped with a warning by default, or rejected in strict mode.
 
 ```sh
 hatel emit team.deploy service=api outcome=passed duration_s:=3.2 --receipt

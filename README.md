@@ -126,7 +126,7 @@ measures = ["duration_s"]
 redact = ["actor"]
 ```
 
-형식은 `string`, `number`, `integer`, `boolean`, `array`, `object`, `any`이며 필수 여부와 단위를 선언할 수 있다. 기존 문자열 배열형 `fields`도 허용하지만 새 계약은 타입을 명시하는 편이 좋다. 잘못된 타입·필수 필드 누락은 저장 전에 거절한다. 알 수 없는 설정·스키마 키도 거절한다. 알 수 없는 페이로드 필드는 기본적으로 경고 후 제거하며 strict 모드에서는 거절한다.
+형식은 `string`, `number`, `integer`, `boolean`, `array`, `object`, `any`이며 필수 여부와 단위를 선언할 수 있다. 잘못된 타입·필수 필드 누락은 저장 전에 거절한다. 알 수 없는 설정·스키마 키도 거절한다. 알 수 없는 페이로드 필드는 기본적으로 경고 후 제거하며 strict 모드에서는 거절한다.
 
 ```sh
 hatel emit team.deploy service=api outcome=passed duration_s:=3.2 --receipt

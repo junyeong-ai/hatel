@@ -4,7 +4,8 @@
 # A custom Kind is filled by one of two paths, chosen by where the signal originates:
 #   • a signal the Claude Code lifecycle can observe → a hook binding (zero code);
 #   • a signal only your own tooling knows → `hatel emit`.
-# The allow-list, redaction, group_key, and measures apply to either path.
+# `fields` is the allow-list with each field's type; it, redaction, group_key and measures
+# apply to either path.
 
 # emit-based: a project-origin signal (a CI check rollup). It is not a Claude Code
 # event, so your CI records it with `emit`. `measures` are numeric fields a report
@@ -12,7 +13,7 @@
 # `redact` hashes the actor before it is stored.
 [[kind]]
 name = "ci_check"
-fields = ["check", "date", "project", "runs", "failures", "actor"]
+fields = { check = { type = "string", required = true }, date = { type = "string" }, project = { type = "string" }, runs = { type = "integer" }, failures = { type = "integer" }, actor = { type = "string" } }
 group_key = "check"
 measures = ["runs", "failures"]
 redact = ["actor"]
@@ -21,7 +22,7 @@ redact = ["actor"]
 # only because this binding maps from it (a `spec/<slug>` branch → the slug).
 [[kind]]
 name = "branch_work"
-fields = ["session_id", "project", "spec"]
+fields = { session_id = { type = "string" }, project = { type = "string" }, spec = { type = "string" } }
 group_key = "spec"
 
 [[binding]]

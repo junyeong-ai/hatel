@@ -1874,13 +1874,21 @@ mod tests {
 
     #[test]
     fn unwireable_flags_only_out_of_vocabulary_bound_events() {
-        use hatel_core::registry::{HookBinding, KindSpec, KindSpecRaw};
+        use hatel_core::registry::{FieldSpec, FieldType, HookBinding, KindSpec, KindSpecRaw};
         let mut reg = hatel_core::Registry::new();
         reg.add_kind(
             KindSpec::from_raw(KindSpecRaw {
                 name: "x".into(),
                 mode: Default::default(),
-                fields: vec!["session_id".into()].into(),
+                fields: [(
+                    "session_id".to_string(),
+                    FieldSpec {
+                        field_type: FieldType::String,
+                        required: false,
+                        unit: None,
+                    },
+                )]
+                .into(),
                 version: 1,
                 group_key: "session_id".into(),
                 redact: vec![],

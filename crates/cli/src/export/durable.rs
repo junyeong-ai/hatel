@@ -670,7 +670,7 @@ mod tests {
         let plugin = home.path().join("plugin.toml");
         std::fs::write(
             &plugin,
-            "[[kind]]\nname='secret'\nfields=['label','secret']\ngroup_key='label'\n",
+            "[[kind]]\nname='secret'\nfields={ label = { type = 'any' }, secret = { type = 'any' } }\ngroup_key='label'\n",
         )
         .unwrap();
         let path = home.path().join("config.toml");
@@ -692,7 +692,7 @@ mod tests {
         hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
             .write_record(&env)
             .unwrap();
-        std::fs::write(&plugin,"[[kind]]\nname='secret'\nfields=['label','secret']\ngroup_key='label'\nredact=['secret']\n").unwrap();
+        std::fs::write(&plugin,"[[kind]]\nname='secret'\nfields={ label = { type = 'any' }, secret = { type = 'any' } }\ngroup_key='label'\nredact=['secret']\n").unwrap();
         deliver(
             &path,
             home.path(),

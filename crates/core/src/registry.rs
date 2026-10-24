@@ -62,7 +62,7 @@ pub struct KindSpecRaw {
     pub name: String,
     #[serde(default)]
     pub mode: KindMode,
-    pub fields: Fields,
+    pub fields: BTreeMap<String, FieldSpec>,
     #[serde(default = "default_version")]
     pub version: u32,
     pub group_key: String,
@@ -101,19 +101,6 @@ pub struct FieldSpec {
     pub unit: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(untagged)]
-pub enum Fields {
-    Names(Vec<String>),
-    Typed(BTreeMap<String, FieldSpec>),
-}
-
-impl From<Vec<String>> for Fields {
-    fn from(names: Vec<String>) -> Self {
-        Self::Names(names)
-    }
-}
-
 impl FieldType {
     pub fn accepts(&self, value: &serde_json::Value) -> bool {
         match self {
@@ -144,27 +131,7 @@ impl KindSpec {
     }
 
     pub fn from_raw(raw: KindSpecRaw) -> Result<KindSpec> {
-        let field_specs = match raw.fields {
-            Fields::Typed(fields) => fields,
-            Fields::Names(names) => names
-                .into_iter()
-                .map(|name| {
-                    let field_type = if raw.measures.contains(&name) {
-                        FieldType::Number
-                    } else {
-                        FieldType::Any
-                    };
-                    (
-                        name,
-                        FieldSpec {
-                            field_type,
-                            required: false,
-                            unit: None,
-                        },
-                    )
-                })
-                .collect(),
-        };
+        let field_specs = raw.fields;
         let fields: BTreeSet<String> = field_specs.keys().cloned().collect();
         let invalid = |reason: String| Error::InvalidSpec {
             name: raw.name.clone(),
@@ -251,7 +218,7 @@ impl KindSpec {
         KindSpecRaw {
             name: self.name.clone(),
             mode: self.mode,
-            fields: Fields::Typed(self.field_specs.clone()),
+            fields: self.field_specs.clone(),
             version: self.version,
             group_key: self.group_key.clone(),
             redact: self.redact.iter().cloned().collect(),
@@ -705,8 +672,10 @@ mod tests {
         let mut reg = Registry::new();
         reg.add_kind(
             KindSpec::from_raw(
-                toml::from_str("name = \"k\"\nfields = [\"thing\"]\ngroup_key = \"thing\"")
-                    .unwrap(),
+                toml::from_str(
+                    "name = \"k\"\nfields = { thing = { type = \"any\" } }\ngroup_key = \"thing\"",
+                )
+                .unwrap(),
             )
             .unwrap(),
         )
