@@ -100,10 +100,11 @@ and its CI check unless a deliberate compatibility change requires raising both.
   `session_id`, so keying on it would erase every resume and the cache spend each one pays.
 - **Snapshots describe state rather than repeated events.** A Kind with `mode = "snapshot"`
   requires a non-empty string `identity`. Reports select the latest occurrence per project and
-  identity within the requested window before filtering or grouping. Equal occurrences use observation
-  time; conflicting states tied on both times fail the section, as do missing retained identities
-  or observation times. Legacy records without observation time cannot be reinterpreted as snapshots.
-  Event mode remains the default and
+  identity within the requested window, under every stored contract, before filtering or grouping;
+  an entity whose latest occurrence is under a contract the answered definition cannot read is
+  left out rather than shown in an older readable state. Equal occurrences use observation
+  time; conflicting states tied on both times fail the section, as do readable records missing
+  their identity or observation time. Event mode remains the default and
   its identity selects the earliest matching record per group. An unchanged entity outside the
   window is absent, so a rolling snapshot report is not a complete current inventory.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,

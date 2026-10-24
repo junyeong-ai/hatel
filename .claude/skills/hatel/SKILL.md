@@ -59,9 +59,10 @@ Report interpretation:
   `unreadable_kinds` means some stored records have no loaded schema.
 - Event mode counts records, or the earliest matching identity per group when declared.
   ID-less event records count individually. This is not storage deduplication.
-- Snapshot mode selects the latest occurrence per project and identity inside the window
-  before filtering/grouping. Equal occurrences use observation time; conflicting ties
-  fail. Unchanged entities outside the window are absent: no complete-inventory claim.
+- Snapshot mode selects the latest occurrence per project and identity inside the window,
+  under every contract, before filtering/grouping; an entity whose latest state is unreadable
+  is left out. Equal occurrences use observation time; conflicting ties fail. Unchanged
+  entities outside the window are absent: no complete-inventory claim.
 - Native `cost` is lifetime session totals selected by last activity, as `cost_basis`
   states. Use `claude.api_request` for occurrence-window request cost estimates.
   Neither is an invoice. `observed_metrics` absent means measurement coverage is unknown.

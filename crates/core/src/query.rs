@@ -238,7 +238,17 @@ fn aggregate_connection(
         label_in(document, &dimension)
     };
     let mut conditions = scope(spec, q, &mut args);
-    conditions.push(readable(resolved, &mut args));
+    let readable = readable(resolved, &mut args);
+    // A snapshot's current state is each entity's latest record under any contract, so a newer state
+    // under a contract this definition cannot read hides the entity instead of letting an older
+    // readable state stand in for it. An event is read only under a readable contract.
+    let snapshot = spec.mode == crate::registry::KindMode::Snapshot;
+    let readable_column = if snapshot {
+        format!(", {readable} AS readable")
+    } else {
+        conditions.push(readable);
+        String::new()
+    };
     let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
         format!(
             "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"
@@ -260,16 +270,16 @@ fn aggregate_connection(
         }
     });
     let mut sql = format!(
-        "WITH scoped AS (SELECT rowid AS sequence, ts,occurred_seconds,occurred_nanos, payload, metadata, {key} AS key {} FROM records WHERE {})",
+        "WITH scoped AS (SELECT rowid AS sequence, ts,occurred_seconds,occurred_nanos, payload, metadata, {key} AS key {}{readable_column} FROM records WHERE {})",
         identity
             .as_ref()
             .map(|i| format!(", {i} AS identity"))
             .unwrap_or_default(),
         conditions.join(" AND ")
     );
-    let selected = if spec.mode == crate::registry::KindMode::Snapshot {
+    let selected = if snapshot {
         let invalid = conn.query_row(
-            &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE identity IS NULL OR identity='' OR hatel_epoch(json_extract(metadata,'$.observed_at')) IS NULL)"),
+            &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE readable AND (identity IS NULL OR identity='' OR hatel_epoch(json_extract(metadata,'$.observed_at')) IS NULL))"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
         ).map_err(io)?;
         if invalid {
@@ -280,7 +290,7 @@ fn aggregate_connection(
         }
         let entity = "COALESCE(json_extract(metadata,'$.project.key'), json_extract(metadata,'$.project.label'), json_extract(payload,'$.project')), identity";
         let observed = "json_extract(metadata,'$.observed_at')";
-        sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY occurred_seconds DESC, occurred_nanos DESC, hatel_epoch({observed}) DESC, hatel_nanos({observed}) DESC) AS revision FROM scoped), latest AS (SELECT * FROM versions WHERE revision=1)"));
+        sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY occurred_seconds DESC, occurred_nanos DESC, hatel_epoch({observed}) DESC, hatel_nanos({observed}) DESC) AS revision FROM scoped WHERE identity IS NOT NULL AND identity<>''), latest AS (SELECT * FROM versions WHERE revision=1)"));
         let ambiguous = conn.query_row(
             &format!("{sql} SELECT EXISTS(SELECT 1 FROM latest GROUP BY {entity} HAVING COUNT(DISTINCT payload)>1)"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
@@ -291,7 +301,7 @@ fn aggregate_connection(
                 spec.name
             )));
         }
-        sql.push_str(&format!(", representatives AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY {entity} ORDER BY sequence DESC) AS duplicate FROM latest), selected AS (SELECT * FROM representatives WHERE duplicate=1)"));
+        sql.push_str(&format!(", representatives AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY {entity} ORDER BY sequence DESC) AS duplicate FROM latest), selected AS (SELECT * FROM representatives WHERE duplicate=1 AND readable)"));
         "selected"
     } else {
         "scoped"
@@ -305,7 +315,7 @@ fn aggregate_connection(
             filters.join(" AND ")
         }
     ));
-    let from = if identity.is_some() && spec.mode == crate::registry::KindMode::Event {
+    let from = if identity.is_some() && !snapshot {
         sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY occurred_seconds,occurred_nanos,sequence) AS ordinal FROM matching)");
         "ranked WHERE identity IS NULL OR ordinal=1"
     } else {

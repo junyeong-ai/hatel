@@ -154,7 +154,7 @@ group_key = "outcome"
 measures = ["unresolved"]
 ```
 
-Snapshots select the latest occurrence per project and ID inside the requested project and window before filters and grouping. Filtering unresolved items cannot resurrect an older unresolved state after resolution. Observation time breaks equal occurrences; contradictory states tied on both times fail. IDs must be required non-empty strings; legacy records without observation time cannot be reinterpreted. Unchanged items outside the window are absent, so this is not a complete current inventory.
+Snapshots select the latest occurrence per project and ID inside the requested project and window, under every stored contract, before filters and grouping. Filtering unresolved items cannot resurrect an older unresolved state after resolution, and an item whose latest state is under an unreadable contract is left out rather than shown in an older state. Observation time breaks equal occurrences; contradictory states tied on both times fail. IDs must be required non-empty strings. Unchanged items outside the window are absent, so this is not a complete current inventory.
 
 Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque `v2:` contract identifier covering fields, units, redaction, mode and identity. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. Pending deliveries continue under a compatible contract and are cancelled under an incompatible one. Historical local records are preserved, never automatically reinterpreted.
 

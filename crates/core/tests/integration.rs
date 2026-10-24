@@ -1589,6 +1589,60 @@ measures = ["ms"]
 }
 
 #[test]
+fn a_newer_state_under_an_unreadable_contract_hides_its_entity() {
+    // A writer still holding another definition — an MCP server not yet reconnected — can record an
+    // entity's newest state under a contract the reader cannot interpret. That entity's current
+    // state is then unknown, and an older readable state must not stand in for it.
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("review.toml");
+    let cfg = config_in(dir.path(), vec![plugin.clone()]);
+    let define = |outcome: &str| {
+        std::fs::write(&plugin, format!("[[kind]]\nname = \"team.review\"\nmode = \"snapshot\"\nidentity = \"id\"\nfields = {{ id = {{ type = \"string\", required = true }}, outcome = {{ type = \"{outcome}\" }} }}\ngroup_key = \"outcome\"\n")).unwrap();
+        build_registry(&cfg).unwrap()
+    };
+    let record = |reg: &Registry, id: &str, outcome: &str, second: u8| {
+        let mut env = make_envelope(
+            "team.review",
+            serde_json::from_value(serde_json::json!({"id": id, "outcome": outcome})).unwrap(),
+            reg,
+            true,
+        )
+        .unwrap();
+        env.ts = format!("2026-01-01T00:00:0{second}Z");
+        hatel_core::build_sink(&cfg, reg)
+            .write_record(&env)
+            .unwrap();
+    };
+    let current = define("string");
+    record(&current, "r1", "open", 0);
+    record(&current, "r2", "open", 0);
+    record(&define("any"), "r1", "resolved", 1);
+    let current = define("string");
+    let section = hatel_core::query::section(
+        &cfg,
+        current.kind("team.review").unwrap(),
+        &query(0, 0, None),
+    )
+    .unwrap();
+    let groups = section.groups.unwrap().groups;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        (groups[0].key.as_deref(), groups[0].count),
+        (Some("open"), 1)
+    );
+    let mut resolutions: Vec<_> = section
+        .contracts
+        .iter()
+        .map(|c| (format!("{:?}", c.resolution), c.count))
+        .collect();
+    resolutions.sort();
+    assert_eq!(
+        resolutions,
+        [("Incompatible".to_string(), 1), ("Selected".to_string(), 2)]
+    );
+}
+
+#[test]
 fn snapshot_queries_select_latest_project_entities_before_filtering_and_grouping() {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("snapshot.toml");
