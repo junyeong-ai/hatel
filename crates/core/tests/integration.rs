@@ -1653,6 +1653,86 @@ fn a_newer_state_under_an_unreadable_contract_hides_its_entity() {
 }
 
 #[test]
+fn a_snapshot_whose_identity_changed_is_not_read_as_the_same_entities() {
+    // Each stored state belongs to the entity its writer's identity named. Reading it under another
+    // identity would merge or fail entities, so the records are excluded and counted instead.
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("host.toml");
+    let cfg = config_in(dir.path(), vec![plugin.clone()]);
+    let define = |identity: &str| {
+        std::fs::write(&plugin, format!("[[kind]]\nname = \"team.host\"\nmode = \"snapshot\"\nidentity = \"{identity}\"\nfields = {{ service = {{ type = \"string\", required = true }}, host = {{ type = \"string\", required = true }} }}\ngroup_key = \"service\"\n")).unwrap();
+        build_registry(&cfg).unwrap()
+    };
+    let writer = define("service");
+    write(
+        &cfg,
+        &writer,
+        "team.host",
+        serde_json::json!({"service": "api", "host": "h1"}),
+    );
+    write(
+        &cfg,
+        &writer,
+        "team.host",
+        serde_json::json!({"service": "web", "host": "h1"}),
+    );
+    let reader = define("host");
+    let section =
+        hatel_core::query::section(&cfg, reader.kind("team.host").unwrap(), &query(0, 0, None))
+            .unwrap();
+    assert!(section.groups.unwrap().groups.is_empty());
+    let resolutions: Vec<_> = section
+        .contracts
+        .iter()
+        .map(|c| (format!("{:?}", c.resolution), c.count))
+        .collect();
+    assert_eq!(resolutions, [("Incompatible".to_string(), 2)]);
+}
+
+#[test]
+fn a_payload_project_only_the_writer_declared_is_not_read_as_attribution() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("task.toml");
+    let cfg = config_in(dir.path(), vec![plugin.clone()]);
+    let define = |definition: &str| {
+        std::fs::write(
+            &plugin,
+            format!("[[kind]]\nname = \"team.task\"\ngroup_key = \"name\"\n{definition}\n"),
+        )
+        .unwrap();
+        build_registry(&cfg).unwrap()
+    };
+    let writer = define(
+        "fields = { name = { type = \"string\" }, project = { type = \"string\" } }\nredact = [\"project\"]",
+    );
+    write(
+        &cfg,
+        &writer,
+        "team.task",
+        serde_json::json!({"name": "lint", "project": "foo"}),
+    );
+    let reader = define("fields = { name = { type = \"string\" } }");
+    let spec = reader.kind("team.task").unwrap();
+    let grouped = hatel_core::query::section(
+        &cfg,
+        spec,
+        &report::Query {
+            group_by: Some("project"),
+            ..query(0, 0, None)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        grouped.contracts[0].resolution,
+        hatel_core::catalog::Resolution::Compatible
+    );
+    let groups = grouped.groups.unwrap().groups;
+    assert_eq!((groups[0].key.as_deref(), groups[0].count), (None, 1));
+    let scoped = hatel_core::query::section(&cfg, spec, &query(0, 0, Some("foo"))).unwrap();
+    assert!(scoped.groups.unwrap().groups.is_empty());
+}
+
+#[test]
 fn snapshot_queries_select_latest_project_entities_before_filtering_and_grouping() {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("snapshot.toml");

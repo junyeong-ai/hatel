@@ -100,7 +100,7 @@ hatel report --kind memory --group-by file_path
 hatel report --project /absolute/repository/path --format json
 ```
 
-`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, falling back to the payload's `project` for records without one. `--project` accepts key or label; use keys to distinguish repositories with equal labels. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
+`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, falling back to the payload's `project`, when the Kind declares that field, for records without one. `--project` accepts key or label; use keys to distinguish repositories with equal labels. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
 
 Ordinary Kind `count` counts records. With event-mode `identity`, each group uses the earliest matching record per ID; records without an ID count separately. This is query selection, not storage deduplication. Snapshot mode selects state as described below.
 
@@ -110,7 +110,7 @@ Aggregates use SQLite REAL/f64; integers above 2^53 can lose precision. Record i
 
 `retained_since` is the oldest retained record, not proof of continuous collection, completeness or whole-period usage. `unreadable_kinds` identifies missing schemas, `storage_error` a failed ledger inspection, and `cost_error` an unreadable cost baseline. Check these with each Kind’s `error`; an empty array after failure is not absence of records. A receiver with an unreadable cost baseline does not rewrite its files; repair the baseline and restart it.
 
-Each section answers under the Kind's current contract, or the one `--contract SCHEMA_ID` selects. Records of another stored contract join it when name, version and mode match, every field the answering definition declares keeps its type, unit and redaction, and every field it requires was required when written. `contracts` counts records per contract with a `resolution`: `selected` and `compatible` records are answered, while `incompatible` records and `undefined` ones without a known definition are excluded. `retained_since` covers answered records only. Inspect definitions in `kinds --json` under `stored_contracts`, then select `report --kind KIND --contract SCHEMA_ID`, including for a retired Kind. Records without a known definition are counted, never interpreted.
+Each section answers under the Kind's current contract, or the one `--contract SCHEMA_ID` selects. Records of another stored contract join it when name, version and mode match, a snapshot keeps its identity, every field the answering definition declares keeps its type, unit and redaction, and every field it requires was required when written. `contracts` counts records per contract with a `resolution`: `selected` and `compatible` records are answered, while `incompatible` records and `undefined` ones without a known definition are excluded. `retained_since` covers answered records only. Inspect definitions in `kinds --json` under `stored_contracts`, then select `report --kind KIND --contract SCHEMA_ID`, including for a retired Kind. Records without a known definition are counted, never interpreted.
 
 ## Custom Kinds
 
@@ -156,7 +156,7 @@ measures = ["unresolved"]
 
 Snapshots select the latest occurrence per project and ID inside the requested project and window, under every stored contract, before filters and grouping. Filtering unresolved items cannot resurrect an older unresolved state after resolution, and an item whose latest state is under an unreadable contract is left out rather than shown in an older state. Observation time breaks equal occurrences; contradictory states tied on both times fail. IDs must be required non-empty strings. Unchanged items outside the window are absent, so this is not a complete current inventory.
 
-Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque `v2:` contract identifier covering fields, units, redaction, mode and identity. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. Adding an optional field, removing a field or making one optional keeps earlier records readable; a type, unit or redaction change or a newly required field does not. Pending deliveries continue under a compatible contract and are cancelled under an incompatible one. Historical local records are preserved, never automatically reinterpreted.
+Manage Kind names or versions explicitly when meaning or units change. `schema_id` is an opaque `v2:` contract identifier covering fields, units, redaction, mode and identity. SQLite commits validated records with their contract definitions. Changing default grouping or ranking does not change the data contract. Adding an optional field, removing a field or making one optional keeps earlier records readable; a type, unit or redaction change, a newly required field or a changed snapshot identity does not. Pending deliveries continue under a compatible contract and are cancelled under an incompatible one or when they carry a field the definition no longer declares. Historical local records are preserved, never automatically reinterpreted.
 
 ### Hook bindings
 
@@ -193,7 +193,7 @@ Omitted `signals` means native metrics and logs; omitted `kinds` means no local 
 
 Native OTLP forwarding uses a best-effort memory queue. `raw` relays the body; `enriched` adds a project label to JSON. Native bodies do not pass through the local payload allow-list or hashing. If content capture is enabled upstream, that content may leave the machine.
 
-Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits or incompatible contract changes may prevent delivery. Lost acknowledgements can cause duplicate delivery.
+Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits, incompatible contract changes or a removed field may prevent delivery. Lost acknowledgements can cause duplicate delivery.
 
 ```sh
 hatel deliveries --json

@@ -91,12 +91,14 @@ pub enum Resolution {
     Undefined,
 }
 
-/// The contract identifiers one definition reads, resolved from every definition known for its
-/// Kind: itself and those stored beside the records.
+/// The contract identifiers one definition reads, and of those the ones whose records it may
+/// export, resolved from every definition known for its Kind: itself and those stored beside the
+/// records.
 #[derive(Debug, Clone)]
 pub struct Contracts {
     selected: String,
     readable: BTreeSet<String>,
+    exportable: BTreeSet<String>,
     known: BTreeSet<String>,
 }
 
@@ -105,11 +107,15 @@ impl Contracts {
         let mut contracts = Self {
             selected: spec.schema_id.clone(),
             readable: BTreeSet::new(),
+            exportable: BTreeSet::new(),
             known: BTreeSet::new(),
         };
         for writer in std::iter::once(spec.clone()).chain(stored) {
             if spec.reads(&writer) {
                 contracts.readable.insert(writer.schema_id.clone());
+            }
+            if spec.exports(&writer) {
+                contracts.exportable.insert(writer.schema_id.clone());
             }
             contracts.known.insert(writer.schema_id);
         }
@@ -163,6 +169,10 @@ impl Contracts {
 
     pub fn reads(&self, schema_id: Option<&str>) -> bool {
         schema_id.is_some_and(|id| self.readable.contains(id))
+    }
+
+    pub fn exports(&self, schema_id: Option<&str>) -> bool {
+        schema_id.is_some_and(|id| self.exportable.contains(id))
     }
 
     pub(crate) fn readable(&self) -> &BTreeSet<String> {

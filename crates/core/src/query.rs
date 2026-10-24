@@ -145,8 +145,8 @@ fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
     ];
     if let Some(project) = q.project {
         let p = parameter(args, project.into());
-        let payload = parameter(args, payload_project(spec, project));
-        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={payload}))"));
+        let payload = payload_project(spec, project, args);
+        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p}{payload})"));
     }
     conditions
 }
@@ -155,9 +155,11 @@ fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<S
     let mut filters = Vec::new();
     for (field, value) in q.filters {
         if field == "project" {
-            let payload = parameter(args, payload_project(spec, value));
+            let payload = payload_project(spec, value, args);
             let value = parameter(args, value.clone());
-            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={payload}))"));
+            filters.push(format!(
+                "(json_extract(metadata,'$.project.key')={value}{payload})"
+            ));
         } else {
             let (document, path) = selector(field);
             let path = parameter(args, path);
@@ -203,12 +205,26 @@ fn contract_counts(
     .map_err(io)
 }
 
-fn payload_project(spec: &KindSpec, project: &str) -> String {
-    if spec.redact.contains("project") {
+/// The alternative that matches a record without common project metadata by its payload's own
+/// `project`, offered only when the answering definition declares that field: a field only the
+/// writer declared is outside this definition's allow-list, and its redaction is unknown here.
+fn payload_project(spec: &KindSpec, project: &str, args: &mut Vec<Value>) -> String {
+    if !declares_project(spec) {
+        return String::new();
+    }
+    let value = if spec.redact.contains("project") {
         crate::pii::redacted(project)
     } else {
         project.into()
-    }
+    };
+    let payload = parameter(args, value);
+    format!(
+        " OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={payload})"
+    )
+}
+
+fn declares_project(spec: &KindSpec) -> bool {
+    spec.field_specs.contains_key("project")
 }
 
 fn parameter(args: &mut Vec<Value>, value: String) -> String {
@@ -227,9 +243,13 @@ fn aggregate_connection(
         q.since.into(),
         i64::from(crate::SCHEMA_VERSION).into(),
     ];
-    let (document, field_path) = selector(q.group_by.unwrap_or(&spec.group_key));
+    let group = match q.group_by.unwrap_or(&spec.group_key) {
+        "project" if !declares_project(spec) => "metadata.project.key",
+        group => group,
+    };
+    let (document, field_path) = selector(group);
     let dimension = parameter(&mut args, field_path);
-    let dimension_label = if q.group_by.unwrap_or(&spec.group_key) == "project" {
+    let dimension_label = if group == "project" {
         format!(
             "COALESCE(json_extract(metadata, '$.project.key'), {})",
             label(&dimension)
@@ -249,7 +269,7 @@ fn aggregate_connection(
         conditions.push(readable);
         String::new()
     };
-    let key = if q.group_by.unwrap_or(&spec.group_key) == "project" {
+    let key = if group == "project" {
         format!(
             "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"
         )
@@ -288,7 +308,14 @@ fn aggregate_connection(
                 spec.name
             )));
         }
-        let entity = "COALESCE(json_extract(metadata,'$.project.key'), json_extract(metadata,'$.project.label'), json_extract(payload,'$.project')), identity";
+        let payload_project = if declares_project(spec) {
+            ", json_extract(payload,'$.project')"
+        } else {
+            ""
+        };
+        let entity = format!(
+            "COALESCE(json_extract(metadata,'$.project.key'), json_extract(metadata,'$.project.label'){payload_project}), identity"
+        );
         let observed = "json_extract(metadata,'$.observed_at')";
         sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY occurred_seconds DESC, occurred_nanos DESC, hatel_epoch({observed}) DESC, hatel_nanos({observed}) DESC) AS revision FROM scoped WHERE identity IS NOT NULL AND identity<>''), latest AS (SELECT * FROM versions WHERE revision=1)"));
         let ambiguous = conn.query_row(

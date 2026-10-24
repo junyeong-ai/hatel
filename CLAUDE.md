@@ -68,12 +68,14 @@ and its CI check unless a deliberate compatibility change requires raising both.
   A Kind data-contract fingerprint accompanies each record; identity is part of it, query
   defaults are not. SQLite records and their validated definitions commit together in
   `contracts`. Readers resolve each stored contract against the answering definition
-  (`KindSpec::reads`, `catalog::Contracts`): same name, version and mode; every field it declares
-  keeps its type, unit and redaction; every field it requires was required when written.
-  Compatible records answer with the selected ones, and a pending delivery stays deliverable only
-  under a definition that reads it. Incompatible records and records without a known definition
-  are excluded and counted per `resolution` in `KindSection.contracts`, never reinterpreted.
-  Historical query registries never record data.
+  (`KindSpec::reads`, `catalog::Contracts`): same name, version and mode, and for a snapshot the
+  same identity; every field it declares keeps its type, unit and redaction; every field it
+  requires was required when written. A field only the writer declared is outside the reader's
+  allow-list and is never read, the payload `project` included. Compatible records answer with the
+  selected ones. A pending delivery is egress, so it stays deliverable only under a definition that
+  reads it and still declares every field it carries (`KindSpec::exports`). Incompatible records
+  and records without a known definition are excluded and counted per `resolution` in
+  `KindSection.contracts`, never reinterpreted. Historical query registries never record data.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.
@@ -105,8 +107,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   an entity whose latest occurrence is under a contract the answering definition cannot read is
   left out rather than shown in an older readable state. Equal occurrences use observation
   time; conflicting states tied on both times fail the section, as do readable records missing
-  their identity or observation time. Event mode remains the default and
-  its identity selects the earliest matching record per group. An unchanged entity outside the
+  their identity or observation time. Event mode remains the default and its identity selects the
+  earliest readable matching record per group. An unchanged entity outside the
   window is absent, so a rolling snapshot report is not a complete current inventory.
 - **A schema describes data; a query asks a question of it.** A Kind declares its fields,
   its measures, and the dimension/measure a report *defaults* to; `--group-by` / `--sort-by`

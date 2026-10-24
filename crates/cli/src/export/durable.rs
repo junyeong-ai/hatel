@@ -91,9 +91,15 @@ impl Policy {
         pending: &outbox::Pending,
         now: i64,
     ) -> Option<Outcome<'static>> {
-        if !self.reads(&pending.record) {
+        let contracts = self.contracts.get(&pending.record.kind);
+        let schema_id = pending.record.metadata.schema_id.as_deref();
+        if !contracts.is_some_and(|c| c.reads(schema_id)) {
             Some(Outcome::Cancelled(
                 "record contract is incompatible with the current definition",
+            ))
+        } else if !contracts.is_some_and(|c| c.exports(schema_id)) {
+            Some(Outcome::Cancelled(
+                "record carries a field the current definition no longer declares",
             ))
         } else if !target.allows_record(&pending.record) {
             Some(Outcome::Cancelled(
@@ -106,12 +112,6 @@ impl Policy {
         } else {
             None
         }
-    }
-
-    fn reads(&self, record: &Envelope) -> bool {
-        self.contracts
-            .get(&record.kind)
-            .is_some_and(|contracts| contracts.reads(record.metadata.schema_id.as_deref()))
     }
 }
 
@@ -704,6 +704,48 @@ mod tests {
         assert_eq!(
             outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
             "cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_field_removed_from_the_definition_cancels_pending_records_that_carry_it() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home.path().join("plugin.toml");
+        let kind = "[[kind]]\nname='secret'\nfields={ label = { type = 'any' }, secret = { type = 'any' } }\ngroup_key='label'\n";
+        std::fs::write(&plugin, kind).unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path,format!("plugins=[{plugin:?}]\n[storage]\nstate_dir={:?}\n[[export]]\nendpoint='http://127.0.0.1:1'\nmode='raw'\nsignals=[]\nkinds=['secret']\n",home.path().to_string_lossy())).unwrap();
+        let (cfg, _) =
+            hatel_core::Config::from_settings_in(&Settings::read(&path).unwrap(), &|_| None);
+        let registry = hatel_core::schema::build_registry(&cfg).unwrap();
+        let env = hatel_core::make_envelope(
+            "secret",
+            [
+                ("label".into(), json!("check")),
+                ("secret".into(), json!("private")),
+            ]
+            .into(),
+            &registry,
+            true,
+        )
+        .unwrap();
+        hatel_core::build_sink(&cfg, &registry)
+            .write_record(&env)
+            .unwrap();
+        std::fs::write(&plugin, kind.replace(", secret = { type = 'any' }", "")).unwrap();
+        deliver(
+            &path,
+            home.path(),
+            "http://127.0.0.1:1",
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let state = &outbox::states(&home.path().join("telemetry.db")).unwrap()[0];
+        assert_eq!(state.status, "cancelled");
+        assert_eq!(
+            state.error.as_deref(),
+            Some("record carries a field the current definition no longer declares")
         );
     }
 

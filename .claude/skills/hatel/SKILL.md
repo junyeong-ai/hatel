@@ -39,12 +39,12 @@ from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
 `cost_session_count` and `cost_group_count` give totals, and `--top 0` returns all. Filter hashed
 payload fields by their original value.
 `--project` accepts canonical key or display label; labels may combine equal-named repos.
-`project` grouping and filtering prefer the common key, falling back to the payload's `project`
-for records without one. Use `metadata.project.key` to address that common field explicitly.
+`project` grouping and filtering prefer the common key, falling back to the payload's `project`,
+when the Kind declares that field, for records without one. Use `metadata.project.key` to address that common field explicitly.
 
 A section answers under the current contract plus stored contracts it can read: same name, version
-and mode; every field it declares keeps type, unit and redaction; every field it requires was
-required when written.
+and mode, and for a snapshot the same identity; every field it declares keeps type, unit and
+redaction; every field it requires was required when written.
 `contracts[].resolution` is `selected`, `compatible`, `incompatible` or `undefined`; only the first two
 are aggregated and covered by `retained_since`. State excluded counts with the answer. Inspect
 `stored_contracts` in `kinds --json`; `report --kind KIND --contract SCHEMA_ID` uses its saved
@@ -114,8 +114,8 @@ requiredness and units. `redact` hashes selected payload fields before storage.
 For state, add `mode = "snapshot"` and `identity` naming a required non-empty string field.
 A data contract's opaque `schema_id` changes with field, unit, identity, redaction or mode changes.
 Adding an optional field, removing a field or making one optional keeps earlier records readable;
-a type, unit or redaction change or a newly required field does not, and pending records under an
-unreadable contract cancel. Semantic changes require an explicit Kind/version and history decision.
+a type, unit or redaction change, a newly required field or a changed snapshot identity does not.
+Pending deliveries cancel under an unreadable contract and when they carry a removed field. Semantic changes require an explicit Kind/version and history decision.
 
 Use hook bindings only for facts present in lifecycle input. Producers own domain meaning.
 Keep one writer for each fact. Check `hatel kinds --json` and exercise a real receipt/query

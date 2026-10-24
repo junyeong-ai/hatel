@@ -48,7 +48,7 @@ pub fn format_text(report: &Report) -> String {
             "count",
             section.sort_by.as_deref(),
             &section.groups,
-            note(section),
+            note(section, !report.filters.is_empty()),
         ));
         if let Some(cut) = truncated(section.groups.len(), section.group_count, "groups") {
             out.push_str(&format!("  ({cut})\n"));
@@ -90,7 +90,7 @@ pub fn format_markdown(report: &Report) -> String {
             &section.group_by,
             "count",
             &section.groups,
-            note(section),
+            note(section, !report.filters.is_empty()),
         ));
         if let Some(cut) = truncated(section.groups.len(), section.group_count, "groups") {
             out.push_str(&format!("\n_{cut}_\n"));
@@ -153,14 +153,17 @@ fn inline(s: &str) -> String {
         .collect()
 }
 
-/// What to say in place of rows, when there are none to say anything about.
-fn note(section: &KindSection) -> Option<&'static str> {
+/// What to say in place of rows, when there are none to say anything about. Under filters the
+/// window may hold records that simply do not match, so the note says so instead of claiming none.
+fn note(section: &KindSection, filtered: bool) -> Option<&'static str> {
     section
         .groups
         .is_empty()
-        .then_some(match exclusions(section) {
-            Some(_) => "no readable records in this window",
-            None => "no records in this window",
+        .then_some(match (exclusions(section).is_some(), filtered) {
+            (true, true) => "no readable records match the filters in this window",
+            (true, false) => "no readable records in this window",
+            (false, true) => "no records match the filters in this window",
+            (false, false) => "no records in this window",
         })
 }
 
@@ -564,6 +567,20 @@ mod tests {
             cols(wide, "100") + 3,
             cols(ascii, "90") + 2,
             "measure columns end at the same terminal column:\n{wide}\n{ascii}"
+        );
+    }
+
+    #[test]
+    fn an_empty_filtered_section_says_nothing_matched_rather_than_nothing_was_recorded() {
+        let mut r = report(vec![section("check", Vec::new())]);
+        r.filters = vec![Filter {
+            field: "outcome".to_string(),
+            value: "failed".to_string(),
+        }];
+        let text = format_text(&r);
+        assert!(
+            text.contains("no records match the filters in this window"),
+            "{text}"
         );
     }
 

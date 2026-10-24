@@ -231,12 +231,15 @@ impl KindSpec {
     /// Each field declared here must have the same type, unit and redaction in the writer, and a
     /// required one must have been required there; a field only the writer declared is outside
     /// this allow-list. Name, version and mode must match: a version is the declared marker of a
-    /// change in meaning, and the mode decides whether a record is an occurrence or a state.
-    /// Identity is not compared because it is applied when reading and never shapes what is stored.
+    /// change in meaning, and the mode decides whether a record is an occurrence or a state. A
+    /// snapshot's identity names the entity each stored state belongs to and was validated when it
+    /// was written, so it must match too; an event's identity only chooses which occurrence a
+    /// query counts.
     pub fn reads(&self, writer: &KindSpec) -> bool {
         self.name == writer.name
             && self.version == writer.version
             && self.mode == writer.mode
+            && (self.mode == KindMode::Event || self.identity == writer.identity)
             && self.field_specs.iter().all(|(name, field)| {
                 writer
                     .field_specs
@@ -248,6 +251,17 @@ impl KindSpec {
                             && writer.redact.contains(name) == self.redact.contains(name)
                     })
             })
+    }
+
+    /// Whether a record written under `writer` may leave the machine under this definition: it
+    /// reads the record and still declares every field the record can carry, so a field removed
+    /// from the allow-list is never sent from a record queued before the removal.
+    pub fn exports(&self, writer: &KindSpec) -> bool {
+        self.reads(writer)
+            && writer
+                .field_specs
+                .keys()
+                .all(|name| self.field_specs.contains_key(name))
     }
 }
 
