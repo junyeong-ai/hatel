@@ -125,8 +125,9 @@ Single writes exit 0 stored, 1 when configuration, registry or store is unusable
 input. Batches exit 0 all stored, 1 when some items were not stored, 2 when the call failed before
 any item (invalid input, unusable configuration or registry); only 0 and 1 print per-item
 results, and the whole batch is not atomic. `hatel:emit_batch` sets `isError` only
-for a whole-call failure, so resend only the items not `stored`. CLI stdin cap is 8 MiB; batches allow 4096 items; sanitized payloads allow 256 KiB. A receipt confirms local
-storage. Inspect warnings and `delivery` enqueue outcomes; neither confirms downstream receipt.
+for a whole-call failure, so resend only the items not `stored`. CLI stdin cap is 8 MiB; an MCP
+message above 16 MiB is dropped without a reply; batches allow 4096 items; sanitized payloads
+allow 256 KiB. A receipt confirms local storage. Inspect warnings and `delivery` enqueue outcomes; neither confirms downstream receipt.
 Detached best-effort producers cannot claim acknowledged storage or exactly-once recording.
 
 ## Configure local storage or delivery
