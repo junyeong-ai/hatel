@@ -153,18 +153,25 @@ fn inline(s: &str) -> String {
         .collect()
 }
 
-/// What to say in place of rows, when there are none to say anything about. Under filters the
-/// window may hold records that simply do not match, so the note says so instead of claiming none.
+/// What to say in place of rows, when there are none to say anything about. A scope holding no
+/// retained record at all is said to, since a quiet window and a project that was never recorded
+/// (or a mistyped one) differ. Under filters the window may hold records that simply do not
+/// match, so the note says so instead of claiming none.
 fn note(section: &KindSection, filtered: bool) -> Option<&'static str> {
-    section
-        .groups
-        .is_empty()
-        .then_some(match (exclusions(section).is_some(), filtered) {
-            (true, true) => "no readable records match the filters in this window",
-            (true, false) => "no readable records in this window",
-            (false, true) => "no records match the filters in this window",
-            (false, false) => "no records in this window",
-        })
+    section.groups.is_empty().then_some(
+        match (
+            section.retained_since.is_some(),
+            exclusions(section).is_some(),
+            filtered,
+        ) {
+            (false, true, _) => "no readable records retained",
+            (false, false, _) => "no records retained",
+            (true, true, true) => "no readable records match the filters in this window",
+            (true, true, false) => "no readable records in this window",
+            (true, false, true) => "no records match the filters in this window",
+            (true, false, false) => "no records in this window",
+        },
+    )
 }
 
 /// The records a section could not read, by reason: those under another known definition are
@@ -459,7 +466,7 @@ mod tests {
             sort_by: Some("duration_ms".to_string()),
             identity: None,
             project_scope: ProjectScope::Unrestricted,
-            retained_since: None,
+            retained_since: Some("2026-01-01T00:00:00Z".to_string()),
             error: None,
             group_count: Some(groups.len()),
             groups,
@@ -585,13 +592,16 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_project_scope_reports_records_without_asserting_inactivity() {
+    fn an_empty_project_scope_says_whether_anything_was_ever_retained() {
         let mut s = section("aix.rules", Vec::new());
         s.project_scope = ProjectScope::Applied;
         let mut r = report(vec![s]);
         r.project = Some("acme".to_string());
-        let text = format_text(&r);
-        assert!(text.contains("no records in this window"), "{text}");
+        let quiet = format_text(&r);
+        assert!(quiet.contains("no records in this window"), "{quiet}");
+        r.kinds[0].retained_since = None;
+        let unrecorded = format_markdown(&r);
+        assert!(unrecorded.contains("no records retained"), "{unrecorded}");
     }
 
     #[test]
