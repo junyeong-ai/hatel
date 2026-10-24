@@ -62,20 +62,7 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          cache: false
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-
-      - name: Build release binaries
-        run: cargo build --release --locked
+      # Platform-specific code (service units, flock) lints only where it compiles, so clippy runs
+      # on every OS the release gate checks.
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
