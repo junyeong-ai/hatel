@@ -2621,3 +2621,30 @@ fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snap
     assert_eq!(report.kinds[0].groups[0].sums[0].sum, 0.02);
     assert_eq!(report.kinds[0].groups[0].count, 1);
 }
+
+#[test]
+fn concurrent_first_writers_on_a_fresh_store_all_store_their_records() {
+    // Hooks for parallel tool calls can be the first writers a store ever sees.
+    let registry = build_registry(&config_in(Path::new("."), vec![])).unwrap();
+    for _ in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config_in(dir.path(), vec![]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let (cfg, registry, barrier) = (cfg.clone(), registry.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let env = make_envelope("prompt", Default::default(), &registry, true).unwrap();
+                    barrier.wait();
+                    hatel_core::build_sink(&cfg, &registry)
+                        .write_record(&env)
+                        .map(drop)
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        assert_eq!(records_of(&cfg, "prompt").len(), 8);
+    }
+}

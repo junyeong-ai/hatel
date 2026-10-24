@@ -96,12 +96,38 @@ fn connect(path: &Path) -> crate::Result<Connection> {
             .map_err(io)?;
     }
     let conn = Connection::open(path).map_err(io)?;
-    conn.busy_timeout(std::time::Duration::from_millis(100))
-        .map_err(io)?;
+    conn.busy_timeout(WRITE_BUSY_TIMEOUT).map_err(io)?;
     check_version(&conn)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(io)?;
     crate::query::functions(&conn).map_err(io)?;
     Ok(conn)
+}
+
+/// How long a writer waits for another one's lock: long enough for a concurrent insert, short
+/// enough that a lifecycle hook never visibly delays the tool call it records.
+const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long a store's first writers wait for one another. Whichever arrives first switches the file
+/// to WAL and creates the schema while the rest queue behind it, once per store, so they get a
+/// reader's budget rather than a hook's.
+const FIRST_WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A fresh file starts in rollback mode, and switching it to WAL needs the database to itself, so
+/// SQLite answers a concurrent switch with BUSY at once instead of waiting on the busy timeout.
+/// Once one switch lands the mode is stored in the file, so retrying lets every first writer
+/// through.
+fn enable_wal(conn: &Connection) -> crate::Result<()> {
+    let deadline = std::time::Instant::now() + FIRST_WRITE_BUSY_TIMEOUT;
+    loop {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => return result.map_err(io),
+        }
+    }
 }
 
 pub(crate) fn check_version(conn: &Connection) -> crate::Result<i64> {
@@ -286,7 +312,10 @@ impl SqliteSink {
     fn init(path: &Path) -> crate::Result<Connection> {
         let mut conn = connect(path)?;
         if check_version(&conn)? != DATABASE_VERSION {
+            conn.busy_timeout(FIRST_WRITE_BUSY_TIMEOUT).map_err(io)?;
+            enable_wal(&conn)?;
             initialize(&mut conn)?;
+            conn.busy_timeout(WRITE_BUSY_TIMEOUT).map_err(io)?;
         }
         Ok(conn)
     }
