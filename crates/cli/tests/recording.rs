@@ -366,6 +366,120 @@ fn the_cost_section_follows_top_and_states_its_totals() {
     assert_eq!(all["cost_groups"].as_array().unwrap().len(), 2);
 }
 
+/// Drives `hatel mcp` over stdio and returns each tool call's result in order. Every response is
+/// read before stdin closes, so shutdown never cuts a call short.
+fn mcp_calls(home: &std::path::Path, calls: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use std::io::BufRead;
+    let mut child = isolated(home)
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut send = |message: serde_json::Value| writeln!(stdin, "{message}").unwrap();
+    send(
+        serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}}),
+    );
+    send(serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    for (id, call) in calls.iter().enumerate() {
+        send(
+            serde_json::json!({"jsonrpc": "2.0", "id": id + 1, "method": "tools/call", "params": call}),
+        );
+    }
+    let mut responses: Vec<serde_json::Value> =
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .lines()
+            .take(calls.len() + 1)
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect();
+    drop(stdin);
+    child.wait().unwrap();
+    responses.sort_by_key(|response| response["id"].as_u64());
+    responses
+        .into_iter()
+        .skip(1)
+        .map(|response| response["result"].clone())
+        .collect()
+}
+
+#[test]
+fn mcp_rejects_misspelled_arguments_and_marks_a_failed_diagnosis_as_an_error() {
+    let healthy = tempfile::tempdir().unwrap();
+    std::fs::write(
+        healthy.path().join("config.toml"),
+        format!(
+            "[storage]\nstate_dir = {:?}\n",
+            healthy.path().join("state").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let results = mcp_calls(
+        healthy.path(),
+        &[
+            serde_json::json!({"name": "report", "arguments": {"kind": "check", "filters": ["name=late"]}}),
+            serde_json::json!({"name": "emit", "arguments": {
+                "kind": "check", "payload": {"name": "lint", "outcome": "passed"}, "contxt": {}}}),
+            serde_json::json!({"name": "doctor", "arguments": {"local": true}}),
+        ],
+    );
+    for misspelled in &results[..2] {
+        assert_eq!(misspelled["isError"], true, "{misspelled}");
+        assert!(
+            misspelled["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("unknown field"),
+            "{misspelled}"
+        );
+    }
+    assert!(!healthy.path().join("state/telemetry.db").exists());
+    assert_eq!(results[2]["isError"], false, "{}", results[2]);
+
+    let broken = tempfile::tempdir().unwrap();
+    std::fs::write(
+        broken.path().join("config.toml"),
+        "[storage]\nsink = \"sqlite\"\n",
+    )
+    .unwrap();
+    let results = mcp_calls(
+        broken.path(),
+        &[serde_json::json!({"name": "doctor", "arguments": {"local": true}})],
+    );
+    assert_eq!(results[0]["isError"], true, "{}", results[0]);
+    let diagnosis: serde_json::Value =
+        serde_json::from_str(results[0]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(diagnosis["ok"], false);
+}
+
+#[test]
+fn a_batch_that_cannot_load_its_configuration_exits_as_an_environment_fault() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[storage]\nsink = \"sqlite\"\n",
+    )
+    .unwrap();
+    let mut child = isolated(home.path())
+        .arg("emit-batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"[{"kind":"check","payload":{"name":"lint","outcome":"passed"}}]"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("sink"));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_reader_that_stops_early_ends_a_command_quietly() {

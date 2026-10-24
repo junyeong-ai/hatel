@@ -86,9 +86,9 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **Fail-open at the lifecycle hook boundary** (a write error is a stderr note, never a blocked
   tool call). CLI/MCP writes return a storage receipt or an explicit failure. **Fail-closed on
   egress privacy** (an unattributable batch is not forwarded to a filtered destination).
-- `#[serde(deny_unknown_fields)]` on every config/schema surface — a misspelled key must
-  fail loudly, never silently disable a feature. `config.toml` therefore has exactly one
-  typed shape (`settings.rs`) covering every section: a second parser over the same file
+- `#[serde(deny_unknown_fields)]` on every config, schema and MCP argument surface — a misspelled
+  key must fail loudly, never silently disable a feature or answer another question.
+  `config.toml` therefore has exactly one typed shape (`settings.rs`) covering every section: a second parser over the same file
   would have to tolerate the sections it doesn't own, and a writer that rebuilt the file
   from its own section alone would drop the rest. A storage variable's or a `HATEL_*` flag's
   value is held to the same bar: `Config` resolves one it cannot read as unset and returns it
@@ -156,9 +156,11 @@ and its CI check unless a deliberate compatibility change requires raising both.
 - **Read failure is not an empty store.** Reports and Kind inventories carry `storage_error`;
   reports carry `cost_error` when the native baseline cannot be read. CLI exit status and MCP
   `isError` reflect those failures; invalid arguments and unreadable configuration are `isError`
-  tool results too, so a model can correct the call, never protocol errors. An unreadable cost
-  baseline disables only its persistence until repair and receiver restart; it must never be
-  rewritten from an empty baseline.
+  tool results too, so a model can correct the call, never protocol errors. A read tool's
+  `isError` is its CLI command's nonzero exit; `emit_batch` sets it only for a whole-call failure,
+  because its per-item results name what was stored and a resent batch would duplicate it. An
+  unreadable cost baseline disables only its persistence until repair and receiver restart; it
+  must never be rewritten from an empty baseline.
 - **Numbers need a measurement basis.** Read a measure with its valid/missing/invalid counts.
   Human reports distinguish no measurement from zero and show the measured fraction for partial
   sums. Native summaries count a metric only when `observed_metrics` explicitly names it; a

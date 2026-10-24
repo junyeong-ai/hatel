@@ -23,6 +23,7 @@ use crate::{EmitError, doctor, emit_record, kinds_value, machine_json, parse_que
 pub struct HatelMcp;
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReportParams {
     #[schemars(description = "Rolling window in days, e.g. \"30d\" (days only; default \"30d\")")]
     pub window: Option<String>,
@@ -57,6 +58,7 @@ pub struct ReportParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EmitParams {
     #[schemars(description = "A registered Kind name (e.g. \"check\")")]
     pub kind: String,
@@ -71,6 +73,7 @@ pub struct EmitParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DoctorParams {
     #[schemars(
         description = "Check only local recording, schemas, storage and deliveries, without Claude Code wiring (default false)"
@@ -79,6 +82,7 @@ pub struct DoctorParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BatchParams {
     #[schemars(
         description = "Up to 4096 entries, each {kind, payload, context?} as in emit. Each entry is stored, rejected or failed on its own; the batch is not atomic."
@@ -128,19 +132,17 @@ impl HatelMcp {
         Parameters(p): Parameters<DoctorParams>,
     ) -> Result<CallToolResult, McpError> {
         answer(move || {
-            let value = if p.local.unwrap_or(false) {
-                doctor::local_report_value()
-            } else {
-                doctor::report_value()
-            };
-            Ok(success(machine_json(&value)))
+            let report = doctor::report(p.local.unwrap_or(false));
+            let mut result = success(machine_json(&report));
+            result.is_error = Some(!report.ok);
+            Ok(result)
         })
         .await
     }
 
     #[tool(
         title = "Record a batch of signals",
-        description = "Record up to 4096 structured {kind, payload, context?} entries. Returns one ordered result per entry: stored, rejected or failed; a stored receipt confirms local storage only.",
+        description = "Record up to 4096 structured {kind, payload, context?} entries. Returns one ordered result per entry: stored, rejected or failed; a stored receipt confirms local storage only. `isError` is set only when the whole call failed, so resend just the entries that were not stored — resending the batch would duplicate the stored ones.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -152,8 +154,12 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || crate::emit_batch(p.records).map(|results| success(machine_json(&results))))
-            .await
+        answer(move || {
+            crate::emit_batch(p.records)
+                .map(|results| success(machine_json(&results)))
+                .map_err(|(EmitError::Registry(e) | EmitError::Rejected(e))| e)
+        })
+        .await
     }
 
     #[tool(

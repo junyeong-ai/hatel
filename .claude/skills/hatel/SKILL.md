@@ -121,9 +121,10 @@ Use hook bindings only for facts present in lifecycle input. Producers own domai
 Keep one writer for each fact. Check `hatel kinds --json` and exercise a real receipt/query
 in an isolated store when changing a schema; do not write test records to the user's store.
 
-Single writes exit 0 stored, 1 storage failure, 2 rejected input. Batches exit 0 all stored,
-1 item failures, 2 top-level input failure; the whole batch is not atomic. CLI stdin cap is
-8 MiB; batches allow 4096 items; sanitized payloads allow 256 KiB. A receipt confirms local
+Single writes exit 0 stored, 1 when configuration, registry or store is unusable, 2 for rejected
+input. Batches exit 0 all stored, 1 for item failures or an unusable environment, 2 for a
+top-level input failure; the whole batch is not atomic. `hatel:emit_batch` sets `isError` only
+for a whole-call failure, so resend only the items not `stored`. CLI stdin cap is 8 MiB; batches allow 4096 items; sanitized payloads allow 256 KiB. A receipt confirms local
 storage. Inspect warnings and `delivery` enqueue outcomes; neither confirms downstream receipt.
 Detached best-effort producers cannot claim acknowledged storage or exactly-once recording.
 

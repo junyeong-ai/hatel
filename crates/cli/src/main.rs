@@ -271,10 +271,10 @@ fn end_quietly_on_closed_stdout() {
 #[cfg(not(unix))]
 fn end_quietly_on_closed_stdout() {}
 
-/// Why an emit was refused: `Registry` is an environment problem (the registry itself
-/// failed to load); `Rejected` is a caller problem (unknown Kind,
-/// malformed input, or — in strict mode — disallowed keys). The CLI maps them to exit
-/// codes 1 / 2; MCP returns either as an `isError` result the model can act on.
+/// Why an emit was refused: `Registry` is an environment problem (the configuration, registry or
+/// store could not be used); `Rejected` is a caller problem (unknown Kind, malformed input, an
+/// oversized batch, or — in strict mode — disallowed keys). The CLI maps them to exit codes 1 / 2;
+/// MCP returns either as an `isError` result the model can act on.
 pub(crate) enum EmitError {
     Registry(String),
     Rejected(String),
@@ -345,12 +345,12 @@ fn emit_cmd(
 
 pub(crate) fn emit_batch(
     items: Vec<serde_json::Value>,
-) -> Result<Vec<hatel_core::record::RecordResult>, String> {
+) -> Result<Vec<hatel_core::record::RecordResult>, EmitError> {
     if items.len() > 4096 {
-        return Err("batch exceeds 4096 records".into());
+        return Err(EmitError::Rejected("batch exceeds 4096 records".into()));
     }
-    let cfg = Config::load().map_err(|e| e.to_string())?;
-    let reg = build_registry(&cfg).map_err(|e| e.to_string())?;
+    let cfg = Config::load().map_err(|e| EmitError::Registry(e.to_string()))?;
+    let reg = build_registry(&cfg).map_err(|e| EmitError::Registry(e.to_string()))?;
     let mut writer = hatel_core::record::Writer::new(&cfg, &reg);
     Ok(items
         .into_iter()
@@ -387,7 +387,7 @@ fn emit_batch_cmd() -> i32 {
         }
     };
     let result = serde_json::from_str::<Vec<serde_json::Value>>(&input)
-        .map_err(|e| e.to_string())
+        .map_err(|e| EmitError::Rejected(e.to_string()))
         .and_then(emit_batch);
     match result {
         Ok(results) => {
@@ -397,7 +397,11 @@ fn emit_batch_cmd() -> i32 {
             print!("{}", machine_json(&results));
             if failed { 1 } else { 0 }
         }
-        Err(e) => {
+        Err(EmitError::Registry(e)) => {
+            eprintln!("emit-batch: {e}");
+            1
+        }
+        Err(EmitError::Rejected(e)) => {
             eprintln!("emit-batch: {e}");
             2
         }

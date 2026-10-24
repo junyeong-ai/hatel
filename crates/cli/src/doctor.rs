@@ -101,8 +101,8 @@ struct SettingsFileInfo {
 }
 
 #[derive(Debug, Serialize)]
-struct Report {
-    ok: bool,
+pub(crate) struct Report {
+    pub(crate) ok: bool,
     sections: Vec<Section>,
     settings_files: Vec<SettingsFileInfo>,
     /// The managed-settings paste block — the fix `init` would apply, carried in the
@@ -110,13 +110,8 @@ struct Report {
     snippet: String,
 }
 
-/// The full report as a JSON value — the `--json` payload, shared with the MCP tool.
-pub(crate) fn report_value() -> serde_json::Value {
-    serde_json::to_value(build_report()).unwrap_or_default()
-}
-
 pub fn run(json: bool, local: bool) -> i32 {
-    let report = build_report_for(local);
+    let report = report(local);
     if json {
         print!("{}", crate::machine_json(&report));
     } else {
@@ -128,15 +123,9 @@ pub fn run(json: bool, local: bool) -> i32 {
     i32::from(!report.ok)
 }
 
-fn build_report() -> Report {
-    build_report_for(false)
-}
-
-pub(crate) fn local_report_value() -> serde_json::Value {
-    serde_json::to_value(build_report_for(true)).expect("doctor serializes")
-}
-
-fn build_report_for(local: bool) -> Report {
+/// The report `doctor --json` prints and the MCP tool returns; `local` skips the Claude Code
+/// wiring checks.
+pub(crate) fn report(local: bool) -> Report {
     let files = if local { Vec::new() } else { cs::scope_files() };
     let env = cs::effective_env(&files, cs::process_env());
     let settings_env = cs::settings_env(&files);
