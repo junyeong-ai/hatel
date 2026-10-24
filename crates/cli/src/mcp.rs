@@ -154,12 +154,8 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || {
-            crate::emit_batch(p.records)
-                .map(|results| success(machine_json(&results)))
-                .map_err(|(EmitError::Registry(e) | EmitError::Rejected(e))| e)
-        })
-        .await
+        answer(move || crate::emit_batch(p.records).map(|results| success(machine_json(&results))))
+            .await
     }
 
     #[tool(

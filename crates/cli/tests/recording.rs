@@ -505,7 +505,8 @@ fn mcp_rejects_misspelled_arguments_and_marks_a_failed_diagnosis_as_an_error() {
 }
 
 #[test]
-fn a_batch_that_cannot_load_its_configuration_exits_as_an_environment_fault() {
+fn a_batch_that_cannot_load_its_configuration_prints_no_results_and_exits_2() {
+    // Producers parse stdout as one result per item whenever the exit is 0 or 1.
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("config.toml"),
@@ -526,7 +527,8 @@ fn a_batch_that_cannot_load_its_configuration_exits_as_an_environment_fault() {
         .write_all(br#"[{"kind":"check","payload":{"name":"lint","outcome":"passed"}}]"#)
         .unwrap();
     let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("sink"));
 }
 
