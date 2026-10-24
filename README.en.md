@@ -100,7 +100,7 @@ hatel report --kind memory --group-by file_path
 hatel report --project /absolute/repository/path --format json
 ```
 
-`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, with payload attribution for legacy records. `--project` accepts key or label; use keys to distinguish repositories with equal labels. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
+`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, falling back to the payload's `project` for records without one. `--project` accepts key or label; use keys to distinguish repositories with equal labels. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
 
 Ordinary Kind `count` counts records. With event-mode `identity`, each group uses the earliest matching record per ID; records without an ID count separately. This is query selection, not storage deduplication. Snapshot mode selects state as described below.
 

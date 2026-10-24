@@ -26,9 +26,7 @@ pub struct Spend {
 pub struct CostRow {
     pub session_id: String,
     pub project: String,
-    #[serde(default)]
     pub project_key: Option<String>,
-    #[serde(default)]
     pub observed_metrics: Option<BTreeSet<String>>,
     pub tokens: i64,
     pub cost_usd: f64,
@@ -39,14 +37,9 @@ pub struct CostRow {
     /// `cacheCreation` — the cache-hit accounting), and spend by model and by
     /// subagent attribution. A series missing the dimension buckets under
     /// `(unattributed)` — recorded, never guessed. A breakdown sums to its total
-    /// only when every contributing record carried the dimension: rows persisted
-    /// before a dimension existed deserialize to an empty map (`serde(default)`),
-    /// which is the honest reading — the breakdown genuinely was not recorded.
-    #[serde(default)]
+    /// only when every contributing record carried the dimension.
     pub tokens_by_type: BTreeMap<String, i64>,
-    #[serde(default)]
     pub by_model: BTreeMap<String, Spend>,
-    #[serde(default)]
     pub by_agent: BTreeMap<String, Spend>,
     pub ts: String,
 }
@@ -334,20 +327,6 @@ mod tests {
         let base = spends(&[("opus", 100, 1.0)]);
         let merged = merge_spend(&base, spends(&[("opus", 10, 3.0)]), true, false);
         assert_eq!(merged, spends(&[("opus", 110, 3.0)]));
-    }
-
-    #[test]
-    fn a_row_persisted_without_breakdowns_deserializes_to_empty_maps() {
-        // A snapshot line written before the dimensional breakdowns existed still
-        // parses — its breakdowns read as empty (not recorded), never as a parse
-        // failure that would silently drop the row (and its totals) from reports.
-        let line = "{\"session_id\":\"S\",\"project\":\"alpha\",\"tokens\":7,\"cost_usd\":0.5,\
-                    \"active_time_s\":1.0,\"lines\":2,\"ts\":\"2026-01-01T00:00:00Z\"}";
-        let row: CostRow = serde_json::from_str(line).unwrap();
-        assert_eq!(row.tokens, 7);
-        assert!(row.tokens_by_type.is_empty());
-        assert!(row.by_model.is_empty());
-        assert!(row.by_agent.is_empty());
     }
 
     #[test]

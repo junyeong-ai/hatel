@@ -756,10 +756,14 @@ mod tests {
         let cfg = test_cfg(vec![]);
         let dir = &cfg.state_dir;
         let row = |sid: &str, proj: &str, ts: &str| {
-            format!(
-                "{{\"session_id\":\"{sid}\",\"project\":\"{proj}\",\"tokens\":1,\"cost_usd\":0.0,\
-                 \"active_time_s\":0.0,\"lines\":0,\"ts\":\"{ts}\"}}"
-            )
+            serde_json::to_string(&hatel_core::cost::CostRow {
+                session_id: sid.into(),
+                project: proj.into(),
+                tokens: 1,
+                ts: ts.into(),
+                ..Default::default()
+            })
+            .unwrap()
         };
         let now = hatel_core::now_iso_utc();
         std::fs::write(

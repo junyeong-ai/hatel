@@ -114,8 +114,9 @@ and its CI check unless a deliberate compatibility change requires raising both.
   distinguish a command exit, timeout, spawn error, signal and reuse at their execution boundary;
   missing durations or exit codes stay absent. It implies no defect, flakiness or saved time.
 - **Typed records and explicit missingness.** A Kind's field declarations own types, requiredness
-  and units. Numbers are JSON numbers; invalid legacy values remain visible as `invalid_count`.
-  Reports aggregate inside SQLite with bounded caches. A field's duration buckets are cumulative and use its declared `s` or `ms` unit.
+  and units. Numbers are JSON numbers; a stored value its declared type rejects stays visible as
+  `invalid_count`. Reports aggregate inside SQLite with bounded caches. A field's duration buckets
+  are cumulative and use its declared `s` or `ms` unit.
 - **One registry and one store for the write and read paths.** Plugins and `[storage]` live in
   `config.toml`, which the hook, the service's receiver and `report` all read however each was
   started, so a Kind the hook can record is one `report` can read, in the store it reads;

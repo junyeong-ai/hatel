@@ -337,7 +337,7 @@ fn the_cost_section_follows_top_and_states_its_totals() {
         .map(|(session, project, cost)| {
             format!(
                 "{}\n",
-                serde_json::json!({"session_id": session, "project": project, "tokens": 1, "cost_usd": cost, "active_time_s": 1.0, "lines": 0, "observed_metrics": ["cost.usage"], "ts": ts})
+                serde_json::json!({"session_id": session, "project": project, "tokens": 1, "cost_usd": cost, "active_time_s": 1.0, "lines": 0, "observed_metrics": ["cost.usage"], "tokens_by_type": {}, "by_model": {}, "by_agent": {}, "ts": ts})
             )
         })
         .collect();

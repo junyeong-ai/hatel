@@ -38,8 +38,8 @@ from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
 `cost_session_count` and `cost_group_count` give totals, and `--top 0` returns all. Filter hashed
 payload fields by their original value.
 `--project` accepts canonical key or display label; labels may combine equal-named repos.
-`project` grouping and filtering prefer the common key, using payload attribution only
-for legacy records. Use `metadata.project.key` to address that common field explicitly.
+`project` grouping and filtering prefer the common key, falling back to the payload's `project`
+for records without one. Use `metadata.project.key` to address that common field explicitly.
 
 A section answers under the current contract plus stored contracts it reads unchanged: same name,
 version and mode, and every declared field keeps type, unit, redaction and requiredness.

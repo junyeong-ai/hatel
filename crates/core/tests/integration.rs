@@ -2446,7 +2446,7 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
 }
 
 #[test]
-fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_legacy_payloads() {
+fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_payload_projects() {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("private.toml");
     std::fs::write(

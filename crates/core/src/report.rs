@@ -106,7 +106,7 @@ pub struct Query<'a> {
 }
 
 /// Whether this query applies a project restriction. Common metadata supplies attribution for
-/// every Kind; legacy records without attribution cannot match a project restriction.
+/// every Kind; a record without attribution cannot match a project restriction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectScope {

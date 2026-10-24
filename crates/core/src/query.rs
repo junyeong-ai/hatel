@@ -145,8 +145,8 @@ fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
     ];
     if let Some(project) = q.project {
         let p = parameter(args, project.into());
-        let legacy = parameter(args, payload_project(spec, project));
-        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={legacy}))"));
+        let payload = parameter(args, payload_project(spec, project));
+        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p} OR (json_extract(metadata, '$.project') IS NULL AND json_extract(payload, '$.project')={payload}))"));
     }
     conditions
 }
@@ -155,9 +155,9 @@ fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<S
     let mut filters = Vec::new();
     for (field, value) in q.filters {
         if field == "project" {
-            let legacy = parameter(args, payload_project(spec, value));
+            let payload = parameter(args, payload_project(spec, value));
             let value = parameter(args, value.clone());
-            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={legacy}))"));
+            filters.push(format!("(json_extract(metadata,'$.project.key')={value} OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={payload}))"));
         } else {
             let (document, path) = selector(field);
             let path = parameter(args, path);
