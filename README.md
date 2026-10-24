@@ -110,7 +110,7 @@ hatel report --kind memory --group-by file_path
 hatel report --project /absolute/repository/path --format json
 ```
 
-`--group-by`, `--sort-by`, 반복 가능한 `--filter field=value`는 `--kind`와 함께 사용한다. 필터는 정확히 일치해야 하며 모두 만족해야 한다. 빈 문자열과 누락은 구분한다. 해시 처리된 페이로드 필드는 원래 값으로 필터링한다. `project`는 공통 프로젝트 키를 우선하고 이전 기록은 페이로드의 프로젝트를 사용한다. `--project`는 키 또는 표시 이름에 일치한다. 같은 표시 이름을 가진 저장소를 구분하려면 키를 사용한다.
+`--group-by`, `--sort-by`, 반복 가능한 `--filter field=value`는 `--kind`와 함께 사용한다. 필터는 정확히 일치해야 하며 모두 만족해야 한다. 빈 문자열과 누락은 구분한다. 해시 처리된 페이로드 필드는 원래 값으로 필터링한다. `project`는 공통 프로젝트 키를 우선하고 이전 기록은 페이로드의 프로젝트를 사용한다. `--project`는 키 또는 표시 이름에 일치한다. 같은 표시 이름을 가진 저장소를 구분하려면 키를 사용한다. `--top`(기본 5, `0`이면 전체)은 Kind별 그룹, 비용 섹션의 세션(`cost`, `cost_usd` 내림차순)과 프로젝트(`cost_groups`) 목록을 모두 자른다. 자르기 전 개수는 `group_count`, `cost_session_count`, `cost_group_count`가 알려 준다.
 
 일반 Kind의 `count`는 기록 수다. 이벤트 모드에서 `identity`를 선언하면 그룹별 ID의 가장 이른 일치 기록을 대표로 고르고, ID가 없는 기록은 각각 센다. 이는 저장 시 중복 제거가 아니다. 스냅샷 모드는 아래 규칙으로 최신 상태를 고른다.
 

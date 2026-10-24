@@ -158,9 +158,15 @@ fn scratch() -> crate::Result<Connection> {
 }
 
 pub struct SectionResult {
-    pub groups: crate::Result<Vec<GroupAgg>>,
+    pub groups: crate::Result<Groups>,
     pub retained_since: Option<String>,
     pub contracts: Vec<ContractCount>,
+}
+
+/// The ranked groups a query returned, and how many it had before `top_n` cut them.
+pub struct Groups {
+    pub groups: Vec<GroupAgg>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -209,7 +215,7 @@ impl Selection<'_> {
 }
 
 pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
-    section(cfg, spec, q).and_then(|result| result.groups)
+    section(cfg, spec, q).and_then(|result| result.groups.map(|ranked| ranked.groups))
 }
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
@@ -352,7 +358,7 @@ fn aggregate_connection(
     spec: &KindSpec,
     q: &Query,
     selection: &Selection,
-) -> crate::Result<Vec<GroupAgg>> {
+) -> crate::Result<Groups> {
     let mut args: Vec<Value> = vec![
         spec.name.clone().into(),
         q.since.into(),
@@ -478,6 +484,8 @@ fn aggregate_connection(
         }
         layouts.push((start, bounds));
     }
+    let total_column = columns.len();
+    columns.push("COUNT(*) OVER ()".into());
     sql.push_str(&format!(
         " SELECT {} FROM {from} GROUP BY key",
         columns.join(",")
@@ -491,8 +499,16 @@ fn aggregate_connection(
         sql.push_str(&format!(" LIMIT {}", q.top_n));
     }
     let mut stmt = conn.prepare(&sql).map_err(io)?;
+    let mut total = 0;
     let rows = stmt
         .query_map(rusqlite::params_from_iter(args), |row| {
+            total = usize::try_from(row.get::<_, i64>(total_column)?).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    total_column,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?;
             let count: i64 = row.get(1)?;
             let sums = spec
                 .measures
@@ -546,7 +562,8 @@ fn aggregate_connection(
             })
         })
         .map_err(io)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)
+    let groups = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)?;
+    Ok(Groups { groups, total })
 }
 
 #[cfg(test)]

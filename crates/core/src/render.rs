@@ -5,7 +5,7 @@
 use unicode_width::UnicodeWidthStr;
 
 use crate::catalog::Resolution;
-use crate::report::{GroupAgg, KindSection, Report, cost_axes, cost_by_project, rank_value};
+use crate::report::{GroupAgg, KindSection, Report, cost_axes, rank_value};
 
 /// Width of the magnitude bar that prefixes a terminal row. Fixed, so rows stay aligned across
 /// sections and the eye can compare within one.
@@ -50,18 +50,18 @@ pub fn format_text(report: &Report) -> String {
             &section.groups,
             note(section),
         ));
+        if let Some(cut) = truncated(section.groups.len(), section.group_count, "groups") {
+            out.push_str(&format!("  ({cut})\n"));
+        }
     }
     if let Some(groups) = cost_groups(report) {
         let (dimension, rank) = cost_axes();
         out.push('\n');
         out.push_str(&format!("cost — by {dimension}, ranked by {rank}\n"));
-        out.push_str(&text_table(
-            dimension,
-            "sessions",
-            Some(rank),
-            &groups,
-            None,
-        ));
+        out.push_str(&text_table(dimension, "sessions", Some(rank), groups, None));
+        if let Some(cut) = truncated(groups.len(), report.cost_group_count, "projects") {
+            out.push_str(&format!("  ({cut})\n"));
+        }
     }
     out
 }
@@ -92,20 +92,32 @@ pub fn format_markdown(report: &Report) -> String {
             &section.groups,
             note(section),
         ));
+        if let Some(cut) = truncated(section.groups.len(), section.group_count, "groups") {
+            out.push_str(&format!("\n_{cut}_\n"));
+        }
     }
     if let Some(groups) = cost_groups(report) {
         let (dimension, rank) = cost_axes();
         out.push_str(&format!("\n## cost — by {dimension}, ranked by {rank}\n\n"));
-        out.push_str(&markdown_table(dimension, "sessions", &groups, None));
+        out.push_str(&markdown_table(dimension, "sessions", groups, None));
+        if let Some(cut) = truncated(groups.len(), report.cost_group_count, "projects") {
+            out.push_str(&format!("\n_{cut}_\n"));
+        }
     }
     out
 }
 
 /// The ranked cost rollup, or `None` when the report carries no cost rows (a Kind-scoped report,
 /// or a window with no recorded spend).
-fn cost_groups(report: &Report) -> Option<Vec<GroupAgg>> {
-    let groups = cost_by_project(&report.cost, report.top_n);
-    (!groups.is_empty()).then_some(groups)
+fn cost_groups(report: &Report) -> Option<&[GroupAgg]> {
+    (!report.cost_groups.is_empty()).then_some(report.cost_groups.as_slice())
+}
+
+/// A list `top_n` cut says how much it left out and how to see the rest.
+fn truncated(shown: usize, total: Option<usize>, noun: &str) -> Option<String> {
+    total
+        .filter(|total| *total > shown)
+        .map(|total| format!("top {shown} of {total} {noun}; --top 0 shows all"))
 }
 
 /// The header's restriction summary — the project and each `field=value` filter — so a saved
@@ -455,6 +467,7 @@ mod tests {
             project_scope: ProjectScope::Unrestricted,
             retained_since: None,
             error: None,
+            group_count: Some(groups.len()),
             groups,
         }
     }
@@ -482,6 +495,9 @@ mod tests {
             top_n: 5,
             kinds,
             cost: Vec::new(),
+            cost_groups: Vec::new(),
+            cost_session_count: None,
+            cost_group_count: None,
             cost_basis: "session_lifetime_totals_selected_by_last_seen",
             unreadable_kinds: None,
         }

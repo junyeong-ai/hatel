@@ -117,8 +117,9 @@ pub enum ProjectScope {
 /// One Kind's answer, self-describing: which dimension it was grouped by, which measure ranked
 /// it (`None` — and so count — when the Kind declares no measures), what each group's count
 /// counts (`identity`: distinct values of that field, else records), how the project scope
-/// applied, and the oldest retained occurrence (`retained_since`). This timestamp does not
-/// establish continuous collection; an empty period is an absence of records, not proof of inactivity.
+/// applied, how many groups existed before `top_n` cut them (`None` when the query failed), and
+/// the oldest retained occurrence (`retained_since`). This timestamp does not establish
+/// continuous collection; an empty period is an absence of records, not proof of inactivity.
 #[derive(Debug, Clone, Serialize)]
 pub struct KindSection {
     pub kind: String,
@@ -131,6 +132,7 @@ pub struct KindSection {
     pub contract: String,
     pub contracts: Vec<crate::query::ContractCount>,
     pub groups: Vec<GroupAgg>,
+    pub group_count: Option<usize>,
     pub error: Option<String>,
 }
 
@@ -143,10 +145,15 @@ pub struct Report {
     pub filters: Vec<Filter>,
     pub top_n: usize,
     pub kinds: Vec<KindSection>,
-    /// The native-OTel cost snapshot, one row per session in the window. Kept whole — it is the
-    /// join table a caller reaches for when relating spend to its own records — while
-    /// [`cost_by_project`] provides the ranked rollup a summary shows.
+    /// The native-OTel cost snapshot, one row per session in the window, ranked by spend and cut
+    /// at `top_n` like every other list; `top_n = 0` keeps the whole join table a caller relates
+    /// to its own records by session.
     pub cost: Vec<CostRow>,
+    /// The same sessions rolled up by project, as every format summarizes them.
+    pub cost_groups: Vec<GroupAgg>,
+    /// Sessions and projects before `top_n` cut them; `None` when no cost section was read.
+    pub cost_session_count: Option<usize>,
+    pub cost_group_count: Option<usize>,
     pub cost_error: Option<String>,
     pub cost_basis: &'static str,
     /// Kinds the ledger holds that this registry cannot read. A report answered over less than
@@ -171,16 +178,17 @@ impl Report {
                 let result = crate::query::section(cfg, spec, q);
                 let (groups, retained_since, contracts, error) = match result {
                     Ok(result) => match result.groups {
-                        Ok(groups) => (groups, result.retained_since, result.contracts, None),
+                        Ok(groups) => (Some(groups), result.retained_since, result.contracts, None),
                         Err(error) => (
-                            Vec::new(),
+                            None,
                             result.retained_since,
                             result.contracts,
                             Some(error.to_string()),
                         ),
                     },
-                    Err(e) => (Vec::new(), None, Vec::new(), Some(e.to_string())),
+                    Err(e) => (None, None, Vec::new(), Some(e.to_string())),
                 };
+                let group_count = groups.as_ref().map(|ranked| ranked.total);
                 KindSection {
                     kind: spec.name.clone(),
                     mode: spec.mode,
@@ -191,18 +199,30 @@ impl Report {
                     retained_since,
                     contract: q.contract.unwrap_or(&spec.schema_id).into(),
                     contracts,
-                    groups,
+                    groups: groups.map(|ranked| ranked.groups).unwrap_or_default(),
+                    group_count,
                     error,
                 }
             })
             .collect();
         let (cost, cost_error) = match q.kind {
-            Some(_) => (Vec::new(), None),
+            Some(_) => (None, None),
             None => match cost_rows(&cfg.state_dir, q) {
-                Ok(rows) => (rows, None),
-                Err(error) => (Vec::new(), Some(error.to_string())),
+                Ok(rows) => (Some(rows), None),
+                Err(error) => (None, Some(error.to_string())),
             },
         };
+        let cost_session_count = cost.as_ref().map(Vec::len);
+        let mut cost_groups = cost.as_deref().map(cost_by_project).unwrap_or_default();
+        let cost_group_count = cost.as_ref().map(|_| cost_groups.len());
+        truncate(&mut cost_groups, q.top_n);
+        let mut cost = cost.unwrap_or_default();
+        cost.sort_by(|a, b| {
+            b.cost_usd
+                .total_cmp(&a.cost_usd)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
+        truncate(&mut cost, q.top_n);
         let (unreadable_kinds, storage_error) = match UnreadableKinds::detect(reg, cfg) {
             Ok(found) => (found, None),
             Err(error) => (None, Some(error.to_string())),
@@ -223,6 +243,9 @@ impl Report {
             // The cost snapshot is not a Kind, so a Kind-scoped report leaves it out entirely
             // rather than showing spend the scope did not ask about.
             cost,
+            cost_groups,
+            cost_session_count,
+            cost_group_count,
             cost_error,
             cost_basis: "session_lifetime_totals_selected_by_last_seen",
             unreadable_kinds,
@@ -250,12 +273,12 @@ fn cost_rows(state_dir: &std::path::Path, q: &Query) -> std::io::Result<Vec<Cost
         .collect())
 }
 
-/// Roll cost rows up by project, ranked by spend and capped at `top_n` (0 = all). The group
-/// count is sessions, and the measures are the four totals a snapshot row carries — the same
-/// shape a Kind's groups take, so one renderer serves both. A row whose project was never
-/// resolved keys on the empty string it actually holds, so it can never merge with a real
-/// project however that project happens to be named; naming it is the renderer's job.
-pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
+/// Roll cost rows up by project, ranked by spend. The group count is sessions, and the measures
+/// are the four totals a snapshot row carries — the same shape a Kind's groups take, so one
+/// renderer serves both. A row whose project was never resolved keys on the empty string it
+/// actually holds, so it can never merge with a real project however that project happens to be
+/// named; naming it is the renderer's job.
+pub fn cost_by_project(rows: &[CostRow]) -> Vec<GroupAgg> {
     let mut by_project: BTreeMap<&str, (i64, [f64; 4], [i64; 4])> = BTreeMap::new();
     let metrics = [
         "token.usage",
@@ -307,7 +330,6 @@ pub fn cost_by_project(rows: &[CostRow], top_n: usize) -> Vec<GroupAgg> {
         })
         .collect();
     rank(&mut groups, Some(COST_RANK));
-    truncate(&mut groups, top_n);
     groups
 }
 
@@ -356,9 +378,9 @@ fn rank(groups: &mut [GroupAgg], measure: Option<&str>) {
     });
 }
 
-fn truncate(groups: &mut Vec<GroupAgg>, top_n: usize) {
+fn truncate<T>(items: &mut Vec<T>, top_n: usize) {
     if top_n > 0 {
-        groups.truncate(top_n);
+        items.truncate(top_n);
     }
 }
 
@@ -433,15 +455,12 @@ mod tests {
             ),
             ..CostRow::default()
         };
-        let groups = cost_by_project(
-            &[
-                row("s1", "alpha", 1.0, 10),
-                row("s2", "beta", 5.0, 20),
-                row("s3", "alpha", 9.0, 30),
-                row("s4", "", 0.5, 1),
-            ],
-            0,
-        );
+        let groups = cost_by_project(&[
+            row("s1", "alpha", 1.0, 10),
+            row("s2", "beta", 5.0, 20),
+            row("s3", "alpha", 9.0, 30),
+            row("s4", "", 0.5, 1),
+        ]);
         assert_eq!(groups[0].key.as_deref(), Some("alpha"));
         assert_eq!(groups[0].count, 2, "the group count is sessions");
         assert_eq!(groups[0].sums[0].sum, 40.0, "tokens summed across sessions");
@@ -467,7 +486,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let groups = cost_by_project(&rows, 0);
+        let groups = cost_by_project(&rows);
         let cost = &groups[0].sums[1];
         assert_eq!(
             (cost.sum, cost.valid_count, cost.missing_count),

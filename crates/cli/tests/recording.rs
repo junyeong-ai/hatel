@@ -436,6 +436,54 @@ fn read_errors_are_machine_visible_and_do_not_disable_independent_recording() {
 }
 
 #[test]
+fn the_cost_section_follows_top_and_states_its_totals() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nsink = \"sqlite\"\nstate_dir = {:?}\n",
+            state.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let ts = hatel_core::now_iso_utc();
+    let rows: String = [("s1", "alpha", 1.0), ("s2", "beta", 5.0), ("s3", "alpha", 9.0)]
+        .into_iter()
+        .map(|(session, project, cost)| {
+            format!(
+                "{}\n",
+                serde_json::json!({"session_id": session, "project": project, "tokens": 1, "cost_usd": cost, "active_time_s": 1.0, "lines": 0, "observed_metrics": ["cost.usage"], "ts": ts})
+            )
+        })
+        .collect();
+    std::fs::write(state.join("cost_snapshot.jsonl"), rows).unwrap();
+    let report = |top: &str| -> serde_json::Value {
+        let output = isolated(home.path())
+            .args(["report", "--top", top, "--format", "json"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    let top = report("1");
+    assert_eq!(top["cost"].as_array().unwrap().len(), 1);
+    assert_eq!(top["cost"][0]["session_id"], "s3");
+    assert_eq!(top["cost_session_count"], 3);
+    assert_eq!(top["cost_groups"][0]["key"], "alpha");
+    assert_eq!(top["cost_groups"][0]["sums"][1]["sum"], 10.0);
+    assert_eq!(top["cost_group_count"], 2);
+    let all = report("0");
+    assert_eq!(all["cost"].as_array().unwrap().len(), 3);
+    assert_eq!(all["cost_groups"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn record_commands_reject_oversized_stdin_before_storing_records() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(

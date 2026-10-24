@@ -41,7 +41,9 @@ pub struct ReportParams {
         description = "Exact-match restrictions, each \"field=value\" (every one must match). Requires `kind`; the field must be in that Kind's allow-list. A redacted field is matched by its original value."
     )]
     pub filter: Option<Vec<String>>,
-    #[schemars(description = "Groups shown per Kind (0 = all; default 5)")]
+    #[schemars(
+        description = "Items per list: each Kind's groups and the cost section's sessions and projects (0 = all; default 5). group_count, cost_session_count and cost_group_count give the totals before the cut."
+    )]
     pub top: Option<usize>,
     #[schemars(
         description = "Group by this field instead of the Kind's declared group_key. Requires `kind`; the field must be in that Kind's allow-list."
@@ -77,7 +79,7 @@ pub struct BatchParams {
 #[tool_router]
 impl HatelMcp {
     #[tool(
-        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the per-session cost snapshot with its tokens_by_type (cache accounting), by_model (model mix), and by_agent (subagent budget) breakdowns. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
+        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the cost snapshot: sessions ranked by spend with their tokens_by_type (cache accounting), by_model (model mix) and by_agent (subagent budget) breakdowns, and their per-project rollup in cost_groups. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
     )]
     async fn report(
         &self,

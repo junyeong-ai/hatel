@@ -1413,7 +1413,7 @@ fn sqlite_maintenance_is_explicit_and_preserves_exact_occurrence_times() {
     let section =
         hatel_core::query::section(&cfg, reg.kind("prompt").unwrap(), &legacy_query(0, 0, None))
             .unwrap();
-    assert_eq!(section.groups.unwrap()[0].count, 2);
+    assert_eq!(section.groups.unwrap().groups[0].count, 2);
     assert_eq!(section.retained_since.as_deref(), Some(times[1]));
     assert_eq!(hatel_core::migration::upgrade_sqlite(&db).unwrap(), 2);
     hatel_core::sink::write_readiness(&db).unwrap();
@@ -1684,10 +1684,15 @@ fn top_zero_means_all_groups() {
         .map(|t| format!("{}\n", rec(t)))
         .collect();
     std::fs::write(cfg.ledger_dir.join("tool.jsonl"), body).unwrap();
+    let capped =
+        hatel_core::query::section(&cfg, reg.kind("tool").unwrap(), &legacy_query(0, 3, None))
+            .unwrap()
+            .groups
+            .unwrap();
     assert_eq!(
-        aggregate(&reg, &cfg, "tool", &legacy_query(0, 3, None)).len(),
-        3,
-        "capped at 3"
+        (capped.groups.len(), capped.total),
+        (3, 6),
+        "capped at 3 of 6"
     );
     assert_eq!(
         aggregate(&reg, &cfg, "tool", &legacy_query(0, 0, None)).len(),
@@ -2843,9 +2848,9 @@ fn common_metadata_separates_equal_project_labels_and_filters_runs_without_paylo
         ..query(0, 0, Some("/team-one/repo"))
     };
     let result = hatel_core::query::section(&cfg, spec, &q).unwrap();
-    assert_eq!(result.groups.as_ref().unwrap().len(), 1);
+    assert_eq!(result.groups.as_ref().unwrap().groups.len(), 1);
     assert_eq!(
-        result.groups.as_ref().unwrap()[0].key.as_deref(),
+        result.groups.as_ref().unwrap().groups[0].key.as_deref(),
         Some("/team-one/repo")
     );
     assert!(result.retained_since.is_some());
@@ -2909,6 +2914,7 @@ fn project_scope_and_filters_keep_canonical_metadata_separate_from_redacted_lega
                 .groups
                 .as_ref()
                 .unwrap()
+                .groups
                 .iter()
                 .map(|group| group.count)
                 .sum::<i64>(),

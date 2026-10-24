@@ -1689,7 +1689,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.project == "repo"));
         assert_ne!(rows[0].project_key, rows[1].project_key);
-        assert_eq!(hatel_core::report::cost_by_project(&rows, 0).len(), 2);
+        assert_eq!(hatel_core::report::cost_by_project(&rows).len(), 2);
         assert!(
             rows.iter()
                 .all(|r| r.observed_metrics.as_ref().unwrap().contains("cost.usage"))

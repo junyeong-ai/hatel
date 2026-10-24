@@ -63,7 +63,7 @@ enum Command {
         /// Select an exact stored schema ID, or explicitly interpret one legacy contract.
         #[arg(long, requires = "kind")]
         contract: Option<String>,
-        /// How many groups to show per Kind (0 = all).
+        /// Items per list: each Kind's groups and the cost section's sessions and projects (0 = all).
         #[arg(long, default_value_t = report::TOP_N)]
         top: usize,
         /// Group by this field instead of the Kind's declared `group_key` (`--group-by outcome`).
