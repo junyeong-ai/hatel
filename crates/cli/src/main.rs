@@ -183,7 +183,11 @@ fn main() {
 }
 
 fn run() -> i32 {
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    if !matches!(command, Command::Serve { .. } | Command::Mcp) {
+        end_quietly_on_closed_stdout();
+    }
+    match command {
         Command::Serve {
             port,
             project,
@@ -251,6 +255,21 @@ fn run() -> i32 {
         Command::Deliveries { json } => deliveries_cmd(json),
     }
 }
+
+/// A one-shot command is usually read through a pipe, and a reader that stops early (`| head`)
+/// must end it the way it ends any Unix tool, not turn the next write into a panic. Rust ignores
+/// SIGPIPE by default; the receiver and the MCP server keep that, so a client that disconnects is
+/// an error they handle rather than a signal that kills them.
+#[cfg(unix)]
+fn end_quietly_on_closed_stdout() {
+    // SAFETY: restores the default disposition of one signal; no Rust invariant depends on it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn end_quietly_on_closed_stdout() {}
 
 /// Why an emit was refused: `Registry` is an environment problem (the registry itself
 /// failed to load); `Rejected` is a caller problem (unknown Kind,

@@ -366,6 +366,29 @@ fn the_cost_section_follows_top_and_states_its_totals() {
     assert_eq!(all["cost_groups"].as_array().unwrap().len(), 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_reader_that_stops_early_ends_a_command_quietly() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::ExitStatusExt;
+    let home = tempfile::tempdir().unwrap();
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    drop(read);
+    let output = isolated(home.path())
+        .args(["kinds", "--json"])
+        .stdout(Stdio::from(write))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.signal(), Some(libc::SIGPIPE));
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn record_commands_reject_oversized_stdin_before_storing_records() {
     let home = tempfile::tempdir().unwrap();
