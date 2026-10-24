@@ -137,13 +137,8 @@ fn scope(report: &Report) -> String {
 /// A section's axes in the terms the query used, so a reader knows which question was answered.
 fn axes(section: &KindSection) -> String {
     let rank = section.sort_by.as_deref().unwrap_or("count");
-    let basis = if section.contract == "legacy" {
-        ", unverified legacy contract"
-    } else {
-        ""
-    };
     format!(
-        "by {}, ranked by {}{basis}",
+        "by {}, ranked by {}",
         inline(&section.group_by),
         inline(rank)
     )
@@ -169,9 +164,8 @@ fn note(section: &KindSection) -> Option<&'static str> {
         })
 }
 
-/// The records a section could not read, by the reason that decides how a reader reaches them:
-/// another known definition is selected by its ID, and records without one only by an explicit
-/// legacy interpretation.
+/// The records a section could not read, by reason: those under another known definition are
+/// reached by selecting its ID, and those without a known definition are not interpreted at all.
 fn exclusions(section: &KindSection) -> Option<String> {
     let count = |resolution| -> i64 {
         section
@@ -186,10 +180,7 @@ fn exclusions(section: &KindSection) -> Option<String> {
             count(Resolution::Incompatible),
             "under an incompatible contract (--contract <schema_id>)",
         ),
-        (
-            count(Resolution::Undefined),
-            "without a known definition (--contract legacy)",
-        ),
+        (count(Resolution::Undefined), "without a known definition"),
     ]
     .into_iter()
     .filter(|(records, _)| *records > 0)

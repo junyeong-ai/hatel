@@ -46,9 +46,8 @@ version and mode, and every declared field keeps type, unit, redaction and requi
 `contracts[].resolution` is `selected`, `compatible`, `incompatible` or `undefined`; only the first two
 are aggregated and covered by `retained_since`. State excluded counts with the answer. Inspect
 `stored_contracts` in `kinds --json`; `report --kind KIND --contract SCHEMA_ID` uses its saved
-definition, including retired Kinds. Without a definition, load the exact historical schema and
-explicitly select `--contract legacy`; use `--filter metadata.schema_id=OLD_ID` for a retained
-old fingerprint. This basis is unverified: never infer missing identities, units or semantics.
+definition, including retired Kinds. Records without a known definition are counted, never
+interpreted: never infer their identities, units or semantics.
 
 Report interpretation:
 

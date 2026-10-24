@@ -110,7 +110,7 @@ hatel report --project /absolute/repository/path --format json
 
 `retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `unreadable_kinds`는 스키마 미등록, `storage_error`는 원장 검사 실패, `cost_error`는 비용 이력 읽기 실패를 뜻한다. Kind의 `error`와 함께 확인한다. 실패한 빈 배열을 기록 없음으로 해석하지 않는다. 비용 기준값을 읽지 못한 수신기는 해당 파일을 갱신하지 않으며, 복구 후 재시작이 필요하다.
 
-각 섹션은 Kind의 현재 계약, 또는 `--contract SCHEMA_ID`로 선택한 계약을 기준으로 답한다. 다른 저장 계약의 기록은 이름·버전·모드가 같고 선언된 모든 필드의 타입·단위·해시 처리·필수 여부가 유지될 때 함께 집계한다. `contracts`는 계약별 기록 수와 `resolution`을 표시한다. `selected`와 `compatible` 기록은 집계에 포함하고, `incompatible` 기록과 정의를 알 수 없는 `undefined` 기록은 제외한다. `retained_since`도 집계한 기록만 기준으로 한다. `kinds --json`의 `stored_contracts`에서 정의를 확인하고 `report --kind KIND --contract SCHEMA_ID`로 선택한다. 정의가 없는 과거 기록은 정확한 당시 스키마를 불러온 뒤 `--contract legacy`로 명시적으로 조회한다. 지문이 남은 과거 기록은 `--filter metadata.schema_id=OLD_ID`로 한 계약을 선택한다. `contract=legacy`는 검증되지 않은 해석이며 자동 단위 변환이나 과거 의미 복원을 보장하지 않는다.
+각 섹션은 Kind의 현재 계약, 또는 `--contract SCHEMA_ID`로 선택한 계약을 기준으로 답한다. 다른 저장 계약의 기록은 이름·버전·모드가 같고 선언된 모든 필드의 타입·단위·해시 처리·필수 여부가 유지될 때 함께 집계한다. `contracts`는 계약별 기록 수와 `resolution`을 표시한다. `selected`와 `compatible` 기록은 집계에 포함하고, `incompatible` 기록과 정의를 알 수 없는 `undefined` 기록은 제외한다. `retained_since`도 집계한 기록만 기준으로 한다. `kinds --json`의 `stored_contracts`에서 정의를 확인하고 `report --kind KIND --contract SCHEMA_ID`로 선택한다. 은퇴한 Kind도 같은 방식으로 조회한다. 정의를 알 수 없는 기록은 건수만 세고 해석하지 않는다.
 
 ## 커스텀 Kind
 

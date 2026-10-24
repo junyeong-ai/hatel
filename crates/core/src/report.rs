@@ -91,7 +91,7 @@ pub struct Query<'a> {
     pub project: Option<&'a str>,
     /// Restrict to one registered Kind.
     pub kind: Option<&'a str>,
-    /// An exact stored contract, or an explicit unverified interpretation of legacy records.
+    /// A stored contract to answer under instead of the Kind's current one.
     pub contract: Option<&'a str>,
     /// Dimension to group by, overriding the Kind's declared default. Validated against that
     /// Kind's allow-list by the caller, so a dimension that reaches here is one the Kind records.

@@ -35,7 +35,7 @@ pub struct ReportParams {
     )]
     pub kind: Option<String>,
     #[schemars(
-        description = "Answer under this stored schema ID instead of the current contract, or \"legacy\" for an explicit unverified interpretation of records without a known definition. Requires kind."
+        description = "Answer under this stored schema ID (see stored_contracts in kinds) instead of the Kind's current contract. Requires kind."
     )]
     pub contract: Option<String>,
     #[schemars(

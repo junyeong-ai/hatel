@@ -72,9 +72,7 @@ and its CI check unless a deliberate compatibility change requires raising both.
   keeps its type, unit, redaction and requiredness. Compatible records answer with the selected
   ones, and a pending delivery stays deliverable only under a definition that reads it. Incompatible records and records without a
   known definition are excluded and counted per `resolution` in `KindSection.contracts`, never
-  reinterpreted. Imports never invent definitions for old fingerprints. `contract=legacy` is an
-  operator-selected unverified interpretation with an exact historical schema. Historical query
-  registries never record data.
+  reinterpreted. Historical query registries never record data.
 - **Native telemetry follows Claude Code's environment policy.** Project/local init writes hooks
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.

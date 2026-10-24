@@ -84,10 +84,9 @@ pub fn build_query_registry(
     };
     let kind =
         kind.ok_or_else(|| Error::InvalidPayload("contract selection requires a Kind".into()))?;
-    if contract == "legacy"
-        || reg
-            .kind(kind)
-            .is_some_and(|spec| spec.schema_id == contract)
+    if reg
+        .kind(kind)
+        .is_some_and(|spec| spec.schema_id == contract)
     {
         return Ok(reg);
     }

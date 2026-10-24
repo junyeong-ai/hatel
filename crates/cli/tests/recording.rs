@@ -149,7 +149,7 @@ fn incompatible_contracts_are_excluded_and_selected_history_uses_its_saved_defin
 }
 
 #[test]
-fn records_without_a_known_definition_are_excluded_until_explicitly_interpreted() {
+fn records_without_a_known_definition_are_counted_and_never_aggregated() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -175,61 +175,46 @@ fn records_without_a_known_definition_are_excluded_until_explicitly_interpreted(
             .unwrap();
     };
     insert(serde_json::json!({}));
-    insert(serde_json::json!({"schema_id":"old-contract","kind_version":1}));
+    insert(serde_json::json!({"schema_id":"unknown-contract","kind_version":1}));
+    insert(serde_json::json!({"schema_id":registry.kind("prompt").unwrap().schema_id}));
     let report = isolated(home.path())
         .args(["report", "--kind", "prompt", "--format", "json"])
         .output()
         .unwrap();
     assert!(report.status.success());
     let value: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
-    assert_eq!(value["kinds"][0]["groups"], serde_json::json!([]));
-    assert!(
-        value["kinds"][0]["contracts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|c| c["resolution"] == "undefined" && c["count"] == 1)
+    let section = &value["kinds"][0];
+    assert_eq!(section["groups"][0]["count"], 1);
+    let mut resolutions: Vec<_> = section["contracts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["resolution"].as_str().unwrap(),
+                c["count"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    resolutions.sort();
+    assert_eq!(
+        resolutions,
+        [("selected", 1), ("undefined", 1), ("undefined", 1)]
     );
-    for filter in [None, Some("metadata.schema_id=old-contract")] {
-        let mut command = isolated(home.path());
-        command.args([
-            "report",
-            "--kind",
-            "prompt",
-            "--contract",
-            "legacy",
-            "--format",
-            "json",
-        ]);
-        if let Some(filter) = filter {
-            command.args(["--filter", filter]);
-        }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["kinds"][0]["contract"], "legacy");
-        assert_eq!(value["kinds"][0]["groups"][0]["count"], 1);
-    }
-    insert(serde_json::json!({"schema_id":"old-contract","kind_version":2}));
-    let mixed = isolated(home.path())
+    let interpreted = isolated(home.path())
         .args([
             "report",
             "--kind",
             "prompt",
             "--contract",
-            "legacy",
-            "--filter",
-            "metadata.schema_id=old-contract",
-            "--format",
-            "json",
+            "unknown-contract",
         ])
         .output()
         .unwrap();
-    assert_eq!(mixed.status.code(), Some(1));
+    assert!(
+        !interpreted.status.success(),
+        "a contract without a stored definition is never interpreted"
+    );
 }
 
 #[test]

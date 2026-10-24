@@ -59,7 +59,7 @@ enum Command {
         /// Scopes the rollup to that Kind and drops the native cost section.
         #[arg(long)]
         kind: Option<String>,
-        /// Select an exact stored schema ID, or explicitly interpret one legacy contract.
+        /// Answer under this stored schema ID instead of the Kind's current contract.
         #[arg(long, requires = "kind")]
         contract: Option<String>,
         /// Items per list: each Kind's groups and the cost section's sessions and projects (0 = all).
