@@ -6,6 +6,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::catalog::Resolution;
 use crate::report::{GroupAgg, KindSection, Report, cost_axes, rank_value};
+use crate::ts_epoch;
 
 /// Width of the magnitude bar that prefixes a terminal row. Fixed, so rows stay aligned across
 /// sections and the eye can compare within one.
@@ -42,6 +43,9 @@ pub fn format_text(report: &Report) -> String {
         }
         if let Some(excluded) = exclusions(section) {
             out.push_str(&format!("  ({excluded})\n"));
+        }
+        if let Some(retention) = retention(report, section) {
+            out.push_str(&format!("  ({retention})\n"));
         }
         out.push_str(&text_table(
             &section.group_by,
@@ -85,6 +89,9 @@ pub fn format_markdown(report: &Report) -> String {
         }
         if let Some(excluded) = exclusions(section) {
             out.push_str(&format!("_{excluded}_\n\n"));
+        }
+        if let Some(retention) = retention(report, section) {
+            out.push_str(&format!("_{retention}_\n\n"));
         }
         out.push_str(&markdown_table(
             &section.group_by,
@@ -172,6 +179,19 @@ fn note(section: &KindSection, filtered: bool) -> Option<&'static str> {
             (true, false, false) => "no records in this window",
         },
     )
+}
+
+/// A section whose oldest retained record is later than the window's start says so, since its
+/// totals cover the window only from that record on. Which of a quiet period, collection not yet
+/// running and records already pruned explains the earlier part, the store cannot tell.
+fn retention(report: &Report, section: &KindSection) -> Option<String> {
+    let retained = section.retained_since.as_deref()?;
+    (ts_epoch(retained)? > ts_epoch(&report.since)?).then(|| {
+        format!(
+            "window starts {}; oldest retained record {retained}",
+            report.since
+        )
+    })
 }
 
 /// The records a section could not read, by reason: those under another known definition are
@@ -491,6 +511,7 @@ mod tests {
             cost_error: None,
             storage_error: None,
             window: "30d".to_string(),
+            since: "2026-01-02T00:00:00Z".to_string(),
             project: None,
             filters: Vec::new(),
             top_n: 5,
@@ -602,6 +623,17 @@ mod tests {
         r.kinds[0].retained_since = None;
         let unrecorded = format_markdown(&r);
         assert!(unrecorded.contains("no records retained"), "{unrecorded}");
+    }
+
+    #[test]
+    fn a_section_retained_from_after_the_window_start_says_so() {
+        let mut r = report(vec![section("tool", vec![group(Some("Bash"), 1, 1.0)])]);
+        assert!(!format_text(&r).contains("oldest retained record"));
+        r.kinds[0].retained_since = Some("2026-01-20T08:00:00.5Z".to_string());
+        let line =
+            "window starts 2026-01-02T00:00:00Z; oldest retained record 2026-01-20T08:00:00.5Z";
+        assert!(format_text(&r).contains(&format!("  ({line})\n")));
+        assert!(format_markdown(&r).contains(&format!("_{line}_\n")));
     }
 
     #[test]

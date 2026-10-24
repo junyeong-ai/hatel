@@ -140,6 +140,9 @@ pub struct KindSection {
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub window: String,
+    /// The instant the window starts. A section whose `retained_since` is later holds no retained
+    /// record from the window's earlier part, which its totals alone do not show.
+    pub since: String,
     pub project: Option<String>,
     pub filters: Vec<Filter>,
     pub top_n: usize,
@@ -228,6 +231,11 @@ impl Report {
         };
         Report {
             window: window.to_string(),
+            // A window starts no later than now, so a boundary outside the representable range
+            // lies before its earliest instant and admits the records that instant does.
+            since: jiff::Timestamp::from_second(q.since)
+                .unwrap_or(jiff::Timestamp::MIN)
+                .to_string(),
             project: q.project.map(str::to_string),
             filters: q
                 .filters

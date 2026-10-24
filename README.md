@@ -108,7 +108,7 @@ hatel report --project "$PWD" --format json
 
 집계는 SQLite REAL/f64를 사용하므로 2^53을 넘는 정수는 정밀도가 손실될 수 있다. 식별자는 문자열로 기록한다.
 
-`retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `retained_since`가 null이면 그 범위에 보존된 기록이 하나도 없다는 뜻이며, 텍스트 출력은 이를 `no records in this window`가 아니라 `no records retained`로 표시한다. `unreadable_kinds`는 스키마 미등록, `storage_error`는 원장 검사 실패, `cost_error`는 비용 이력 읽기 실패를 뜻한다. Kind의 `error`와 함께 확인한다. 실패한 빈 배열을 기록 없음으로 해석하지 않는다. 비용 기준값을 읽지 못한 수신기는 해당 파일을 갱신하지 않으며, 복구 후 재시작이 필요하다.
+`retained_since`는 아직 남아 있는 가장 오래된 기록 시각이다. 연속 수집, 누락 없음, 해당 기간의 전체 사용량을 보장하지 않는다. `retained_since`가 null이면 그 범위에 보존된 기록이 하나도 없다는 뜻이며, 텍스트 출력은 이를 `no records in this window`가 아니라 `no records retained`로 표시한다. `since`는 기간의 시작 시각이다. `retained_since`가 그보다 늦은 섹션은 기간 앞부분의 기록을 하나도 보존하고 있지 않으며, 텍스트와 Markdown 출력은 그 섹션에 두 시각을 함께 적는다. `unreadable_kinds`는 스키마 미등록, `storage_error`는 원장 검사 실패, `cost_error`는 비용 이력 읽기 실패를 뜻한다. Kind의 `error`와 함께 확인한다. 실패한 빈 배열을 기록 없음으로 해석하지 않는다. 비용 기준값을 읽지 못한 수신기는 해당 파일을 갱신하지 않으며, 복구 후 재시작이 필요하다.
 
 각 섹션은 Kind의 현재 계약, 또는 `--contract SCHEMA_ID`로 선택한 계약을 기준으로 답한다. 다른 저장 계약의 기록은 이름·버전·모드가 같고, 스냅샷이면 identity도 같고, 답하는 정의가 선언한 모든 필드의 타입·단위·해시 처리가 같으며, 그 정의가 필수로 요구하는 필드가 기록 당시에도 필수였을 때 함께 집계한다. `contracts`는 계약별 기록 수와 `resolution`을 표시한다. `selected`와 `compatible` 기록은 집계에 포함하고, `incompatible` 기록과 정의를 알 수 없는 `undefined` 기록은 제외한다. `retained_since`도 집계한 기록만 기준으로 한다. `kinds --json`의 `stored_contracts`에서 정의를 확인하고 `report --kind KIND --contract SCHEMA_ID`로 선택한다. 은퇴한 Kind도 같은 방식으로 조회한다. 정의를 알 수 없는 기록은 건수만 세고 해석하지 않는다.
 

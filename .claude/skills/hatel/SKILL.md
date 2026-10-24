@@ -62,6 +62,8 @@ Report interpretation:
   A measured zero remains zero. Numeric strings are not coerced into measures.
   Aggregates use f64; integers above 2^53 can lose precision. Record identifiers as strings.
 - `retained_since` is the oldest retained record, not proof of continuous collection.
+  A `retained_since` later than the report's `since` (the window's start) means the window's
+  earlier part holds no retained record, whether it was quiet, uncollected or already pruned.
   `unreadable_kinds` means some stored records have no loaded schema.
 - Event mode counts records, or the earliest matching identity per group when declared.
   ID-less event records count individually. This is not storage deduplication.
