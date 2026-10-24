@@ -1,8 +1,9 @@
-//! `hatel mcp` — the machine-facing surface: the collector's read paths (`report`,
-//! `kinds`, `doctor`) and its one write (`emit`) as typed MCP tools over stdio, so an
-//! agent calls them in-protocol instead of shelling out and parsing stdout. Each read
-//! tool returns exactly the JSON its CLI counterpart prints (`--format json` /
-//! `--json`). Writes return storage receipts, including per-item batch outcomes.
+//! `hatel mcp` — the machine-facing surface: the read paths (`report`, `kinds`, `doctor`,
+//! `deliveries`) and the writes (`emit`, `emit_batch`) as typed MCP tools over stdio, so an agent
+//! calls them in-protocol instead of shelling out and parsing stdout. Each tool returns exactly
+//! the JSON its CLI counterpart prints. A failure the caller can act on — invalid arguments, an
+//! unreadable configuration or store — is a tool result with `isError`, which the model reads and
+//! can correct; a protocol error means the server itself failed.
 //! stdout is the protocol channel; diagnostics go to stderr only.
 
 use rmcp::{
@@ -16,12 +17,12 @@ use rmcp::{
 use hatel_core::schema::{Inventory, build_query_registry, build_registry};
 use hatel_core::{Config, Payload, report};
 
-use crate::{EmitError, doctor, emit_record, kinds_value, parse_query, report_json};
+use crate::{EmitError, doctor, emit_record, kinds_value, machine_json, parse_query};
 
 #[derive(Debug, Clone)]
 pub struct HatelMcp;
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 pub struct ReportParams {
     #[schemars(description = "Rolling window in days, e.g. \"30d\" (days only; default \"30d\")")]
     pub window: Option<String>,
@@ -57,121 +58,141 @@ pub struct ReportParams {
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct EmitParams {
-    #[schemars(description = "A registered Kind name (e.g. \"ci_check\")")]
+    #[schemars(description = "A registered Kind name (e.g. \"check\")")]
     pub kind: String,
     #[schemars(
-        description = "The record's fields as a JSON object. Keys outside the Kind's allow-list are dropped and warned about in the result text."
+        description = "The record's fields as a JSON object. Keys outside the Kind's allow-list are dropped and named in the receipt's warning."
     )]
     pub payload: serde_json::Map<String, serde_json::Value>,
+    #[schemars(
+        description = "Common record context: occurred_at (RFC 3339), source, run_id, correlation_id"
+    )]
     pub context: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct DoctorParams {
+    #[schemars(
+        description = "Check only local recording, schemas, storage and deliveries, without Claude Code wiring (default false)"
+    )]
     pub local: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct BatchParams {
+    #[schemars(
+        description = "Up to 4096 entries, each {kind, payload, context?} as in emit. Each entry is stored, rejected or failed on its own; the batch is not atomic."
+    )]
     pub records: Vec<serde_json::Value>,
 }
 
 #[tool_router]
 impl HatelMcp {
     #[tool(
-        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the cost snapshot: sessions ranked by spend with their tokens_by_type (cache accounting), by_model (model mix) and by_agent (subagent budget) breakdowns, and their per-project rollup in cost_groups. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`."
+        title = "Aggregate recorded telemetry",
+        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the cost snapshot: sessions ranked by spend with their tokens_by_type (cache accounting), by_model (model mix) and by_agent (subagent budget) breakdowns, and their per-project rollup in cost_groups. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn report(
         &self,
         Parameters(p): Parameters<ReportParams>,
     ) -> Result<CallToolResult, McpError> {
-        blocking(move || report_tool(p)).await?
+        answer(move || report_tool(p)).await
     }
 
     #[tool(
-        description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and the identity a count is of when one is declared — plus `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`."
+        title = "List queryable Kinds",
+        description = "List the queryable Kinds under `kinds` — each with its fields (the allow-list), group_key, measures, redact set, and the identity a count is of when one is declared — plus `stored_contracts` and `unreadable_kinds`: the Kinds the ledger holds that no loaded schema declares, so a partial registry is never mistaken for the whole one. Same JSON as `hatel kinds --json`.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn kinds(&self) -> Result<CallToolResult, McpError> {
-        blocking(kinds_tool).await?
+        answer(kinds_tool).await
     }
 
     #[tool(
-        description = "Inspect durable local-record delivery states per destination. Same JSON as hatel deliveries --json. Native OTLP forwarding is best-effort and is not included."
+        title = "Show delivery states",
+        description = "Inspect durable local-record delivery states per destination, status and error reason. Native OTLP forwarding is best-effort and is not included. Same JSON as `hatel deliveries --json`.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn deliveries(&self) -> Result<CallToolResult, McpError> {
-        blocking(|| {
-            crate::delivery_value()
-                .map(|value| {
-                    text_result(format!(
-                        "{}\n",
-                        serde_json::to_string_pretty(&value).expect("states serialize")
-                    ))
-                })
-                .map_err(internal)
-        })
-        .await?
+        answer(|| crate::delivery_value().map(|value| success(machine_json(&value)))).await
     }
 
     #[tool(
-        description = "Verify the Claude Code ↔ collector wiring. `ok: false` means a hard requirement failed; each section's findings carry a status (ok / fail / warn / note) and the message names the gap and its fix. `snippet` is the managed-settings paste block. Same JSON as `hatel doctor --json`."
+        title = "Diagnose the wiring",
+        description = "Verify the Claude Code ↔ collector wiring. `ok: false` means a hard requirement failed; each section's findings carry a status (ok / fail / warn / note) and the message names the gap and its fix. `snippet` is the managed-settings paste block. Same JSON as `hatel doctor --json`.",
+        annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn doctor(
         &self,
         Parameters(p): Parameters<DoctorParams>,
     ) -> Result<CallToolResult, McpError> {
-        blocking(move || {
-            let json = serde_json::to_string_pretty(&if p.local.unwrap_or(false) {
+        answer(move || {
+            let value = if p.local.unwrap_or(false) {
                 doctor::local_report_value()
             } else {
                 doctor::report_value()
-            })
-            .unwrap_or_default();
-            text_result(format!("{json}\n"))
+            };
+            Ok(success(machine_json(&value)))
         })
         .await
     }
 
     #[tool(
-        description = "Record up to 4096 structured {kind, payload, context?} entries. Each result is stored, rejected, or failed; a stored receipt confirms local storage only."
+        title = "Record a batch of signals",
+        description = "Record up to 4096 structured {kind, payload, context?} entries. Returns one ordered result per entry: stored, rejected or failed; a stored receipt confirms local storage only.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn emit_batch(
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        blocking(move || {
-            let results = crate::emit_batch(p.records).map_err(internal)?;
-            Ok(text_result(
-                serde_json::to_string(&results).expect("batch serializes"),
-            ))
-        })
-        .await?
+        answer(move || crate::emit_batch(p.records).map(|results| success(machine_json(&results))))
+            .await
     }
 
     #[tool(
-        description = "Record one domain signal for a registered Kind — the programmatic path for project metrics that aren't derived from a Claude Code hook (a gate decision, a check rollup, a deploy outcome). The payload is allow-list-filtered and redacted like any other record; include attribution (e.g. `project`) as fields."
+        title = "Record one signal",
+        description = "Record one domain signal for a registered Kind — the programmatic path for project metrics that aren't derived from a Claude Code hook (a gate decision, a check rollup, a deploy outcome). The payload is allow-list-filtered and redacted like any other record; include attribution (e.g. `project`) as fields. Returns the storage receipt.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     async fn emit(
         &self,
         Parameters(p): Parameters<EmitParams>,
     ) -> Result<CallToolResult, McpError> {
-        blocking(move || emit_tool(p)).await?
+        answer(move || emit_tool(p)).await
     }
 }
 
 /// Every tool answers from the ledger on disk or from the receiver over the wire — blocking work,
 /// run off the runtime's workers so the stdio transport keeps serving while one call reads a large
-/// ledger or waits on a probe.
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, McpError> {
-    tokio::task::spawn_blocking(work).await.map_err(internal)
+/// ledger or waits on a probe. Its failure message becomes an `isError` result.
+async fn answer(
+    work: impl FnOnce() -> Result<CallToolResult, String> + Send + 'static,
+) -> Result<CallToolResult, McpError> {
+    let result = tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+    Ok(result.unwrap_or_else(|message| CallToolResult::error(vec![ContentBlock::text(message)])))
 }
 
-fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
+fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
     let window = p.window.unwrap_or_else(|| "30d".to_string());
-    let cfg = Config::load().map_err(internal)?;
-    let reg =
-        build_query_registry(&cfg, p.kind.as_deref(), p.contract.as_deref()).map_err(internal)?;
+    let window_secs = report::parse_window(&window)
+        .ok_or_else(|| format!("invalid window {window:?} (expected e.g. 30d — days only)"))?;
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    let reg = build_query_registry(&cfg, p.kind.as_deref(), p.contract.as_deref())
+        .map_err(|e| e.to_string())?;
     let filters = parse_query(
         &reg,
         &cfg,
@@ -179,14 +200,7 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
         p.group_by.as_deref(),
         p.sort_by.as_deref(),
         &p.filter.unwrap_or_default(),
-    )
-    .map_err(|e| McpError::invalid_params(e, None))?;
-    let Some(window_secs) = report::parse_window(&window) else {
-        return Err(McpError::invalid_params(
-            format!("invalid window {window:?} (expected e.g. 30d — days only)"),
-            None,
-        ));
-    };
+    )?;
     let q = report::Query {
         since: hatel_core::now_epoch().saturating_sub(window_secs),
         top_n: p.top.unwrap_or(report::TOP_N),
@@ -198,37 +212,31 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, McpError> {
         filters: &filters,
     };
     let report = report::Report::build(&reg, &cfg, &window, &q);
-    let mut result = text_result(report_json(&report));
+    let mut result = success(machine_json(&report));
     result.is_error = Some(report.failed());
     Ok(result)
 }
 
-fn kinds_tool() -> Result<CallToolResult, McpError> {
-    let cfg = Config::load().map_err(internal)?;
-    let reg = build_registry(&cfg).map_err(internal)?;
+fn kinds_tool() -> Result<CallToolResult, String> {
+    let cfg = Config::load().map_err(|e| e.to_string())?;
+    let reg = build_registry(&cfg).map_err(|e| e.to_string())?;
     let inspection = Inventory::inspect(&reg, &cfg);
-    let json = serde_json::to_string_pretty(&kinds_value(&reg, &inspection))
-        .expect("inventory serializes");
-    // Trailing newline included, so the payload is byte-equal to the CLI's println!.
-    let mut result = text_result(format!("{json}\n"));
+    let mut result = success(machine_json(&kinds_value(&reg, &inspection)));
     result.is_error = Some(inspection.storage_error.is_some());
     Ok(result)
 }
 
-fn emit_tool(p: EmitParams) -> Result<CallToolResult, McpError> {
+fn emit_tool(p: EmitParams) -> Result<CallToolResult, String> {
     let payload: Payload = p.payload.into_iter().collect();
     let context = p
         .context
         .map(serde_json::from_value)
         .transpose()
-        .map_err(|e| McpError::invalid_params(format!("invalid context: {e}"), None))?
+        .map_err(|e| format!("invalid context: {e}"))?
         .unwrap_or_default();
     match emit_record(&p.kind, || Ok(payload), context) {
-        Ok(receipt) => Ok(text_result(
-            serde_json::to_string(&receipt).expect("receipt serializes"),
-        )),
-        Err(EmitError::Registry(e)) => Err(internal(e)),
-        Err(EmitError::Rejected(e)) => Err(McpError::invalid_params(e, None)),
+        Ok(receipt) => Ok(success(machine_json(&receipt))),
+        Err(EmitError::Registry(e) | EmitError::Rejected(e)) => Err(e),
     }
 }
 
@@ -241,23 +249,22 @@ impl ServerHandler for HatelMcp {
         let mut info = ServerConfig::default()
             .with_server_info(Implementation::new("hatel", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Local Claude Code telemetry. Ask `doctor` first when data looks missing \
-                 (`ok: false` means the wiring is incomplete). `kinds` lists the queryable \
-                 record Kinds and their fields; `report` aggregates them and returns the \
-                 per-session cost snapshot with tokens_by_type / by_model / by_agent \
-                 breakdowns; `emit` records a custom domain signal for a registered Kind.",
+                "Local telemetry records and Claude Code usage. Ask `doctor` first when data \
+                 looks missing (`ok: false` means the wiring is incomplete; `local: true` checks \
+                 recording and storage only). `kinds` lists the queryable record Kinds, their \
+                 fields and stored contracts; `report` aggregates them, cuts each list at `top` \
+                 while stating its total, and adds the Claude Code cost snapshot unless a Kind is \
+                 given; `deliveries` shows downstream delivery states. `emit` and `emit_batch` \
+                 record domain signals for registered Kinds and return storage receipts. A \
+                 failed call returns an error result whose text names the problem.",
             );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
 }
 
-fn text_result(body: String) -> CallToolResult {
+fn success(body: String) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(body)])
-}
-
-fn internal(e: impl std::fmt::Display) -> McpError {
-    McpError::internal_error(e.to_string(), None)
 }
 
 /// Serve MCP over stdio until the client disconnects (a clean disconnect is a normal
@@ -288,4 +295,27 @@ pub fn run() -> i32 {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_arguments_are_tool_errors_the_model_can_read() {
+        let result = answer(|| {
+            report_tool(ReportParams {
+                window: Some("7 days".into()),
+                ..Default::default()
+            })
+        })
+        .await
+        .expect("a tool failure is a result, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.content[0]
+                .as_text()
+                .is_some_and(|text| text.text.contains("invalid window"))
+        );
+    }
 }

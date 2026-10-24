@@ -150,15 +150,16 @@ and its CI check unless a deliberate compatibility change requires raising both.
   therefore moves the rendering it replaces into `earlier_launchd_plists` / `earlier_systemd_units`,
   with a copy in the classification test: the pinned-rendering tests fail on the change but cannot
   check the move, and without it every installed unit reads as hand-edited.
-- **Machine outputs are one shape per question**: `--json` / `--format json` serialize
-  keys alphabetically, and the MCP read tools (report / kinds / doctor) return exactly
-  the JSON their CLI counterparts print. Changing one means changing both (they share
-  the same functions — keep it that way). A missing group field is `key: null` (`—` in human
+- **Machine outputs are one shape per question**: `--json`, `--format json` and receipts are
+  one line of JSON with alphabetical keys (`machine_json`), and every MCP tool returns exactly
+  the JSON its CLI counterpart prints. Changing one means changing both (they share
+  the same functions — keep it that way). Every list a report cuts at `top_n` states its total. A missing group field is `key: null` (`—` in human
   output); an empty string is `key: ""` (`(empty)`). An exact empty-value filter selects only
   the latter. Keep that distinction in report explanations.
 - **Read failure is not an empty store.** Reports and Kind inventories carry `storage_error`;
   reports carry `cost_error` when the native baseline cannot be read. CLI exit status and MCP
-  `isError` reflect those failures. An unreadable cost baseline disables only its persistence
+  `isError` reflect those failures; invalid arguments and unreadable configuration are `isError`
+  tool results too, so a model can correct the call, never protocol errors. An unreadable cost baseline disables only its persistence
   until repair and receiver restart; it must never be rewritten from an empty baseline.
 - **Numbers need a measurement basis.** Read a measure with its valid/missing/invalid counts.
   Human reports distinguish no measurement from zero and show the measured fraction for partial

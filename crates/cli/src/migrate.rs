@@ -149,11 +149,7 @@ pub fn run(check: bool, json: bool) -> i32 {
         report.error = Some(error.to_string());
     }
     if json {
-        let value = serde_json::to_value(&report).expect("migration report serializes");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).expect("JSON serializes")
-        );
+        print!("{}", crate::machine_json(&report));
     } else if let Some(error) = &report.error {
         eprintln!(
             "migrate: {error}; stage={}; operation_committed={}",

@@ -118,13 +118,7 @@ pub(crate) fn report_value() -> serde_json::Value {
 pub fn run(json: bool, local: bool) -> i32 {
     let report = build_report_for(local);
     if json {
-        // Through `to_value` so object keys serialize alphabetically, like every other
-        // machine output.
-        let value = serde_json::to_value(&report).unwrap_or_default();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).unwrap_or_default()
-        );
+        print!("{}", crate::machine_json(&report));
     } else {
         print!("{}", render_human(&report));
         if !report.ok {

@@ -56,7 +56,7 @@ enum Command {
         /// Restrict to one project by canonical key or label; default is all projects.
         #[arg(long)]
         project: Option<String>,
-        /// Restrict to one registered Kind (e.g. `ci_check`); default is every Kind.
+        /// Restrict to one registered Kind (e.g. `check`); default is every Kind.
         /// Scopes the rollup to that Kind and drops the native cost section.
         #[arg(long)]
         kind: Option<String>,
@@ -148,7 +148,7 @@ enum Command {
     /// Give fields as `key=value` (string) or `key:=value` (JSON — for numbers,
     /// bools, arrays), or pass a whole JSON object via `--json` or on stdin.
     Emit {
-        /// A registered Kind name (e.g. `ci_check`).
+        /// A registered Kind name (e.g. `check`).
         kind: String,
         /// `key=value` (string) or `key:=value` (JSON) field pairs.
         #[arg(value_name = "key=value")]
@@ -327,10 +327,7 @@ fn emit_cmd(
                 );
             }
             if receipt {
-                println!(
-                    "{}",
-                    serde_json::to_string(&result).expect("receipt serializes")
-                );
+                print!("{}", machine_json(&result));
             }
             0
         }
@@ -396,10 +393,7 @@ fn emit_batch_cmd() -> i32 {
             let failed = results
                 .iter()
                 .any(|r| !matches!(r, hatel_core::record::RecordResult::Stored { .. }));
-            println!(
-                "{}",
-                serde_json::to_string(&results).expect("batch serializes")
-            );
+            print!("{}", machine_json(&results));
             if failed { 1 } else { 0 }
         }
         Err(e) => {
@@ -420,10 +414,7 @@ fn deliveries_cmd(json: bool) -> i32 {
     match delivery_value() {
         Ok(value) => {
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&value).expect("states serialize")
-                );
+                print!("{}", machine_json(&value));
             } else if let Some(states) = value.as_array() {
                 for state in states {
                     println!(
@@ -542,7 +533,7 @@ fn report_cmd(
     let report = report::Report::build(&reg, &cfg, window, &q);
     let failed = report.failed();
     match format {
-        Format::Json => print!("{}", report_json(&report)),
+        Format::Json => print!("{}", machine_json(&report)),
         Format::Md => print!("{}", render::format_markdown(&report)),
         Format::Text => print!("{}", render::format_text(&report)),
     }
@@ -681,14 +672,16 @@ pub(crate) fn parse_filters(
     Ok(filters)
 }
 
-/// The report as machine-readable JSON. Routed through `serde_json::Value`, whose object is a
-/// sorted map, so every key at every depth serializes alphabetically without a struct having to
-/// declare its fields in that order to stay that way.
-pub(crate) fn report_json(report: &report::Report) -> String {
-    serde_json::to_value(report)
-        .and_then(|v| serde_json::to_string_pretty(&v))
+/// Every machine output, printed by the CLI and returned by the MCP tools alike: one line of
+/// JSON routed through `serde_json::Value`, whose object is a sorted map, so every key at every
+/// depth serializes alphabetically without a struct having to declare its fields in that order.
+/// Compact, because its readers are parsers and agents, and indentation roughly doubles the
+/// tokens an agent spends on the same answer.
+pub(crate) fn machine_json(value: &impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .and_then(|v| serde_json::to_string(&v))
         .map(|s| s + "\n")
-        .unwrap_or_default()
+        .expect("machine output serializes")
 }
 
 /// The `kinds --json` payload, shared by the CLI flag and the MCP tool: what this registry can
@@ -732,10 +725,7 @@ fn kinds_cmd(json: bool) -> i32 {
     };
     let inspection = Inventory::inspect(&reg, &cfg);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&kinds_value(&reg, &inspection)).unwrap_or_default()
-        );
+        print!("{}", machine_json(&kinds_value(&reg, &inspection)));
     } else {
         for s in reg.kinds() {
             let fields: Vec<&str> = s.fields.iter().map(String::as_str).collect();
@@ -946,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn report_json_kind_filter_scopes_to_one_kind() {
+    fn report_kind_filter_scopes_to_one_kind() {
         let cfg = test_cfg(vec![]);
         let reg = build_registry(&cfg).unwrap();
         let q = |kind: Option<&'static str>| report::Query {
@@ -961,7 +951,7 @@ mod tests {
         };
         // An empty ledger still lists one entry per Kind (with empty groups), so the
         // filter is observable without seeding records.
-        let full: serde_json::Value = serde_json::from_str(&report_json(&report::Report::build(
+        let full: serde_json::Value = serde_json::from_str(&machine_json(&report::Report::build(
             &reg,
             &cfg,
             "7d",
@@ -980,12 +970,9 @@ mod tests {
         );
         assert!(full_kinds.len() > 1);
 
-        let scoped: serde_json::Value = serde_json::from_str(&report_json(&report::Report::build(
-            &reg,
-            &cfg,
-            "7d",
-            &q(Some("tool")),
-        )))
+        let scoped: serde_json::Value = serde_json::from_str(&machine_json(
+            &report::Report::build(&reg, &cfg, "7d", &q(Some("tool"))),
+        ))
         .unwrap();
         let scoped_kinds: Vec<&str> = scoped["kinds"]
             .as_array()
