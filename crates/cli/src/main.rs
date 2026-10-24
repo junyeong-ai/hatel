@@ -15,7 +15,7 @@ mod throttle;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use hatel_core::schema::{Inventory, UnreadableKinds, build_query_registry, build_registry};
-use hatel_core::{Config, Payload, Registry, render, report};
+use hatel_core::{Config, Payload, Registry, project_selector, render, report};
 
 #[derive(Parser)]
 #[command(
@@ -34,7 +34,9 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 4318)]
         port: u16,
-        /// Show only this project's sessions (defaults to the receiver's cwd).
+        /// Show only this project's sessions: an absolute path names the repository it is in (a
+        /// linked worktree or subdirectory included), anything else is a canonical key or label;
+        /// defaults to the receiver's cwd.
         #[arg(long, conflicts_with = "all")]
         project: Option<String>,
         /// Show every project's sessions.
@@ -52,7 +54,9 @@ enum Command {
         window: String,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
-        /// Restrict to one project by canonical key or label; default is all projects.
+        /// Restrict to one project: an absolute path names the repository it is in (a linked
+        /// worktree or subdirectory included), anything else is a canonical key or label; default
+        /// is all projects.
         #[arg(long)]
         project: Option<String>,
         /// Restrict to one registered Kind (e.g. `check`); default is every Kind.
@@ -193,7 +197,13 @@ fn run() -> i32 {
             project,
             all,
             wait,
-        } => serve::run(port, project, all, wait),
+        } => match project.as_deref().map(project_selector).transpose() {
+            Ok(project) => serve::run(port, project, all, wait),
+            Err(e) => {
+                eprintln!("serve: {e}");
+                2
+            }
+        },
         Command::Report {
             window,
             format,
@@ -511,8 +521,8 @@ fn report_cmd(
             return 1;
         }
     };
-    let filters = match parse_query(&reg, &cfg, kind, group_by, sort_by, filter) {
-        Ok(f) => f,
+    let restrictions = match parse_query(&reg, &cfg, project, kind, group_by, sort_by, filter) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("report: {e}");
             return 2;
@@ -527,12 +537,12 @@ fn report_cmd(
     let q = report::Query {
         since: hatel_core::now_epoch().saturating_sub(window_secs),
         top_n: top,
-        project,
+        project: restrictions.project.as_deref(),
         kind,
         contract,
         group_by,
         sort_by,
-        filters: &filters,
+        filters: &restrictions.filters,
     };
     let report = report::Report::build(&reg, &cfg, window, &q);
     let failed = report.failed();
@@ -573,17 +583,24 @@ fn unknown_kind(kind: &str, reg: &Registry, cfg: &Config) -> String {
     )
 }
 
-/// Validate every Kind-scoped part of a query against the registry and return the parsed
-/// filters. Each restriction names a field the Kind declares; one that does not could only ever
+/// A query's restrictions as the report matches them.
+pub(crate) struct Restrictions {
+    pub project: Option<String>,
+    pub filters: Vec<(String, String)>,
+}
+
+/// Validate every restriction of a query and return it in the form the report matches. Each
+/// Kind-scoped restriction names a field the Kind declares; one that does not could only ever
 /// match nothing, so it is rejected here rather than answered with a convincing empty result.
 pub(crate) fn parse_query(
     reg: &Registry,
     cfg: &Config,
+    project: Option<&str>,
     kind: Option<&str>,
     group_by: Option<&str>,
     sort_by: Option<&str>,
     filter: &[String],
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Restrictions, String> {
     if let Some(k) = kind
         && reg.kind(k).is_none()
     {
@@ -618,7 +635,10 @@ pub(crate) fn parse_query(
             });
         }
     }
-    parse_filters(filter, kind, reg)
+    Ok(Restrictions {
+        project: project.map(project_selector).transpose()?,
+        filters: parse_filters(filter, kind, reg)?,
+    })
 }
 
 fn kind_of<'a>(

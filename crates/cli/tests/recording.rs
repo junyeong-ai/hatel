@@ -772,6 +772,66 @@ fn local_diagnosis_does_not_require_claude_code_settings() {
 }
 
 #[test]
+fn a_query_naming_a_directory_reads_the_project_that_recorded_there() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    let nested = repo.join("crates/core");
+    std::fs::create_dir_all(&nested).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!(
+            "[storage]\nstate_dir={:?}\n",
+            home.path().join("state").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let write = isolated(home.path())
+        .current_dir(&nested)
+        .args(["emit", "check", "name=lint", "outcome=passed"])
+        .output()
+        .unwrap();
+    assert!(
+        write.status.success(),
+        "{}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+    let report = |project: &std::path::Path| {
+        isolated(home.path())
+            .args(["report", "--kind", "check", "--format", "json", "--project"])
+            .arg(project)
+            .output()
+            .unwrap()
+    };
+    let found = report(&nested);
+    assert!(
+        found.status.success(),
+        "{}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    let found: serde_json::Value = serde_json::from_slice(&found.stdout).unwrap();
+    assert_eq!(
+        found["project"],
+        repo.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(found["kinds"][0]["groups"][0]["count"], 1);
+    let outside = report(home.path());
+    assert_eq!(outside.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&outside.stderr).contains("names no project"),
+        "{}",
+        String::from_utf8_lossy(&outside.stderr)
+    );
+}
+
+#[test]
 fn a_redacted_payload_project_does_not_change_the_canonical_metadata_filter() {
     let home = tempfile::tempdir().unwrap();
     let repo = home.path().join("repo");

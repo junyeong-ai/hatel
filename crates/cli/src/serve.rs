@@ -61,7 +61,7 @@ struct AppState {
     /// The current project's unique key (git-root path) — the default filter, so
     /// two same-named repositories are never conflated.
     current_key: Option<String>,
-    /// An explicit `--project` override, matched against the display label.
+    /// An explicit `--project` override, matched against the key or the display label.
     project_filter: Option<String>,
     show_all: bool,
     /// Whether a terminal is attached to stdout, and so whether the live view has a reader.
@@ -715,14 +715,14 @@ fn render(st: &AppState) {
     let _ = std::io::stdout().flush();
 }
 
-/// Filter on the unique project *key* by default; on the *label* only when the user
-/// gave an explicit `--project`.
+/// Filter on the unique project *key* by default; on the key or the *label* when the user
+/// gave an explicit `--project`, as a report restriction matches.
 fn passes_filter(st: &AppState, project_key: &str, project_label: &str) -> bool {
     if st.show_all {
         return true;
     }
     if let Some(filter) = &st.project_filter {
-        return project_label == filter;
+        return project_key == filter || project_label == filter;
     }
     match &st.current_key {
         Some(k) => project_key == k,

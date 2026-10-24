@@ -27,11 +27,34 @@ pub fn resolve_project(cwd: &str) -> Option<ProjectRef> {
     if !cwd.is_absolute() {
         return None;
     }
-    let cwd = std::fs::canonicalize(cwd).ok()?;
+    project_of(&std::fs::canonicalize(cwd).ok()?)
+}
+
+/// The value a project restriction matches, from what a caller named. An absolute path names the
+/// project recording attributed work there to, so a query from a linked worktree, a subdirectory
+/// or a symlinked checkout finds that work without restating these rules. A path that does not
+/// exist may be the key a moved or deleted repository was recorded under, so it is matched as
+/// given, as is any value that is not a path: a key or a label.
+pub fn project_selector(value: &str) -> Result<String, String> {
+    let path = Path::new(value);
+    if !path.is_absolute() {
+        return Ok(value.to_string());
+    }
+    match std::fs::canonicalize(path) {
+        Ok(path) => project_of(&path)
+            .map(|project| project.key)
+            .ok_or_else(|| format!("{value} is not in a Git repository, so it names no project")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(value.to_string()),
+        Err(e) => Err(format!("{value}: {e}")),
+    }
+}
+
+/// The project of a path the filesystem has already resolved.
+fn project_of(path: &Path) -> Option<ProjectRef> {
     // A linked worktree is a checkout of a repository, not a project of its own — work done on a
     // branch in one belongs to the repository's totals, not to a project named after the branch
     // it happened to be checked out for.
-    let tree = git_root(&cwd)?;
+    let tree = git_root(path)?;
     let root = main_worktree(&tree).unwrap_or(tree);
     let key = root.to_string_lossy().into_owned();
     // A root without a basename (a repository at `/`) falls back to the full path as its label —
@@ -332,6 +355,28 @@ mod tests {
             assert_eq!(Path::new(&p.key), repo, "from {}", from.display());
             assert_eq!(p.label, "acme-api", "from {}", from.display());
         }
+    }
+
+    #[test]
+    fn a_path_selects_the_project_recording_attributed_it_to() {
+        let base = tempfile::tempdir().unwrap();
+        let (repo, checkout) = repo_with_worktree(base.path());
+        let key = std::fs::canonicalize(&repo).unwrap();
+        let select = |value: &Path| project_selector(value.to_str().unwrap());
+        assert_eq!(select(&checkout).unwrap(), key.to_str().unwrap());
+        let moved = base.path().join("moved-away");
+        assert_eq!(
+            select(&moved).unwrap(),
+            moved.to_str().unwrap(),
+            "a path that no longer exists may be a recorded key"
+        );
+        let outside = base.path().join("scratch");
+        std::fs::create_dir(&outside).unwrap();
+        assert!(
+            select(&outside).is_err(),
+            "an existing tree outside a repository names no project"
+        );
+        assert_eq!(project_selector("acme-api").unwrap(), "acme-api");
     }
 
     #[test]

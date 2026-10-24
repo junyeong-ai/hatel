@@ -28,7 +28,7 @@ pub struct ReportParams {
     #[schemars(description = "Rolling window in days, e.g. \"30d\" (days only; default \"30d\")")]
     pub window: Option<String>,
     #[schemars(
-        description = "Restrict to one project by canonical key or label; default is all projects"
+        description = "Restrict to one project: an absolute path names the repository it is in (a linked worktree or subdirectory included), anything else is a canonical key or label; default is all projects"
     )]
     pub project: Option<String>,
     #[schemars(
@@ -195,9 +195,10 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
     let cfg = Config::load().map_err(|e| e.to_string())?;
     let reg = build_query_registry(&cfg, p.kind.as_deref(), p.contract.as_deref())
         .map_err(|e| e.to_string())?;
-    let filters = parse_query(
+    let restrictions = parse_query(
         &reg,
         &cfg,
+        p.project.as_deref(),
         p.kind.as_deref(),
         p.group_by.as_deref(),
         p.sort_by.as_deref(),
@@ -206,12 +207,12 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
     let q = report::Query {
         since: hatel_core::now_epoch().saturating_sub(window_secs),
         top_n: p.top.unwrap_or(report::TOP_N),
-        project: p.project.as_deref(),
+        project: restrictions.project.as_deref(),
         kind: p.kind.as_deref(),
         contract: p.contract.as_deref(),
         group_by: p.group_by.as_deref(),
         sort_by: p.sort_by.as_deref(),
-        filters: &filters,
+        filters: &restrictions.filters,
     };
     let report = report::Report::build(&reg, &cfg, &window, &q);
     let mut result = success(machine_json(&report));

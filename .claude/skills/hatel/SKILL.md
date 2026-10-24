@@ -30,7 +30,7 @@ hatel report --kind check --group-by metadata.source --sort-by duration_s
 hatel report --kind claude.api_request --window 7d --group-by model --format json
 hatel report --kind memory --group-by file_path --format json
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
-hatel report --project /absolute/repository/path --format json
+hatel report --project "$PWD" --format json
 ```
 
 `--filter` is repeatable exact equality; all filters must match. An empty string differs
@@ -38,7 +38,10 @@ from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
 `--top` cuts every list: Kind groups, `cost` sessions and `cost_groups` projects; `group_count`,
 `cost_session_count` and `cost_group_count` give totals, and `--top 0` returns all. Filter hashed
 payload fields by their original value.
-`--project` accepts canonical key or display label; labels may combine equal-named repos.
+To scope to the current repository, pass the working directory's absolute path as `--project`
+(MCP `project`): it selects the repository recording attributed that directory to, a linked
+worktree included, and a path outside every repository is rejected. A canonical key or display
+label also works; labels may combine equal-named repos.
 `project` grouping and filtering prefer the common key, falling back to the payload's `project`,
 when the Kind declares that field, for records without one. Use `metadata.project.key` to address that common field explicitly.
 

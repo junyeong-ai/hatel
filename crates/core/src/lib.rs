@@ -29,7 +29,7 @@ pub use export::{ExportConfig, ExportMode, ExportTarget, ProjectFilter};
 pub use model::{
     Envelope, Payload, SCHEMA_VERSION, make_envelope, now_epoch, now_iso_utc, ts_epoch,
 };
-pub use project::{ProjectRef, resolve_project};
+pub use project::{ProjectRef, project_selector, resolve_project};
 pub use registry::{FieldMap, HookBinding, KindSpec, Registry};
 pub use session::{SessionIndex, SessionIndexCache, SessionRow};
 pub use settings::Settings;

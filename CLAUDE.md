@@ -80,7 +80,9 @@ and its CI check unless a deliberate compatibility change requires raising both.
   only. Diagnosis applies repository restrictions and managed destination locks without changing
   user settings; inherited variables describe this process, not another session's launch.
 - **A project is a repository, never the directory work ran in.** A linked worktree attributes
-  to the repository it checks out; a tree outside one has no project. Every identified session
+  to the repository it checks out; a tree outside one has no project. A query naming a path reads
+  through the same resolution (`project_selector`), so consumers pass a directory rather than
+  restating these rules. Every identified session
   start is recorded either way, so the receiver can tell a session that has no project from one
   whose start it has not seen — the first is answered now, the second is the only one worth
   holding an egress batch back for. Collapsing those two states again silently restores

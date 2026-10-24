@@ -86,7 +86,7 @@ pub struct Query<'a> {
     pub since: i64,
     /// Groups shown per Kind (0 = all).
     pub top_n: usize,
-    /// Restrict to one project (its label).
+    /// Restrict to one project, by key or label (`project_selector` turns a path into its key).
     pub project: Option<&'a str>,
     /// Restrict to one registered Kind.
     pub kind: Option<&'a str>,

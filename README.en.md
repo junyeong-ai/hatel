@@ -97,10 +97,10 @@ hatel report --kind check --group-by metadata.source --sort-by duration_s
 hatel report --kind claude.api_request --group-by model --window 7d
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
 hatel report --kind memory --group-by file_path
-hatel report --project /absolute/repository/path --format json
+hatel report --project "$PWD" --format json
 ```
 
-`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, falling back to the payload's `project`, when the Kind declares that field, for records without one. `--project` accepts key or label; use keys to distinguish repositories with equal labels. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
+`--group-by`, `--sort-by` and repeatable `--filter field=value` require `--kind`. Filters match exactly and all must match. Empty strings differ from absent fields. Filter hashed payload fields by their original value. `project` uses the common project key, falling back to the payload's `project`, when the Kind declares that field, for records without one. `--project` takes an absolute path, naming the repository it is in (a linked worktree or subdirectory included), or a key or label; a path outside every repository is rejected, and a label can combine repositories with equal names. `--top` (default 5, `0` for all) cuts every list: each Kind's groups, the cost section's sessions (`cost`, ranked by `cost_usd`) and its projects (`cost_groups`). `group_count`, `cost_session_count` and `cost_group_count` give the totals before the cut.
 
 Ordinary Kind `count` counts records. With event-mode `identity`, each group uses the earliest matching record per ID; records without an ID count separately. This is query selection, not storage deduplication. Snapshot mode selects state as described below.
 
