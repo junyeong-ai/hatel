@@ -2664,6 +2664,36 @@ fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snap
 }
 
 #[test]
+fn a_writer_waits_out_a_slow_commit_instead_of_losing_its_record() {
+    // A slow disk stretches every commit by its fsync and parallel tool calls queue their hooks
+    // behind one another, so a writer can wait through several commits before its turn.
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_in(dir.path(), vec![]);
+    let registry = build_registry(&cfg).unwrap();
+    let record = || make_envelope("prompt", Default::default(), &registry, true).unwrap();
+    hatel_core::build_sink(&cfg, &registry)
+        .write_record(&record())
+        .unwrap();
+
+    let (locked, wait_for_lock) = std::sync::mpsc::channel();
+    let database = cfg.database();
+    let committer = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(database).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    wait_for_lock.recv().unwrap();
+    hatel_core::build_sink(&cfg, &registry)
+        .write_record(&record())
+        .unwrap();
+    committer.join().unwrap();
+
+    assert_eq!(records_of(&cfg, "prompt").len(), 2);
+}
+
+#[test]
 fn concurrent_first_writers_on_a_fresh_store_all_store_their_records() {
     // Hooks for parallel tool calls can be the first writers a store ever sees.
     let registry = build_registry(&config_in(Path::new("."), vec![])).unwrap();

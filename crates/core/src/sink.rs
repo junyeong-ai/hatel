@@ -96,27 +96,24 @@ fn connect(path: &Path) -> crate::Result<Connection> {
             .map_err(io)?;
     }
     let conn = Connection::open(path).map_err(io)?;
-    conn.busy_timeout(WRITE_BUSY_TIMEOUT).map_err(io)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(io)?;
     check_version(&conn)?;
     crate::query::functions(&conn).map_err(io)?;
     Ok(conn)
 }
 
-/// How long a writer waits for another one's lock: long enough for a concurrent insert, short
-/// enough that a lifecycle hook never visibly delays the tool call it records.
-const WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// How long a store's first writers wait for one another. Whichever arrives first switches the file
-/// to WAL and creates the schema while the rest queue behind it, once per store, so they get a
-/// reader's budget rather than a hook's.
-const FIRST_WRITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long a writer waits for another one's lock. A slow disk stretches every commit by its fsync
+/// and parallel tool calls queue their hooks behind one another, so a writer can wait through
+/// several commits. A shorter wait would lose its record to save time nothing is spending: the hook
+/// is wired asynchronously, so no tool call waits on it.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A fresh file starts in rollback mode, and switching it to WAL needs the database to itself, so
 /// SQLite answers a concurrent switch with BUSY at once instead of waiting on the busy timeout.
 /// Once one switch lands the mode is stored in the file, so retrying lets every first writer
 /// through.
 fn enable_wal(conn: &Connection) -> crate::Result<()> {
-    let deadline = std::time::Instant::now() + FIRST_WRITE_BUSY_TIMEOUT;
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
     loop {
         match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
             Err(rusqlite::Error::SqliteFailure(error, _))
@@ -237,7 +234,7 @@ pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
     }
     let result = (|| -> rusqlite::Result<usize> {
         let mut conn = Connection::open(&path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("CREATE TEMP TABLE prune_records (id INTEGER PRIMARY KEY);")?;
         let mut total = 0;
         loop {
@@ -312,10 +309,8 @@ impl SqliteSink {
     fn init(path: &Path) -> crate::Result<Connection> {
         let mut conn = connect(path)?;
         if check_version(&conn)? != DATABASE_VERSION {
-            conn.busy_timeout(FIRST_WRITE_BUSY_TIMEOUT).map_err(io)?;
             enable_wal(&conn)?;
             initialize(&mut conn)?;
-            conn.busy_timeout(WRITE_BUSY_TIMEOUT).map_err(io)?;
         }
         Ok(conn)
     }
