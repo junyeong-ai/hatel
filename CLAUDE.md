@@ -176,7 +176,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   written; changing one means changing both.
 - `SKILL.md` frontmatter keeps a `version` field tracking the workspace version. It is not
   part of the official skill spec — it exists so an installed skill can be matched to its
-  binaries — keep it when editing frontmatter, and bump it with `workspace.package.version`.
+  binaries — keep it when editing frontmatter, and bump it and the body's `This skill targets`
+  version with `workspace.package.version` (`skill_version_tracks_the_workspace_version` checks both).
   The installer and release workflow copy only `SKILL.md`; keep it self-contained unless both
   packaging paths are updated to ship supporting files. Put discovery cues in `description` and
   keep query guidance separate from setup and diagnosis.
