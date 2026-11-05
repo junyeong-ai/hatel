@@ -163,6 +163,8 @@ To include selected local records, set `kinds = ["check", "team.deploy"]`; nativ
 is independent. Omitted `signals` means metrics+logs, omitted `kinds` means no local records.
 `signals=[]` can send domain records alone. `projects` or `exclude_projects` match key/label;
 unresolved attribution fails closed for filtered targets. Duplicate endpoints are rejected.
+`accounts` lists Claude sign-in emails, case-insensitive, for native signals only and rejects
+`kinds`; a batch passes only when every record carries a listed email.
 
 Native forwarding is best-effort and carries the full body without local payload redaction.
 Local record delivery commits an outbox row with the record. The receiver

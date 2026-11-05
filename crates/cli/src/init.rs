@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use hatel_core::export::parse_otlp_headers;
-use hatel_core::{ExportConfig, ExportMode, ExportTarget, ProjectFilter};
+use hatel_core::{AccountFilter, ExportConfig, ExportMode, ExportTarget, ProjectFilter};
 use serde_json::{Value, json};
 
 use crate::claude_settings as cs;
@@ -350,9 +350,10 @@ pub fn insert(mode: InsertMode) -> i32 {
         retry_attempts: 8,
         queue_days: 7,
         queue_bytes: 64 * 1024 * 1024,
-        // Insert forwards every project by default; a `projects`/`exclude_projects` filter is
-        // added by editing config.toml when a destination should not see some projects.
-        filter: ProjectFilter::All,
+        // Insert forwards every project and account; a `projects`, `exclude_projects` or
+        // `accounts` filter is added by editing config.toml when a destination should see less.
+        projects: ProjectFilter::All,
+        accounts: AccountFilter::All,
         headers,
         timeout_ms: None,
     });

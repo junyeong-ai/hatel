@@ -107,8 +107,8 @@ fn retention_days<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option
     Ok(Some(days))
 }
 
-/// One `[[export]]` entry exactly as the file spells it, before validation. `Option` on the two
-/// project lists distinguishes absent (no filter) from an explicit empty list, which
+/// One `[[export]]` entry exactly as the file spells it, before validation. `Option` on the filter
+/// lists distinguishes absent (no filter) from an explicit empty list, which
 /// [`crate::ExportConfig`] rejects. `headers` is a sub-table, so it is declared last — TOML
 /// requires a table's keys to follow every scalar of its parent.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -130,6 +130,8 @@ pub struct ExportTargetRaw {
     pub projects: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_projects: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]

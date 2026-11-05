@@ -703,8 +703,7 @@ fn report_export(
             n => format!(", {n} header(s)"),
         };
         let filter = t
-            .filter
-            .describe()
+            .describe_filters()
             .map(|d| format!(", {d}"))
             .unwrap_or_default();
         sec.note(format!(
@@ -733,11 +732,14 @@ fn report_export(
     if local || export.targets.iter().all(|t| t.signals.is_empty()) {
         return Some(sec);
     }
-    // Both enriching and filtering read the JSON body (to inject, or to resolve a batch's project
-    // from its session.id); a non-JSON protocol makes an enriched target skip and a filtered target
-    // fail closed (forward nothing). Flag the protocol that would do so.
+    // Both enriching and filtering read the JSON body (to inject, or to attribute a batch by its
+    // session.id or user.email); a non-JSON protocol makes an enriched target skip and a filtered
+    // target fail closed (forward nothing). Flag the protocol that would do so.
     let needs_json = export.targets.iter().any(|t| {
-        !t.signals.is_empty() && (t.mode == ExportMode::Enriched || t.filter.is_filtered())
+        !t.signals.is_empty()
+            && (t.mode == ExportMode::Enriched
+                || t.projects.is_filtered()
+                || t.accounts.is_filtered())
     });
     if needs_json {
         let mut checked = std::collections::BTreeSet::new();

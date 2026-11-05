@@ -6,9 +6,9 @@
 //! which is insignificant to any OTLP parser) except the one attribute we add. A datapoint whose
 //! session is unknown is forwarded unchanged (the label is omitted, never fabricated).
 //!
-//! `session.id` is read at the datapoint / log-record level — the layer Claude Code emits it on,
-//! and the same layer `claude/decode.rs` reads for the local view, so the two never disagree. A
-//! resource-level `session.id` (a layout Claude Code does not produce) is intentionally not
+//! Attributes are read at the datapoint / log-record level — the layer Claude Code emits
+//! `session.id` and `user.email` on, and the layer `claude/decode.rs` reads `session.id` from for
+//! the local view, so the two never disagree. A resource-level copy is intentionally not
 //! consulted; that would have to change in lockstep with `decode.rs` to stay consistent.
 
 use std::collections::BTreeSet;
@@ -20,12 +20,13 @@ use crate::claude::{PROJECT, SESSION_ID};
 /// Resolve a `session.id` to a project label (`None` when unknown).
 pub type Resolve<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
-/// Collect the distinct `session.id`s carried by an OTLP body — at the datapoint level for
-/// metrics, the log-record level for logs. A filtered batch requires an unambiguous session on
-/// every record, including metric types the local Claude Code view does not aggregate.
-pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
+/// Collect the distinct values of the string attribute `key` carried by an OTLP body — at the
+/// datapoint level for metrics, the log-record level for logs. `None` unless the body holds at
+/// least one record and every record carries one non-empty value, including metric types the
+/// local Claude Code view does not aggregate: a filtered batch is attributed in full or not at all.
+pub fn attribute_values(body: &[u8], is_metrics: bool, key: &str) -> Option<BTreeSet<String>> {
     let root: Value = serde_json::from_slice(body).ok()?;
-    let mut ids = BTreeSet::new();
+    let mut values = BTreeSet::new();
     if is_metrics {
         for rm in read_children(&root, "resourceMetrics") {
             for sm in read_children(rm, "scopeMetrics") {
@@ -51,7 +52,7 @@ pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
                             .and_then(|s| s.get("dataPoints"))
                             .and_then(Value::as_array);
                         for dp in points.into_iter().flatten() {
-                            ids.insert(point_session_id(dp)?.to_string());
+                            values.insert(point_attribute(dp, key)?.to_string());
                         }
                     }
                 }
@@ -61,12 +62,12 @@ pub fn session_ids(body: &[u8], is_metrics: bool) -> Option<BTreeSet<String>> {
         for rl in read_children(&root, "resourceLogs") {
             for sl in read_children(rl, "scopeLogs") {
                 for rec in read_children(sl, "logRecords") {
-                    ids.insert(point_session_id(rec)?.to_string());
+                    values.insert(point_attribute(rec, key)?.to_string());
                 }
             }
         }
     }
-    Some(ids)
+    (!values.is_empty()).then_some(values)
 }
 
 /// Inject `project` into every metrics datapoint whose `session.id` resolves. Returns the
@@ -133,7 +134,7 @@ fn read_children<'a>(v: &'a Value, key: &str) -> impl Iterator<Item = &'a Value>
 /// No-op when: the attribute set is absent, a `project` is already present (don't duplicate),
 /// the datapoint carries no `session.id`, or the session doesn't resolve (don't fabricate).
 fn inject_project(point: &mut Value, resolve: &Resolve) {
-    let session = point_session_id(point).map(str::to_string);
+    let session = point_attribute(point, SESSION_ID).map(str::to_string);
     let Some(attrs) = point.get_mut("attributes").and_then(Value::as_array_mut) else {
         return;
     };
@@ -147,13 +148,14 @@ fn inject_project(point: &mut Value, resolve: &Resolve) {
     attrs.push(json!({ "key": PROJECT, "value": { "stringValue": label } }));
 }
 
-/// The `session.id` string attribute on one datapoint/record, if present.
-fn point_session_id(point: &Value) -> Option<&str> {
+/// The non-empty string attribute `key` on one datapoint/record — `None` when it is absent,
+/// empty, not a string, or carried more than once.
+fn point_attribute<'a>(point: &'a Value, key: &str) -> Option<&'a str> {
     let mut attributes = point
         .get("attributes")?
         .as_array()?
         .iter()
-        .filter(|a| attr_key(a) == Some(SESSION_ID));
+        .filter(|a| attr_key(a) == Some(key));
     let attribute = attributes.next()?;
     if attributes.next().is_some() {
         return None;
@@ -342,29 +344,34 @@ mod tests {
     }
 
     #[test]
-    fn session_ids_collects_distinct_across_datapoints() {
+    fn attribute_values_collects_distinct_across_datapoints() {
         let body = metrics_body(json!([
             { "attributes": [{ "key": "session.id", "value": { "stringValue": "S1" } }], "asInt": "1" },
             { "attributes": [{ "key": "session.id", "value": { "stringValue": "S2" } }], "asInt": "2" },
             { "attributes": [{ "key": "session.id", "value": { "stringValue": "S1" } }], "asInt": "3" }
         ]));
-        let ids = session_ids(&body, true).unwrap();
+        let ids = attribute_values(&body, true, SESSION_ID).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains("S1") && ids.contains("S2"));
     }
 
     #[test]
-    fn session_ids_reject_non_json_and_sessionless_records() {
+    fn attribute_values_reject_bodies_that_do_not_attribute_every_record() {
         assert!(
-            session_ids(b"\x00proto", true).is_none(),
+            attribute_values(b"\x00proto", true, SESSION_ID).is_none(),
             "non-JSON is None"
         );
         let body = metrics_body(json!([{ "attributes": [], "asInt": "1" }]));
         assert!(
-            session_ids(&body, true).is_none(),
+            attribute_values(&body, true, SESSION_ID).is_none(),
             "a record without a session cannot authorize a filtered batch"
         );
+        assert!(
+            attribute_values(&metrics_body(json!([])), true, SESSION_ID).is_none(),
+            "a body without records attributes nothing"
+        );
     }
+
     #[test]
     fn a_filtered_batch_cannot_hide_unattributed_records_behind_a_known_session() {
         for shape in [
@@ -379,7 +386,7 @@ mod tests {
                 {"name":"unattributed",shape:{"dataPoints":[{"attributes":[]}]}}
             ]}]}]});
             assert!(
-                session_ids(&serde_json::to_vec(&body).unwrap(), true).is_none(),
+                attribute_values(&serde_json::to_vec(&body).unwrap(), true, SESSION_ID).is_none(),
                 "{shape}"
             );
         }
@@ -387,11 +394,13 @@ mod tests {
             {"attributes":[{"key":"session.id","value":{"stringValue":"company"}}]},
             {"attributes":[]}
         ]}]}]});
-        assert!(session_ids(&serde_json::to_vec(&body).unwrap(), false).is_none());
+        assert!(attribute_values(&serde_json::to_vec(&body).unwrap(), false, SESSION_ID).is_none());
         let duplicate = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":[
             {"key":"session.id","value":{"stringValue":"company"}},
             {"key":"session.id","value":{"stringValue":"personal"}}
         ]}]}]}]});
-        assert!(session_ids(&serde_json::to_vec(&duplicate).unwrap(), false).is_none());
+        assert!(
+            attribute_values(&serde_json::to_vec(&duplicate).unwrap(), false, SESSION_ID).is_none()
+        );
     }
 }

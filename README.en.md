@@ -191,6 +191,8 @@ queue_bytes = 67108864
 
 Omitted `signals` means native metrics and logs; omitted `kinds` means no local records. Use `signals=[]` and selected `kinds` for domain records alone. Configure each destination independently; duplicate endpoints are rejected. Use either `projects` or `exclude_projects`, matching key or label. Batches with unresolved attribution are not sent to project-filtered destinations.
 
+`accounts` is an allow-list of Claude sign-in emails, compared case-insensitively. It applies to native signals only, so it cannot be combined with `kinds`. Only batches whose every record carries a listed email are sent, so signals from sessions signed in with another email, or with none, never reach that destination.
+
 Native OTLP forwarding uses a best-effort memory queue. `raw` relays the body; `enriched` adds a project label to JSON. Native bodies do not pass through the local payload allow-list or hashing. If content capture is enabled upstream, that content may leave the machine.
 
 Selected local Kinds commit their delivery rows with the SQLite record. The receiver retries with the same `record_id` and current policy and contract. Queue capacity does not undo local storage; the receipt reports records not queued. Retention, queue age, retry limits, incompatible contract changes or a removed field may prevent delivery. Lost acknowledgements can cause duplicate delivery.

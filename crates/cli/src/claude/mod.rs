@@ -12,6 +12,10 @@ pub use decode::{parse_logs, parse_metrics};
 /// it lives here rather than as a literal both must keep in lockstep.
 pub const SESSION_ID: &str = "session.id";
 
+/// The datapoint / log-record attribute carrying the signed-in Claude account's email — what an
+/// account-filtered destination matches.
+pub const USER_EMAIL: &str = "user.email";
+
 /// The attribute the enriched export injects to label a datapoint with its project. Named once so
 /// the inject side and the duplicate-guard read cannot disagree on its spelling.
 pub const PROJECT: &str = "project";

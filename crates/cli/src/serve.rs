@@ -282,8 +282,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     // header values are never printed).
     for t in &export_cfg.targets {
         let filter = t
-            .filter
-            .describe()
+            .describe_filters()
             .map(|d| format!(", {d}"))
             .unwrap_or_default();
         println!(

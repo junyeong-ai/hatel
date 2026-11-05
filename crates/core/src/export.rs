@@ -83,17 +83,52 @@ impl ProjectFilter {
         !matches!(self, ProjectFilter::All)
     }
 
-    /// A human-readable summary for `serve`'s forwarding line and `doctor` — `only: a, b` /
-    /// `except: c`, or `None` for an unfiltered destination — so both surfaces describe a
-    /// destination's project policy the same way.
-    pub fn describe(&self) -> Option<String> {
-        let list = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
+    fn describe(&self) -> Option<String> {
         match self {
             ProjectFilter::All => None,
-            ProjectFilter::Only(set) => Some(format!("only: {}", list(set))),
-            ProjectFilter::Except(set) => Some(format!("except: {}", list(set))),
+            ProjectFilter::Only(set) => Some(format!("projects only: {}", join(set))),
+            ProjectFilter::Except(set) => Some(format!("projects except: {}", join(set))),
         }
     }
+}
+
+/// Which Claude accounts a destination accepts, named by sign-in email. Claude Code reports the
+/// signed-in account's email as `user.email` on its native datapoints and log records, so a batch
+/// passes only when every record names a listed account. Local records carry no account, which is
+/// why a destination that filters accounts takes native signals only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccountFilter {
+    /// No filter — forward every account (the default).
+    All,
+    /// Forward only these accounts.
+    Only(BTreeSet<String>),
+}
+
+impl AccountFilter {
+    /// Whether an account, by its sign-in email, is forwarded to this destination. Addresses
+    /// compare ignoring ASCII case, so a capitalization difference between the listed and the
+    /// reported address cannot silently stop a destination's flow.
+    pub fn allows(&self, email: &str) -> bool {
+        match self {
+            AccountFilter::All => true,
+            AccountFilter::Only(set) => set.iter().any(|listed| listed.eq_ignore_ascii_case(email)),
+        }
+    }
+
+    pub fn is_filtered(&self) -> bool {
+        !matches!(self, AccountFilter::All)
+    }
+
+    fn describe(&self) -> Option<String> {
+        match self {
+            AccountFilter::All => None,
+            AccountFilter::Only(set) => Some(format!("accounts only: {}", join(set))),
+        }
+    }
+}
+
+fn join(set: &BTreeSet<String>) -> String {
+    set.iter().cloned().collect::<Vec<_>>().join(", ")
 }
 
 /// One validated downstream destination.
@@ -108,7 +143,9 @@ pub struct ExportTarget {
     pub queue_days: u32,
     pub queue_bytes: u64,
     /// Which projects reach this destination (default `All`).
-    pub filter: ProjectFilter,
+    pub projects: ProjectFilter,
+    /// Which Claude accounts reach this destination (default `All`).
+    pub accounts: AccountFilter,
     /// Extra request headers (e.g. a downstream's `authorization`). Never logged by value.
     pub headers: BTreeMap<String, String>,
     /// Per-request timeout in milliseconds; `None` uses the receiver default.
@@ -185,29 +222,16 @@ impl ExportConfig {
                      two to the same endpoint would double-count delta metrics"
                 )));
             }
-            // A present-but-empty list is a config mistake, not a fail-open `All`: reject it so an
-            // empty allow-list never silently forwards everything. Absent (`None`) is no filter.
-            // An empty/whitespace entry is rejected for the same reason — no real project has an
-            // empty label or key, so the entry could only ever match by accident.
-            let nonempty = |set: BTreeSet<String>, what: &str| -> Result<BTreeSet<String>> {
-                if set.is_empty() {
-                    Err(Error::InvalidExport(format!(
-                        "export endpoint {endpoint:?}: `{what}` is present but empty — list the \
-                         projects, or remove the key (an empty list has no useful meaning)"
-                    )))
-                } else if set.iter().any(|e| e.trim().is_empty()) {
-                    Err(Error::InvalidExport(format!(
-                        "export endpoint {endpoint:?}: `{what}` contains an empty entry — every \
-                         entry must be a project label or git-root path"
-                    )))
-                } else {
-                    Ok(set)
-                }
-            };
-            let filter = match (raw.projects, raw.exclude_projects) {
+            let projects = match (raw.projects, raw.exclude_projects) {
                 (None, None) => ProjectFilter::All,
-                (Some(allow), None) => ProjectFilter::Only(nonempty(allow, "projects")?),
-                (None, Some(deny)) => ProjectFilter::Except(nonempty(deny, "exclude_projects")?),
+                (Some(allow), None) => {
+                    ProjectFilter::Only(PROJECT_ENTRY.list(&endpoint, "projects", allow)?)
+                }
+                (None, Some(deny)) => ProjectFilter::Except(PROJECT_ENTRY.list(
+                    &endpoint,
+                    "exclude_projects",
+                    deny,
+                )?),
                 (Some(_), Some(_)) => {
                     return Err(Error::InvalidExport(format!(
                         "export endpoint {endpoint:?}: set either `projects` (allow-list) or \
@@ -215,6 +239,19 @@ impl ExportConfig {
                     )));
                 }
             };
+            let accounts = match raw.accounts {
+                None => AccountFilter::All,
+                Some(emails) => {
+                    AccountFilter::Only(ACCOUNT_ENTRY.list(&endpoint, "accounts", emails)?)
+                }
+            };
+            if accounts.is_filtered() && !raw.kinds.is_empty() {
+                return Err(Error::InvalidExport(format!(
+                    "export endpoint {endpoint:?}: `accounts` applies to native signals only — \
+                     local records carry no Claude account, so send `kinds` to a destination \
+                     without `accounts`"
+                )));
+            }
             let signals = raw.signals.unwrap_or_else(default_signals);
             if signals
                 .iter()
@@ -255,7 +292,8 @@ impl ExportConfig {
                 retry_attempts,
                 queue_days,
                 queue_bytes,
-                filter,
+                projects,
+                accounts,
                 headers: raw.headers,
                 timeout_ms: raw.timeout_ms,
             });
@@ -304,10 +342,14 @@ impl ExportConfig {
         self.targets
             .iter()
             .map(|t| {
-                let (projects, exclude_projects) = match &t.filter {
+                let (projects, exclude_projects) = match &t.projects {
                     ProjectFilter::All => (None, None),
                     ProjectFilter::Only(s) => (Some(s.clone()), None),
                     ProjectFilter::Except(s) => (None, Some(s.clone())),
+                };
+                let accounts = match &t.accounts {
+                    AccountFilter::All => None,
+                    AccountFilter::Only(s) => Some(s.clone()),
                 };
                 ExportTargetRaw {
                     endpoint: t.endpoint.clone(),
@@ -319,6 +361,7 @@ impl ExportConfig {
                     queue_bytes: (t.queue_bytes != 64 * 1024 * 1024).then_some(t.queue_bytes),
                     projects,
                     exclude_projects,
+                    accounts,
                     timeout_ms: t.timeout_ms,
                     headers: t.headers.clone(),
                 }
@@ -335,11 +378,76 @@ impl ExportTarget {
     pub fn allows_record(&self, env: &crate::Envelope) -> bool {
         self.kinds.contains(&env.kind)
             && !env.metadata.projection
+            && !self.accounts.is_filtered()
             && match &env.metadata.project {
-                Some(project) => self.filter.allows(&project.label, &project.key),
-                None => !self.filter.is_filtered(),
+                Some(project) => self.projects.allows(&project.label, &project.key),
+                None => !self.projects.is_filtered(),
             }
     }
+
+    /// The destination's project and account policy — `projects only: a, b, accounts only: c` —
+    /// or `None` when it forwards everything; one rendering, so `serve`'s forwarding line and
+    /// `doctor` describe a destination the same way.
+    pub fn describe_filters(&self) -> Option<String> {
+        let parts: Vec<String> = [self.projects.describe(), self.accounts.describe()]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// What a filter list's entries name, and how one is recognized.
+struct FilterEntry {
+    expected: &'static str,
+    valid: fn(&str) -> bool,
+}
+
+const PROJECT_ENTRY: FilterEntry = FilterEntry {
+    expected: "a project label or git-root path",
+    valid: |entry| !entry.trim().is_empty(),
+};
+
+const ACCOUNT_ENTRY: FilterEntry = FilterEntry {
+    expected: "a sign-in email address",
+    valid: is_email_address,
+};
+
+impl FilterEntry {
+    /// A filter list as configured. A present-but-empty list is a config mistake, not a fail-open
+    /// `All`, so an empty allow-list never silently forwards everything; an entry that cannot name
+    /// what its key matches is rejected for the same reason, since it could only ever match by
+    /// accident, or never.
+    fn list(
+        &self,
+        endpoint: &str,
+        key: &str,
+        entries: BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
+        if entries.is_empty() {
+            return Err(Error::InvalidExport(format!(
+                "export endpoint {endpoint:?}: `{key}` is present but empty — list at least one \
+                 entry, or remove the key (an empty list has no useful meaning)"
+            )));
+        }
+        match entries.iter().find(|entry| !(self.valid)(entry)) {
+            Some(entry) => Err(Error::InvalidExport(format!(
+                "export endpoint {endpoint:?}: `{key}` entry {entry:?} is not {}",
+                self.expected
+            ))),
+            None => Ok(entries),
+        }
+    }
+}
+
+/// Whether `entry` has the shape of an email address: a local part and a domain around its last
+/// `@`, with no surrounding whitespace. Deliverability is not judged; the check refuses a domain,
+/// a name or a padded copy, which could never equal the address Claude Code reports.
+fn is_email_address(entry: &str) -> bool {
+    entry.trim() == entry
+        && entry
+            .rsplit_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
 }
 
 /// Normalize an endpoint to its canonical form: trim surrounding whitespace and any trailing
@@ -388,7 +496,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: ProjectFilter::All,
+            projects: ProjectFilter::All,
+            accounts: AccountFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
         });
@@ -484,7 +593,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: ProjectFilter::All,
+            projects: ProjectFilter::All,
+            accounts: AccountFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
         });
@@ -496,7 +606,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: ProjectFilter::All,
+            projects: ProjectFilter::All,
+            accounts: AccountFilter::All,
             headers: BTreeMap::new(),
             timeout_ms: None,
         });
@@ -515,7 +626,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: ProjectFilter::All,
+            projects: ProjectFilter::All,
+            accounts: AccountFilter::All,
             headers: parse_otlp_headers("authorization=tok, x-team=core"),
             timeout_ms: Some(3000),
         });
@@ -535,13 +647,13 @@ mod tests {
              projects = [\"work-a\", \"work-b\"]\n",
         )
         .unwrap();
-        let f = &cfg.targets[0].filter;
+        let f = &cfg.targets[0].projects;
         assert!(f.is_filtered());
         assert!(f.allows("work-a", "/repos/work-a") && f.allows("work-b", "/x/work-b"));
         assert!(!f.allows("personal", "/repos/personal"));
         // survives a serialize/parse round-trip
         let back = parse(&cfg.to_toml()).unwrap();
-        assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
+        assert_eq!(back.targets[0].projects, cfg.targets[0].projects);
     }
 
     #[test]
@@ -551,11 +663,11 @@ mod tests {
              exclude_projects = [\"personal\"]\n",
         )
         .unwrap();
-        let f = &cfg.targets[0].filter;
+        let f = &cfg.targets[0].projects;
         assert!(f.allows("work-a", "/repos/work-a"));
         assert!(!f.allows("personal", "/repos/personal"));
         let back = parse(&cfg.to_toml()).unwrap();
-        assert_eq!(back.targets[0].filter, cfg.targets[0].filter);
+        assert_eq!(back.targets[0].projects, cfg.targets[0].projects);
     }
 
     #[test]
@@ -567,7 +679,7 @@ mod tests {
              projects = [\"/Users/me/work/api\"]\n",
         )
         .unwrap();
-        let f = &cfg.targets[0].filter;
+        let f = &cfg.targets[0].projects;
         // same label "api", different keys — only the listed key is allowed.
         assert!(f.allows("api", "/Users/me/work/api"));
         assert!(!f.allows("api", "/Users/me/personal/api"));
@@ -595,7 +707,7 @@ mod tests {
     fn an_explicit_empty_filter_list_is_rejected_not_fail_open() {
         // `projects = []` must NOT silently become `All` (forward everything) — an empty allow-list
         // is a config mistake. Both an empty allow-list and an empty exclude-list are rejected.
-        for key in ["projects", "exclude_projects"] {
+        for key in ["projects", "exclude_projects", "accounts"] {
             let err = parse(&format!(
                 "[[export]]\nendpoint = \"http://x:4318\"\nmode = \"raw\"\n{key} = []\n"
             ));
@@ -622,6 +734,37 @@ mod tests {
     }
 
     #[test]
+    fn an_account_allow_list_matches_sign_in_emails_ignoring_case() {
+        let cfg = parse(
+            "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n\
+             accounts = [\"Me@Company.example\"]\n",
+        )
+        .unwrap();
+        let accounts = &cfg.targets[0].accounts;
+        assert!(accounts.allows("me@company.example"));
+        assert!(!accounts.allows("me@personal.example"));
+        let back = parse(&cfg.to_toml()).unwrap();
+        assert_eq!(back.targets[0].accounts, *accounts);
+    }
+
+    #[test]
+    fn an_account_entry_that_is_no_address_or_a_local_kind_route_is_rejected() {
+        // A domain, a padded copy or local Kinds (which carry no account) would otherwise leave
+        // the destination silently matching nothing, or never deciding those records.
+        for entry in [
+            "accounts = [\"company.example\"]",
+            "accounts = [\"@company.example\"]",
+            "accounts = [\" me@company.example\"]",
+            "accounts = [\"me@company.example\"]\nkinds = [\"check\"]",
+        ] {
+            let err = parse(&format!(
+                "[[export]]\nendpoint = \"http://x:4318\"\nmode = \"raw\"\n{entry}\n"
+            ));
+            assert!(matches!(err, Err(Error::InvalidExport(_))), "{entry}");
+        }
+    }
+
+    #[test]
     fn allow_and_exclude_together_is_rejected() {
         let err = parse(
             "[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n\
@@ -633,7 +776,7 @@ mod tests {
     #[test]
     fn no_filter_is_all_and_allows_everything() {
         let cfg = parse("[[export]]\nendpoint = \"http://corp:4318\"\nmode = \"raw\"\n").unwrap();
-        let f = &cfg.targets[0].filter;
+        let f = &cfg.targets[0].projects;
         assert_eq!(*f, ProjectFilter::All);
         assert!(!f.is_filtered());
         assert!(f.allows("anything", "/any/where"));

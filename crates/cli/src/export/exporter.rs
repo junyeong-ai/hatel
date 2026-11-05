@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 
 use hatel_core::{ExportMode, ExportTarget, SessionIndexCache};
 
-use super::transform::{enrich_logs, enrich_metrics, session_ids};
+use super::transform::{attribute_values, enrich_logs, enrich_metrics};
+use crate::claude::{SESSION_ID, USER_EMAIL};
 use crate::throttle::{Tally, Throttle};
 
 /// Queue depth (slot backstop) before new batches are dropped. The memory bound is `MAX_QUEUED_BYTES`
@@ -309,7 +310,7 @@ impl Worker {
             .expect("reqwest client (rustls) initialises");
         let index_needed = targets
             .iter()
-            .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
+            .any(|t| t.mode == ExportMode::Enriched || t.projects.is_filtered());
         Worker {
             policy: None,
             client,
@@ -390,7 +391,7 @@ impl Worker {
             self.index_needed = self
                 .targets
                 .iter()
-                .any(|t| t.mode == ExportMode::Enriched || t.filter.is_filtered());
+                .any(|t| t.mode == ExportMode::Enriched || t.projects.is_filtered());
         }
         // Refresh the session→project map only when something actually enriches or filters, and
         // only when the index file changed since last load (mtime-gated) — no per-batch file read,
@@ -399,7 +400,7 @@ impl Worker {
             self.index.refresh();
         }
         self.retry_deferred(false).await;
-        if !self.targets.iter().any(|t| t.filter.is_filtered()) {
+        if !self.targets.iter().any(|t| t.projects.is_filtered()) {
             self.forward(&out, TargetSet::All, None).await;
             self.release(&out);
             return;
@@ -477,8 +478,10 @@ impl Worker {
     }
 
     /// Forward one body to the destinations selected by `set`. `projects` is the batch's resolved
-    /// project set; a filtered destination forwards only when every project passes its filter and
-    /// fails closed when the set is absent.
+    /// project set; a project-filtered destination forwards only when every project passes its
+    /// filter and fails closed when the set is absent. Accounts need no resolution: an
+    /// account-filtered destination reads them from the body, and forwards only when every record
+    /// names a listed account.
     async fn forward(
         &mut self,
         out: &Outbound,
@@ -493,11 +496,8 @@ impl Worker {
         if matches!(&policy, Some(Err(_))) {
             return;
         }
-        let native = crate::claude::decode::repository_projects(
-            &out.body,
-            matches!(out.signal, OtlpSignal::Metrics),
-        )
-        .ok();
+        let metrics = matches!(out.signal, OtlpSignal::Metrics);
+        let native = crate::claude::decode::repository_projects(&out.body, metrics).ok();
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
@@ -506,6 +506,7 @@ impl Worker {
         // The enriched body is identical for every enriched target — the project label is resolved
         // from the index, not the target — so it is built at most once per forward and reused.
         let mut enriched: Option<Result<Bytes, String>> = None;
+        let mut accounts: Option<Option<BTreeSet<String>>> = None;
         for original in targets {
             let target = if let Some(Ok(policy)) = &policy {
                 let Some(target) = policy
@@ -526,7 +527,7 @@ impl Worker {
             if !target.signals.contains(signal) {
                 continue;
             }
-            let filtered = target.filter.is_filtered();
+            let filtered = target.projects.is_filtered();
             let addressed = match set {
                 TargetSet::All => true,
                 TargetSet::UnfilteredOnly => !filtered,
@@ -538,10 +539,20 @@ impl Worker {
             if filtered {
                 let allowed = projects.is_some_and(|ps| {
                     ps.iter()
-                        .all(|(label, key)| target.filter.allows(label, key))
+                        .all(|(label, key)| target.projects.allows(label, key))
                 });
                 if !allowed {
                     continue; // project not allowed here, or undeterminable → fail closed
+                }
+            }
+            if target.accounts.is_filtered() {
+                let emails = accounts
+                    .get_or_insert_with(|| attribute_values(&out.body, metrics, USER_EMAIL));
+                let allowed = emails
+                    .as_ref()
+                    .is_some_and(|emails| emails.iter().all(|e| target.accounts.allows(e)));
+                if !allowed {
+                    continue; // account not allowed here, or a record names none → fail closed
                 }
             }
             let url = format!("{}{}", target.endpoint, out.signal.path());
@@ -630,12 +641,10 @@ impl Worker {
     /// datapoint carries one and a single export body is a single session, so the set is one
     /// project the filter then accepts or rejects.
     fn resolve_batch_projects(&self, body: &[u8], signal: OtlpSignal) -> BatchProjects {
-        let Some(ids) = session_ids(body, matches!(signal, OtlpSignal::Metrics)) else {
+        let Some(ids) = attribute_values(body, matches!(signal, OtlpSignal::Metrics), SESSION_ID)
+        else {
             return BatchProjects::Unattributable;
         };
-        if ids.is_empty() {
-            return BatchProjects::Unattributable;
-        }
         let native =
             crate::claude::decode::repository_projects(body, matches!(signal, OtlpSignal::Metrics))
                 .ok();
@@ -893,6 +902,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_account_filtered_destination_takes_only_batches_whose_every_record_is_listed() {
+        let (addr, received, server) = stub_collector().await;
+        let dir = tempfile::tempdir().unwrap();
+        let target = ExportTarget {
+            endpoint: format!("http://{addr}"),
+            mode: ExportMode::Raw,
+            signals: hatel_core::export::default_signals(),
+            kinds: Default::default(),
+            retry_attempts: 8,
+            queue_days: 7,
+            queue_bytes: 64 * 1024 * 1024,
+            projects: hatel_core::ProjectFilter::All,
+            accounts: hatel_core::AccountFilter::Only(["me@company.example".to_string()].into()),
+            headers: std::collections::BTreeMap::new(),
+            timeout_ms: Some(2_000),
+        };
+        let qb = Arc::new(AtomicUsize::new(0));
+        let mut worker = Worker::new(vec![target], dir.path().to_path_buf(), qb.clone());
+        let body = |emails: &[Option<&str>]| {
+            let points: Vec<_> = emails
+                .iter()
+                .map(|email| {
+                    let attributes: Vec<_> = email
+                        .map(|e| serde_json::json!({"key":"user.email","value":{"stringValue":e}}))
+                        .into_iter()
+                        .collect();
+                    serde_json::json!({"attributes": attributes, "asInt": "1"})
+                })
+                .collect();
+            serde_json::to_vec(&serde_json::json!({"resourceMetrics":[{"scopeMetrics":[{"metrics":[
+                {"name":"claude_code.token.usage","sum":{"aggregationTemporality":1,"dataPoints":points}}
+            ]}]}]}))
+            .unwrap()
+        };
+
+        for batch in [
+            body(&[Some("Me@Company.example")]),
+            body(&[Some("me@personal.example")]),
+            body(&[Some("me@company.example"), None]),
+        ] {
+            qb.fetch_add(batch.len(), Ordering::Relaxed);
+            worker.handle(outbound(batch)).await;
+        }
+
+        let received = received.lock().unwrap();
+        assert_eq!(
+            received.len(),
+            1,
+            "an unlisted or unnamed account fails closed"
+        );
+        assert!(String::from_utf8_lossy(&received[0]).contains("Me@Company.example"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn a_batch_from_a_session_with_no_project_takes_no_park_slot() {
         let (addr, received, server) = stub_collector().await;
         let dir = tempfile::tempdir().unwrap();
@@ -904,7 +968,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            projects: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };
@@ -948,7 +1013,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            projects: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };
@@ -1006,7 +1072,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::Only(allow),
+            projects: hatel_core::ProjectFilter::Only(allow),
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };
@@ -1072,7 +1139,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            projects: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
         };
@@ -1116,7 +1184,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::All,
+            projects: hatel_core::ProjectFilter::All,
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
         };
@@ -1149,7 +1218,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            projects: hatel_core::ProjectFilter::Only(["alpha".to_string()].into_iter().collect()),
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(500),
         };
@@ -1213,7 +1283,8 @@ mod tests {
             retry_attempts: 8,
             queue_days: 7,
             queue_bytes: 64 * 1024 * 1024,
-            filter: hatel_core::ProjectFilter::All,
+            projects: hatel_core::ProjectFilter::All,
+            accounts: hatel_core::AccountFilter::All,
             headers: std::collections::BTreeMap::new(),
             timeout_ms: Some(2_000),
         };
