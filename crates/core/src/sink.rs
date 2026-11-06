@@ -246,6 +246,44 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
     rows.collect::<rusqlite::Result<Vec<String>>>().map_err(io)
 }
 
+/// What the ledger occupies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    /// The database file and its write-ahead log, in bytes.
+    pub bytes: u64,
+    /// The records each Kind holds, most first.
+    pub records: Vec<(String, i64)>,
+}
+
+/// Measure the ledger. Counting reads only the Kind index, not the records themselves.
+pub fn usage(cfg: &Config) -> crate::Result<Usage> {
+    let path = cfg.database();
+    let conn = read(&path)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT k.name, COUNT(*) FROM records r JOIN kinds k ON k.id = r.kind_id \
+             GROUP BY r.kind_id ORDER BY 2 DESC, 1",
+        )
+        .map_err(io)?;
+    let records = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .map_err(io)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(io)?;
+    let mut wal = path.clone().into_os_string();
+    wal.push("-wal");
+    let bytes = file_len(&path).map_err(io)? + file_len(Path::new(&wal)).map_err(io)?;
+    Ok(Usage { bytes, records })
+}
+
+fn file_len(path: &Path) -> std::io::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
+    }
+}
+
 /// When the ledger last recorded an occurrence of `kind`, in epoch seconds, or `None` when it holds
 /// none or cannot say. How long a kind nothing writes any more is kept follows from it
 /// ([`Config::stored_until`]).

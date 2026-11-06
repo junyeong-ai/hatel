@@ -1,7 +1,7 @@
 ---
 name: hatel
 version: 0.25.0
-description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code cost and token usage, instruction loads, storage diagnosis, and selective downstream delivery. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
+description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code cost and token usage, instruction loads, storage diagnosis, disk usage and retention, and selective downstream delivery. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
 allowed-tools: Bash, Read, Edit
 ---
 
@@ -148,8 +148,9 @@ The store is one SQLite/WAL database (`telemetry.db`) in the state directory. A 
 schema this build did not create refuses reads and writes and is never altered; `doctor --local`
 and `/healthz` report it, and moving `telemetry.db` aside starts a new store. `[storage]
 retention_days` keeps every Kind that many days; `[storage.kinds."<Kind>"] retention_days` sets
-one Kind's own. Restart the receiver after configuration changes: it applies a shorter retention
-only then, and returns the space of deleted records to the file system. Do not restart a live
+one Kind's own; `hatel doctor --local` names the ledger's size and the Kinds holding the most
+records. Restart the receiver after configuration changes: it applies a shorter retention only
+then, and returns the space of deleted records to the file system. Do not restart a live
 service just to test an integration.
 
 Each destination is `[[export]]`. Native metrics only, with no logs or local Kinds:

@@ -186,8 +186,9 @@ pub(crate) fn report(local: bool) -> Report {
     report_invalid_variables(&mut storage, &invalid, &settings_env);
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
-    if let Err(error) = hatel_core::sink::write_readiness(&cfg.database()) {
-        storage.fail(format!("SQLite is not ready for writes: {error}"));
+    match hatel_core::sink::write_readiness(&cfg.database()) {
+        Ok(()) => report_usage(&mut storage, &cfg, &registry),
+        Err(error) => storage.fail(format!("SQLite is not ready for writes: {error}")),
     }
     if let Err(error) = hatel_core::cost::read_snapshot(&cfg.state_dir) {
         storage.fail(format!("cost baseline unreadable: {error}"));
@@ -669,6 +670,64 @@ fn retention(store: &receiver::Store) -> String {
             kinds.join(", ")
         )
     }
+}
+
+/// How many Kinds the ledger usage note names; it states how many more there are.
+const USAGE_KINDS: usize = 5;
+
+/// What the ledger occupies and which Kinds hold most of it, with the setting that shortens one
+/// Kind's retention, and a Kind retention that applies to nothing because no loaded schema
+/// declares that name and the ledger holds no records of it.
+fn report_usage(sec: &mut Section, cfg: &Config, registry: &hatel_core::Registry) {
+    let usage = match hatel_core::sink::usage(cfg) {
+        Ok(usage) => usage,
+        Err(e) => return sec.fail(format!("cannot measure the ledger: {e}")),
+    };
+    for kind in cfg.kind_retention_days.keys() {
+        if registry.kind(kind).is_none() && !usage.records.iter().any(|(held, _)| held == kind) {
+            sec.warn(format!(
+                "[storage.kinds.\"{kind}\"] names no Kind a loaded schema declares or the ledger \
+                 holds, so its retention applies to nothing — check the name"
+            ));
+        }
+    }
+    if usage.records.is_empty() {
+        return;
+    }
+    let total: i64 = usage.records.iter().map(|(_, n)| n).sum();
+    let mut most: Vec<String> = usage
+        .records
+        .iter()
+        .take(USAGE_KINDS)
+        .map(|(kind, n)| format!("{kind} {n} ({} days)", cfg.retention_days_for(kind)))
+        .collect();
+    if usage.records.len() > USAGE_KINDS {
+        most.push(format!(
+            "{} more Kind(s)",
+            usage.records.len() - USAGE_KINDS
+        ));
+    }
+    sec.note(format!(
+        "the ledger holds {total} record(s) in {} on disk: {} — \
+         `[storage.kinds.\"<Kind>\"] retention_days` keeps one Kind for its own number of days",
+        size(usage.bytes),
+        most.join(", ")
+    ));
+}
+
+fn size(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    for unit in ["B", "KiB", "MiB", "GiB"] {
+        if value < 1024.0 {
+            return if unit == "B" {
+                format!("{bytes} B")
+            } else {
+                format!("{value:.1} {unit}")
+            };
+        }
+        value /= 1024.0;
+    }
+    format!("{value:.1} TiB")
 }
 
 /// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
@@ -1387,6 +1446,38 @@ mod tests {
             findings[0].message.starts_with("1/2 recorded sessions"),
             "counted against every recorded session: {}",
             findings[0].message
+        );
+    }
+
+    #[test]
+    fn ledger_usage_names_the_largest_kinds_and_a_retention_that_applies_to_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_settings(&Settings::default()).0;
+        cfg.state_dir = dir.path().to_path_buf();
+        cfg.kind_retention_days = [("tool".to_string(), 7), ("tools".to_string(), 7)].into();
+        let registry = hatel_core::schema::load_core().unwrap();
+        let mut sink = hatel_core::build_sink(&cfg, &registry);
+        for kind in ["tool", "tool", "prompt"] {
+            let env = hatel_core::make_envelope(kind, Default::default(), &registry, true).unwrap();
+            sink.write_record(&env).unwrap();
+        }
+        let mut sec = Section::new("storage", "storage:");
+        report_usage(&mut sec, &cfg, &registry);
+        assert_eq!(sec.findings.len(), 2);
+        assert_eq!(sec.findings[0].status, Status::Warn);
+        assert!(
+            sec.findings[0]
+                .message
+                .starts_with("[storage.kinds.\"tools\"]")
+        );
+        assert_eq!(sec.findings[1].status, Status::Note);
+        assert!(
+            sec.findings[1].message.contains("3 record(s) in ")
+                && sec.findings[1]
+                    .message
+                    .contains(": tool 2 (7 days), prompt 1 (90 days) — "),
+            "{}",
+            sec.findings[1].message
         );
     }
 
