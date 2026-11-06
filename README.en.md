@@ -234,7 +234,7 @@ hatel doctor --local --json
 hatel service --restart
 ```
 
-- `doctor` checks through to Claude Code wiring; `--local` checks only local recording, schemas, storage and delivery. It sees this process’s environment only and makes no claim about another session’s.
+- `doctor` checks through to Claude Code wiring; `--local` checks only local recording, schemas, storage and delivery. It sees this process’s environment only and makes no claim about another session’s. What it does report from observation: sessions whose responses were recorded but whose native telemetry never arrived, and batches the receiver failed to forward.
 - After an upgrade, restart the receiver with `hatel service --restart` and reconnect the MCP server in Claude Code through `/mcp` → `hatel` → `Reconnect`. The conversation stays open.
 - Receiver logs are `~/Library/Logs/hatel/serve.log` on macOS and `journalctl --user -u hatel` on Linux.
 - Built-in Kinds store no raw prompts, command output or arbitrary tool input. The ledger holds local repository paths and identifiers, so treat it as sensitive. Hashing does not guarantee anonymity.

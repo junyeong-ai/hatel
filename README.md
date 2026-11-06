@@ -234,7 +234,7 @@ hatel doctor --local --json
 hatel service --restart
 ```
 
-- `doctor`는 Claude Code 연결까지, `--local`은 로컬 기록·스키마·저장소·전달만 확인합니다. 이 프로세스의 환경만 보므로 다른 세션의 실행 환경은 판단하지 않습니다.
+- `doctor`는 Claude Code 연결까지, `--local`은 로컬 기록·스키마·저장소·전달만 확인합니다. 이 프로세스의 환경만 보므로 다른 세션의 실행 환경은 판단하지 않습니다. 대신 응답은 기록됐는데 네이티브 텔레메트리가 오지 않은 세션과, 수신기가 전달하지 못한 batch는 관찰한 사실로 알려 줍니다.
 - 업그레이드 후에는 `hatel service --restart`로 수신기를 재시작하고, Claude Code에서 `/mcp` → `hatel` → `Reconnect`로 MCP 서버를 다시 연결합니다. 대화는 유지됩니다.
 - 수신기 로그는 macOS `~/Library/Logs/hatel/serve.log`, Linux `journalctl --user -u hatel`에 있습니다.
 - 기본 Kind는 프롬프트 원문, 명령 출력, 임의의 도구 입력을 저장하지 않습니다. 원장에는 로컬 저장소 경로와 식별자가 들어가므로 민감한 데이터로 다룹니다. 해시는 익명화를 보장하지 않습니다.

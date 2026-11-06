@@ -29,10 +29,11 @@ cargo audit   # after dependency updates
 - `crates/hook` depends on `crates/core` only and has no async runtime: it is spawned on every
   lifecycle event, so cold start is a design constraint. `crates/core` stays async-free; the
   receiver, CLI and MCP server (official `rmcp` SDK) live in `crates/cli`.
-- Vendor interpretation stays in adapters: `crates/core/src/claude` maps lifecycle hooks and
-  `crates/cli/src/claude` decodes Claude Code metrics and safe event projections. Plugins add Kinds
-  and bindings, not unused native counters. Local decode supports HTTP/JSON sums, gauges and
-  selected events; native forwarding can relay bodies it cannot decode; traces return 501.
+- Vendor interpretation stays in adapters: `crates/core/src/claude` maps lifecycle hooks and reads
+  transcripts, and `crates/cli/src/claude` decodes Claude Code metrics and safe event projections.
+  Plugins add Kinds and bindings, not unused native counters. Local decode supports HTTP/JSON sums,
+  gauges and selected events; native forwarding can relay bodies it cannot decode; traces return
+  501.
 - Comments state rationale and constraints, never the history of edits.
 
 ## Signals and attribution
@@ -68,7 +69,8 @@ cargo audit   # after dependency updates
 - `claude.response` reads billed responses from transcripts, so it survives native telemetry being
   routed elsewhere. A request is recorded once by its id (forks and subagents copy history), a
   token-less entry is not a billed response, and side requests never reach a transcript: it is
-  never added to `claude.api_request`.
+  never added to `claude.api_request`. A hook reads only what a transcript gained since its stored
+  position, which keeps a long session's turn end as cheap as its first.
 - An unreadable cost baseline disables only its persistence until repair and receiver restart; it
   is never rewritten from an empty baseline.
 
