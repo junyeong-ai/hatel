@@ -67,6 +67,7 @@ fn config_in(dir: &Path, plugins: Vec<PathBuf>) -> Config {
         plugin_source: hatel_core::config::PluginSource::ConfigFile,
         rotate_bytes: 10 * 1024 * 1024,
         retention_days: 90,
+        kind_retention_days: Default::default(),
         disabled: false,
         strict: true,
         export: Ok(Default::default()),
@@ -540,6 +541,7 @@ map.spec_slug = { from = "git_branch", capture = "^spec/(.+)$" }
         plugin_source: hatel_core::config::PluginSource::ConfigFile,
         rotate_bytes: 10 * 1024 * 1024,
         retention_days: 90,
+        kind_retention_days: Default::default(),
         disabled: false,
         strict: true,
         export: Ok(Default::default()),
@@ -692,7 +694,7 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
     };
     let filled = pages();
     assert_eq!(
-        hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
+        hatel_core::sink::prune(&cfg, &cfg.retention(hatel_core::now_epoch())),
         2001,
         "exactly the ancient rows are deleted"
     );
@@ -702,6 +704,34 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
         pages() * 10 < filled,
         "the deleted rows' pages return to the file system: {filled} -> {}",
         pages()
+    );
+}
+
+#[test]
+fn a_kind_kept_for_its_own_days_expires_on_its_own_horizon() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config_in(dir.path(), vec![]);
+    cfg.kind_retention_days = [("tool".to_string(), 7)].into();
+    let reg = load_core().unwrap();
+    let month_ago = jiff::Timestamp::now() - jiff::SignedDuration::from_hours(24 * 30);
+    for kind in ["tool", "prompt"] {
+        insert_raw(
+            &cfg,
+            &reg,
+            kind,
+            &month_ago.to_string(),
+            serde_json::json!({}),
+        );
+    }
+    assert_eq!(
+        hatel_core::sink::prune(&cfg, &cfg.retention(hatel_core::now_epoch())),
+        1
+    );
+    assert!(records_of(&cfg, "tool").is_empty());
+    assert_eq!(
+        records_of(&cfg, "prompt").len(),
+        1,
+        "a Kind without its own days keeps the default"
     );
 }
 
@@ -2509,7 +2539,7 @@ fn retention_removes_pending_references_and_releases_queue_capacity() {
         .write_record(&env)
         .unwrap();
     assert_eq!(
-        hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
+        hatel_core::sink::prune(&cfg, &cfg.retention(hatel_core::now_epoch())),
         1
     );
     assert!(

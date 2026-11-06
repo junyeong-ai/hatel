@@ -922,6 +922,7 @@ mod tests {
                 plugin_source: hatel_core::config::PluginSource::ConfigFile,
                 rotate_bytes: 10 * 1024 * 1024,
                 retention_days: 90,
+                kind_retention_days: Default::default(),
                 disabled: false,
                 strict: false,
                 export: Ok(Default::default()),

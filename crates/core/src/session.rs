@@ -112,7 +112,7 @@ impl SessionIndex {
     /// dropping any, so a session stays attributable until its newest line expires — which
     /// [`Self::renew`] keeps from happening to a session still being heard from.
     /// Returns archives removed.
-    pub fn prune(&self, retention: Retention) -> usize {
+    pub fn prune(&self, retention: &Retention) -> usize {
         let removed = rolling::prune_archives_of(&self.state_dir, INDEX_BASE, retention.cutoff);
         rolling::rotate_aged(
             &self.state_dir,
@@ -454,8 +454,9 @@ mod tests {
         let everything = Retention {
             cutoff: i64::MAX,
             rotate_before: i64::MAX,
+            kind_cutoffs: Default::default(),
         };
-        assert!(idx.prune(everything) >= 1, "at least one archive pruned");
+        assert!(idx.prune(&everything) >= 1, "at least one archive pruned");
         let after = idx.load();
         assert!(
             after.contains_key("S2"),
@@ -476,13 +477,14 @@ mod tests {
         let at = |rotate_before| Retention {
             cutoff: i64::MIN,
             rotate_before,
+            kind_cutoffs: Default::default(),
         };
-        idx.prune(at(first));
+        idx.prune(&at(first));
         assert!(
             path.exists(),
             "the undated line is not taken for an older one"
         );
-        idx.prune(at(first + 1));
+        idx.prune(&at(first + 1));
         assert!(
             !path.exists(),
             "archived once its first dated start is past"
@@ -533,6 +535,7 @@ mod tests {
         let retention = Retention {
             cutoff: now - 90 * 86_400,
             rotate_before: now - 9 * 86_400,
+            kind_cutoffs: Default::default(),
         };
         let mut cache = SessionIndexCache::new(dir.path().to_path_buf());
         cache.refresh();
@@ -559,7 +562,7 @@ mod tests {
             cache.due_renewal(heard, 9 * 86_400).is_empty(),
             "a renewal is the session's newest line, so the next flush has nothing to renew"
         );
-        idx.prune(retention);
+        idx.prune(&retention);
         assert!(!archive.exists(), "the expired starts are gone");
         let map = idx.load();
         assert_eq!(

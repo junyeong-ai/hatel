@@ -546,15 +546,14 @@ fn report_receiver(
                     && theirs != *store
                 {
                     sec.warn(format!(
-                        "receiver at {authority} writes {} with {}-day retention, but this process \
-                         reads {} with {}-day retention — the receiver reads config.toml when it \
-                         starts, so restart it after an edit (`hatel service --restart`), and a \
-                         storage or {DEFAULT_STATE_VAR} variable set for only one of them splits \
-                         them too",
+                        "receiver at {authority} writes {} with {}, but this process reads {} \
+                         with {} — the receiver reads config.toml when it starts, so restart it \
+                         after an edit (`hatel service --restart`), and a storage or \
+                         {DEFAULT_STATE_VAR} variable set for only one of them splits them too",
                         describe(&theirs),
-                        theirs.retention_days,
+                        retention(&theirs),
                         describe(store),
-                        store.retention_days
+                        retention(store)
                     ));
                 }
             }
@@ -653,6 +652,23 @@ const DEFAULT_STATE_VAR: &str = "APPDATA";
 /// Which store: where it lives.
 fn describe(store: &receiver::Store) -> String {
     format!("the store at {}", store.state_dir.display())
+}
+
+fn retention(store: &receiver::Store) -> String {
+    let kinds: Vec<String> = store
+        .kind_retention_days
+        .iter()
+        .map(|(kind, days)| format!("{kind} {days}"))
+        .collect();
+    if kinds.is_empty() {
+        format!("{}-day retention", store.retention_days)
+    } else {
+        format!(
+            "{}-day retention ({} days)",
+            store.retention_days,
+            kinds.join(", ")
+        )
+    }
 }
 
 /// Sessions the hook recorded with no project. Honest as data, but an unattributed row in a report
@@ -1219,6 +1235,10 @@ mod tests {
             },
             receiver::Store {
                 retention_days: store.retention_days + 1,
+                ..store.clone()
+            },
+            receiver::Store {
+                kind_retention_days: [("tool".to_string(), 7)].into(),
                 ..store.clone()
             },
         ] {

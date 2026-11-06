@@ -64,6 +64,17 @@ pub struct Storage {
     pub retention_days: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotate_bytes: Option<NonZeroU64>,
+    /// Per-Kind storage, keyed by Kind name. A Kind left out keeps the section's `retention_days`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kinds: BTreeMap<String, KindStorage>,
+}
+
+/// One `[storage.kinds."<name>"]` table.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KindStorage {
+    #[serde(deserialize_with = "days")]
+    pub retention_days: i64,
 }
 
 impl Storage {
@@ -98,13 +109,17 @@ pub(crate) fn refuse_tilde(path: &Path) -> std::result::Result<(), String> {
 }
 
 fn retention_days<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<i64>, D::Error> {
+    days(d).map(Some)
+}
+
+fn days<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<i64, D::Error> {
     let days = i64::deserialize(d)?;
     if !(1..=MAX_RETENTION_DAYS).contains(&days) {
         return Err(serde::de::Error::custom(format!(
             "retention_days must be from 1 to {MAX_RETENTION_DAYS}, not {days}"
         )));
     }
-    Ok(Some(days))
+    Ok(days)
 }
 
 /// One `[[export]]` entry exactly as the file spells it, before validation. `Option` on the filter
@@ -264,6 +279,7 @@ mod tests {
             "pluginz = []",
             "[[exports]]\nendpoint = \"x\"\nmode = \"raw\"",
             "[storage]\nretention = 30",
+            "[storage.kinds.tool]\nretention = 7",
         ] {
             assert!(
                 Settings::parse(text, Path::new("/c/config.toml")).is_err(),
@@ -281,6 +297,8 @@ mod tests {
             "retention_days = 0",
             "retention_days = 100001",
             "rotate_bytes = 0",
+            "kinds.tool = {}",
+            "kinds.tool.retention_days = 0",
         ] {
             let text = format!("[storage]\n{text}");
             assert!(
@@ -344,6 +362,7 @@ mod tests {
         let original = Settings::parse(
             "plugins = [\"/p/a.toml\"]\n\
              [storage]\nstate_dir = \"/s\"\nretention_days = 30\nrotate_bytes = 1024\n\
+             [storage.kinds.\"claude.hook\"]\nretention_days = 7\n\
              [[export]]\nendpoint = \"http://h:4318\"\nmode = \"enriched\"\ntimeout_ms = 900\n\
              [export.headers]\nauthorization = \"t\"\n",
             Path::new("/c/config.toml"),

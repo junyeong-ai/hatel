@@ -177,10 +177,10 @@ impl UnreadableKinds {
         }
         let expires_by = names
             .iter()
-            .map(|kind| sink::last_written(cfg, kind))
+            .map(|kind| sink::last_written(cfg, kind).map(|last| cfg.stored_until(kind, last)))
             .collect::<Option<Vec<i64>>>()
-            .and_then(|written| written.into_iter().max())
-            .and_then(|last| jiff::Timestamp::from_second(cfg.stored_until(last)).ok())
+            .and_then(|until| until.into_iter().max())
+            .and_then(|until| jiff::Timestamp::from_second(until).ok())
             .map(|t| t.strftime("%Y-%m-%d").to_string());
         Ok(Some(Self {
             names,

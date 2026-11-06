@@ -68,9 +68,14 @@ plugins = ["schemas/team.toml"]
 [storage]
 # state_dir = "/data/hatel"
 retention_days = 90
+
+[storage.kinds."claude.hook"]
+retention_days = 14
 ```
 
 The ledger is one SQLite/WAL database, `telemetry.db`, in the state directory. Relative paths resolve against the configuration file; `~` is not expanded. Default state lives under the platform’s state directory in `hatel`.
+
+`retention_days` is every Kind’s default number of days kept; `[storage.kinds."<Kind>"]` sets one Kind’s own. The receiver periodically deletes records past their retention and returns the freed space to the file system.
 
 Hooks, CLI, MCP and receiver read the same configuration. Preserve existing plugin entries. A project script overriding `HATEL_PLUGINS` can hide other producers’ schemas. Restart the receiver after configuration changes. Before deletion it rereads retention and deletes nothing if that read fails.
 

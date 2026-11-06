@@ -6,6 +6,7 @@
 //! build and the store as JSON, so a shell can read it the same way
 //! (`curl localhost:4318/healthz`).
 
+use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, ToSocketAddrs as _};
 use std::path::PathBuf;
@@ -58,6 +59,8 @@ pub struct Capabilities {
 /// Two processes that differ in either read and write different data.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Store {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kind_retention_days: BTreeMap<String, i64>,
     pub retention_days: i64,
     pub state_dir: PathBuf,
 }
@@ -65,6 +68,7 @@ pub struct Store {
 impl Store {
     pub fn of(cfg: &Config) -> Self {
         Self {
+            kind_retention_days: cfg.kind_retention_days.clone(),
             retention_days: cfg.retention_days,
             state_dir: cfg.state_dir.clone(),
         }

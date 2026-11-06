@@ -269,12 +269,12 @@ const PRUNE_BATCH: i64 = 5_000;
 /// transaction, so a writer waits for one step at most rather than for the whole reclaim.
 const RECLAIM_PAGES: u32 = 1_024;
 
-/// Remove records that occurred before the retention horizon, with their delivery references and
-/// the queue capacity they held, then return the freed pages to the file system. Destructive, so it
+/// Remove records that occurred before their Kind's retention horizon, with their delivery
+/// references and the queue capacity they held, then return the freed pages to the file system. Destructive, so it
 /// belongs to exactly one caller: the receiver (which holds the single-writer state lock) — never
 /// the hook, and never a read path. Returns rows deleted; a missing DB is zero, and any error is
 /// logged (fail-open) rather than propagated.
-pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
+pub fn prune(cfg: &Config, retention: &crate::config::Retention) -> usize {
     let path = cfg.database();
     if !path.exists() {
         return 0;
@@ -288,12 +288,12 @@ pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("CREATE TEMP TABLE prune_records (id INTEGER PRIMARY KEY);")?;
         let kinds = conn
-            .prepare("SELECT id FROM kinds")?
-            .query_map([], |r| r.get::<_, i64>(0))?
+            .prepare("SELECT id, name FROM kinds")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut total = 0;
-        for kind_id in kinds {
-            total += prune_kind(&mut conn, kind_id, retention.cutoff)?;
+        for (kind_id, kind) in kinds {
+            total += prune_kind(&mut conn, kind_id, retention.cutoff_for(&kind))?;
         }
         reclaim(&conn)?;
         Ok(total)

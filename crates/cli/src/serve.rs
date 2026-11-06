@@ -817,10 +817,10 @@ fn sweep_due(now: i64, last: i64, every: i64) -> bool {
 }
 
 /// The configuration a step that deletes records applies: the receiver's own, with the longer of
-/// its retention and the one `file` sets now. Raising `retention_days` therefore keeps records from
-/// the next sweep on, and through the stop of the restart that applies every other setting;
-/// lowering it waits for that restart, as every other setting does. `Err` when the file cannot be
-/// read now, since a horizon the file cannot confirm deletes nothing.
+/// its retention and the one `file` sets now, for every Kind. Raising a `retention_days` therefore
+/// keeps records from the next sweep on, and through the stop of the restart that applies every
+/// other setting; lowering one waits for that restart, as every other setting does. `Err` when the
+/// file cannot be read now, since a horizon the file cannot confirm deletes nothing.
 fn horizon(
     running: &Config,
     file: Option<&Path>,
@@ -830,7 +830,18 @@ fn horizon(
     let mut cfg = running.clone();
     // The environment is the one `startup` accepted, so every variable in it resolves.
     let (now, _) = Config::from_settings_in(&settings, &env);
-    cfg.retention_days = cfg.retention_days.max(now.retention_days);
+    cfg.retention_days = running.retention_days.max(now.retention_days);
+    cfg.kind_retention_days = running
+        .kind_retention_days
+        .keys()
+        .chain(now.kind_retention_days.keys())
+        .map(|kind| {
+            let days = running
+                .retention_days_for(kind)
+                .max(now.retention_days_for(kind));
+            (kind.clone(), days)
+        })
+        .collect();
     Ok(cfg)
 }
 
@@ -847,7 +858,7 @@ fn sweep(st: &AppState) {
         }
     };
     let retention = cfg.retention(hatel_core::now_epoch());
-    prune_ledger(&cfg, retention);
+    prune_ledger(&cfg, &retention);
     let mut costs = lock(&st.costs);
     if let Ok(Costs { snapshot, baseline }) = &mut *costs {
         let checkpoint = snapshot.checkpoint(retention.cutoff);
@@ -868,13 +879,10 @@ fn sweep(st: &AppState) {
 /// Tool records bake in their project label at write time, and a cost row keeps the project it
 /// carries once the index no longer holds its session (`persist_cost`), so neither loses its
 /// attribution to this prune.
-fn prune_ledger(cfg: &Config, retention: Retention) {
+fn prune_ledger(cfg: &Config, retention: &Retention) {
     let removed = hatel_core::sink::prune(cfg, retention);
     if removed > 0 {
-        eprintln!(
-            "hatel: retention — removed {removed} ledger row(s) older than {} days",
-            cfg.retention_days
-        );
+        eprintln!("hatel: retention — removed {removed} ledger row(s) past their Kind's retention");
     }
     let index_removed = SessionIndex::new(cfg.state_dir.clone()).prune(retention);
     if index_removed > 0 {
@@ -1056,6 +1064,7 @@ mod tests {
             plugin_source: hatel_core::config::PluginSource::ConfigFile,
             rotate_bytes: 10 * 1024 * 1024,
             retention_days: 90,
+            kind_retention_days: Default::default(),
             disabled: false,
             strict: false,
             export: Ok(Default::default()),
@@ -1462,6 +1471,21 @@ mod tests {
             "a shorter retention waits for the restart"
         );
         assert!(days("[storage\n").is_err());
+        let tool_days = |text: &str| {
+            std::fs::write(&file, text).unwrap();
+            horizon(&running, Some(&file), |_| None)
+                .unwrap()
+                .retention_days_for("tool")
+        };
+        assert_eq!(
+            tool_days("[storage.kinds.tool]\nretention_days = 365\n"),
+            365
+        );
+        assert_eq!(
+            tool_days("[storage.kinds.tool]\nretention_days = 7\n"),
+            90,
+            "a Kind's shorter retention waits for the restart too"
+        );
         std::fs::write(
             &file,
             "[storage]\nstate_dir = \"/elsewhere\"\nretention_days = 365\n",

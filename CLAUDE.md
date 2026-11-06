@@ -135,7 +135,7 @@ and its CI check unless a deliberate compatibility change requires raising both.
   change re-stamps records from their stored definitions in that maintenance; the product never
   keeps a decoder for an earlier format. The receiver
   reads the file when it starts, and again before it deletes anything, keeping the longer retention
-  and deleting nothing while the file cannot be read. It reports that file and its store on
+  for each Kind and deleting nothing while the file cannot be read. It reports that file and its store on
   `/healthz`; `doctor` names a receiver that reads another file or writes another store, and the
   splitting variables it can see, in its own environment and in settings.json `env`. The service
   unit therefore carries nothing to configure. `doctor` names any stored Kind no loaded schema

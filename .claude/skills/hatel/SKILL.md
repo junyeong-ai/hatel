@@ -146,7 +146,10 @@ Find the actual path with `hatel doctor --local --json`. Shared settings belong 
 storage or plugin overrides can split writers from readers and services.
 The store is one SQLite/WAL database (`telemetry.db`) in the state directory. A store at a
 schema this build did not create refuses reads and writes and is never altered; `doctor --local`
-and `/healthz` report it, and moving `telemetry.db` aside starts a new store. Restart the receiver after configuration changes. Do not restart a live
+and `/healthz` report it, and moving `telemetry.db` aside starts a new store. `[storage]
+retention_days` keeps every Kind that many days; `[storage.kinds."<Kind>"] retention_days` sets
+one Kind's own. Restart the receiver after configuration changes: it applies a shorter retention
+only then, and returns the space of deleted records to the file system. Do not restart a live
 service just to test an integration.
 
 Each destination is `[[export]]`. Native metrics only, with no logs or local Kinds:

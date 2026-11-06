@@ -3,6 +3,7 @@
 //! `settings.json`, which carries only the native `OTEL_*` / `CLAUDE_CODE_ENABLE_TELEMETRY`
 //! block the agent reads at startup.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -25,6 +26,8 @@ pub struct Config {
     /// Retention horizon in days — see [`Config::retention`]. This does not establish
     /// collection coverage inside the horizon.
     pub retention_days: i64,
+    /// Kinds kept for their own number of days instead of `retention_days`.
+    pub kind_retention_days: BTreeMap<String, i64>,
     pub disabled: bool,
     pub strict: bool,
     pub export: std::result::Result<crate::ExportConfig, String>,
@@ -69,13 +72,22 @@ const FILES_PER_HORIZON: i64 = 10;
 const MAX_SWEEP_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
 /// The retention horizon at one instant, in epoch seconds.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Retention {
     /// Records from before this have expired.
     pub cutoff: i64,
     /// A store that deletes whole files rotates each open file holding a record from before this,
     /// one rotation span back — see [`Config::rotation_span_secs`].
     pub rotate_before: i64,
+    /// The cutoff of each Kind kept for its own number of days, in place of `cutoff`.
+    pub kind_cutoffs: BTreeMap<String, i64>,
+}
+
+impl Retention {
+    /// Records of `kind` from before this have expired.
+    pub fn cutoff_for(&self, kind: &str) -> i64 {
+        self.kind_cutoffs.get(kind).copied().unwrap_or(self.cutoff)
+    }
 }
 
 impl Config {
@@ -169,6 +181,12 @@ impl Config {
         let retention_days = valid(env.retention_days(), &mut invalid)
             .or(settings.storage.retention_days)
             .unwrap_or(DEFAULT_RETENTION_DAYS);
+        let kind_retention_days = settings
+            .storage
+            .kinds
+            .iter()
+            .map(|(kind, storage)| (kind.clone(), storage.retention_days))
+            .collect();
         let disabled = valid(env.flag("HATEL_DISABLED"), &mut invalid).unwrap_or(false);
         let strict = valid(env.flag("HATEL_STRICT"), &mut invalid).unwrap_or(false);
         let cfg = Config {
@@ -177,6 +195,7 @@ impl Config {
             plugin_source,
             rotate_bytes,
             retention_days,
+            kind_retention_days,
             disabled,
             strict,
             export: crate::ExportConfig::from_settings(settings).map_err(|e| e.to_string()),
@@ -189,12 +208,25 @@ impl Config {
         self.state_dir.join("telemetry.db")
     }
 
-    /// The retention horizon as of `now_epoch`, one for every store. `retention_days` is capped at
-    /// parse time, so the arithmetic cannot overflow.
+    /// How many days records of `kind` are kept.
+    pub fn retention_days_for(&self, kind: &str) -> i64 {
+        self.kind_retention_days
+            .get(kind)
+            .copied()
+            .unwrap_or(self.retention_days)
+    }
+
+    /// The retention horizon as of `now_epoch`, one for every store. Every number of days is capped
+    /// at parse time, so the arithmetic cannot overflow.
     pub fn retention(&self, now_epoch: i64) -> Retention {
         Retention {
             cutoff: now_epoch - self.retention_days * 86_400,
             rotate_before: now_epoch - self.rotation_span_secs(),
+            kind_cutoffs: self
+                .kind_retention_days
+                .iter()
+                .map(|(kind, days)| (kind.clone(), now_epoch - days * 86_400))
+                .collect(),
         }
     }
 
@@ -209,11 +241,11 @@ impl Config {
         MAX_SWEEP_INTERVAL_SECS.min(self.rotation_span_secs())
     }
 
-    /// The latest a store still holds a record kind whose newest record was written at `written`
-    /// (epoch seconds), when nothing writes that kind again and a receiver keeps sweeping: that
-    /// record's file is rotated well within the horizon and removed by the first sweep after it.
-    pub fn stored_until(&self, written: i64) -> i64 {
-        written + self.retention_days * 86_400 + self.sweep_interval_secs()
+    /// The latest a store still holds a record of `kind` whose newest record was written at
+    /// `written` (epoch seconds), when nothing writes that kind again and a receiver keeps
+    /// sweeping: the first sweep after its horizon removes it.
+    pub fn stored_until(&self, kind: &str, written: i64) -> i64 {
+        written + self.retention_days_for(kind) * 86_400 + self.sweep_interval_secs()
     }
 }
 
@@ -391,7 +423,8 @@ mod tests {
 
     #[test]
     fn storage_comes_from_a_variable_then_the_file_then_the_default() {
-        let file = "[storage]\nstate_dir = \"data\"\nretention_days = 30\nrotate_bytes = 1024";
+        let file = "[storage]\nstate_dir = \"data\"\nretention_days = 30\nrotate_bytes = 1024\n\
+                    [storage.kinds.tool]\nretention_days = 3";
         let from_file = resolved(file, &[]);
         assert_eq!(from_file.state_dir, Path::new("/home/u/.config/hatel/data"));
         assert_eq!(
@@ -399,6 +432,8 @@ mod tests {
             Path::new("/home/u/.config/hatel/data/telemetry.db")
         );
         assert_eq!(from_file.retention_days, 30);
+        assert_eq!(from_file.retention_days_for("tool"), 3);
+        assert_eq!(from_file.retention_days_for("prompt"), 30);
         assert_eq!(from_file.rotate_bytes, 1024);
 
         // Absolute on this platform: Windows resolves a rooted path without a drive against the
@@ -421,6 +456,11 @@ mod tests {
             "a relative variable names one directory whatever directory later work runs in"
         );
         assert_eq!(overridden.retention_days, 7);
+        assert_eq!(
+            overridden.retention_days_for("tool"),
+            3,
+            "the variable replaces the default, not a Kind's own"
+        );
         assert_eq!(overridden.rotate_bytes, 2048);
 
         let defaults = resolved("", &[]);
