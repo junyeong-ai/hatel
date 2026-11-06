@@ -127,7 +127,8 @@ and its CI check unless a deliberate compatibility change requires raising both.
   started, so a Kind the hook can record is one `report` can read, in the store it reads;
   `HATEL_PLUGINS` and the storage variables override them for a single process only. The ledger
   is one SQLite database created at its current schema with raw timestamps beside normalized
-  seconds/nanoseconds. Hooks never convert data: a store at another schema version is refused
+  seconds/nanoseconds. A record references its Kind, contract and project by id; readers read the
+  `envelopes` view, so only the write path knows the tables behind it. Hooks never convert data: a store at another schema version is refused
   (`sink::write_readiness`), never altered. A future physical schema change ships with explicit
   maintenance that runs while every writer — hooks, receiver and MCP servers (Claude Code
   conversations can stay open and reconnect through `/mcp`) — is stopped. A fingerprint format

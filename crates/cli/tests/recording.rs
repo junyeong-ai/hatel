@@ -208,25 +208,19 @@ fn records_without_a_known_definition_are_counted_and_never_aggregated() {
         format!("[storage]\nstate_dir={:?}\n", state.to_string_lossy()),
     )
     .unwrap();
-    let database = state.join("telemetry.db");
     let registry = hatel_core::schema::load_core().unwrap();
-    drop(hatel_core::SqliteSink::open(database.clone(), &registry));
-    let insert = |metadata: serde_json::Value| {
-        rusqlite::Connection::open(&database)
-            .unwrap()
-            .execute(
-                "INSERT INTO records VALUES (?1,'prompt',1,'{\"prompt_len\":5}',?2,?3,0)",
-                rusqlite::params![
-                    hatel_core::now_iso_utc(),
-                    metadata.to_string(),
-                    hatel_core::now_epoch()
-                ],
-            )
-            .unwrap();
-    };
-    insert(serde_json::json!({}));
-    insert(serde_json::json!({"schema_id":"unknown-contract","kind_version":1}));
-    insert(serde_json::json!({"schema_id":registry.kind("prompt").unwrap().schema_id}));
+    let mut sink = hatel_core::SqliteSink::open(state.join("telemetry.db"), &registry);
+    let payload: hatel_core::Payload = [("prompt_len".to_string(), 5.into())].into();
+    let selected = hatel_core::make_envelope("prompt", payload.clone(), &registry, true).unwrap();
+    sink.write_record(&selected).unwrap();
+    sink.write_record(&hatel_core::Envelope {
+        ts: hatel_core::now_iso_utc(),
+        kind: "prompt".into(),
+        schema_version: hatel_core::SCHEMA_VERSION,
+        payload,
+        metadata: Default::default(),
+    })
+    .unwrap();
     let report = isolated(home.path())
         .args(["report", "--kind", "prompt", "--format", "json"])
         .output()
@@ -247,10 +241,7 @@ fn records_without_a_known_definition_are_counted_and_never_aggregated() {
         })
         .collect();
     resolutions.sort();
-    assert_eq!(
-        resolutions,
-        [("selected", 1), ("undefined", 1), ("undefined", 1)]
-    );
+    assert_eq!(resolutions, [("selected", 1), ("undefined", 1)]);
     let interpreted = isolated(home.path())
         .args([
             "report",

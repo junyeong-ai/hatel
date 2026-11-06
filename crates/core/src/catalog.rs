@@ -1,23 +1,78 @@
 //! Immutable registered definitions kept beside SQLite records, including retired Kinds, and the
 //! resolution of each stored contract against the definition a reader answers under.
 
-use crate::{Config, KindSpec, Registry, registry::KindSpecRaw};
-use rusqlite::{Connection, Transaction};
+use crate::{Config, Envelope, KindSpec, Registry, registry::KindSpecRaw};
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS contracts (
-    schema_id TEXT PRIMARY KEY, kind TEXT NOT NULL, definition TEXT NOT NULL
-); CREATE INDEX IF NOT EXISTS idx_contracts_kind ON contracts(kind);";
+pub(crate) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kinds (
+    id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS contracts (
+    id INTEGER PRIMARY KEY, schema_id TEXT NOT NULL UNIQUE,
+    kind_id INTEGER NOT NULL REFERENCES kinds (id), definition TEXT NOT NULL
+);";
 
 fn io(error: impl std::fmt::Display) -> crate::Error {
     crate::Error::Io(error.to_string())
 }
 
-pub(crate) fn save(tx: &Transaction<'_>, spec: &KindSpec) -> crate::Result<()> {
+/// The id of the Kind named `name`, registered on first use.
+pub(crate) fn kind_id(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    let stored = conn
+        .query_row("SELECT id FROM kinds WHERE name = ?1", [name], |r| r.get(0))
+        .optional()?;
+    match stored {
+        Some(id) => Ok(id),
+        None => conn.query_row(
+            "INSERT INTO kinds (name) VALUES (?1) RETURNING id",
+            [name],
+            |r| r.get(0),
+        ),
+    }
+}
+
+/// The id of the contract `env` is stamped with, stored with its definition on first use. A record
+/// is kept only beside the definition of its contract, so one stamped with a contract that is
+/// neither stored nor the registry's current definition of its Kind is refused.
+pub(crate) fn contract_id(
+    conn: &Connection,
+    registry: &Registry,
+    env: &Envelope,
+    kind_id: i64,
+) -> crate::Result<Option<i64>> {
+    let Some(schema_id) = env.metadata.schema_id.as_deref() else {
+        return Ok(None);
+    };
+    let stored = conn
+        .query_row(
+            "SELECT id FROM contracts WHERE schema_id = ?1",
+            [schema_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(io)?;
+    if stored.is_some() {
+        return Ok(stored);
+    }
+    let spec = registry
+        .kind(&env.kind)
+        .filter(|spec| spec.schema_id == schema_id)
+        .ok_or_else(|| {
+            crate::Error::InvalidPayload(format!(
+                "{} contract {schema_id} has no definition to store beside the record",
+                env.kind
+            ))
+        })?;
     let definition = serde_json::to_string(&spec.definition()).map_err(io)?;
-    tx.execute("INSERT INTO contracts(schema_id,kind,definition) VALUES (?1,?2,?3) ON CONFLICT(schema_id) DO NOTHING",rusqlite::params![spec.schema_id,spec.name,definition]).map_err(io)?;
-    Ok(())
+    conn.query_row(
+        "INSERT INTO contracts (schema_id, kind_id, definition) VALUES (?1, ?2, ?3) RETURNING id",
+        rusqlite::params![schema_id, kind_id, definition],
+        |r| r.get(0),
+    )
+    .map(Some)
+    .map_err(io)
 }
 
 #[derive(Debug, Serialize)]
@@ -29,7 +84,10 @@ pub struct StoredContract {
 pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
     let conn = crate::sink::read(&cfg.database())?;
     let mut stmt = conn
-        .prepare("SELECT schema_id,kind,definition FROM contracts ORDER BY kind,schema_id")
+        .prepare(
+            "SELECT c.schema_id, k.name, c.definition FROM contracts c \
+             JOIN kinds k ON k.id = c.kind_id ORDER BY k.name, c.schema_id",
+        )
         .map_err(io)?;
     let rows = stmt
         .query_map([], |r| {
@@ -48,7 +106,6 @@ pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
 }
 
 pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSpec> {
-    use rusqlite::OptionalExtension;
     let missing = || {
         io(format!(
             "no stored definition for {kind} contract {schema_id}; load its exact schema explicitly"
@@ -57,7 +114,8 @@ pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSp
     let conn = crate::sink::read(&cfg.database())?;
     let json: String = conn
         .query_row(
-            "SELECT definition FROM contracts WHERE schema_id=?1 AND kind=?2",
+            "SELECT c.definition FROM contracts c JOIN kinds k ON k.id = c.kind_id \
+             WHERE c.schema_id = ?1 AND k.name = ?2",
             [schema_id, kind],
             |r| r.get(0),
         )
@@ -113,7 +171,10 @@ impl Contracts {
     /// Resolve `spec` against the definitions stored in an open ledger.
     pub(crate) fn resolve(conn: &Connection, spec: &KindSpec) -> crate::Result<Self> {
         let mut stmt = conn
-            .prepare("SELECT schema_id,definition FROM contracts WHERE kind=?1")
+            .prepare(
+                "SELECT c.schema_id, c.definition FROM contracts c \
+                 JOIN kinds k ON k.id = c.kind_id WHERE k.name = ?1",
+            )
             .map_err(io)?;
         let stored = stmt
             .query_map([&spec.name], |r| {

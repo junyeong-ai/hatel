@@ -1,24 +1,72 @@
-//! The ledger: one embedded SQLite database (WAL) under the state directory, indexed by Kind and
-//! normalized occurrence time, with the delivery outbox and the contract catalog beside the
-//! records. Writers return errors; only the lifecycle-hook boundary converts them to notices so
-//! telemetry cannot block a tool call.
+//! The ledger: one embedded SQLite database (WAL) under the state directory. A record references
+//! its Kind, contract and project by id, and the `envelopes` view joins them back into the record
+//! every reader sees. The delivery outbox and the contract catalog live beside the records. Writers
+//! return errors; only the lifecycle-hook boundary converts them to notices so telemetry cannot
+//! block a tool call.
 
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 
-use crate::{Config, Envelope};
+use crate::model::RecordMetadata;
+use crate::{Config, Envelope, ProjectRef};
 
 pub const DATABASE_VERSION: i64 = 1;
 
-/// The schema a fresh store is created with, and an empty read is answered from.
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS records (
-    ts TEXT NOT NULL, kind TEXT NOT NULL, schema_version INTEGER NOT NULL, payload TEXT NOT NULL,
-    metadata TEXT NOT NULL, occurred_seconds INTEGER NOT NULL, occurred_nanos INTEGER NOT NULL
+/// The schema a fresh store is created with, and an empty read is answered from. A Kind, a contract
+/// and a project repeat across most records, so each is stored once and referenced by id.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS projects (
+    id INTEGER PRIMARY KEY, key TEXT NOT NULL, label TEXT NOT NULL, UNIQUE (key, label)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_records_id ON records(json_extract(metadata,'$.record_id')) WHERE json_extract(metadata,'$.record_id') IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_records_kind_time ON records(kind,occurred_seconds,occurred_nanos);
-CREATE INDEX IF NOT EXISTS idx_records_time ON records(occurred_seconds,occurred_nanos);";
+CREATE TABLE IF NOT EXISTS records (
+    id INTEGER PRIMARY KEY,
+    kind_id INTEGER NOT NULL REFERENCES kinds (id),
+    occurred_seconds INTEGER NOT NULL, occurred_nanos INTEGER NOT NULL, ts TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    contract_id INTEGER REFERENCES contracts (id), kind_version INTEGER,
+    record_id TEXT UNIQUE, observed_at TEXT, project_id INTEGER REFERENCES projects (id),
+    source TEXT, run_id TEXT, correlation_id TEXT, projection INTEGER NOT NULL,
+    payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_records_kind_time ON records (kind_id, occurred_seconds, occurred_nanos);
+CREATE VIEW IF NOT EXISTS envelopes AS SELECT
+    r.id, k.name AS kind, r.ts, r.occurred_seconds, r.occurred_nanos, r.schema_version, r.payload,
+    r.projection, r.record_id, r.observed_at, p.key AS project_key, p.label AS project_label,
+    r.source, r.run_id, r.correlation_id, r.kind_version, c.schema_id
+FROM records r JOIN kinds k ON k.id = r.kind_id
+LEFT JOIN contracts c ON c.id = r.contract_id LEFT JOIN projects p ON p.id = r.project_id;";
+
+/// The `envelopes` columns [`envelope`] reads, in its order, from the view aliased `e`.
+pub const ENVELOPE_COLUMNS: &str = "e.ts, e.kind, e.schema_version, e.payload, e.projection, \
+    e.record_id, e.observed_at, e.project_key, e.project_label, e.source, e.run_id, \
+    e.correlation_id, e.kind_version, e.schema_id";
+
+/// The record a row of [`ENVELOPE_COLUMNS`] holds.
+pub fn envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<Envelope> {
+    let payload: String = row.get(3)?;
+    Ok(Envelope {
+        ts: row.get(0)?,
+        kind: row.get(1)?,
+        schema_version: row.get(2)?,
+        payload: serde_json::from_str(&payload).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        metadata: RecordMetadata {
+            projection: row.get(4)?,
+            record_id: row.get(5)?,
+            observed_at: row.get(6)?,
+            project: row
+                .get::<_, Option<String>>(7)?
+                .zip(row.get(8)?)
+                .map(|(key, label)| ProjectRef { key, label }),
+            source: row.get(9)?,
+            run_id: row.get(10)?,
+            correlation_id: row.get(11)?,
+            kind_version: row.get(12)?,
+            schema_id: row.get(13)?,
+        },
+    })
+}
 
 fn io(error: impl std::fmt::Display) -> crate::Error {
     crate::Error::Io(error.to_string())
@@ -143,7 +191,7 @@ pub(crate) fn check_version(conn: &Connection) -> crate::Result<i64> {
 /// refused rather than altered: a hook writing on every lifecycle event must never convert data.
 fn initialize(conn: &mut Connection) -> crate::Result<()> {
     let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(io)?;
     let version = check_version(&tx)?;
     if has_records(&tx)? {
@@ -151,9 +199,9 @@ fn initialize(conn: &mut Connection) -> crate::Result<()> {
             return Err(unsupported(version));
         }
     } else {
+        tx.execute_batch(crate::catalog::SCHEMA).map_err(io)?;
         tx.execute_batch(SCHEMA).map_err(io)?;
         tx.execute_batch(crate::outbox::SCHEMA).map_err(io)?;
-        tx.execute_batch(crate::catalog::SCHEMA).map_err(io)?;
         tx.pragma_update(None, "user_version", DATABASE_VERSION)
             .map_err(io)?;
     }
@@ -169,18 +217,12 @@ pub(crate) fn empty() -> crate::Result<Connection> {
 }
 
 pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelope> {
-    let io = |e: rusqlite::Error| crate::Error::Io(e.to_string());
-    let (ts, kind, schema_version, payload, metadata): (String, String, u32, String, String) = conn.query_row(
-        "SELECT ts,kind,schema_version,payload,metadata FROM records WHERE json_extract(metadata,'$.record_id')=?1",
-        [id], |r|Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-    ).map_err(io)?;
-    Ok(Envelope {
-        ts,
-        kind,
-        schema_version,
-        payload: serde_json::from_str(&payload).map_err(|e| crate::Error::Io(e.to_string()))?,
-        metadata: serde_json::from_str(&metadata).map_err(|e| crate::Error::Io(e.to_string()))?,
-    })
+    conn.query_row(
+        &format!("SELECT {ENVELOPE_COLUMNS} FROM envelopes e WHERE e.record_id = ?1"),
+        [id],
+        envelope,
+    )
+    .map_err(io)
 }
 
 /// Every Kind the ledger holds records for, sorted — an exact statement about storage, which is
@@ -193,7 +235,10 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
     let conn = read(&cfg.database()).map_err(std::io::Error::other)?;
     let io = |e: rusqlite::Error| std::io::Error::other(e.to_string());
     let mut stmt = conn
-        .prepare("SELECT DISTINCT kind FROM records ORDER BY kind")
+        .prepare(
+            "SELECT name FROM kinds k WHERE EXISTS (SELECT 1 FROM records WHERE kind_id = k.id) \
+             ORDER BY name",
+        )
         .map_err(io)?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
@@ -207,7 +252,8 @@ pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
 pub fn last_written(cfg: &Config, kind: &str) -> Option<i64> {
     let conn = read(&cfg.database()).ok()?;
     conn.query_row(
-        "SELECT occurred_seconds FROM records WHERE kind=?1 ORDER BY occurred_seconds DESC LIMIT 1",
+        "SELECT occurred_seconds FROM records WHERE kind_id = (SELECT id FROM kinds WHERE name = ?1) \
+         ORDER BY occurred_seconds DESC LIMIT 1",
         [kind],
         |row| row.get(0),
     )
@@ -219,10 +265,15 @@ pub fn last_written(cfg: &Config, kind: &str) -> Option<i64> {
 /// enough to starve concurrent hook inserts.
 const PRUNE_BATCH: i64 = 5_000;
 
+/// Pages one incremental-vacuum step returns to the file system. Each step is its own write
+/// transaction, so a writer waits for one step at most rather than for the whole reclaim.
+const RECLAIM_PAGES: u32 = 1_024;
+
 /// Remove records that occurred before the retention horizon, with their delivery references and
-/// the queue capacity they held. Destructive, so it belongs to exactly one caller: the receiver
-/// (which holds the single-writer state lock) — never the hook, and never a read path. Returns
-/// rows deleted; a missing DB is zero, and any error is logged (fail-open) rather than propagated.
+/// the queue capacity they held, then return the freed pages to the file system. Destructive, so it
+/// belongs to exactly one caller: the receiver (which holds the single-writer state lock) — never
+/// the hook, and never a read path. Returns rows deleted; a missing DB is zero, and any error is
+/// logged (fail-open) rather than propagated.
 pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
     let path = cfg.database();
     if !path.exists() {
@@ -236,40 +287,15 @@ pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
         let mut conn = Connection::open(&path)?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.execute_batch("CREATE TEMP TABLE prune_records (id INTEGER PRIMARY KEY);")?;
+        let kinds = conn
+            .prepare("SELECT id FROM kinds")?
+            .query_map([], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut total = 0;
-        loop {
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute("DELETE FROM prune_records", [])?;
-            let count = tx.execute(
-                "INSERT INTO prune_records SELECT rowid FROM records WHERE occurred_seconds<?1 LIMIT ?2",
-                rusqlite::params![retention.cutoff, PRUNE_BATCH],
-            )?;
-            if count == 0 {
-                tx.commit()?;
-                break;
-            }
-            let pending = {
-                let mut stmt = tx.prepare("SELECT d.destination,COUNT(*),SUM(d.size_bytes) FROM deliveries d JOIN records r ON json_extract(r.metadata,'$.record_id')=d.record_id WHERE r.rowid IN (SELECT id FROM prune_records) AND d.status='pending' GROUP BY d.destination")?;
-                stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for (destination, count, bytes) in pending {
-                tx.execute("UPDATE delivery_queues SET pending_records=pending_records-?1,pending_bytes=pending_bytes-?2 WHERE destination=?3",rusqlite::params![count,bytes,destination])?;
-            }
-            tx.execute("DELETE FROM deliveries WHERE record_id IN (SELECT json_extract(metadata,'$.record_id') FROM records WHERE rowid IN (SELECT id FROM prune_records))",[])?;
-            tx.execute(
-                "DELETE FROM records WHERE rowid IN (SELECT id FROM prune_records)",
-                [],
-            )?;
-            tx.commit()?;
-            total += count;
+        for kind_id in kinds {
+            total += prune_kind(&mut conn, kind_id, retention.cutoff)?;
         }
+        reclaim(&conn)?;
         Ok(total)
     })();
     match result {
@@ -277,6 +303,74 @@ pub fn prune(cfg: &Config, retention: crate::config::Retention) -> usize {
         Err(error) => {
             eprintln!("hatel: sqlite retention failed: {error}");
             0
+        }
+    }
+}
+
+fn prune_kind(conn: &mut Connection, kind_id: i64, cutoff: i64) -> rusqlite::Result<usize> {
+    let mut total = 0;
+    loop {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM prune_records", [])?;
+        let count = tx.execute(
+            "INSERT INTO prune_records SELECT id FROM records \
+             WHERE kind_id = ?1 AND occurred_seconds < ?2 LIMIT ?3",
+            rusqlite::params![kind_id, cutoff, PRUNE_BATCH],
+        )?;
+        if count == 0 {
+            tx.commit()?;
+            return Ok(total);
+        }
+        let pending = tx
+            .prepare(
+                "SELECT d.destination, COUNT(*), SUM(d.size_bytes) FROM deliveries d \
+                 JOIN records r ON r.record_id = d.record_id \
+                 WHERE r.id IN (SELECT id FROM prune_records) AND d.status = 'pending' \
+                 GROUP BY d.destination",
+            )?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (destination, count, bytes) in pending {
+            tx.execute(
+                "UPDATE delivery_queues SET pending_records = pending_records - ?1, \
+                 pending_bytes = pending_bytes - ?2 WHERE destination = ?3",
+                rusqlite::params![count, bytes, destination],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM deliveries WHERE record_id IN \
+             (SELECT record_id FROM records WHERE id IN (SELECT id FROM prune_records))",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM records WHERE id IN (SELECT id FROM prune_records)",
+            [],
+        )?;
+        tx.commit()?;
+        total += count;
+    }
+}
+
+/// Return free pages to the file system in [`RECLAIM_PAGES`] steps until none are left, or until a
+/// step frees nothing, as in a file created without incremental auto-vacuum.
+fn reclaim(conn: &Connection) -> rusqlite::Result<()> {
+    let free = || conn.query_row("PRAGMA freelist_count", [], |r| r.get::<_, i64>(0));
+    loop {
+        let before = free()?;
+        if before == 0 {
+            return Ok(());
+        }
+        let mut step = conn.prepare(&format!("PRAGMA incremental_vacuum({RECLAIM_PAGES})"))?;
+        let mut pages = step.raw_query();
+        while pages.next()?.is_some() {}
+        if free()? == before {
+            return Ok(());
         }
     }
 }
@@ -309,6 +403,10 @@ impl SqliteSink {
     fn init(path: &Path) -> crate::Result<Connection> {
         let mut conn = connect(path)?;
         if check_version(&conn)? != DATABASE_VERSION {
+            // The retention sweep returns deleted records' pages through incremental vacuum. SQLite
+            // fixes the auto-vacuum mode when it writes the first page, which the WAL switch does.
+            conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+                .map_err(io)?;
             enable_wal(&conn)?;
             initialize(&mut conn)?;
         }
@@ -317,27 +415,55 @@ impl SqliteSink {
 
     pub fn write_record(&mut self, env: &Envelope) -> crate::Result<WriteReceipt> {
         let conn = self.conn.as_mut().map_err(|e| e.clone())?;
-        let payload =
-            serde_json::to_string(&env.payload).map_err(|e| crate::Error::Io(e.to_string()))?;
+        let payload = serde_json::to_string(&env.payload).map_err(io)?;
         let occurred = env
             .ts
             .parse::<jiff::Timestamp>()
             .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
         let (seconds, nanos) = crate::model::timestamp_parts(occurred);
+        // Immediate, because the ids looked up first decide what is inserted: a deferred
+        // transaction that read before another writer committed could not take the write lock.
         let tx = conn
-            .transaction()
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
-        if let Some(spec) = self.registry.kind(&env.kind)
-            && env.metadata.schema_id.as_deref() == Some(spec.schema_id.as_str())
-        {
-            crate::catalog::save(&tx, spec)?;
-        }
-        let inserted = tx.execute(
-            "INSERT INTO records (ts, kind, schema_version, payload, metadata, occurred_seconds,occurred_nanos) VALUES (?1, ?2, ?3, ?4, ?5, ?6,?7) ON CONFLICT DO NOTHING",
-            rusqlite::params![env.ts, env.kind, env.schema_version, payload, serde_json::to_string(&env.metadata).map_err(|e| crate::Error::Io(e.to_string()))?, seconds,nanos],
-        ).map_err(|e| crate::Error::Io(e.to_string()))?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(io)?;
+        let kind_id = crate::catalog::kind_id(&tx, &env.kind).map_err(io)?;
+        let contract_id = crate::catalog::contract_id(&tx, &self.registry, env, kind_id)?;
+        let project_id = env
+            .metadata
+            .project
+            .as_ref()
+            .map(|project| project_id(&tx, project))
+            .transpose()
+            .map_err(io)?;
+        let m = &env.metadata;
+        let inserted = tx
+            .execute(
+                "INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
+                 contract_id, kind_version, record_id, observed_at, project_id, source, run_id, \
+                 correlation_id, projection, payload) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                 ON CONFLICT DO NOTHING",
+                rusqlite::params![
+                    kind_id,
+                    seconds,
+                    nanos,
+                    env.ts,
+                    env.schema_version,
+                    contract_id,
+                    m.kind_version,
+                    m.record_id,
+                    m.observed_at,
+                    project_id,
+                    m.source,
+                    m.run_id,
+                    m.correlation_id,
+                    m.projection,
+                    payload,
+                ],
+            )
+            .map_err(io)?;
         if inserted == 0 {
-            let id = env.metadata.record_id.as_deref().ok_or_else(|| {
+            let id = m.record_id.as_deref().ok_or_else(|| {
                 crate::Error::InvalidPayload("duplicate record without id".into())
             })?;
             let stored = record_by_id(&tx, id)?;
@@ -346,18 +472,37 @@ impl SqliteSink {
                     "record id already describes different data".into(),
                 ));
             }
-            tx.commit().map_err(|e| crate::Error::Io(e.to_string()))?;
+            tx.commit().map_err(io)?;
             return Ok(WriteReceipt {
                 record_id: Some(id.into()),
                 delivery: Default::default(),
             });
         }
-        let delivery = crate::outbox::enqueue(&tx, env, &self.targets, crate::now_epoch())
-            .map_err(|e| crate::Error::Io(e.to_string()))?;
-        tx.commit().map_err(|e| crate::Error::Io(e.to_string()))?;
+        let delivery =
+            crate::outbox::enqueue(&tx, env, &self.targets, crate::now_epoch()).map_err(io)?;
+        tx.commit().map_err(io)?;
         Ok(WriteReceipt {
-            record_id: env.metadata.record_id.clone(),
+            record_id: m.record_id.clone(),
             delivery,
         })
+    }
+}
+
+fn project_id(conn: &Connection, project: &ProjectRef) -> rusqlite::Result<i64> {
+    let key = [&project.key, &project.label];
+    let stored = conn
+        .query_row(
+            "SELECT id FROM projects WHERE key = ?1 AND label = ?2",
+            key,
+            |r| r.get(0),
+        )
+        .optional()?;
+    match stored {
+        Some(id) => Ok(id),
+        None => conn.query_row(
+            "INSERT INTO projects (key, label) VALUES (?1, ?2) RETURNING id",
+            key,
+            |r| r.get(0),
+        ),
     }
 }

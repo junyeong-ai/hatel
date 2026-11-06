@@ -31,29 +31,40 @@ fn path(field: &str) -> String {
     )
 }
 
-fn label_in(document: &str, expression: &str) -> String {
+/// The text a payload value at `expression` groups and filters by.
+fn label(expression: &str) -> String {
     format!(
-        "CASE json_type({document}, {expression}) WHEN 'text' THEN json_extract({document}, {expression}) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN 'null' ELSE json_quote(json_extract({document}, {expression})) END"
+        "CASE json_type(payload, {expression}) WHEN 'text' THEN json_extract(payload, {expression}) WHEN 'true' THEN 'true' WHEN 'false' THEN 'false' WHEN 'null' THEN 'null' ELSE json_quote(json_extract(payload, {expression})) END"
     )
 }
 
-fn label(expression: &str) -> String {
-    label_in("payload", expression)
+/// Where a queryable field is read from.
+enum Field {
+    /// A payload field, at the JSON path bound to this parameter.
+    Payload(String),
+    /// A record metadata field: the `envelopes` column its path names, `.` written as `_`.
+    Metadata(String),
 }
 
-fn selector(field: &str) -> (&'static str, String) {
-    if crate::registry::METADATA_FIELDS.contains(&field) {
-        (
-            "metadata",
-            format!(
-                "$.{}",
-                field
-                    .strip_prefix("metadata.")
-                    .expect("known metadata field")
+impl Field {
+    fn of(field: &str, args: &mut Vec<Value>) -> Self {
+        match field.strip_prefix("metadata.") {
+            Some(name) if crate::registry::METADATA_FIELDS.contains(&field) => {
+                Field::Metadata(name.replace('.', "_"))
+            }
+            _ => Field::Payload(parameter(args, path(field))),
+        }
+    }
+
+    /// The field's value as text, `NULL` where the record has none.
+    fn label(&self) -> String {
+        match self {
+            Field::Payload(p) => format!(
+                "CASE WHEN json_type(payload, {p}) IS NULL THEN NULL ELSE {} END",
+                label(p)
             ),
-        )
-    } else {
-        ("payload", path(field))
+            Field::Metadata(column) => format!("CAST({column} AS TEXT)"),
+        }
     }
 }
 
@@ -94,10 +105,7 @@ fn readable(contracts: &Contracts, args: &mut Vec<Value>) -> String {
         .iter()
         .map(|id| parameter(args, id.clone()))
         .collect();
-    format!(
-        "json_extract(metadata,'$.schema_id') IN ({})",
-        ids.join(",")
-    )
+    format!("schema_id IN ({})", ids.join(","))
 }
 
 pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<GroupAgg>> {
@@ -120,7 +128,17 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
     ];
     let mut oldest_scope = scope(spec, &oldest, &mut oldest_args);
     oldest_scope.push(readable(&resolved, &mut oldest_args));
-    let retained_since=transaction.query_row(&format!("SELECT ts FROM records WHERE {} ORDER BY occurred_seconds,occurred_nanos,rowid LIMIT 1",oldest_scope.join(" AND ")),rusqlite::params_from_iter(oldest_args),|r|r.get(0)).optional().map_err(io)?;
+    let retained_since = transaction
+        .query_row(
+            &format!(
+                "SELECT ts FROM envelopes WHERE {} ORDER BY occurred_seconds, occurred_nanos, id LIMIT 1",
+                oldest_scope.join(" AND ")
+            ),
+            rusqlite::params_from_iter(oldest_args),
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(io)?;
     let contracts = contract_counts(&transaction, spec, q, &resolved)?;
     let groups = aggregate_connection(&transaction, spec, q, &resolved);
     Ok(SectionResult {
@@ -139,7 +157,9 @@ fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
     if let Some(project) = q.project {
         let p = parameter(args, project.into());
         let payload = payload_project(spec, project, args);
-        conditions.push(format!("(json_extract(metadata, '$.project.key')={p} OR json_extract(metadata, '$.project.label')={p}{payload})"));
+        conditions.push(format!(
+            "(project_key = {p} OR project_label = {p}{payload})"
+        ));
     }
     conditions
 }
@@ -150,17 +170,11 @@ fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<S
         if field == "project" {
             let payload = payload_project(spec, value, args);
             let value = parameter(args, value.clone());
-            filters.push(format!(
-                "(json_extract(metadata,'$.project.key')={value}{payload})"
-            ));
+            filters.push(format!("(project_key = {value}{payload})"));
         } else {
-            let (document, path) = selector(field);
-            let path = parameter(args, path);
+            let field = Field::of(field, args);
             let value = parameter(args, value.clone());
-            filters.push(format!(
-                "json_type({document},{path}) IS NOT NULL AND {}={value}",
-                label_in(document, &path)
-            ));
+            filters.push(format!("{} = {value}", field.label()));
         }
     }
     filters
@@ -183,7 +197,12 @@ fn contract_counts(
     if spec.mode == crate::registry::KindMode::Event {
         conditions.extend(filter_conditions(spec, q, &mut args));
     }
-    let mut stmt=conn.prepare(&format!("SELECT json_extract(metadata,'$.schema_id'),json_extract(metadata,'$.kind_version'),COUNT(*) FROM records WHERE {} GROUP BY 1,2 ORDER BY 1,2",conditions.join(" AND "))).map_err(io)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT schema_id, kind_version, COUNT(*) FROM envelopes WHERE {} GROUP BY 1, 2 ORDER BY 1, 2",
+            conditions.join(" AND ")
+        ))
+        .map_err(io)?;
     stmt.query_map(rusqlite::params_from_iter(args), |r| {
         let schema_id: Option<String> = r.get(0)?;
         Ok(ContractCount {
@@ -211,9 +230,7 @@ fn payload_project(spec: &KindSpec, project: &str, args: &mut Vec<Value>) -> Str
         project.into()
     };
     let payload = parameter(args, value);
-    format!(
-        " OR (json_extract(metadata,'$.project') IS NULL AND json_extract(payload,'$.project')={payload})"
-    )
+    format!(" OR (project_key IS NULL AND json_extract(payload, '$.project') = {payload})")
 }
 
 fn declares_project(spec: &KindSpec) -> bool {
@@ -240,15 +257,11 @@ fn aggregate_connection(
         "project" if !declares_project(spec) => "metadata.project.key",
         group => group,
     };
-    let (document, field_path) = selector(group);
-    let dimension = parameter(&mut args, field_path);
-    let dimension_label = if group == "project" {
-        format!(
-            "COALESCE(json_extract(metadata, '$.project.key'), {})",
-            label(&dimension)
-        )
+    let dimension = Field::of(group, &mut args).label();
+    let key = if group == "project" {
+        format!("COALESCE(project_key, {dimension})")
     } else {
-        label_in(document, &dimension)
+        dimension
     };
     let mut conditions = scope(spec, q, &mut args);
     let readable = readable(resolved, &mut args);
@@ -262,15 +275,6 @@ fn aggregate_connection(
         conditions.push(readable);
         String::new()
     };
-    let key = if group == "project" {
-        format!(
-            "CASE WHEN json_type(payload, {dimension}) IS NULL AND json_extract(metadata, '$.project.key') IS NULL THEN NULL ELSE {dimension_label} END"
-        )
-    } else {
-        format!(
-            "CASE WHEN json_type({document}, {dimension}) IS NULL THEN NULL ELSE {dimension_label} END"
-        )
-    };
     let identity = spec.identity.as_ref().map(|field| {
         let p = parameter(&mut args, path(field));
         if spec.mode == crate::registry::KindMode::Snapshot {
@@ -283,7 +287,7 @@ fn aggregate_connection(
         }
     });
     let mut sql = format!(
-        "WITH scoped AS (SELECT rowid AS sequence, ts,occurred_seconds,occurred_nanos, payload, metadata, {key} AS key {}{readable_column} FROM records WHERE {})",
+        "WITH scoped AS (SELECT *, {key} AS key{}{readable_column} FROM envelopes WHERE {})",
         identity
             .as_ref()
             .map(|i| format!(", {i} AS identity"))
@@ -292,7 +296,7 @@ fn aggregate_connection(
     );
     let selected = if snapshot {
         let invalid = conn.query_row(
-            &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE readable AND (identity IS NULL OR identity='' OR hatel_epoch(json_extract(metadata,'$.observed_at')) IS NULL))"),
+            &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE readable AND (identity IS NULL OR identity='' OR hatel_epoch(observed_at) IS NULL))"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
         ).map_err(io)?;
         if invalid {
@@ -302,15 +306,12 @@ fn aggregate_connection(
             )));
         }
         let payload_project = if declares_project(spec) {
-            ", json_extract(payload,'$.project')"
+            ", json_extract(payload, '$.project')"
         } else {
             ""
         };
-        let entity = format!(
-            "COALESCE(json_extract(metadata,'$.project.key'), json_extract(metadata,'$.project.label'){payload_project}), identity"
-        );
-        let observed = "json_extract(metadata,'$.observed_at')";
-        sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY occurred_seconds DESC, occurred_nanos DESC, hatel_epoch({observed}) DESC, hatel_nanos({observed}) DESC) AS revision FROM scoped WHERE identity IS NOT NULL AND identity<>''), latest AS (SELECT * FROM versions WHERE revision=1)"));
+        let entity = format!("COALESCE(project_key, project_label{payload_project}), identity");
+        sql.push_str(&format!(", versions AS (SELECT *, DENSE_RANK() OVER (PARTITION BY {entity} ORDER BY occurred_seconds DESC, occurred_nanos DESC, hatel_epoch(observed_at) DESC, hatel_nanos(observed_at) DESC) AS revision FROM scoped WHERE identity IS NOT NULL AND identity<>''), latest AS (SELECT * FROM versions WHERE revision=1)"));
         let ambiguous = conn.query_row(
             &format!("{sql} SELECT EXISTS(SELECT 1 FROM latest GROUP BY {entity} HAVING COUNT(DISTINCT payload)>1)"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
@@ -321,7 +322,7 @@ fn aggregate_connection(
                 spec.name
             )));
         }
-        sql.push_str(&format!(", representatives AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY {entity} ORDER BY sequence DESC) AS duplicate FROM latest), selected AS (SELECT * FROM representatives WHERE duplicate=1 AND readable)"));
+        sql.push_str(&format!(", representatives AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY {entity} ORDER BY id DESC) AS duplicate FROM latest), selected AS (SELECT * FROM representatives WHERE duplicate=1 AND readable)"));
         "selected"
     } else {
         "scoped"
@@ -336,7 +337,7 @@ fn aggregate_connection(
         }
     ));
     let from = if identity.is_some() && !snapshot {
-        sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY occurred_seconds,occurred_nanos,sequence) AS ordinal FROM matching)");
+        sql.push_str(", ranked AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY key, identity ORDER BY occurred_seconds, occurred_nanos, id) AS ordinal FROM matching)");
         "ranked WHERE identity IS NULL OR ordinal=1"
     } else {
         "matching"
@@ -465,7 +466,7 @@ mod tests {
     fn window_queries_use_the_kind_and_time_index() {
         let conn = crate::sink::empty().unwrap();
         let plan = conn
-            .prepare("EXPLAIN QUERY PLAN SELECT ts FROM records WHERE kind='prompt' AND occurred_seconds>=0 ORDER BY occurred_seconds,occurred_nanos,rowid LIMIT 1")
+            .prepare("EXPLAIN QUERY PLAN SELECT ts FROM envelopes WHERE kind='prompt' AND occurred_seconds>=0 ORDER BY occurred_seconds, occurred_nanos, id LIMIT 1")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(3))
             .unwrap()

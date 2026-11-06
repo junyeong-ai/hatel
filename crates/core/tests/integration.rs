@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use hatel_core::model::RecordMetadata;
 use hatel_core::registry::FieldMap;
 use hatel_core::schema::{build_registry, load_core};
 use hatel_core::{Config, Envelope, Payload, Registry, SessionIndex, make_envelope, report};
@@ -79,31 +80,26 @@ fn write(cfg: &Config, reg: &Registry, kind: &str, payload: serde_json::Value) -
     env
 }
 
-/// Insert a row the write path refuses — a value its type rejects, or a Kind no loaded schema
-/// declares — stamped with `kind`'s current contract when `reg` declares one, so a query reads it
-/// the way it reads any stored record.
+/// Store a record that `make_envelope` refuses — a value its type rejects, or a Kind no loaded
+/// schema declares — stamped with `kind`'s current contract when `reg` declares one, so a query
+/// reads it the way it reads any stored record.
 fn insert_raw(cfg: &Config, reg: &Registry, kind: &str, ts: &str, payload: serde_json::Value) {
-    hatel_core::SqliteSink::open(cfg.database(), reg);
-    let metadata = match reg.kind(kind) {
-        Some(spec) => {
-            serde_json::json!({"schema_id": spec.schema_id, "kind_version": spec.version})
-        }
-        None => serde_json::json!({}),
+    let metadata = reg
+        .kind(kind)
+        .map_or_else(Default::default, |spec| RecordMetadata {
+            schema_id: Some(spec.schema_id.clone()),
+            kind_version: Some(spec.version),
+            ..Default::default()
+        });
+    let env = Envelope {
+        ts: ts.into(),
+        kind: kind.into(),
+        schema_version: hatel_core::SCHEMA_VERSION,
+        payload: serde_json::from_value(payload).unwrap(),
+        metadata,
     };
-    let nanos = ts.parse::<jiff::Timestamp>().unwrap().as_nanosecond();
-    rusqlite::Connection::open(cfg.database())
-        .unwrap()
-        .execute(
-            "INSERT INTO records (ts,kind,schema_version,payload,metadata,occurred_seconds,occurred_nanos) VALUES (?1,?2,1,?3,?4,?5,?6)",
-            rusqlite::params![
-                ts,
-                kind,
-                payload.to_string(),
-                metadata.to_string(),
-                i64::try_from(nanos.div_euclid(1_000_000_000)).unwrap(),
-                i64::try_from(nanos.rem_euclid(1_000_000_000)).unwrap(),
-            ],
-        )
+    hatel_core::SqliteSink::open(cfg.database(), reg)
+        .write_record(&env)
         .unwrap();
 }
 
@@ -114,20 +110,16 @@ fn records_of(cfg: &Config, kind: &str) -> Vec<Envelope> {
     }
     let conn = rusqlite::Connection::open(cfg.database()).unwrap();
     let mut stmt = conn
-        .prepare("SELECT ts,schema_version,payload,metadata FROM records WHERE kind=?1 ORDER BY occurred_seconds,occurred_nanos,rowid")
+        .prepare(&format!(
+            "SELECT {} FROM envelopes e WHERE e.kind = ?1 \
+             ORDER BY e.occurred_seconds, e.occurred_nanos, e.id",
+            hatel_core::sink::ENVELOPE_COLUMNS
+        ))
         .unwrap();
-    stmt.query_map([kind], |r| {
-        Ok(Envelope {
-            ts: r.get(0)?,
-            kind: kind.to_string(),
-            schema_version: r.get(1)?,
-            payload: serde_json::from_str(&r.get::<_, String>(2)?).unwrap(),
-            metadata: serde_json::from_str(&r.get::<_, String>(3)?).unwrap(),
-        })
-    })
-    .unwrap()
-    .collect::<rusqlite::Result<_>>()
-    .unwrap()
+    stmt.query_map([kind], hatel_core::sink::envelope)
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
 }
 
 #[test]
@@ -202,6 +194,13 @@ fn contracts_survive_plugin_changes_and_commit_atomically_with_records() {
     second.metadata.record_id = Some("second".into());
     sink.write_record(&second).unwrap();
     assert_eq!(hatel_core::catalog::stored(&cfg).unwrap().len(), 2);
+    let mut undefined = second.clone();
+    undefined.metadata.record_id = Some("undefined".into());
+    undefined.metadata.schema_id = Some("v2:undefined".into());
+    assert!(
+        sink.write_record(&undefined).is_err(),
+        "a record is stored only beside its contract's definition"
+    );
     std::fs::remove_file(plugin).unwrap();
     cfg.plugins.clear();
     let old = hatel_core::catalog::select(
@@ -213,9 +212,10 @@ fn contracts_survive_plugin_changes_and_commit_atomically_with_records() {
     assert_eq!(old.version, 1);
     assert_eq!(old.field_specs["duration"].unit.as_deref(), Some("ms"));
     let conn = rusqlite::Connection::open(home.path().join("telemetry.db")).unwrap();
-    conn.execute(
-        "INSERT INTO contracts(schema_id,kind,definition) VALUES ('broken','other','{}')",
-        [],
+    conn.execute_batch(
+        "INSERT INTO kinds (name) VALUES ('other'); \
+         INSERT INTO contracts (schema_id, kind_id, definition) \
+         VALUES ('broken', last_insert_rowid(), '{}');",
     )
     .unwrap();
     assert!(hatel_core::catalog::stored(&cfg).is_err());
@@ -676,13 +676,33 @@ fn sqlite_retention_prunes_only_rows_older_than_the_cutoff() {
     hatel_core::build_sink(&cfg, &reg)
         .write_record(&ancient)
         .unwrap();
+    let conn = rusqlite::Connection::open(cfg.database()).unwrap();
+    conn.execute_batch(
+        "WITH RECURSIVE n (i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000) \
+         INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
+         projection, payload) \
+         SELECT kind_id, occurred_seconds, occurred_nanos, ts, schema_version, projection, \
+         json_object('pad', hex(randomblob(200))) FROM records, n \
+         WHERE ts = '2000-01-01T00:00:00Z'",
+    )
+    .unwrap();
+    let pages = || {
+        conn.query_row("PRAGMA page_count", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let filled = pages();
     assert_eq!(
         hatel_core::sink::prune(&cfg, cfg.retention(hatel_core::now_epoch())),
-        1,
-        "exactly the ancient row is deleted"
+        2001,
+        "exactly the ancient rows are deleted"
     );
     let rows = records_of(&cfg, "tool");
     assert_eq!(rows.len(), 1, "the in-window row remains");
+    assert!(
+        pages() * 10 < filled,
+        "the deleted rows' pages return to the file system: {filled} -> {}",
+        pages()
+    );
 }
 
 #[test]
@@ -2415,7 +2435,7 @@ fn selected_sanitized_records_and_pending_delivery_commit_together() {
     );
     assert_eq!(
         conn.query_row(
-            "SELECT COUNT(*) FROM records WHERE json_extract(metadata,'$.record_id')='rolled-back'",
+            "SELECT COUNT(*) FROM records WHERE record_id = 'rolled-back'",
             [],
             |r| r.get::<_, i64>(0)
         )

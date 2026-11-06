@@ -70,28 +70,21 @@ pub fn destinations(conn: &Connection) -> crate::Result<Vec<String>> {
 }
 
 pub fn due(conn: &Connection, destination: &str, now: i64) -> crate::Result<Vec<Pending>> {
-    let mut stmt = conn.prepare("SELECT r.ts,r.kind,r.schema_version,r.payload,r.metadata,d.attempts,d.created_at FROM deliveries d JOIN records r ON json_extract(r.metadata,'$.record_id')=d.record_id WHERE d.destination=?1 AND d.status='pending' AND d.next_attempt_at<=?2 ORDER BY d.created_at,d.record_id LIMIT 16").map_err(io)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {}, d.attempts, d.created_at FROM deliveries d \
+             JOIN envelopes e ON e.record_id = d.record_id \
+             WHERE d.destination = ?1 AND d.status = 'pending' AND d.next_attempt_at <= ?2 \
+             ORDER BY d.created_at, d.record_id LIMIT 16",
+            crate::sink::ENVELOPE_COLUMNS
+        ))
+        .map_err(io)?;
     let rows = stmt
         .query_map(rusqlite::params![destination, now], |r| {
-            let payload: String = r.get(3)?;
-            let metadata: String = r.get(4)?;
-            let parse_error = |e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            };
             Ok(Pending {
-                record: Envelope {
-                    ts: r.get(0)?,
-                    kind: r.get(1)?,
-                    schema_version: r.get(2)?,
-                    payload: serde_json::from_str(&payload).map_err(parse_error)?,
-                    metadata: serde_json::from_str(&metadata).map_err(parse_error)?,
-                },
-                attempts: r.get(5)?,
-                created_at: r.get(6)?,
+                record: crate::sink::envelope(r)?,
+                attempts: r.get(14)?,
+                created_at: r.get(15)?,
             })
         })
         .map_err(io)?;
