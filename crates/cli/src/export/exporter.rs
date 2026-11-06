@@ -1269,9 +1269,12 @@ mod tests {
         let forwarding = exporter.forwarding();
         let destination = &forwarding.destinations[0];
         assert_eq!((destination.delivered, destination.failed), (0, 2));
+        // The cause differs by platform (a refused connection, or the request's own timeout where
+        // the system retries a refused connection); what matters is that one follows the request.
         let last = destination.last_failure.as_deref().unwrap();
+        let cause = last.split_once("/v1/metrics): ").map(|(_, cause)| cause);
         assert!(
-            last.contains("refused"),
+            cause.is_some_and(|cause| !cause.is_empty()),
             "the cause beneath the request error is named: {last}"
         );
         handle.abort();
