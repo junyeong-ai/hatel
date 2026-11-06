@@ -284,6 +284,31 @@ fn file_len(path: &Path) -> std::io::Result<u64> {
     }
 }
 
+/// The sessions that recorded `kind` at or after `since` (epoch seconds), each with its earliest
+/// such occurrence. A session is named by the payload's `session_id`; a record without one names
+/// none.
+pub fn sessions_since(
+    cfg: &Config,
+    kind: &str,
+    since: i64,
+) -> crate::Result<std::collections::BTreeMap<String, i64>> {
+    let conn = read(&cfg.database())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(payload, '$.session_id'), MIN(occurred_seconds) FROM records \
+             WHERE kind_id = (SELECT id FROM kinds WHERE name = ?1) AND occurred_seconds >= ?2 \
+             AND typeof(json_extract(payload, '$.session_id')) = 'text' \
+             GROUP BY json_extract(payload, '$.session_id')",
+        )
+        .map_err(io)?;
+    stmt.query_map(rusqlite::params![kind, since], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .map_err(io)?
+    .collect::<rusqlite::Result<_>>()
+    .map_err(io)
+}
+
 /// When the ledger last recorded an occurrence of `kind`, in epoch seconds, or `None` when it holds
 /// none or cannot say. How long a kind nothing writes any more is kept follows from it
 /// ([`Config::stored_until`]).

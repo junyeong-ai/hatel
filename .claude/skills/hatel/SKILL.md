@@ -203,6 +203,9 @@ unseen sessions, without guessing equality with local paths. Cost needs a runnin
 
 Doctor cannot inspect another session's launch environment. Claude Code strips `OTEL_*`
 from child processes; the tool environment alone does not prove the session's destination.
+What sessions sent is observable: doctor names sessions whose transcript responses were recorded
+but whose native telemetry never arrived. Server-managed settings from a Team or Enterprise
+organization outrank every local setting; `/status` in such a session names the managed source.
 For a configuration/store/build mismatch, resolve the named path or restart the appropriate
 receiver. `hatel service --print` inspects service wiring; preserve hand-edited units.
 Logs: `~/Library/Logs/hatel/serve.log` on macOS, `journalctl --user -u hatel` on Linux.

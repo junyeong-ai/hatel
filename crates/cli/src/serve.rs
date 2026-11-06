@@ -30,7 +30,7 @@ use crate::export::{Exporter, OtlpSignal};
 use crate::receiver;
 use crate::throttle::{Tally, Throttle};
 
-const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 /// How long shutdown waits for the export queue to drain before abandoning the rest — bounded so
 /// a dead downstream can't hang the receiver's exit.
 pub(crate) const EXPORT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

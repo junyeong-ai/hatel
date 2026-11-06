@@ -3,6 +3,11 @@
 use super::decode::{LogsRequest, repository};
 use hatel_core::{Envelope, Payload, Registry};
 
+const API_REQUEST: &str = "claude.api_request";
+const HOOK: &str = "claude.hook";
+/// The Kinds native log events are projected into.
+pub const KINDS: [&str; 2] = [API_REQUEST, HOOK];
+
 pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, String> {
     let request: LogsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -18,8 +23,8 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                 };
                 let name = record.name()?;
                 let kind = match name.as_deref() {
-                    Some("api_request") => "claude.api_request",
-                    Some("hook_execution_complete") => "claude.hook",
+                    Some("api_request") => API_REQUEST,
+                    Some("hook_execution_complete") => HOOK,
                     _ => continue,
                 };
                 let timestamp = if let Some(timestamp) = attribute("event.timestamp") {
@@ -44,7 +49,7 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                     return Err(format!("{kind} has no occurrence timestamp"));
                 };
                 let mut payload = Payload::new();
-                let string_fields: &[(&str, &str)] = if kind == "claude.api_request" {
+                let string_fields: &[(&str, &str)] = if kind == API_REQUEST {
                     &[
                         ("session_id", "session.id"),
                         ("request_id", "request_id"),
@@ -60,7 +65,7 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                         ("hook_name", "hook_name"),
                     ]
                 };
-                let number_fields: &[(&str, &str)] = if kind == "claude.api_request" {
+                let number_fields: &[(&str, &str)] = if kind == API_REQUEST {
                     &[
                         ("cost_usd", "cost_usd"),
                         ("duration_ms", "duration_ms"),
@@ -111,7 +116,7 @@ pub fn records(bytes: &[u8], registry: &Registry) -> Result<Vec<Envelope>, Strin
                 env.metadata.run_id = attribute("workflow.run_id")
                     .map(|v| v.as_string())
                     .transpose()?;
-                if kind == "claude.api_request"
+                if kind == API_REQUEST
                     && let (Some(session), Some(request)) = (
                         env.payload.get("session_id").and_then(|v| v.as_str()),
                         env.payload.get("request_id").and_then(|v| v.as_str()),

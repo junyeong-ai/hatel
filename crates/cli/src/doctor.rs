@@ -162,6 +162,9 @@ pub(crate) fn report(local: bool) -> Report {
     check_endpoint_present(&mut native, &env);
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
+    if !local {
+        advise_native_coverage(&mut native, &env, &cfg);
+    }
 
     let receiver = if local {
         None
@@ -1047,6 +1050,82 @@ fn advise_session_id(sec: &mut Section, env: &cs::Env) {
     }
 }
 
+/// How far back the native-coverage check looks for sessions that recorded responses.
+const COVERAGE_WINDOW_S: i64 = 86_400;
+
+/// Compare what the sessions did with what they sent: a session whose transcript responses this
+/// ledger recorded, but from which no native log projection or cost row arrived, ran with its
+/// native telemetry sent elsewhere or turned off — what the settings files cannot show, since a
+/// Team or Enterprise organization's server-managed settings and a session's launch environment
+/// both outrank them. Only sessions whose first response is older than two export intervals and a
+/// receiver flush are judged, so a session that has just begun is not reported for a delivery
+/// still under way. Unreadable storage is the storage section's finding, not a coverage verdict.
+fn advise_native_coverage(sec: &mut Section, env: &cs::Env, cfg: &Config) {
+    use hatel_core::claude::transcript;
+    let now = hatel_core::now_epoch();
+    let since = now - COVERAGE_WINDOW_S;
+    let settled_before = now - native_settle_s(env);
+    let Ok(responding) = hatel_core::sink::sessions_since(cfg, transcript::KIND, since) else {
+        return;
+    };
+    let due: Vec<(String, i64)> = responding
+        .into_iter()
+        .filter(|(_, first)| *first <= settled_before)
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+    let mut native = std::collections::BTreeSet::new();
+    for kind in crate::claude::projection::KINDS {
+        let Ok(sessions) = hatel_core::sink::sessions_since(cfg, kind, since) else {
+            return;
+        };
+        native.extend(sessions.into_keys());
+    }
+    let Ok(costs) = hatel_core::cost::read_snapshot(&cfg.state_dir) else {
+        return;
+    };
+    native.extend(
+        costs
+            .into_iter()
+            .filter(|row| hatel_core::model::ts_epoch(&row.ts).is_some_and(|t| t >= since))
+            .map(|row| row.session_id),
+    );
+    let silent: Vec<&(String, i64)> = due.iter().filter(|(s, _)| !native.contains(s)).collect();
+    let Some((latest, _)) = silent.iter().max_by_key(|(_, first)| *first) else {
+        sec.ok(format!(
+            "native telemetry arrived from all {} session(s) that recorded responses in the last 24h",
+            due.len()
+        ));
+        return;
+    };
+    sec.warn(format!(
+        "{} of {} session(s) that recorded responses in the last 24h sent no native telemetry here \
+         (latest: {latest}) — their cost and native events are missing, and their tokens are only \
+         in `{}`. Server-managed settings from a Team or Enterprise organization outrank every \
+         local setting, and a launch environment can turn telemetry off: `/status` in such a \
+         session names the managed source",
+        silent.len(),
+        due.len(),
+        transcript::KIND
+    ));
+}
+
+/// Seconds after a session's first response by which its native telemetry has reached a receiver
+/// it is routed to: two of the longer of Claude Code's metric and log export intervals (60 s and
+/// 5 s unless set), plus one cost-snapshot flush.
+fn native_settle_s(env: &cs::Env) -> i64 {
+    let interval_ms = |key: &str, default: i64| {
+        env.get(key)
+            .and_then(|(value, _)| value.trim().parse::<i64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(default)
+    };
+    let longest = interval_ms("OTEL_METRIC_EXPORT_INTERVAL", 60_000)
+        .max(interval_ms("OTEL_LOGS_EXPORT_INTERVAL", 5_000));
+    2 * longest / 1_000 + crate::serve::FLUSH_INTERVAL.as_secs() as i64
+}
+
 fn writable(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let probe = dir.join(".doctor_write_probe");
@@ -1446,6 +1525,42 @@ mod tests {
             findings[0].message.starts_with("1/2 recorded sessions"),
             "counted against every recorded session: {}",
             findings[0].message
+        );
+    }
+
+    #[test]
+    fn a_session_whose_responses_arrived_without_native_telemetry_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::from_settings(&Settings::default()).0;
+        cfg.state_dir = dir.path().to_path_buf();
+        let registry = hatel_core::schema::load_core().unwrap();
+        let mut sink = hatel_core::build_sink(&cfg, &registry);
+        let now = hatel_core::now_epoch();
+        let write = |sink: &mut hatel_core::SqliteSink, kind: &str, session: &str, at: i64| {
+            let payload = serde_json::json!({"session_id": session, "request_id": "r"});
+            let payload = serde_json::from_value(payload).unwrap();
+            let mut env = hatel_core::make_envelope(kind, payload, &registry, false).unwrap();
+            env.ts = jiff::Timestamp::from_second(at).unwrap().to_string();
+            sink.write_record(&env).unwrap();
+        };
+        // Routed here: its native request projection arrived.
+        write(&mut sink, "claude.response", "routed", now - 3_600);
+        write(&mut sink, "claude.api_request", "routed", now - 3_600);
+        // Routed elsewhere: responses for an hour and nothing native.
+        write(&mut sink, "claude.response", "elsewhere", now - 3_000);
+        // Just begun: its first export may still be on its way.
+        write(&mut sink, "claude.response", "starting", now - 10);
+
+        let mut sec = Section::new("native_telemetry", "native telemetry:");
+        advise_native_coverage(&mut sec, &cs::Env::new(), &cfg);
+        assert_eq!(sec.findings.len(), 1);
+        assert_eq!(sec.findings[0].status, Status::Warn);
+        assert!(
+            sec.findings[0]
+                .message
+                .starts_with("1 of 2 session(s) that recorded responses in the last 24h sent no native telemetry here (latest: elsewhere)"),
+            "{}",
+            sec.findings[0].message
         );
     }
 
