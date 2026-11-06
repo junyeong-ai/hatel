@@ -7,9 +7,13 @@
 //! one transcript at once, or a forked session's copy of its parent's responses all leave one
 //! record per request. Reading is therefore correct without the position, which only spares the
 //! work; an unreadable position is read as none.
+//!
+//! A subagent's hook can run before its last response reaches its transcript, and no later event
+//! names that transcript again. So a subagent's transcript is remembered under its session, and the
+//! session's next turn or its end reads every remembered transcript along with its own.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -26,19 +30,82 @@ pub const EVENTS: [&str; 3] = ["Stop", "SubagentStop", "SessionEnd"];
 
 const SOURCE: &str = "claude_code.transcript";
 const POSITIONS: &str = "transcripts";
+/// The extension of a session's list of subagent transcripts, beside the positions.
+const SUBAGENTS: &str = "subagents";
 
-/// The transcript an event says has new responses, if it names one.
-pub fn transcript_of(event_name: &str, event: &serde_json::Value) -> Option<PathBuf> {
-    let key = match event_name {
-        "Stop" | "SessionEnd" => "transcript_path",
-        "SubagentStop" => "agent_transcript_path",
-        _ => return None,
+/// The transcripts an event leaves with responses to read. A subagent's end names its own
+/// transcript and remembers it under the session; a turn's or the session's end names the
+/// session's transcript and every subagent transcript remembered for it.
+pub fn due(cfg: &Config, event_name: &str, event: &serde_json::Value) -> Vec<PathBuf> {
+    let path = |key: &str| {
+        event
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
     };
-    event
-        .get(key)
+    let session = event
+        .get("session_id")
         .and_then(serde_json::Value::as_str)
-        .filter(|path| !path.is_empty())
+        .filter(|id| !id.is_empty());
+    let positions = cfg.state_dir.join(POSITIONS);
+    match event_name {
+        "SubagentStop" => {
+            let agent = path("agent_transcript_path");
+            if let (Some(session), Some(agent)) = (session, &agent) {
+                remember_subagent(&positions, session, agent);
+            }
+            agent.into_iter().collect()
+        }
+        "Stop" | "SessionEnd" => path("transcript_path")
+            .into_iter()
+            .chain(session.map_or_else(Vec::new, |s| subagents(&positions, s)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn subagents_path(positions: &Path, session: &str) -> PathBuf {
+    let name = blake3::hash(session.as_bytes()).to_hex();
+    positions.join(format!("{name}.{SUBAGENTS}"))
+}
+
+/// Append `agent` to the session's list: one short line through an append-only descriptor, so
+/// subagents ending at once each keep their line.
+fn remember_subagent(positions: &Path, session: &str, agent: &Path) {
+    if subagents(positions, session)
+        .iter()
+        .any(|known| known == agent)
+    {
+        return;
+    }
+    let mut line = agent.as_os_str().as_encoded_bytes().to_vec();
+    line.push(b'\n');
+    let written = std::fs::create_dir_all(positions).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(subagents_path(positions, session))?
+            .write_all(&line)
+    });
+    if let Err(e) = written {
+        // This subagent's responses are read now; only what it writes after this hook is missed.
+        eprintln!("hatel hook: {}: {e}", positions.display());
+    }
+}
+
+fn subagents(positions: &Path, session: &str) -> Vec<PathBuf> {
+    let Ok(text) = std::fs::read_to_string(subagents_path(positions, session)) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = text
+        .lines()
+        .filter(|line| !line.is_empty())
         .map(PathBuf::from)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 /// What one read of a transcript recorded.
@@ -217,7 +284,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// The file a position was measured in, so a transcript replaced under the same path is read from
-/// its start instead of from an offset into different content.
+/// its start instead of from an offset into different content. Where the platform names no file
+/// identity (outside Unix), only a transcript shorter than its position is read again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileId {
@@ -287,9 +355,10 @@ impl Position {
     }
 }
 
-/// Remove the positions of transcripts that no longer exist, and any position that cannot be read.
-/// Returns how many were removed. A position outlives its session for as long as Claude Code keeps
-/// the transcript, since a resumed session appends to it.
+/// Remove what is kept for transcripts Claude Code no longer has: a position whose transcript is
+/// gone or that cannot be read, and a session's subagent list none of whose transcripts remain.
+/// Returns how many files were removed. Both outlive their session for as long as Claude Code keeps
+/// the transcripts, since a resumed session appends to them.
 pub fn prune_positions(state_dir: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(state_dir.join(POSITIONS)) else {
         return 0;
@@ -297,10 +366,15 @@ pub fn prune_positions(state_dir: &Path) -> usize {
     let mut removed = 0;
     for entry in entries.flatten() {
         let path = entry.path();
-        let stale = std::fs::read(&path)
-            .ok()
-            .and_then(|text| serde_json::from_slice::<Position>(&text).ok())
-            .is_none_or(|p| !p.transcript.exists());
+        let stale = if path.extension().is_some_and(|e| e == SUBAGENTS) {
+            std::fs::read_to_string(&path)
+                .map_or(true, |list| !list.lines().any(|l| Path::new(l).exists()))
+        } else {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|text| serde_json::from_slice::<Position>(&text).ok())
+                .is_none_or(|p| !p.transcript.exists())
+        };
         if stale && std::fs::remove_file(&path).is_ok() {
             removed += 1;
         }
@@ -519,9 +593,17 @@ mod tests {
         append(&gone, &assistant("T", "req_2", 1));
         read_once(&cfg, &registry, &kept);
         read_once(&cfg, &registry, &gone);
+        let positions = dir.path().join(POSITIONS);
+        remember_subagent(&positions, "S", &kept);
+        remember_subagent(&positions, "T", &gone);
         std::fs::remove_file(&gone).unwrap();
 
-        assert_eq!(prune_positions(dir.path()), 1);
-        assert!(Position::load(&dir.path().join(POSITIONS), &kept).is_some());
+        assert_eq!(
+            prune_positions(dir.path()),
+            2,
+            "the position and the list naming only it"
+        );
+        assert!(Position::load(&positions, &kept).is_some());
+        assert_eq!(subagents(&positions, "S"), [kept]);
     }
 }

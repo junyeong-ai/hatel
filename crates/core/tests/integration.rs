@@ -416,13 +416,21 @@ fn turn_and_subagent_ends_record_the_responses_their_transcripts_gained() {
         "agent_transcript_path": agent.to_str().unwrap()
     });
     hatel_core::claude::hook::process_event(&mut subagent, &cfg, &reg);
+    // The subagent's last response lands after its own hook ran; the session's next turn end
+    // reads it.
+    let mut late = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&agent)
+        .unwrap();
+    std::io::Write::write_all(&mut late, response("req_3", Some("a1")).as_bytes()).unwrap();
+    hatel_core::claude::hook::process_event(&mut stop, &cfg, &reg);
 
     let responses = records_of(&cfg, "claude.response");
     let requests: Vec<_> = responses
         .iter()
         .map(|r| r.payload["request_id"].clone())
         .collect();
-    assert_eq!(requests, ["req_1", "req_2"]);
+    assert_eq!(requests, ["req_1", "req_2", "req_3"]);
     assert_eq!(responses[1].payload["agent_id"], "a1");
     assert_eq!(
         records_of(&cfg, "subagent").len(),
