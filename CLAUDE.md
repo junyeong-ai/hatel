@@ -115,10 +115,7 @@ cargo audit   # after dependency updates
   A record references its Kind, contract and project by id; readers read the `envelopes` view, so
   only the write path knows the tables behind it. Reports aggregate inside SQLite.
 - Hooks never convert data: a store at another schema version is refused (`sink::write_readiness`),
-  never altered. While the project has no external consumers, a physical schema change is made in
-  place as if designed that way, and an existing store is converted once by a script kept outside
-  the repository. A fingerprint format change re-stamps records from their stored definitions in
-  that conversion; the product never keeps a decoder for an earlier format.
+  never altered.
 - The receiver reads `config.toml` when it starts and again before it deletes anything, keeping the
   longer retention for each Kind and deleting nothing while the file cannot be read. `/healthz`
   reports the file, the store, the local decode capabilities and what native forwarding delivered,
