@@ -5,6 +5,14 @@
 //! unreadable configuration or store — is a tool result with `isError`, which the model reads and
 //! can correct; a protocol error means the server itself failed.
 //! stdout is the protocol channel; diagnostics go to stderr only.
+//!
+//! A server keeps the build it started from, while an upgrade replaces the installed file, so a
+//! call answered after one would read a store the new build may have reshaped and record under an
+//! older registry. Every call is refused instead, naming the reconnect step, once the file the
+//! server started from is no longer the one at its path ([`Executable::replaced`]).
+
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -20,7 +28,74 @@ use hatel_core::{Config, Payload, report};
 use crate::{EmitError, doctor, emit_record, kinds_value, machine_json, parse_query};
 
 #[derive(Debug, Clone)]
-pub struct HatelMcp;
+pub struct HatelMcp {
+    started_from: Option<Executable>,
+}
+
+/// The file this process was started from, as the file system identified it then.
+#[derive(Debug, Clone)]
+struct Executable {
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+/// What tells a file at a path from one put there later. The installer renames a staged copy over
+/// the old binary, which gives the path another inode; an in-place rewrite keeps the inode and moves
+/// the modification time. A `touch` alone also moves it, and is read as a replacement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileIdentity {
+    fn of(path: &Path) -> std::io::Result<Self> {
+        let meta = std::fs::metadata(path)?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            #[cfg(unix)]
+            device: meta.dev(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
+}
+
+impl Executable {
+    fn current() -> std::io::Result<Self> {
+        let path = std::env::current_exe()?;
+        let identity = FileIdentity::of(&path)?;
+        Ok(Self { path, identity })
+    }
+
+    /// Why this process must not answer: the file it started from is no longer the one at its path.
+    /// `None` while it still is.
+    fn replaced(&self) -> Option<String> {
+        let path = self.path.display();
+        let ours = env!("CARGO_PKG_VERSION");
+        let reconnect = "Reconnect the server (in Claude Code: /mcp → hatel → Reconnect; the \
+                         conversation stays open) and call again.";
+        match FileIdentity::of(&self.path) {
+            Ok(now) if now == self.identity => None,
+            Ok(_) => Some(format!(
+                "hatel at {path} was replaced after this MCP server started, so this server still \
+                 runs the earlier build ({ours}) and does not answer for the installed one. \
+                 {reconnect}"
+            )),
+            Err(e) => Some(format!(
+                "this MCP server ({ours}) cannot confirm it still runs the installed hatel: \
+                 {path}: {e}. {reconnect}"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -101,7 +176,7 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<ReportParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || report_tool(p)).await
+        self.answer(move || report_tool(p)).await
     }
 
     #[tool(
@@ -110,7 +185,7 @@ impl HatelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn kinds(&self) -> Result<CallToolResult, McpError> {
-        answer(kinds_tool).await
+        self.answer(kinds_tool).await
     }
 
     #[tool(
@@ -119,7 +194,8 @@ impl HatelMcp {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn deliveries(&self) -> Result<CallToolResult, McpError> {
-        answer(|| crate::delivery_value().map(|value| success(machine_json(&value)))).await
+        self.answer(|| crate::delivery_value().map(|value| success(machine_json(&value))))
+            .await
     }
 
     #[tool(
@@ -131,7 +207,7 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<DoctorParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || {
+        self.answer(move || {
             let report = doctor::report(p.local.unwrap_or(false));
             let mut result = success(machine_json(&report));
             result.is_error = Some(!report.ok);
@@ -154,8 +230,10 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<BatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || crate::emit_batch(p.records).map(|results| success(machine_json(&results))))
-            .await
+        self.answer(move || {
+            crate::emit_batch(p.records).map(|results| success(machine_json(&results)))
+        })
+        .await
     }
 
     #[tool(
@@ -172,20 +250,41 @@ impl HatelMcp {
         &self,
         Parameters(p): Parameters<EmitParams>,
     ) -> Result<CallToolResult, McpError> {
-        answer(move || emit_tool(p)).await
+        self.answer(move || emit_tool(p)).await
     }
 }
 
-/// Every tool answers from the ledger on disk or from the receiver over the wire — blocking work,
-/// run off the runtime's workers so the stdio transport keeps serving while one call reads a large
-/// ledger or waits on a probe. Its failure message becomes an `isError` result.
-async fn answer(
-    work: impl FnOnce() -> Result<CallToolResult, String> + Send + 'static,
-) -> Result<CallToolResult, McpError> {
-    let result = tokio::task::spawn_blocking(work)
-        .await
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-    Ok(result.unwrap_or_else(|message| CallToolResult::error(vec![ContentBlock::text(message)])))
+impl HatelMcp {
+    /// A server that refuses every call once the file it started from is replaced. One whose file
+    /// could not be identified answers every call, and says so on stderr.
+    fn new() -> Self {
+        let started_from = Executable::current()
+            .inspect_err(|e| {
+                eprintln!(
+                    "mcp: cannot identify this executable ({e}); calls after an upgrade will be \
+                     answered by this build"
+                );
+            })
+            .ok();
+        Self { started_from }
+    }
+
+    /// Every tool answers from the ledger on disk or from the receiver over the wire — blocking
+    /// work, run off the runtime's workers so the stdio transport keeps serving while one call reads
+    /// a large ledger or waits on a probe. Its failure message becomes an `isError` result.
+    async fn answer(
+        &self,
+        work: impl FnOnce() -> Result<CallToolResult, String> + Send + 'static,
+    ) -> Result<CallToolResult, McpError> {
+        if let Some(reason) = self.started_from.as_ref().and_then(Executable::replaced) {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(reason)]));
+        }
+        let result = tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(result
+            .unwrap_or_else(|message| CallToolResult::error(vec![ContentBlock::text(message)])))
+    }
 }
 
 fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
@@ -284,7 +383,7 @@ pub fn run() -> i32 {
         }
     };
     runtime.block_on(async {
-        match HatelMcp.serve(stdio()).await {
+        match HatelMcp::new().serve(stdio()).await {
             Ok(service) => {
                 if let Err(e) = service.waiting().await {
                     eprintln!("mcp: {e}");
@@ -304,21 +403,101 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn started_from(path: &Path) -> HatelMcp {
+        HatelMcp {
+            started_from: Some(Executable {
+                path: path.to_path_buf(),
+                identity: FileIdentity::of(path).unwrap(),
+            }),
+        }
+    }
+
+    /// Answers one call on `server` with work that records whether it ran.
+    async fn call(server: &HatelMcp) -> (CallToolResult, bool) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let result = server
+            .answer(move || {
+                flag.store(true, Ordering::SeqCst);
+                Ok(success("answered".into()))
+            })
+            .await
+            .expect("a refusal is a result, not a protocol error");
+        (result, ran.load(Ordering::SeqCst))
+    }
+
+    fn text(result: &CallToolResult) -> &str {
+        result.content[0].as_text().map_or("", |t| t.text.as_str())
+    }
+
     #[tokio::test]
     async fn invalid_arguments_are_tool_errors_the_model_can_read() {
-        let result = answer(|| {
-            report_tool(ReportParams {
-                window: Some("7 days".into()),
-                ..Default::default()
+        let result = HatelMcp { started_from: None }
+            .answer(|| {
+                report_tool(ReportParams {
+                    window: Some("7 days".into()),
+                    ..Default::default()
+                })
             })
-        })
-        .await
-        .expect("a tool failure is a result, not a protocol error");
+            .await
+            .expect("a tool failure is a result, not a protocol error");
         assert_eq!(result.is_error, Some(true));
-        assert!(
-            result.content[0]
-                .as_text()
-                .is_some_and(|text| text.text.contains("invalid window"))
-        );
+        assert!(text(&result).contains("invalid window"));
+    }
+
+    #[tokio::test]
+    async fn a_server_whose_executable_is_still_installed_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hatel");
+        std::fs::write(&exe, "build A").unwrap();
+        let (result, ran) = call(&started_from(&exe)).await;
+        assert!(ran);
+        assert_eq!(text(&result), "answered");
+    }
+
+    #[tokio::test]
+    async fn a_server_whose_executable_was_replaced_refuses_without_answering() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hatel");
+        std::fs::write(&exe, "build A").unwrap();
+        let server = started_from(&exe);
+        let staged = dir.path().join("hatel.staged");
+        std::fs::write(&staged, "build A").unwrap();
+        std::fs::rename(&staged, &exe).unwrap();
+
+        let (result, ran) = call(&server).await;
+        assert!(!ran);
+        assert_eq!(result.is_error, Some(true));
+        assert!(text(&result).contains("was replaced after this MCP server started"));
+        assert!(text(&result).contains("/mcp → hatel → Reconnect"));
+    }
+
+    #[tokio::test]
+    async fn a_server_whose_executable_was_rewritten_in_place_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hatel");
+        std::fs::write(&exe, "build A").unwrap();
+        let server = started_from(&exe);
+        std::fs::write(&exe, "build B, longer").unwrap();
+
+        let (result, ran) = call(&server).await;
+        assert!(!ran);
+        assert!(text(&result).contains("was replaced after this MCP server started"));
+    }
+
+    #[tokio::test]
+    async fn a_server_whose_executable_is_gone_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("hatel");
+        std::fs::write(&exe, "build A").unwrap();
+        let server = started_from(&exe);
+        std::fs::remove_file(&exe).unwrap();
+
+        let (result, ran) = call(&server).await;
+        assert!(!ran);
+        assert!(text(&result).contains("cannot confirm it still runs the installed hatel"));
     }
 }
