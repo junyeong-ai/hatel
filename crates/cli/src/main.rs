@@ -15,6 +15,7 @@ mod throttle;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use hatel_core::schema::{Inventory, UnreadableKinds, build_query_registry, build_registry};
+use hatel_core::sink::{DATABASE_VERSION, Migration};
 use hatel_core::{Config, Payload, Registry, project_selector, render, report};
 
 #[derive(Parser)]
@@ -173,6 +174,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Bring the ledger to this build's layout: convert one hatel 0.23 to 0.25 wrote in place,
+    /// keeping every record, or stamp the one hatel 0.26.0 wrote. A current or absent ledger is
+    /// left as it is.
+    Migrate,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -263,7 +268,36 @@ fn run() -> i32 {
         } => emit_cmd(&kind, fields, json, receipt, context),
         Command::EmitBatch => emit_batch_cmd(),
         Command::Deliveries { json } => deliveries_cmd(json),
+        Command::Migrate => migrate_cmd(),
     }
+}
+
+fn migrate_cmd() -> i32 {
+    let cfg = match Config::load() {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            eprintln!("migrate: {error}");
+            return 1;
+        }
+    };
+    let path = cfg.database();
+    let path = path.display();
+    match hatel_core::sink::migrate(&cfg) {
+        Ok(Migration::Absent) => println!("migrate: no ledger at {path} to convert"),
+        Ok(Migration::Current) => println!("migrate: {path} is already this build's layout"),
+        Ok(Migration::Restamped) => println!(
+            "migrate: {path} holds this build's layout; stamped it schema {DATABASE_VERSION}"
+        ),
+        Ok(Migration::Converted { records }) => println!(
+            "migrate: converted {records} record(s) at {path} from the layout hatel 0.23 to 0.25 \
+             wrote"
+        ),
+        Err(error) => {
+            eprintln!("migrate: {error}");
+            return 1;
+        }
+    }
+    0
 }
 
 /// A one-shot command is usually read through a pipe, and a reader that stops early (`| head`)

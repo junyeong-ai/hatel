@@ -223,6 +223,11 @@ echo
 # `set -e` from aborting the rest of the script.
 rc=0
 echo
+# A ledger an earlier release wrote is brought to this build's layout before the receiver restarts
+# onto it; a current or absent ledger is left as it is.
+"$BIN_DIR/hatel" migrate || rc=$?
+
+echo
 if [ "$WIRE" = true ]; then
     "$BIN_DIR/hatel" init --scope user || rc=$?
 else
