@@ -453,55 +453,13 @@ impl SqliteSink {
 
     pub fn write_record(&mut self, env: &Envelope) -> crate::Result<WriteReceipt> {
         let conn = self.conn.as_mut().map_err(|e| e.clone())?;
-        let payload = serde_json::to_string(&env.payload).map_err(io)?;
-        let occurred = env
-            .ts
-            .parse::<jiff::Timestamp>()
-            .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
-        let (seconds, nanos) = crate::model::timestamp_parts(occurred);
         // Immediate, because the ids looked up first decide what is inserted: a deferred
         // transaction that read before another writer committed could not take the write lock.
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(io)?;
-        let kind_id = crate::catalog::kind_id(&tx, &env.kind).map_err(io)?;
-        let contract_id = crate::catalog::contract_id(&tx, &self.registry, env, kind_id)?;
-        let project_id = env
-            .metadata
-            .project
-            .as_ref()
-            .map(|project| project_id(&tx, project))
-            .transpose()
-            .map_err(io)?;
-        let m = &env.metadata;
-        let inserted = tx
-            .execute(
-                "INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
-                 contract_id, kind_version, record_id, observed_at, project_id, source, run_id, \
-                 correlation_id, projection, payload) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
-                 ON CONFLICT DO NOTHING",
-                rusqlite::params![
-                    kind_id,
-                    seconds,
-                    nanos,
-                    env.ts,
-                    env.schema_version,
-                    contract_id,
-                    m.kind_version,
-                    m.record_id,
-                    m.observed_at,
-                    project_id,
-                    m.source,
-                    m.run_id,
-                    m.correlation_id,
-                    m.projection,
-                    payload,
-                ],
-            )
-            .map_err(io)?;
-        if inserted == 0 {
-            let id = m.record_id.as_deref().ok_or_else(|| {
+        let Some(delivery) = insert(&tx, &self.registry, &self.targets, env)? else {
+            let id = env.metadata.record_id.as_deref().ok_or_else(|| {
                 crate::Error::InvalidPayload("duplicate record without id".into())
             })?;
             let stored = record_by_id(&tx, id)?;
@@ -515,15 +473,109 @@ impl SqliteSink {
                 record_id: Some(id.into()),
                 delivery: Default::default(),
             });
-        }
-        let delivery =
-            crate::outbox::enqueue(&tx, env, &self.targets, crate::now_epoch()).map_err(io)?;
+        };
         tx.commit().map_err(io)?;
         Ok(WriteReceipt {
-            record_id: m.record_id.clone(),
+            record_id: env.metadata.record_id.clone(),
             delivery,
         })
     }
+
+    /// Write records that each carry a stable id, [`WRITE_BATCH`] to a transaction, keeping
+    /// whatever the ledger already holds under an id: the first write of an id owns it. A source
+    /// that presents one occurrence more than once records it once this way — a transcript read
+    /// again, or a forked session's copy of its parent's history, whose session differs from the
+    /// original's. Returns how many records were new and what their delivery queues accepted.
+    pub fn write_new(&mut self, envs: &[Envelope]) -> crate::Result<NewRecords> {
+        let conn = self.conn.as_mut().map_err(|e| e.clone())?;
+        let mut written = NewRecords::default();
+        for batch in envs.chunks(WRITE_BATCH) {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(io)?;
+            for env in batch {
+                if env.metadata.record_id.is_none() {
+                    return Err(crate::Error::InvalidPayload(
+                        "a record written once per id needs an id".into(),
+                    ));
+                }
+                if let Some(delivery) = insert(&tx, &self.registry, &self.targets, env)? {
+                    written.records += 1;
+                    written.delivery.queued += delivery.queued;
+                    written.delivery.not_queued += delivery.not_queued;
+                }
+            }
+            tx.commit().map_err(io)?;
+        }
+        Ok(written)
+    }
+}
+
+/// Records [`SqliteSink::write_new`] commits in one transaction: enough that a long transcript is
+/// not one commit per response, few enough that a concurrent hook waits one batch at most.
+pub const WRITE_BATCH: usize = 500;
+
+#[derive(Debug, Clone, Default)]
+pub struct NewRecords {
+    pub records: usize,
+    pub delivery: crate::outbox::Enqueued,
+}
+
+/// Insert `env` and queue its deliveries, or `None` when its id is already stored.
+fn insert(
+    tx: &rusqlite::Transaction<'_>,
+    registry: &crate::Registry,
+    targets: &[crate::ExportTarget],
+    env: &Envelope,
+) -> crate::Result<Option<crate::outbox::Enqueued>> {
+    let payload = serde_json::to_string(&env.payload).map_err(io)?;
+    let occurred = env
+        .ts
+        .parse::<jiff::Timestamp>()
+        .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
+    let (seconds, nanos) = crate::model::timestamp_parts(occurred);
+    let kind_id = crate::catalog::kind_id(tx, &env.kind).map_err(io)?;
+    let contract_id = crate::catalog::contract_id(tx, registry, env, kind_id)?;
+    let project_id = env
+        .metadata
+        .project
+        .as_ref()
+        .map(|project| project_id(tx, project))
+        .transpose()
+        .map_err(io)?;
+    let m = &env.metadata;
+    let inserted = tx
+        .execute(
+            "INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
+             contract_id, kind_version, record_id, observed_at, project_id, source, run_id, \
+             correlation_id, projection, payload) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT DO NOTHING",
+            rusqlite::params![
+                kind_id,
+                seconds,
+                nanos,
+                env.ts,
+                env.schema_version,
+                contract_id,
+                m.kind_version,
+                m.record_id,
+                m.observed_at,
+                project_id,
+                m.source,
+                m.run_id,
+                m.correlation_id,
+                m.projection,
+                payload,
+            ],
+        )
+        .map_err(io)?;
+    if inserted == 0 {
+        return Ok(None);
+    }
+    crate::outbox::enqueue(tx, env, targets, crate::now_epoch())
+        .map(Some)
+        .map_err(io)
 }
 
 fn project_id(conn: &Connection, project: &ProjectRef) -> rusqlite::Result<i64> {

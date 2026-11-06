@@ -16,11 +16,13 @@ const HOOK_BIN: &str = "hatel-hook";
 /// The lifecycle events this collector *can* wire — its vocabulary. Claude Code deliberately does
 /// not pass the `OTEL_*` telemetry env to hook subprocesses, which is why hooks carry the project
 /// context and domain events the native layer can't. Only the events actually needed are wired
-/// (see [`active_events`]): `SessionStart` (for the session→project index) plus every event a
-/// loaded Kind binds. The rest stay in the vocabulary so a plugin can bind them — e.g. `PostToolUse`
-/// for a tool-driven Kind — without firing the hook on events nothing consumes.
-pub const EVENTS: [&str; 10] = [
+/// (see [`active_events`]): `SessionStart` (for the session→project index), the events after which
+/// a transcript is read, and every event a loaded Kind binds. The rest stay in the vocabulary so a
+/// plugin can bind them — e.g. `PostToolUse` for a tool-driven Kind — without firing the hook on
+/// events nothing consumes.
+pub const EVENTS: [&str; 11] = [
     "SessionStart",
+    "Stop",
     "SessionEnd",
     "UserPromptExpansion",
     "PostToolUse",
@@ -33,13 +35,20 @@ pub const EVENTS: [&str; 10] = [
 ];
 
 /// The events to actually wire for a given registry: `SessionStart` (needed for the session index
-/// even though no Kind binds it) plus every vocabulary event some loaded Kind binds. This is what
-/// keeps the hook off events nothing consumes — no dead `SessionEnd`/`PostCompact` wiring.
+/// even though no Kind binds it), the events after which a transcript is read while its Kind is
+/// loaded, and every vocabulary event some loaded Kind binds. This is what keeps the hook off
+/// events nothing consumes — no dead `PostCompact` wiring.
 pub fn active_events(registry: &hatel_core::Registry) -> Vec<&'static str> {
+    use hatel_core::claude::transcript;
+    let reads_transcripts = registry.kind(transcript::KIND).is_some();
     EVENTS
         .iter()
         .copied()
-        .filter(|ev| *ev == "SessionStart" || !registry.bindings_for(ev).is_empty())
+        .filter(|ev| {
+            *ev == "SessionStart"
+                || (reads_transcripts && transcript::EVENTS.contains(ev))
+                || !registry.bindings_for(ev).is_empty()
+        })
         .collect::<Vec<_>>()
 }
 
@@ -1847,12 +1856,15 @@ mod tests {
     }
 
     #[test]
-    fn active_events_are_session_start_plus_bound_events_only() {
+    fn active_events_are_session_start_transcript_reads_and_bound_events_only() {
         let reg = hatel_core::schema::load_core().unwrap();
         let active = active_events(&reg);
-        // SessionStart (for the index) plus exactly the events a core Kind binds.
+        // SessionStart (for the index), the transcript reads, and exactly the events a core Kind
+        // binds.
         for ev in [
             "SessionStart",
+            "Stop",
+            "SessionEnd",
             "UserPromptSubmit",
             "SubagentStop",
             "InstructionsLoaded",
@@ -1863,13 +1875,11 @@ mod tests {
         ] {
             assert!(active.contains(&ev), "{ev} should be wired");
         }
-        // Vocabulary events nothing binds are NOT wired, so the hook never fires for no record.
-        for ev in ["SessionEnd", "PostCompact"] {
-            assert!(
-                !active.contains(&ev),
-                "{ev} should not be wired (nothing binds it)"
-            );
-        }
+        // A vocabulary event nothing consumes is NOT wired, so the hook never fires for no record.
+        assert!(
+            !active.contains(&"PostCompact"),
+            "PostCompact should not be wired (nothing binds it)"
+        );
     }
 
     #[test]

@@ -26,6 +26,7 @@ flowchart LR
 | 검사는 어디서 시간을 썼나요? | 공통 `check` Kind의 결과와 소요 시간 | 실패가 곧 결함이나 불안정성을 뜻하지는 않습니다. |
 | 규칙·리뷰·배포 상태는 어떤가요? | 직접 정의한 도메인 Kind와 상태 스냅샷 | 생산자가 기록하지 않은 사실은 알 수 없습니다. |
 | 기간 동안 모델·에이전트별로 얼마를 썼나요? | `claude.api_request`의 요청 비용 추정치 | 청구서가 아닙니다. |
+| 대화에서 모델·에이전트가 토큰을 얼마나 썼나요? | 세션 기록에서 읽은 응답별 토큰(`claude.response`) | 압축·요약 같은 부수 요청은 빠지므로 `claude.api_request`와 더하지 않습니다. |
 | 조직에 무엇을 보낼까요? | 목적지마다 고른 기본 신호와 로컬 Kind | 로컬 저장과 외부 전달의 성공은 별개입니다. |
 
 hatel은 Claude Code의 [기본 모니터링](https://code.claude.com/docs/en/monitoring-usage)을 다시 만들지 않고 그 위에 필요한 신호만 더합니다. 범용 OTLP Collector, 분산 추적 백엔드, 청구 원장, 생산성 평가 도구를 대신하지 않습니다.
@@ -58,6 +59,7 @@ hatel doctor                        # 연결 상태 확인
 | 기록할 수 있는 Kind와 필드 | `hatel kinds --json` |
 | 최근 30일 요약과 세션 비용 | `hatel report --window 30d` |
 | 지난 7일의 모델별 요청 비용 | `hatel report --kind claude.api_request --group-by model --window 7d` |
+| 지난 7일의 모델별 대화 토큰 | `hatel report --kind claude.response --group-by model --window 7d` |
 | 실패한 검사 | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | 성공한 스킬 호출 | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | 컨텍스트에 로드된 지침 파일 | `hatel report --kind memory --group-by file_path` |
@@ -215,6 +217,7 @@ projects = ["/absolute/repository/path"]
 | 비용·토큰·활동 시간·코드 줄 수 지표 | 세션별 누적값 | `session.id`가 없는 지표는 추측하지 않고 버립니다 |
 | `api_request` 이벤트 | 안전한 필드만 `claude.api_request`로 기록 | 요청 비용 추정치이며 청구액이 아닙니다 |
 | `hook_execution_complete` 이벤트 | `claude.hook`의 완료 묶음 수와 총 소요 시간 | 개별 훅의 지연으로 나눌 수 없습니다 |
+| 세션 기록 | 턴·서브에이전트·세션이 끝날 때 응답별 토큰을 `claude.response`로 기록 | 관리 설정이 기본 신호를 다른 곳으로 보내도 남지만, 부수 요청과 비용은 없습니다 |
 | 라이프사이클 훅 | 도구 호출·프롬프트 길이·세션 시작·서브에이전트·명령·지침 로드 | 재개할 때마다 다시 발생하는 이벤트가 있습니다 |
 | OTLP traces | 지원하지 않음 (HTTP 501) | 별도의 추적 수집기를 씁니다 |
 

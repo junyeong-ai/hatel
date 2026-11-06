@@ -26,6 +26,7 @@ flowchart LR
 | Where did checks spend time? | Outcomes and durations in the common `check` Kind | A failure does not by itself mean a defect or flakiness. |
 | What state are rules, reviews and deploys in? | Domain Kinds and state snapshots you define | Facts no producer recorded are unknown. |
 | What did each model or agent cost in a period? | Request cost estimates in `claude.api_request` | Not an invoice. |
+| How many tokens did the conversation's models and agents use? | Per-response tokens read from session transcripts (`claude.response`) | Side requests such as compaction and summaries are absent, so never add it to `claude.api_request`. |
 | What should go to the organization? | Native signals and local Kinds chosen per destination | Local storage and downstream delivery succeed separately. |
 
 hatel does not rebuild Claude Code’s [native monitoring](https://code.claude.com/docs/en/monitoring-usage); it adds only the signals you need on top. It is not a general OTLP Collector, a tracing backend, a billing ledger or a productivity scorer.
@@ -58,6 +59,7 @@ hatel doctor                        # check the wiring
 | Kinds and fields that can be recorded | `hatel kinds --json` |
 | The last 30 days with session costs | `hatel report --window 30d` |
 | Request cost by model over 7 days | `hatel report --kind claude.api_request --group-by model --window 7d` |
+| Conversation tokens by model over 7 days | `hatel report --kind claude.response --group-by model --window 7d` |
 | Failed checks | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | Successful skill calls | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | Instruction files loaded into context | `hatel report --kind memory --group-by file_path` |
@@ -215,6 +217,7 @@ projects = ["/absolute/repository/path"]
 | Cost, token, active-time and lines-of-code metrics | Per-session totals | Metrics without `session.id` are dropped, not guessed |
 | `api_request` events | Safe fields only, as `claude.api_request` | A request cost estimate, not a charge |
 | `hook_execution_complete` events | Completed batch counts and total duration in `claude.hook` | Cannot be split into individual hook latency |
+| Session transcripts | Per-response tokens as `claude.response` when a turn, subagent or session ends | Kept even when managed settings send native signals elsewhere, but without side requests or cost |
 | Lifecycle hooks | Tool calls, prompt length, session starts, subagents, commands, instruction loads | Some events fire again on every resume |
 | OTLP traces | Unsupported (HTTP 501) | Use a separate tracing collector |
 

@@ -385,6 +385,53 @@ fn prompt_stores_length_not_text() {
 }
 
 #[test]
+fn turn_and_subagent_ends_record_the_responses_their_transcripts_gained() {
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let response = |request: &str, agent: Option<&str>| {
+        let mut entry = serde_json::json!({
+            "type": "assistant", "sessionId": "S", "requestId": request,
+            "timestamp": "2026-11-06T07:00:00Z",
+            "message": {"model": "claude-opus-5-5", "usage": {"input_tokens": 1, "output_tokens": 9}}
+        });
+        if let Some(agent) = agent {
+            entry["agentId"] = agent.into();
+        }
+        format!("{entry}\n")
+    };
+    let main = dir.path().join("S.jsonl");
+    let agent = dir.path().join("agent-a1.jsonl");
+    std::fs::write(&main, response("req_1", None)).unwrap();
+    std::fs::write(&agent, response("req_2", Some("a1"))).unwrap();
+
+    let mut stop = serde_json::json!({
+        "hook_event_name": "Stop", "session_id": "S", "cwd": "/tmp/x",
+        "transcript_path": main.to_str().unwrap()
+    });
+    hatel_core::claude::hook::process_event(&mut stop, &cfg, &reg);
+    let mut subagent = serde_json::json!({
+        "hook_event_name": "SubagentStop", "session_id": "S", "cwd": "/tmp/x",
+        "transcript_path": main.to_str().unwrap(), "agent_id": "a1", "agent_type": "Explore",
+        "agent_transcript_path": agent.to_str().unwrap()
+    });
+    hatel_core::claude::hook::process_event(&mut subagent, &cfg, &reg);
+
+    let responses = records_of(&cfg, "claude.response");
+    let requests: Vec<_> = responses
+        .iter()
+        .map(|r| r.payload["request_id"].clone())
+        .collect();
+    assert_eq!(requests, ["req_1", "req_2"]);
+    assert_eq!(responses[1].payload["agent_id"], "a1");
+    assert_eq!(
+        records_of(&cfg, "subagent").len(),
+        1,
+        "the subagent binding still fires"
+    );
+}
+
+#[test]
 fn session_start_is_recorded_in_the_index() {
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();

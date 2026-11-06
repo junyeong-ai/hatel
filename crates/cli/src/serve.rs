@@ -868,7 +868,8 @@ fn sweep(st: &AppState) {
     lock(&st.acc).forget_unheard_since(retention.cutoff);
 }
 
-/// Apply `retention` to the ledger and the session index.
+/// Apply `retention` to the ledger and the session index, and drop the read positions of
+/// transcripts Claude Code has removed.
 ///
 /// Pruning the session index is safe even though it is the project-attribution join table.
 /// Rotation only moves lines between its files, all of which attribution reads, and a file goes
@@ -889,6 +890,12 @@ fn prune_ledger(cfg: &Config, retention: &Retention) {
         eprintln!(
             "hatel: retention — removed {index_removed} archived session-index file(s) older than {} days",
             cfg.retention_days
+        );
+    }
+    let positions_removed = hatel_core::claude::transcript::prune_positions(&cfg.state_dir);
+    if positions_removed > 0 {
+        eprintln!(
+            "hatel: retention — removed {positions_removed} read position(s) of transcripts Claude Code no longer keeps"
         );
     }
 }

@@ -74,6 +74,10 @@ Report interpretation:
 - Native `cost` is lifetime session totals selected by last activity, as `cost_basis`
   states. Use `claude.api_request` for occurrence-window request cost estimates.
   Neither is an invoice. `observed_metrics` absent means measurement coverage is unknown.
+- `claude.response` holds the billed tokens of each conversation response, main agent and
+  subagents, read from session transcripts; it stays local when native telemetry goes elsewhere.
+  Side requests (compaction, summaries, titles) are absent and it carries no cost, so never add it
+  to `claude.api_request`; the same `request_id` joins the two.
 - A `session` start records the branch its working tree had checked out. A branch's spend is the
   `cost` rows of its sessions: whole-session totals, so a session that switched branches is not
   apportioned. An absent branch means none was read (detached HEAD, reftable repository, no Git).

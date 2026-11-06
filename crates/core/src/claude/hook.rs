@@ -1,8 +1,10 @@
 //! The hook entrypoint. Reads one Claude Code lifecycle event as stdin JSON, maps
-//! it to records through the registry's declarative bindings, and writes them to
+//! it to records through the registry's declarative bindings, records the responses
+//! the transcript it names has gained (see [`transcript`]), and writes them to
 //! the ledger. It ALWAYS returns 0 — telemetry never blocks a tool call — and
 //! every failure degrades to a stderr notice (an honest gap, never a fabricated value).
 
+use super::transcript;
 use crate::registry::Registry;
 use crate::schema::build_registry_resilient;
 use crate::session::SessionIndex;
@@ -54,11 +56,24 @@ pub fn process_event(event: &mut serde_json::Value, cfg: &Config, registry: &Reg
 
     record_session(cfg, &event_name, &session_id, project.as_ref());
 
-    if bindings.is_empty() {
+    let transcript = transcript::transcript_of(&event_name, event)
+        .filter(|_| registry.kind(transcript::KIND).is_some());
+    if bindings.is_empty() && transcript.is_none() {
         return;
     }
     let project_label = project.as_ref().map_or("", |p| p.label.as_str());
     let mut sink = build_sink(cfg, registry);
+    if let Some(path) = transcript {
+        match transcript::read(cfg, registry, &mut sink, &path, project.as_ref()) {
+            Ok(read) if read.unreadable > 0 => eprintln!(
+                "hatel hook: {} line(s) of {} name a request but are not a readable response",
+                read.unreadable,
+                path.display()
+            ),
+            Err(e) => eprintln!("hatel hook: {e}"),
+            _ => {}
+        }
+    }
     for binding in bindings {
         let mut payload = Payload::new();
         for (field, mapping) in &binding.map {

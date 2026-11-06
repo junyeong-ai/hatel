@@ -65,6 +65,10 @@ cargo audit   # after dependency updates
   never added to native costs.
 - `CostRow.observed_metrics` names the native metrics seen; an absent metric is not a measured
   zero. `project_key` keeps same-named repositories apart.
+- `claude.response` reads billed responses from transcripts, so it survives native telemetry being
+  routed elsewhere. A request is recorded once by its id (forks and subagents copy history), a
+  token-less entry is not a billed response, and side requests never reach a transcript: it is
+  never added to `claude.api_request`.
 - An unreadable cost baseline disables only its persistence until repair and receiver restart; it
   is never rewritten from an empty baseline.
 
