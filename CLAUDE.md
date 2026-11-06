@@ -119,7 +119,8 @@ cargo audit   # after dependency updates
   that conversion; the product never keeps a decoder for an earlier format.
 - The receiver reads `config.toml` when it starts and again before it deletes anything, keeping the
   longer retention for each Kind and deleting nothing while the file cannot be read. `/healthz`
-  reports the file, the store and the local decode capabilities; `doctor` names a receiver on
+  reports the file, the store, the local decode capabilities and what native forwarding delivered,
+  failed (with the error's causes) or dropped since start; `doctor` names a receiver on
   another file or store, the splitting variables in its environment and in settings.json `env`,
   and stored Kinds no loaded schema declares.
 

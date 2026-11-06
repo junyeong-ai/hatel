@@ -199,7 +199,8 @@ It drops session-less metrics; compound metric dimensions are explicitly unsuppo
 Duplicate keys and invalid attribute types are errors, not default values. Traces return 501.
 Hook-observed project attribution takes precedence; explicit VCS browser URLs can identify
 unseen sessions, without guessing equality with local paths. Cost needs a running receiver.
-`/healthz` names build, configuration, store and capabilities.
+`/healthz` names build, configuration, store, capabilities and what native forwarding
+delivered, failed or dropped since the receiver started; doctor reports it.
 
 Doctor cannot inspect another session's launch environment. Claude Code strips `OTEL_*`
 from child processes; the tool environment alone does not prove the session's destination.

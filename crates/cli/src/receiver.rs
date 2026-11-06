@@ -44,6 +44,31 @@ pub struct Identity {
     pub cost_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_error: Option<String>,
+    /// What native forwarding has done since the receiver started. Absent where no destination
+    /// takes native signals, and from builds that predate the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding: Option<Forwarding>,
+}
+
+/// Native forwarding since the receiver started. Forwarding does not retry, so a failed or dropped
+/// batch never reached its destination.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Forwarding {
+    pub destinations: Vec<ForwardingDestination>,
+    /// Batches dropped because a destination's queue was full.
+    pub dropped_queue_full: u64,
+    /// Batches dropped for project-filtered destinations because their sessions were never
+    /// attributed to a project.
+    pub dropped_unattributed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardingDestination {
+    pub endpoint: String,
+    pub delivered: u64,
+    pub failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +112,7 @@ impl Identity {
             storage_error: hatel_core::sink::write_readiness(&cfg.database())
                 .err()
                 .map(|e| e.to_string()),
+            forwarding: None,
             capabilities: Some(Capabilities {
                 local_decode_protocol: "http/json".into(),
                 local_metric_types: vec!["sum".into(), "gauge".into()],
@@ -223,6 +249,7 @@ mod tests {
                 capabilities: None,
                 cost_error: None,
                 storage_error: None,
+                forwarding: None,
             })),
             "a build from before the store was reported still identifies"
         );

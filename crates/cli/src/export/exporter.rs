@@ -3,8 +3,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -202,10 +202,35 @@ impl Exporter {
         if let Some(count) = tallies.unresolved.tally(when) {
             note_unresolved(count);
         }
-        for (endpoint, failures) in &tallies.failed {
-            if let Some(count) = failures.tally(when) {
+        for (endpoint, destination) in &tallies.destinations {
+            if let Some(count) = destination.failed.tally(when) {
                 eprintln!("hatel: export to {endpoint}: {count} failed delivery(ies) so far");
             }
+        }
+    }
+
+    /// What forwarding has done since the receiver started, for `/healthz`.
+    pub fn forwarding(&self) -> crate::receiver::Forwarding {
+        let tallies = &self.tallies;
+        let mut destinations: Vec<_> = tallies
+            .destinations
+            .iter()
+            .map(|(endpoint, d)| crate::receiver::ForwardingDestination {
+                endpoint: endpoint.clone(),
+                delivered: d.delivered.load(Ordering::Relaxed),
+                failed: d.failed.count(),
+                last_failure: d
+                    .last_failure
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone(),
+            })
+            .collect();
+        destinations.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+        crate::receiver::Forwarding {
+            destinations,
+            dropped_queue_full: tallies.queue_full.count(),
+            dropped_unattributed: tallies.unresolved.count(),
         }
     }
 
@@ -225,21 +250,46 @@ struct Tallies {
     /// Batches dropped for the filtered destination(s) because their session never appeared in
     /// the index.
     unresolved: Throttle,
-    /// Deliveries each destination has failed, by endpoint — built from the destinations up front,
-    /// so the handle and the drain task share it without another lock.
-    failed: HashMap<String, Throttle>,
+    /// What each destination's forwarding has come to, by endpoint — built from the destinations up
+    /// front, so the handle and the drain task share it without another lock.
+    destinations: HashMap<String, DestinationTally>,
 }
 
 impl Tallies {
     fn new(targets: &[ExportTarget]) -> Self {
         Tallies {
-            failed: targets
+            destinations: targets
                 .iter()
-                .map(|t| (t.endpoint.clone(), Throttle::default()))
+                .map(|t| (t.endpoint.clone(), DestinationTally::default()))
                 .collect(),
             ..Tallies::default()
         }
     }
+}
+
+/// One destination's forwards since the receiver started. Native forwarding does not retry, so a
+/// failed batch never reached the destination.
+#[derive(Default)]
+struct DestinationTally {
+    delivered: AtomicU64,
+    failed: Throttle,
+    last_failure: Mutex<Option<String>>,
+}
+
+/// An error with every cause beneath it. A request error's own message names only the request; what
+/// failed (name resolution, a connect timeout, a certificate) is in its sources.
+fn causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause = cause.to_string();
+        if !text.contains(&cause) {
+            text.push_str(": ");
+            text.push_str(&cause);
+        }
+        source = source.and_then(std::error::Error::source);
+    }
+    text
 }
 
 /// Resolution of a batch's project set, for project-filtered destinations.
@@ -502,7 +552,7 @@ impl Worker {
         let client = &self.client;
         let targets = &self.targets;
         let warned = &mut self.enrich_skip_warned;
-        let failed = &self.tallies.failed;
+        let destinations = &self.tallies.destinations;
         // The enriched body is identical for every enriched target — the project label is resolved
         // from the index, not the target — so it is built at most once per forward and reused.
         let mut enriched: Option<Result<Bytes, String>> = None;
@@ -617,12 +667,20 @@ impl Worker {
             for (k, v) in &target.headers {
                 req = req.header(k, v);
             }
+            let destination = &destinations[&target.endpoint];
             let failure = match req.send().await {
-                Ok(resp) if resp.status().is_success() => continue,
+                Ok(resp) if resp.status().is_success() => {
+                    destination.delivered.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 Ok(resp) => format!("returned {}", resp.status()),
-                Err(e) => format!("failed: {e}"),
+                Err(e) => format!("failed: {}", causes(&e)),
             };
-            if let Some(count) = failed[&target.endpoint].occur(Instant::now()) {
+            *destination
+                .last_failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(failure.clone());
+            if let Some(count) = destination.failed.occur(Instant::now()) {
                 eprintln!(
                     "hatel: export to {} {failure} ({count} failed delivery(ies) so far)",
                     target.endpoint
@@ -953,6 +1011,13 @@ mod tests {
             "an unlisted or unnamed account fails closed"
         );
         assert!(String::from_utf8_lossy(&received[0]).contains("Me@Company.example"));
+        let destination = &worker.tallies.destinations[&format!("http://{addr}")];
+        assert_eq!(destination.delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            destination.failed.count(),
+            0,
+            "a filtered batch is not a failure"
+        );
         server.abort();
     }
 
@@ -1193,7 +1258,7 @@ mod tests {
         for _ in 0..2 {
             exporter.enqueue(OtlpSignal::Metrics, Bytes::from_static(b"{}"), None, None);
         }
-        let failures = &exporter.tallies.failed[&endpoint];
+        let failures = &exporter.tallies.destinations[&endpoint].failed;
         for _ in 0..100 {
             if failures.count() == 2 {
                 break;
@@ -1201,6 +1266,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(failures.count(), 2, "both deliveries failed");
+        let forwarding = exporter.forwarding();
+        let destination = &forwarding.destinations[0];
+        assert_eq!((destination.delivered, destination.failed), (0, 2));
+        let last = destination.last_failure.as_deref().unwrap();
+        assert!(
+            last.contains("refused"),
+            "the cause beneath the request error is named: {last}"
+        );
         handle.abort();
         exporter.note_tally(Tally::Stopping);
         assert_eq!(failures.tally(Tally::Stopping), None, "already reported");

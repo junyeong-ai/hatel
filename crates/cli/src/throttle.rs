@@ -78,7 +78,7 @@ impl Throttle {
         })
     }
 
-    #[cfg(test)]
+    /// Every occurrence so far, noted or not.
     pub fn count(&self) -> u64 {
         self.lock().count
     }

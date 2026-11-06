@@ -560,6 +560,9 @@ fn report_receiver(
                         retention(store)
                     ));
                 }
+                if let Some(forwarding) = &id.forwarding {
+                    report_forwarding(&mut sec, &authority, forwarding);
+                }
             }
             receiver::Probe::Foreign => sec.note(format!(
                 "something answers at {authority} but not as a hatel receiver — a build from \
@@ -578,6 +581,47 @@ fn report_receiver(
         }
     }
     Some(sec)
+}
+
+/// What the receiver at `authority` reports its native forwarding has done since it started. A
+/// failed or dropped batch is gone, since native forwarding does not retry; only the receiver saw
+/// it, so this is where an unreachable destination becomes visible.
+fn report_forwarding(sec: &mut Section, authority: &str, forwarding: &receiver::Forwarding) {
+    for d in &forwarding.destinations {
+        let sent = d.delivered + d.failed;
+        let last = d
+            .last_failure
+            .as_deref()
+            .map_or_else(String::new, |f| format!(" (last: {f})"));
+        match (d.delivered, d.failed) {
+            (0, 0) => sec.note(format!(
+                "receiver at {authority} has forwarded nothing to {} since it started",
+                d.endpoint
+            )),
+            (delivered, 0) => sec.ok(format!(
+                "receiver at {authority} forwarded {delivered} batch(es) to {} since it started",
+                d.endpoint
+            )),
+            (_, failed) => sec.warn(format!(
+                "receiver at {authority}: {failed} of {sent} batch(es) forwarded to {} since it \
+                 started failed and were not retried{last}",
+                d.endpoint
+            )),
+        }
+    }
+    if forwarding.dropped_queue_full > 0 {
+        sec.warn(format!(
+            "receiver at {authority} dropped {} batch(es) because a destination's queue was full",
+            forwarding.dropped_queue_full
+        ));
+    }
+    if forwarding.dropped_unattributed > 0 {
+        sec.note(format!(
+            "receiver at {authority} withheld {} batch(es) from project-filtered destinations \
+             because their sessions were never attributed to a project",
+            forwarding.dropped_unattributed
+        ));
+    }
 }
 
 /// Name each variable set to a value configuration cannot read: in this process's environment
@@ -1332,6 +1376,7 @@ mod tests {
                 capabilities: None,
                 cost_error: None,
                 storage_error: None,
+                forwarding: None,
             })
             .unwrap()
         };
@@ -1410,6 +1455,7 @@ mod tests {
             capabilities: None,
             cost_error: None,
             storage_error: None,
+            forwarding: None,
             config: Some("/elsewhere/config.toml".into()),
             service: "hatel".to_string(),
             storage: Some(store.clone()),
@@ -1526,6 +1572,53 @@ mod tests {
             "counted against every recorded session: {}",
             findings[0].message
         );
+    }
+
+    #[test]
+    fn forwarding_names_each_destination_by_what_reached_it() {
+        let destination = |endpoint: &str, delivered, failed, last: Option<&str>| {
+            receiver::ForwardingDestination {
+                endpoint: endpoint.into(),
+                delivered,
+                failed,
+                last_failure: last.map(Into::into),
+            }
+        };
+        let forwarding = receiver::Forwarding {
+            destinations: vec![
+                destination(
+                    "https://down.example",
+                    0,
+                    3,
+                    Some("failed: connect timed out"),
+                ),
+                destination("https://up.example", 5, 0, None),
+            ],
+            dropped_queue_full: 2,
+            dropped_unattributed: 0,
+        };
+        let mut sec = Section::new("receiver", "receiver:");
+        report_forwarding(&mut sec, "127.0.0.1:4318", &forwarding);
+        let found: Vec<_> = sec
+            .findings
+            .iter()
+            .map(|f| (f.status, f.message.as_str()))
+            .collect();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found[0].0, Status::Warn);
+        assert!(
+            found[0]
+                .1
+                .contains("3 of 3 batch(es) forwarded to https://down.example")
+        );
+        assert!(
+            found[0]
+                .1
+                .ends_with("not retried (last: failed: connect timed out)")
+        );
+        assert_eq!(found[1].0, Status::Ok);
+        assert_eq!(found[2].0, Status::Warn);
+        assert!(found[2].1.contains("dropped 2 batch(es)"));
     }
 
     #[test]

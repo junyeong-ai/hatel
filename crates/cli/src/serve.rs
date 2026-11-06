@@ -386,6 +386,7 @@ fn ok() -> IngestResponse {
 async fn identity(State(st): State<AppState>) -> Json<receiver::Identity> {
     let mut identity = receiver::Identity::of(&st.cfg);
     identity.cost_error = lock(&st.costs).as_ref().err().cloned();
+    identity.forwarding = st.exporter.as_ref().map(Exporter::forwarding);
     Json(identity)
 }
 
