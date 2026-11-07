@@ -41,7 +41,10 @@ struct Executable {
 
 /// What tells a file at a path from one put there later. The installer renames a staged copy over
 /// the old binary, which gives the path another inode; an in-place rewrite keeps the inode and moves
-/// the modification time. A `touch` alone also moves it, and is read as a replacement.
+/// the modification time. A `touch` alone also moves it, and is read as a replacement. Windows has
+/// no stable file id in std (`file_index` is unstable), and NTFS can give a file created under a
+/// just-vacated name the old file's creation time, so there only length and modification time
+/// count: a replacement that matches both goes unnoticed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileIdentity {
     #[cfg(unix)]
@@ -458,6 +461,10 @@ mod tests {
         assert_eq!(text(&result), "answered");
     }
 
+    /// The installer's path: a staged copy renamed over the installed file. The copy keeps the
+    /// installed file's length and modification time, so only the inode tells the two apart, which
+    /// Windows does not expose (see [`FileIdentity`]).
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_server_whose_executable_was_replaced_refuses_without_answering() {
         let dir = tempfile::tempdir().unwrap();
@@ -466,6 +473,13 @@ mod tests {
         let server = started_from(&exe);
         let staged = dir.path().join("hatel.staged");
         std::fs::write(&staged, "build A").unwrap();
+        let installed = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(installed)
+            .unwrap();
         std::fs::rename(&staged, &exe).unwrap();
 
         let (result, ran) = call(&server).await;
@@ -485,7 +499,9 @@ mod tests {
 
         let (result, ran) = call(&server).await;
         assert!(!ran);
+        assert_eq!(result.is_error, Some(true));
         assert!(text(&result).contains("was replaced after this MCP server started"));
+        assert!(text(&result).contains("/mcp → hatel → Reconnect"));
     }
 
     #[tokio::test]
