@@ -9,8 +9,9 @@ allowed-tools: Bash, Read, Edit
 
 Use the installed contract: `hatel --version`, `hatel <command> --help`, and
 `hatel kinds --json`. This skill targets 0.26.0. A running receiver or MCP server
-keeps the build it started. After upgrading, restart the receiver and reconnect Hatel
-through Claude Code's `/mcp` → `hatel` → `Reconnect`; the conversation can stay open.
+keeps the build it started, and an MCP server whose binary was replaced refuses calls until
+reconnected. After upgrading, restart the receiver and reconnect Hatel through Claude Code's
+`/mcp` → `hatel` → `Reconnect`; the conversation can stay open.
 
 Choose the relevant operation below. Local domain records need neither Claude Code
 nor a receiver. `hatel-hook` runs through lifecycle wiring; do not invoke it manually.
