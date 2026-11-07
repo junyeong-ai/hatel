@@ -114,8 +114,11 @@ cargo audit   # after dependency updates
 - The ledger is one SQLite database with raw timestamps beside normalized seconds and nanoseconds.
   A record references its Kind, contract and project by id; readers read the `envelopes` view, so
   only the write path knows the tables behind it. Reports aggregate inside SQLite.
-- Hooks never convert data: a store at another schema version is refused (`sink::write_readiness`),
-  never altered.
+- Each ledger layout has its own `DATABASE_VERSION`, read in one statement with the records table
+  (`sink::layout`). Hooks never convert data: a store at another layout is refused
+  (`sink::write_readiness`), never altered. A layout change takes the next number
+  (`each_layout_has_its_own_number`) and a command that converts the layout it replaces in place,
+  in one transaction, which the installer runs before it restarts the receiver.
 - The receiver reads `config.toml` when it starts and again before it deletes anything, keeping the
   longer retention for each Kind and deleting nothing while the file cannot be read. `/healthz`
   reports the file, the store, the local decode capabilities and what native forwarding delivered,

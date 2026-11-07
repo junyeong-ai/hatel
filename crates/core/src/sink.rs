@@ -14,7 +14,7 @@ use crate::{Config, Envelope, ProjectRef};
 /// The number a store this build creates is stamped with (`PRAGMA user_version`). Each layout takes
 /// its own number, so a build meets a store another layout holds with a refusal that names it,
 /// never with the first statement that fails on it ([`layout`]).
-pub const DATABASE_VERSION: i64 = 2;
+pub const DATABASE_VERSION: i64 = 1;
 
 /// The schema a fresh store is created with, and an empty read is answered from. A Kind, a contract
 /// and a project repeat across most records, so each is stored once and referenced by id.
@@ -107,8 +107,7 @@ pub(crate) fn read(path: &Path) -> crate::Result<Connection> {
             Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
         match layout(&conn)? {
             Layout::Empty => {}
-            Layout::Current | Layout::CurrentAtOne => return Ok(conn),
-            Layout::Previous => return Err(previous()),
+            Layout::Current => return Ok(conn),
             Layout::Other(version) => return Err(unsupported(version)),
         }
     }
@@ -122,28 +121,20 @@ enum Layout {
     Empty,
     /// The layout this build reads and writes, under [`DATABASE_VERSION`].
     Current,
-    /// The same layout under number 1, which hatel 0.26.0 stamped while the layout before it held
-    /// that number. [`migrate`] stamps it [`DATABASE_VERSION`].
-    CurrentAtOne,
-    /// The layout hatel 0.23 to 0.25 wrote under number 1: each record carries its Kind's name and
-    /// its metadata as JSON. [`migrate`] converts it.
-    Previous,
-    /// A records table under any other number.
+    /// A records table under another number.
     Other(i64),
 }
 
-/// The layout of the store `conn` opens. Two releases stamped number 1, and only the later one
-/// created a `kinds` table, so the table tells them apart. The stamp and the tables are read in one
-/// statement, from one snapshot: read apart, a first writer committing between the reads would show
-/// its tables under the stamp from before its commit.
+/// The layout of the store `conn` opens. The stamp and the records table are read in one statement,
+/// from one snapshot: read apart, a first writer committing between the reads would show its table
+/// under the stamp from before its commit.
 fn layout(conn: &Connection) -> crate::Result<Layout> {
-    let (version, records, kinds): (i64, bool, bool) = conn
+    let (version, records): (i64, bool) = conn
         .query_row(
             "SELECT (SELECT user_version FROM pragma_user_version),
-                 EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records'),
-                 EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kinds')",
+                 EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records')",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(io)?;
     if version > DATABASE_VERSION {
@@ -152,8 +143,6 @@ fn layout(conn: &Connection) -> crate::Result<Layout> {
     Ok(match version {
         _ if !records => Layout::Empty,
         DATABASE_VERSION => Layout::Current,
-        1 if kinds => Layout::CurrentAtOne,
-        1 => Layout::Previous,
         other => Layout::Other(other),
     })
 }
@@ -162,13 +151,6 @@ fn unsupported(version: i64) -> crate::Error {
     io(format!(
         "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION}); move telemetry.db aside to start a new store"
     ))
-}
-
-fn previous() -> crate::Error {
-    io(
-        "SQLite schema 1 holds the layout hatel 0.23 to 0.25 wrote; run `hatel migrate` to convert \
-        it in place, keeping every record",
-    )
 }
 
 fn connect(path: &Path) -> crate::Result<Connection> {
@@ -234,8 +216,7 @@ fn newer(version: i64) -> crate::Error {
 }
 
 /// Create the schema in a store that has none. A store holding records under another layout is
-/// refused rather than altered: a hook writing on every lifecycle event must never convert data,
-/// and [`migrate`] is the one path that does.
+/// refused rather than altered: a hook writing on every lifecycle event must never convert data.
 fn initialize(conn: &mut Connection) -> crate::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -248,129 +229,10 @@ fn initialize(conn: &mut Connection) -> crate::Result<()> {
             tx.pragma_update(None, "user_version", DATABASE_VERSION)
                 .map_err(io)?;
         }
-        Layout::Current | Layout::CurrentAtOne => {}
-        Layout::Previous => return Err(previous()),
+        Layout::Current => {}
         Layout::Other(version) => return Err(unsupported(version)),
     }
     tx.commit().map_err(io)
-}
-
-/// What [`migrate`] found the store to be and did to it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Migration {
-    /// No store, or one no writer has initialized: nothing to convert.
-    Absent,
-    /// Already this build's layout under [`DATABASE_VERSION`].
-    Current,
-    /// This build's layout, which hatel 0.26.0 stamped 1, now stamped [`DATABASE_VERSION`].
-    Restamped,
-    /// Converted from the layout hatel 0.23 to 0.25 wrote; every record was kept.
-    Converted { records: usize },
-}
-
-/// Bring the store to this build's layout: convert one hatel 0.23 to 0.25 wrote, keeping every
-/// record, contract and delivery, and stamp one hatel 0.26.0 wrote under number 1.
-///
-/// The conversion is one transaction in the file every process opens, so SQLite's locks order it
-/// against them and a failure leaves the store as it was; a converted copy renamed into place would
-/// meet the write-ahead log of the file it replaced. A store still without incremental auto-vacuum
-/// is then rewritten by `VACUUM`, the one statement that applies the mode to an existing file: it
-/// returns the space the old tables held, and retention returns the space of deleted records.
-pub fn migrate(cfg: &Config) -> crate::Result<Migration> {
-    let path = cfg.database();
-    if !path.try_exists().map_err(io)? {
-        return Ok(Migration::Absent);
-    }
-    let mut conn = Connection::open(&path).map_err(io)?;
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(io)?;
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(io)?;
-    let migration = match layout(&tx)? {
-        Layout::Empty => Migration::Absent,
-        Layout::Current => Migration::Current,
-        Layout::CurrentAtOne => {
-            tx.pragma_update(None, "user_version", DATABASE_VERSION)
-                .map_err(io)?;
-            Migration::Restamped
-        }
-        Layout::Previous => Migration::Converted {
-            records: convert(&tx)?,
-        },
-        Layout::Other(version) => return Err(unsupported(version)),
-    };
-    tx.commit().map_err(io)?;
-    if migration != Migration::Absent && !incremental(&conn)? {
-        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
-            .map_err(io)?;
-        conn.execute_batch("VACUUM").map_err(io)?;
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .map_err(io)?;
-    }
-    Ok(migration)
-}
-
-fn incremental(conn: &Connection) -> crate::Result<bool> {
-    conn.pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))
-        .map(|mode| mode == 2)
-        .map_err(io)
-}
-
-/// Move the tables of the layout hatel 0.23 to 0.25 wrote under this build's, returning the records
-/// moved. A record keeps its row id as its id; its metadata JSON becomes columns, and its Kind,
-/// contract and project become references. Every Kind a record or contract names is inserted
-/// first, so the inner join drops none, and a contract a record names is always stored, since
-/// those releases stamped a record only with the contract of the registry that saved it. The
-/// delivery tables are the same in both layouts and keyed by record id, so they stay.
-fn convert(tx: &rusqlite::Transaction<'_>) -> crate::Result<usize> {
-    tx.execute_batch(
-        "DROP INDEX IF EXISTS idx_records_id;
-         DROP INDEX IF EXISTS idx_records_kind_time;
-         DROP INDEX IF EXISTS idx_records_time;
-         DROP INDEX IF EXISTS idx_contracts_kind;
-         ALTER TABLE records RENAME TO previous_records;
-         ALTER TABLE contracts RENAME TO previous_contracts;",
-    )
-    .map_err(io)?;
-    tx.execute_batch(crate::catalog::SCHEMA).map_err(io)?;
-    tx.execute_batch(SCHEMA).map_err(io)?;
-    tx.execute_batch(
-        "INSERT INTO kinds (name)
-             SELECT kind FROM previous_records UNION SELECT kind FROM previous_contracts ORDER BY 1;
-         INSERT INTO contracts (schema_id, kind_id, definition)
-             SELECT c.schema_id, k.id, c.definition FROM previous_contracts c
-             JOIN kinds k ON k.name = c.kind ORDER BY c.kind, c.schema_id;
-         INSERT INTO projects (key, label)
-             SELECT DISTINCT json_extract(metadata, '$.project.key'),
-                 json_extract(metadata, '$.project.label')
-             FROM previous_records WHERE json_extract(metadata, '$.project') IS NOT NULL;",
-    )
-    .map_err(io)?;
-    let records = tx
-        .execute(
-            "INSERT INTO records (id, kind_id, occurred_seconds, occurred_nanos, ts, schema_version,
-                 contract_id, kind_version, record_id, observed_at, project_id, source, run_id,
-                 correlation_id, projection, payload)
-             SELECT r.rowid, k.id, r.occurred_seconds, r.occurred_nanos, r.ts, r.schema_version,
-                 c.id, json_extract(r.metadata, '$.kind_version'),
-                 json_extract(r.metadata, '$.record_id'), json_extract(r.metadata, '$.observed_at'),
-                 p.id, json_extract(r.metadata, '$.source'), json_extract(r.metadata, '$.run_id'),
-                 json_extract(r.metadata, '$.correlation_id'),
-                 coalesce(json_extract(r.metadata, '$.projection'), 0), r.payload
-             FROM previous_records r
-             JOIN kinds k ON k.name = r.kind
-             LEFT JOIN contracts c ON c.schema_id = json_extract(r.metadata, '$.schema_id')
-             LEFT JOIN projects p ON p.key = json_extract(r.metadata, '$.project.key')
-                 AND p.label = json_extract(r.metadata, '$.project.label')
-             ORDER BY r.rowid",
-            [],
-        )
-        .map_err(io)?;
-    tx.execute_batch("DROP TABLE previous_records; DROP TABLE previous_contracts;")
-        .map_err(io)?;
-    tx.pragma_update(None, "user_version", DATABASE_VERSION)
-        .map_err(io)?;
-    Ok(records)
 }
 
 /// An empty in-memory ledger at the current schema, which answers a read of a store that has
@@ -631,8 +493,7 @@ impl SqliteSink {
     fn init(path: &Path) -> crate::Result<Connection> {
         let mut conn = connect(path)?;
         match layout(&conn)? {
-            Layout::Current | Layout::CurrentAtOne => {}
-            Layout::Previous => return Err(previous()),
+            Layout::Current => {}
             Layout::Other(version) => return Err(unsupported(version)),
             Layout::Empty => {
                 // The retention sweep returns deleted records' pages through incremental vacuum.
@@ -799,8 +660,9 @@ mod tests {
 
     /// A store's number is how a build tells which layout it holds, so a layout change that keeps
     /// the number reaches a build as the first statement that fails on the other layout. When this
-    /// fails, give the new layout the next `DATABASE_VERSION`, teach `layout` and `migrate` the one
-    /// it replaces, and record the new fingerprint.
+    /// fails because the layout changed, give the new layout the next `DATABASE_VERSION`, add a
+    /// command that converts the layout it replaces in place, and record the new fingerprint. An
+    /// edit that leaves the layout as it was, such as spacing, records the new fingerprint alone.
     #[test]
     fn each_layout_has_its_own_number() {
         let layout = [crate::catalog::SCHEMA, SCHEMA, crate::outbox::SCHEMA].concat();
@@ -810,7 +672,7 @@ mod tests {
                 blake3::hash(layout.as_bytes()).to_hex().to_string()
             ),
             (
-                2,
+                1,
                 "541d825768685e2e21014fa742a54407132c8c261af2a008da382799e6915676".to_string()
             )
         );

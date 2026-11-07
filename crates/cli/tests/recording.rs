@@ -74,51 +74,6 @@ fn a_store_this_build_did_not_create_is_reported_and_left_unchanged() {
 }
 
 #[test]
-fn a_ledger_hatel_0_25_wrote_is_refused_by_name_and_migrate_converts_it() {
-    let home = tempfile::tempdir().unwrap();
-    let state = home.path().join("state");
-    std::fs::create_dir(&state).unwrap();
-    std::fs::write(
-        home.path().join("config.toml"),
-        format!("[storage]\nstate_dir={:?}\n", state.to_string_lossy()),
-    )
-    .unwrap();
-    let conn = rusqlite::Connection::open(state.join("telemetry.db")).unwrap();
-    conn.execute_batch(include_str!("../../core/tests/fixtures/ledger-0.25.sql"))
-        .unwrap();
-    conn.pragma_update(None, "user_version", 1).unwrap();
-    drop(conn);
-    let run = |args: &[&str]| {
-        let output = isolated(home.path()).args(args).output().unwrap();
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        (output.status.code(), text)
-    };
-
-    let (code, text) = run(&["emit", "check", "name=lint", "outcome=passed"]);
-    assert_eq!(code, Some(1));
-    assert!(text.contains("run `hatel migrate`"), "{text}");
-
-    let (code, text) = run(&["migrate"]);
-    assert_eq!(code, Some(0), "{text}");
-    assert!(text.contains("converted 6 record(s)"), "{text}");
-
-    let (code, text) = run(&[
-        "report", "--kind", "check", "--window", "3650d", "--format", "json",
-    ]);
-    assert_eq!(code, Some(0), "{text}");
-    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(report["kinds"][0]["group_count"], 3, "{text}");
-
-    let (code, text) = run(&["migrate"]);
-    assert_eq!(code, Some(0), "{text}");
-    assert!(text.contains("already this build's layout"), "{text}");
-}
-
-#[test]
 fn a_store_its_first_writer_has_not_initialized_reads_as_empty() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("state");
