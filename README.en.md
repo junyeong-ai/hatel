@@ -60,10 +60,11 @@ hatel doctor                        # check the wiring
 | The last 30 days with session costs | `hatel report --window 30d` |
 | Request cost by model over 7 days | `hatel report --kind claude.api_request --group-by model --window 7d` |
 | Conversation tokens by model over 7 days | `hatel report --kind claude.response --group-by model --window 7d` |
+| Conversation tokens by branch in the current repository over 7 days | `hatel report --kind claude.response --project "$PWD" --group-by branch --window 7d` |
 | Failed checks | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | Successful skill calls | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | Instruction files loaded into context | `hatel report --kind memory --group-by file_path` |
-| Sessions started on one branch | `hatel report --kind session --filter branch=main --group-by session_id --top 0` |
+| Sessions started on one branch of the current repository | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | Only the current repository | `hatel report --project "$PWD"` |
 
 `--filter` (repeatable, exact match), `--group-by` and `--sort-by` go with `--kind`. `--top` shows 5 items per list by default and all with `0`, and states the count before the cut. Use `--format json` for machines. A path given to `--project` selects the repository it is in (a linked worktree included); a path outside every repository is rejected.
@@ -225,6 +226,7 @@ projects = ["/absolute/repository/path"]
 - A project comes first from the repository hooks observed for the session. A session whose start was not seen can be identified by the browser URL in `vcs.repository.url.full`.
 - `tool` duration ends when the call returns, so a background command holds only its acceptance time. A missing instruction-load record does not mean the file was absent from context.
 - A `session` start records the branch checked out at the time. A branch’s cost is the `cost` rows of those sessions: whole-session totals.
+- `claude.response` records the branch Claude Code wrote for the working directory on each response, so tokens split by branch even when a session or subagent moves between branches. It follows the working directory rather than the files a request changed, and can stay on the previous branch just after the directory changes, so read it as an approximation. An isolated subagent works on its own `worktree-agent-<id>` branch, and where no branch is checked out there is none, as for `session`.
 
 ## Operations and privacy
 

@@ -191,6 +191,7 @@ struct Entry {
     session_id: Option<String>,
     request_id: Option<String>,
     agent_id: Option<String>,
+    git_branch: Option<String>,
     timestamp: Option<String>,
     message: Option<Message>,
 }
@@ -254,6 +255,16 @@ fn response(line: &[u8], cfg: &Config, registry: &Registry, project: Option<&Pro
     }
     if let Some(agent) = entry.agent_id.filter(|id| !id.is_empty()) {
         payload.insert("agent_id".into(), agent.into());
+    }
+    // Read from each entry rather than once per transcript: an agent creates or switches its
+    // branch after it starts, so one transcript spans branches. Claude Code writes `HEAD` where no
+    // branch is checked out, a detached checkout and a directory outside Git alike; git refuses
+    // `HEAD` as a branch name, so it names no branch.
+    if let Some(branch) = entry
+        .git_branch
+        .filter(|branch| !branch.is_empty() && branch != "HEAD")
+    {
+        payload.insert("branch".into(), branch.into());
     }
     for (field, count) in tokens {
         if let Some(count) = count {
@@ -478,6 +489,51 @@ mod tests {
         assert_eq!(records[1].payload["agent_id"], "a1");
         assert_eq!(records[0].ts, "2026-11-06T07:00:00Z");
         assert_eq!(records[0].metadata.source.as_deref(), Some(SOURCE));
+    }
+
+    #[test]
+    fn each_response_carries_the_branch_its_own_entry_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config(dir.path());
+        let registry = crate::schema::load_core().unwrap();
+        let transcript = dir.path().join("s.jsonl");
+        let branches = [
+            ("req_1", Some("main")),
+            ("req_2", Some("feat/x")),
+            ("req_3", Some("HEAD")),
+            ("req_4", Some("")),
+            ("req_5", None),
+        ];
+        for (request, branch) in branches {
+            let mut line =
+                serde_json::from_str::<serde_json::Value>(&assistant("S", request, 1)).unwrap();
+            if let Some(branch) = branch {
+                line["gitBranch"] = branch.into();
+            }
+            append(&transcript, &format!("{line}\n"));
+        }
+
+        read_once(&cfg, &registry, &transcript);
+        let recorded: Vec<_> = stored(&cfg)
+            .iter()
+            .map(|r| {
+                r.payload
+                    .get("branch")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                Some("main".to_owned()),
+                Some("feat/x".to_owned()),
+                None,
+                None,
+                None
+            ],
+            "each response keeps its own entry's branch; `HEAD`, empty or missing names none"
+        );
     }
 
     #[test]

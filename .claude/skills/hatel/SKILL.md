@@ -29,9 +29,10 @@ hatel report --kind check --window 7d --format json
 hatel report --kind check --filter outcome=failed --group-by name --top 0
 hatel report --kind check --group-by metadata.source --sort-by duration_s
 hatel report --kind claude.api_request --window 7d --group-by model --format json
+hatel report --kind claude.response --project "$PWD" --window 7d --group-by branch --format json
 hatel report --kind memory --group-by file_path --format json
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
-hatel report --kind session --filter branch=main --group-by session_id --top 0 --format json
+hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0 --format json
 hatel report --project "$PWD" --format json
 ```
 
@@ -79,6 +80,12 @@ Report interpretation:
   subagents, read from session transcripts; it stays local when native telemetry goes elsewhere.
   Side requests (compaction, summaries, titles) are absent and it carries no cost, so never add it
   to `claude.api_request`; the same `request_id` joins the two.
+- `claude.response` `branch` is the branch Claude Code wrote for the agent's working directory on
+  that response, so tokens split across the branches a session or subagent moved between. It
+  follows the working directory, not the files a request changed, and can name the previous branch
+  just after a directory change: an approximate apportionment. `worktree-agent-<id>` is an
+  isolated subagent's own branch. An absent branch means none was checked out or an earlier hatel
+  recorded the response. Branch names repeat across repositories, so scope with `--project`.
 - A `session` start records the branch its working tree had checked out. A branch's spend is the
   `cost` rows of its sessions: whole-session totals, so a session that switched branches is not
   apportioned. An absent branch means none was read (detached HEAD, reftable repository, no Git).

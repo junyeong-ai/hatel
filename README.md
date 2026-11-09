@@ -60,10 +60,11 @@ hatel doctor                        # 연결 상태 확인
 | 최근 30일 요약과 세션 비용 | `hatel report --window 30d` |
 | 지난 7일의 모델별 요청 비용 | `hatel report --kind claude.api_request --group-by model --window 7d` |
 | 지난 7일의 모델별 대화 토큰 | `hatel report --kind claude.response --group-by model --window 7d` |
+| 현재 저장소에서 지난 7일의 브랜치별 대화 토큰 | `hatel report --kind claude.response --project "$PWD" --group-by branch --window 7d` |
 | 실패한 검사 | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | 성공한 스킬 호출 | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | 컨텍스트에 로드된 지침 파일 | `hatel report --kind memory --group-by file_path` |
-| 한 브랜치에서 시작한 세션 | `hatel report --kind session --filter branch=main --group-by session_id --top 0` |
+| 현재 저장소의 한 브랜치에서 시작한 세션 | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | 현재 저장소만 | `hatel report --project "$PWD"` |
 
 `--filter`(반복 가능, 정확히 일치), `--group-by`, `--sort-by`는 `--kind`와 함께 씁니다. `--top`은 목록마다 기본 5개를 보여 주고 `0`이면 전부 보여 주며, 자르기 전 개수도 함께 알립니다. 기계가 읽을 때는 `--format json`을 씁니다. `--project`에 경로를 주면 그 경로가 속한 저장소(linked worktree 포함)를 고르고, 저장소 밖의 경로는 거부합니다.
@@ -225,6 +226,7 @@ projects = ["/absolute/repository/path"]
 - 프로젝트는 훅이 관찰한 세션의 저장소를 우선합니다. 시작을 보지 못한 세션은 `vcs.repository.url.full`의 브라우저 URL로 식별할 수 있습니다.
 - `tool`의 소요 시간은 호출이 반환될 때까지이므로 백그라운드 명령은 접수 시간만 담습니다. 지침 로드 기록이 없다고 그 파일이 컨텍스트에 없었던 것은 아닙니다.
 - `session` 시작 기록은 그때 체크아웃된 브랜치를 담습니다. 브랜치의 비용은 그 세션들의 `cost` 행, 즉 세션 전체의 누적값으로 봅니다.
+- `claude.response`는 Claude Code가 응답마다 작업 디렉터리에 대해 적은 브랜치를 담으므로, 세션이나 서브에이전트가 브랜치를 오가도 토큰을 브랜치별로 나눌 수 있습니다. 이 값은 요청이 바꾼 파일이 아니라 작업 디렉터리를 따르고 디렉터리를 옮긴 직후에는 이전 브랜치로 남기도 하므로, 근사치로 읽습니다. 격리된 서브에이전트는 자기 `worktree-agent-<id>` 브랜치에서 일하고, 체크아웃된 브랜치가 없으면 `session`처럼 브랜치가 없습니다.
 
 ## 운영과 개인정보
 
