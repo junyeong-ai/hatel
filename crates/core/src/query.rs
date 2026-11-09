@@ -2,7 +2,7 @@
 //! stays bounded however large the store grows.
 
 use crate::catalog::{Contracts, Resolution};
-use crate::report::{GroupAgg, Measure, Query};
+use crate::report::{GroupAgg, Measure, Query, Relation, RelationSection};
 use crate::{Config, KindSpec};
 use rusqlite::{Connection, functions::FunctionFlags, types::Value};
 
@@ -82,6 +82,7 @@ pub struct SectionResult {
     pub groups: crate::Result<Groups>,
     pub retained_since: Option<String>,
     pub contracts: Vec<ContractCount>,
+    pub relation: Option<RelationSection>,
 }
 
 /// The ranked groups a query returned, and how many it had before `top_n` cut them.
@@ -113,49 +114,100 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
 }
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
-    use rusqlite::OptionalExtension;
     let mut conn = connection(cfg)?;
     let transaction = conn.transaction().map_err(io)?;
     let resolved = Contracts::resolve(&transaction, spec)?;
-    let oldest = Query {
-        since: i64::MIN,
-        ..*q
-    };
-    let mut oldest_args = vec![
-        spec.name.clone().into(),
-        oldest.since.into(),
-        i64::from(crate::SCHEMA_VERSION).into(),
-    ];
-    let mut oldest_scope = scope(spec, &oldest, &mut oldest_args);
-    oldest_scope.push(readable(&resolved, &mut oldest_args));
-    let retained_since = transaction
-        .query_row(
-            &format!(
-                "SELECT ts FROM envelopes WHERE {} ORDER BY occurred_seconds, occurred_nanos, id LIMIT 1",
-                oldest_scope.join(" AND ")
-            ),
-            rusqlite::params_from_iter(oldest_args),
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(io)?;
+    let retained_since = oldest(&transaction, spec, q, &resolved)?;
     let contracts = contract_counts(&transaction, spec, q, &resolved)?;
-    let groups = aggregate_connection(&transaction, spec, q, &resolved);
+    let related = q
+        .relate
+        .map(|relation| -> crate::Result<_> {
+            let related = relation.kind();
+            let resolved = Contracts::resolve(&transaction, related)?;
+            let scope = related_scope(q);
+            let section = RelationSection {
+                kind: related.name.clone(),
+                identity: relation.identity().into(),
+                retained_since: oldest(&transaction, related, &scope, &resolved)?,
+                contracts: contract_counts(&transaction, related, &scope, &resolved)?,
+            };
+            Ok((relation, resolved, section))
+        })
+        .transpose()?;
+    let groups = grouped(
+        &transaction,
+        spec,
+        q,
+        &resolved,
+        related
+            .as_ref()
+            .map(|(relation, resolved, _)| (relation, resolved)),
+    )
+    .and_then(|statement| statement.run(&transaction, spec));
     Ok(SectionResult {
         groups,
         retained_since,
         contracts,
+        relation: related.map(|(_, _, section)| section),
     })
+}
+
+/// The records a related Kind is read over: every one retained, whatever the window, project and
+/// filters, which select the records a section counts. A related record need not occur inside the
+/// window of the record it describes: a transcript response is timestamped before the request event
+/// carrying its id, by minutes for a long one, so a window bound would leave a request at the
+/// window's start unattributed.
+fn related_scope<'a>(q: &Query<'a>) -> Query<'a> {
+    Query {
+        since: i64::MIN,
+        project: None,
+        filters: &[],
+        relate: None,
+        ..*q
+    }
+}
+
+/// The oldest readable record in `q`'s project scope, whatever the window.
+fn oldest(
+    conn: &Connection,
+    spec: &KindSpec,
+    q: &Query,
+    resolved: &Contracts,
+) -> crate::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    let mut args = Vec::new();
+    let mut conditions = scope(
+        spec,
+        &Query {
+            since: i64::MIN,
+            ..*q
+        },
+        &mut args,
+    );
+    conditions.push(readable(resolved, &mut args));
+    conn.query_row(
+        &format!(
+            "SELECT ts FROM envelopes WHERE {} ORDER BY occurred_seconds, occurred_nanos, id LIMIT 1",
+            conditions.join(" AND ")
+        ),
+        rusqlite::params_from_iter(args),
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(io)
 }
 
 fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
     let mut conditions = vec![
-        "kind=?1".into(),
-        "occurred_seconds>=?2".into(),
-        "schema_version<=?3".into(),
+        format!("kind={}", parameter(args, spec.name.clone())),
+        format!("occurred_seconds>={}", parameter(args, q.since)),
+        format!(
+            "schema_version<={}",
+            parameter(args, i64::from(crate::SCHEMA_VERSION))
+        ),
     ];
     if let Some(project) = q.project {
-        let p = parameter(args, project.into());
+        let p = parameter(args, project.to_string());
         let payload = payload_project(spec, project, args);
         conditions.push(format!(
             "(project_key = {p} OR project_label = {p}{payload})"
@@ -188,11 +240,7 @@ fn contract_counts(
     q: &Query,
     resolved: &Contracts,
 ) -> crate::Result<Vec<ContractCount>> {
-    let mut args = vec![
-        spec.name.clone().into(),
-        q.since.into(),
-        i64::from(crate::SCHEMA_VERSION).into(),
-    ];
+    let mut args = Vec::new();
     let mut conditions = scope(spec, q, &mut args);
     if spec.mode == crate::registry::KindMode::Event {
         conditions.extend(filter_conditions(spec, q, &mut args));
@@ -237,31 +285,76 @@ fn declares_project(spec: &KindSpec) -> bool {
     spec.field_specs.contains_key("project")
 }
 
-fn parameter(args: &mut Vec<Value>, value: String) -> String {
+fn parameter(args: &mut Vec<Value>, value: impl Into<Value>) -> String {
     args.push(value.into());
     format!("?{}", args.len())
 }
 
-fn aggregate_connection(
+/// The text a record of `spec` groups under for `group`, `NULL` where it carries none.
+fn dimension(spec: &KindSpec, group: &str, args: &mut Vec<Value>) -> String {
+    let group = match group {
+        "project" if !declares_project(spec) => "metadata.project.key",
+        group => group,
+    };
+    let dimension = Field::of(group, args).label();
+    if group == "project" {
+        format!("COALESCE(project_key, {dimension})")
+    } else {
+        dimension
+    }
+}
+
+/// The CTE holding, per identity, the group key of the earliest readable record of the related
+/// Kind, and the key a scoped record takes from it. The key is a scalar subquery rather than a
+/// join: SQLite builds an automatic index on the materialized CTE for the subquery, where it
+/// planned a `LEFT JOIN` to the same CTE as a scan of it per scoped record
+/// (`a_relation_looks_up_its_records_through_an_index`).
+fn relation(
+    relation: &Relation,
+    resolved: &Contracts,
+    q: &Query,
+    args: &mut Vec<Value>,
+) -> (String, String) {
+    let related = relation.kind();
+    let mut conditions = scope(related, &related_scope(q), args);
+    conditions.push(readable(resolved, args));
+    let identity = Field::of(relation.identity(), args).label();
+    let key = dimension(related, q.group_by.unwrap_or(&related.group_key), args);
+    // Only the columns the selection orders by travel through its sort; a payload would make every
+    // retained related record a temporary row of its full size.
+    let cte = format!(
+        "related AS MATERIALIZED (SELECT identity, key FROM (SELECT identity, key, ROW_NUMBER() OVER (PARTITION BY identity ORDER BY occurred_seconds, occurred_nanos, id) AS ordinal FROM (SELECT {identity} AS identity, {key} AS key, occurred_seconds, occurred_nanos, id FROM envelopes WHERE {}) WHERE identity IS NOT NULL) WHERE ordinal=1), ",
+        conditions.join(" AND ")
+    );
+    let scoped = Field::of(relation.identity(), args).label();
+    (
+        cte,
+        format!("(SELECT related.key FROM related WHERE related.identity = {scoped})"),
+    )
+}
+
+/// A section's aggregate as one statement, and where its measure columns lie in each row.
+struct Grouped {
+    sql: String,
+    args: Vec<Value>,
+    layouts: Vec<(usize, Vec<f64>)>,
+    total_column: usize,
+}
+
+fn grouped(
     conn: &Connection,
     spec: &KindSpec,
     q: &Query,
     resolved: &Contracts,
-) -> crate::Result<Groups> {
-    let mut args: Vec<Value> = vec![
-        spec.name.clone().into(),
-        q.since.into(),
-        i64::from(crate::SCHEMA_VERSION).into(),
-    ];
-    let group = match q.group_by.unwrap_or(&spec.group_key) {
-        "project" if !declares_project(spec) => "metadata.project.key",
-        group => group,
-    };
-    let dimension = Field::of(group, &mut args).label();
-    let key = if group == "project" {
-        format!("COALESCE(project_key, {dimension})")
-    } else {
-        dimension
+    related: Option<(&Relation, &Contracts)>,
+) -> crate::Result<Grouped> {
+    let mut args: Vec<Value> = Vec::new();
+    let (related, key) = match related {
+        Some((related, resolved)) => relation(related, resolved, q, &mut args),
+        None => (
+            String::new(),
+            dimension(spec, q.group_by.unwrap_or(&spec.group_key), &mut args),
+        ),
     };
     let mut conditions = scope(spec, q, &mut args);
     let readable = readable(resolved, &mut args);
@@ -287,7 +380,7 @@ fn aggregate_connection(
         }
     });
     let mut sql = format!(
-        "WITH scoped AS (SELECT *, {key} AS key{}{readable_column} FROM envelopes WHERE {})",
+        "WITH {related}scoped AS (SELECT *, {key} AS key{}{readable_column} FROM envelopes WHERE {})",
         identity
             .as_ref()
             .map(|i| format!(", {i} AS identity"))
@@ -392,76 +485,144 @@ fn aggregate_connection(
     if q.top_n > 0 {
         sql.push_str(&format!(" LIMIT {}", q.top_n));
     }
-    let mut stmt = conn.prepare(&sql).map_err(io)?;
-    let mut total = 0;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(args), |row| {
-            total = usize::try_from(row.get::<_, i64>(total_column)?).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    total_column,
-                    rusqlite::types::Type::Integer,
-                    Box::new(e),
-                )
-            })?;
-            let count: i64 = row.get(1)?;
-            let sums = spec
-                .measures
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let (start, bounds) = &layouts[i];
-                    let start = *start;
-                    let valid_count: i64 = row.get(start + 1)?;
-                    let missing_count: i64 = row.get(start + 2)?;
-                    let sum: Option<f64> = row.get(start)?;
-                    let avg: Option<f64> = row.get(start + 3)?;
-                    if (valid_count > 0 && (sum.is_none() || avg.is_none()))
-                        || [sum, avg].into_iter().flatten().any(|n| !n.is_finite())
-                    {
-                        return Err(rusqlite::Error::FromSqlConversionFailure(
-                            start,
-                            rusqlite::types::Type::Real,
-                            Box::new(std::io::Error::other(format!(
-                                "{name} aggregate exceeds the finite numeric range"
-                            ))),
-                        ));
-                    }
-                    Ok(Measure {
-                        name: name.clone(),
-                        sum: sum.unwrap_or(0.0),
-                        valid_count,
-                        missing_count,
-                        invalid_count: count - valid_count - missing_count,
-                        avg,
-                        min: row.get(start + 4)?,
-                        max: row.get(start + 5)?,
-                        unit: spec.field_specs[name].unit.clone(),
-                        buckets: bounds
-                            .iter()
-                            .enumerate()
-                            .map(|(j, upper_bound)| {
-                                Ok(crate::report::Bucket {
-                                    upper_bound: *upper_bound,
-                                    count: row.get(start + 6 + j)?,
+    Ok(Grouped {
+        sql,
+        args,
+        layouts,
+        total_column,
+    })
+}
+
+impl Grouped {
+    fn run(self, conn: &Connection, spec: &KindSpec) -> crate::Result<Groups> {
+        let Grouped {
+            sql,
+            args,
+            layouts,
+            total_column,
+        } = self;
+        let mut stmt = conn.prepare(&sql).map_err(io)?;
+        let mut total = 0;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(args), |row| {
+                total = usize::try_from(row.get::<_, i64>(total_column)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        total_column,
+                        rusqlite::types::Type::Integer,
+                        Box::new(e),
+                    )
+                })?;
+                let count: i64 = row.get(1)?;
+                let sums = spec
+                    .measures
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let (start, bounds) = &layouts[i];
+                        let start = *start;
+                        let valid_count: i64 = row.get(start + 1)?;
+                        let missing_count: i64 = row.get(start + 2)?;
+                        let sum: Option<f64> = row.get(start)?;
+                        let avg: Option<f64> = row.get(start + 3)?;
+                        if (valid_count > 0 && (sum.is_none() || avg.is_none()))
+                            || [sum, avg].into_iter().flatten().any(|n| !n.is_finite())
+                        {
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                start,
+                                rusqlite::types::Type::Real,
+                                Box::new(std::io::Error::other(format!(
+                                    "{name} aggregate exceeds the finite numeric range"
+                                ))),
+                            ));
+                        }
+                        Ok(Measure {
+                            name: name.clone(),
+                            sum: sum.unwrap_or(0.0),
+                            valid_count,
+                            missing_count,
+                            invalid_count: count - valid_count - missing_count,
+                            avg,
+                            min: row.get(start + 4)?,
+                            max: row.get(start + 5)?,
+                            unit: spec.field_specs[name].unit.clone(),
+                            buckets: bounds
+                                .iter()
+                                .enumerate()
+                                .map(|(j, upper_bound)| {
+                                    Ok(crate::report::Bucket {
+                                        upper_bound: *upper_bound,
+                                        count: row.get(start + 6 + j)?,
+                                    })
                                 })
-                            })
-                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                                .collect::<rusqlite::Result<Vec<_>>>()?,
+                        })
                     })
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(GroupAgg {
+                    key: row.get(0)?,
+                    count,
+                    sums,
                 })
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(GroupAgg {
-                key: row.get(0)?,
-                count,
-                sums,
             })
-        })
-        .map_err(io)?;
-    let groups = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)?;
-    Ok(Groups { groups, total })
+            .map_err(io)?;
+        let groups = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)?;
+        Ok(Groups { groups, total })
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relation_looks_up_its_records_through_an_index() {
+        // Scanning the related records once per scoped record, a day of requests against the five
+        // days of responses a ledger held ran for minutes; an automatic index on the materialized
+        // relation reads each side once.
+        let conn = crate::sink::empty().unwrap();
+        let registry = crate::schema::load_core().unwrap();
+        let requests = registry.kind("claude.api_request").unwrap();
+        let responses = registry.kind("claude.response").unwrap();
+        let relation = Relation::between(requests, responses).unwrap();
+        let q = Query {
+            since: 0,
+            top_n: 0,
+            project: None,
+            kind: Some(&requests.name),
+            contract: None,
+            group_by: Some("branch"),
+            sort_by: None,
+            filters: &[],
+            relate: Some(relation),
+        };
+        let statement = grouped(
+            &conn,
+            requests,
+            &q,
+            &Contracts::resolve(&conn, requests).unwrap(),
+            Some((&relation, &Contracts::resolve(&conn, responses).unwrap())),
+        )
+        .unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", statement.sql))
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(&statement.args), |r| {
+                r.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH related USING AUTOMATIC")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN related")),
+            "{plan:?}"
+        );
+    }
+
     #[test]
     fn window_queries_use_the_kind_and_time_index() {
         let conn = crate::sink::empty().unwrap();

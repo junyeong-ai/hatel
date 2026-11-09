@@ -102,6 +102,81 @@ pub struct Query<'a> {
     /// matches. Values compare against the same rendering the group-key column shows, so
     /// what a report displays is exactly what can be filtered on.
     pub filters: &'a [(String, String)],
+    /// The Kind whose record supplies each record's group key, validated against the Kind the
+    /// query is scoped to by [`Relation::between`]. `group_by` then names a field of that Kind,
+    /// and defaults to its declared `group_key`.
+    pub relate: Option<Relation<'a>>,
+}
+
+/// A query's records grouped by a field of another Kind's record that shares their identity value,
+/// as a request's cost by the branch its transcript response names. The related Kind is read without
+/// the window, project and filters, which select the records counted and not the record that
+/// describes each one: an identity names the same entity whenever its related record occurred.
+#[derive(Debug, Clone, Copy)]
+pub struct Relation<'a> {
+    related: &'a crate::KindSpec,
+    identity: &'a str,
+}
+
+impl<'a> Relation<'a> {
+    /// Relate `kind`'s records to `related`'s, or say why the two name no shared entity. Each event
+    /// Kind declaring the same identity field, with the same type and hashing, is the condition
+    /// under which equal stored values name the same entity; anything else would join unrelated
+    /// records or silently join none.
+    pub fn between(kind: &crate::KindSpec, related: &'a crate::KindSpec) -> Result<Self, String> {
+        if let Some(snapshot) = [kind, related]
+            .into_iter()
+            .find(|spec| spec.mode == crate::registry::KindMode::Snapshot)
+        {
+            return Err(format!(
+                "{} is a snapshot Kind, whose identity names an entity per project rather than one \
+                 record, so --relate joins event Kinds only",
+                snapshot.name
+            ));
+        }
+        let (Some(ours), Some(theirs)) = (&kind.identity, &related.identity) else {
+            let unidentified = if kind.identity.is_none() {
+                kind
+            } else {
+                related
+            };
+            return Err(format!(
+                "{} declares no identity, so its records name no entity another Kind's records \
+                 can share",
+                unidentified.name
+            ));
+        };
+        if ours != theirs {
+            return Err(format!(
+                "{} identifies its records by {ours:?} and {} by {theirs:?}, so no value names \
+                 the same entity in both",
+                kind.name, related.name
+            ));
+        }
+        if kind.field_specs[ours].field_type != related.field_specs[theirs].field_type
+            || kind.redact.contains(ours) != related.redact.contains(theirs)
+        {
+            return Err(format!(
+                "{} and {} both identify records by {ours:?} but declare it with a different type \
+                 or hashing, so equal stored values need not name the same entity",
+                kind.name, related.name
+            ));
+        }
+        Ok(Self {
+            related,
+            identity: theirs,
+        })
+    }
+
+    /// The Kind whose record supplies the group key.
+    pub fn kind(&self) -> &'a crate::KindSpec {
+        self.related
+    }
+
+    /// The identity field both Kinds declare.
+    pub fn identity(&self) -> &'a str {
+        self.identity
+    }
 }
 
 /// Whether this query applies a project restriction. Common metadata supplies attribution for
@@ -130,9 +205,27 @@ pub struct KindSection {
     pub retained_since: Option<String>,
     pub contract: String,
     pub contracts: Vec<crate::query::ContractCount>,
+    /// The Kind the groups were read through (`--relate`), `None` when they group by the section's
+    /// own records.
+    pub relation: Option<RelationSection>,
     pub groups: Vec<GroupAgg>,
     pub group_count: Option<usize>,
     pub error: Option<String>,
+}
+
+/// What a related Kind contributed to a section. Each record takes its key from the earliest
+/// readable related record sharing its identity, the rule an event identity follows within one
+/// Kind. A record with no such record, or whose record lacks `group_by`, groups under the `null`
+/// key, so the groups still add up to every record counted. The related Kind is read over every
+/// retained record, so `contracts` counts all of them by resolution, and only `selected` and
+/// `compatible` ones supply keys; a `retained_since` later than the window's start means the
+/// records before it relate to none.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelationSection {
+    pub kind: String,
+    pub identity: String,
+    pub retained_since: Option<String>,
+    pub contracts: Vec<crate::query::ContractCount>,
 }
 
 /// A whole report: the query that produced it and the answer to it. Computed once, rendered by
@@ -175,20 +268,30 @@ impl Report {
                     None => ProjectScope::Unrestricted,
                     Some(_) => ProjectScope::Applied,
                 };
-                let group_by = q.group_by.unwrap_or(&spec.group_key);
+                let group_by = q.group_by.unwrap_or(match &q.relate {
+                    Some(relation) => &relation.kind().group_key,
+                    None => &spec.group_key,
+                });
                 let sort_by = q.sort_by.or(spec.measures.first().map(String::as_str));
                 let result = crate::query::section(cfg, spec, q);
-                let (groups, retained_since, contracts, error) = match result {
+                let (groups, retained_since, contracts, relation, error) = match result {
                     Ok(result) => match result.groups {
-                        Ok(groups) => (Some(groups), result.retained_since, result.contracts, None),
+                        Ok(groups) => (
+                            Some(groups),
+                            result.retained_since,
+                            result.contracts,
+                            result.relation,
+                            None,
+                        ),
                         Err(error) => (
                             None,
                             result.retained_since,
                             result.contracts,
+                            result.relation,
                             Some(error.to_string()),
                         ),
                     },
-                    Err(e) => (None, None, Vec::new(), Some(e.to_string())),
+                    Err(e) => (None, None, Vec::new(), None, Some(e.to_string())),
                 };
                 let group_count = groups.as_ref().map(|ranked| ranked.total);
                 KindSection {
@@ -201,6 +304,7 @@ impl Report {
                     retained_since,
                     contract: q.contract.unwrap_or(&spec.schema_id).into(),
                     contracts,
+                    relation,
                     groups: groups.map(|ranked| ranked.groups).unwrap_or_default(),
                     group_count,
                     error,

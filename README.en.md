@@ -61,13 +61,14 @@ hatel doctor                        # check the wiring
 | Request cost by model over 7 days | `hatel report --kind claude.api_request --group-by model --window 7d` |
 | Conversation tokens by model over 7 days | `hatel report --kind claude.response --group-by model --window 7d` |
 | Conversation tokens by branch in the current repository over 7 days | `hatel report --kind claude.response --project "$PWD" --group-by branch --window 7d` |
+| Request cost by branch in the current repository over 7 days | `hatel report --kind claude.api_request --relate claude.response --project "$PWD" --group-by branch --window 7d` |
 | Failed checks | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | Successful skill calls | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | Instruction files loaded into context | `hatel report --kind memory --group-by file_path` |
 | Sessions started on one branch of the current repository | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | Only the current repository | `hatel report --project "$PWD"` |
 
-`--filter` (repeatable, exact match), `--group-by` and `--sort-by` go with `--kind`. `--top` shows 5 items per list by default and all with `0`, and states the count before the cut. Use `--format json` for machines. A path given to `--project` selects the repository it is in (a linked worktree included); a path outside every repository is rejected.
+`--filter` (repeatable, exact match), `--group-by`, `--sort-by` and `--relate` go with `--kind`. With `--relate <Kind>`, `--group-by` names a field of that Kind’s record sharing the same identity value. `--top` shows 5 items per list by default and all with `0`, and states the count before the cut. Use `--format json` for machines. A path given to `--project` selects the repository it is in (a linked worktree included); a path outside every repository is rejected.
 
 ## Reading results
 
@@ -76,6 +77,7 @@ hatel doctor                        # check the wiring
 - **Check what is retained.** `retained_since` is the time of the oldest retained record. Later than the window start (`since`), it means the window’s earlier part holds no retained record.
 - **There are two cost bases.** The `cost` section is lifetime session totals selected by last activity (`cost_basis`); request cost that occurred in the window comes from `claude.api_request`. Neither is an invoice, and the `session` cache-write estimate is a forecast never added to them.
 - **An event Kind that declares `identity`** counts the earliest record per ID in each group. This is not deduplication at storage time.
+- **Grouping through `--relate` leaves no record out.** A record with no related record of the same identity value, or whose related record lacks the group field, falls in the `—` (`key: null`) group, so the groups add up to the answer without `--relate`. The related Kind is read over every retained record, whatever the window, project and filters, taking the earliest per identity value; the section’s `relation` gives that Kind’s oldest record (`retained_since`) and its records by contract (`contracts`).
 
 Each Kind section answers under its current contract and counts records under other contracts in `contracts`, by `resolution`.
 
@@ -225,8 +227,9 @@ projects = ["/absolute/repository/path"]
 - Local decoding covers uncompressed HTTP/JSON. Duplicate attribute keys and wrong types are never turned into empty strings or zeros.
 - A project comes first from the repository hooks observed for the session. A session whose start was not seen can be identified by the browser URL in `vcs.repository.url.full`.
 - `tool` duration ends when the call returns, so a background command holds only its acceptance time. A missing instruction-load record does not mean the file was absent from context.
-- A `session` start records the branch checked out at the time. A branch’s cost is the `cost` rows of those sessions: whole-session totals.
+- A `session` start records the branch checked out at the time. Those sessions’ `cost` rows are whole-session totals, so they cannot split a session that moved between branches.
 - `claude.response` records the branch Claude Code wrote for the working directory on each response, so tokens split by branch even when a session or subagent moves between branches. It follows the working directory rather than the files a request changed, and can stay on the previous branch just after the directory changes, so read it as an approximation. An isolated subagent works on its own `worktree-agent-<id>` branch, and where no branch is checked out there is none, as for `session`.
+- Request cost by branch groups `claude.api_request` by this branch through `--relate claude.response`, and is the same approximation. The cost of side requests, which never reach a transcript, of responses with no branch, and of a turn still running, whose responses are read when it ends, falls in the `—` group. That group is the cost attributed to no branch.
 
 ## Operations and privacy
 

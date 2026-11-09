@@ -61,13 +61,14 @@ hatel doctor                        # 연결 상태 확인
 | 지난 7일의 모델별 요청 비용 | `hatel report --kind claude.api_request --group-by model --window 7d` |
 | 지난 7일의 모델별 대화 토큰 | `hatel report --kind claude.response --group-by model --window 7d` |
 | 현재 저장소에서 지난 7일의 브랜치별 대화 토큰 | `hatel report --kind claude.response --project "$PWD" --group-by branch --window 7d` |
+| 현재 저장소에서 지난 7일의 브랜치별 요청 비용 | `hatel report --kind claude.api_request --relate claude.response --project "$PWD" --group-by branch --window 7d` |
 | 실패한 검사 | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | 성공한 스킬 호출 | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | 컨텍스트에 로드된 지침 파일 | `hatel report --kind memory --group-by file_path` |
 | 현재 저장소의 한 브랜치에서 시작한 세션 | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | 현재 저장소만 | `hatel report --project "$PWD"` |
 
-`--filter`(반복 가능, 정확히 일치), `--group-by`, `--sort-by`는 `--kind`와 함께 씁니다. `--top`은 목록마다 기본 5개를 보여 주고 `0`이면 전부 보여 주며, 자르기 전 개수도 함께 알립니다. 기계가 읽을 때는 `--format json`을 씁니다. `--project`에 경로를 주면 그 경로가 속한 저장소(linked worktree 포함)를 고르고, 저장소 밖의 경로는 거부합니다.
+`--filter`(반복 가능, 정확히 일치), `--group-by`, `--sort-by`, `--relate`는 `--kind`와 함께 씁니다. `--relate <Kind>`를 주면 `--group-by`는 같은 identity 값을 가진 그 Kind 기록의 필드를 가리킵니다. `--top`은 목록마다 기본 5개를 보여 주고 `0`이면 전부 보여 주며, 자르기 전 개수도 함께 알립니다. 기계가 읽을 때는 `--format json`을 씁니다. `--project`에 경로를 주면 그 경로가 속한 저장소(linked worktree 포함)를 고르고, 저장소 밖의 경로는 거부합니다.
 
 ## 결과 읽는 법
 
@@ -76,6 +77,7 @@ hatel doctor                        # 연결 상태 확인
 - **보존 범위를 확인합니다.** `retained_since`는 남아 있는 가장 오래된 기록의 시각입니다. 기간 시작(`since`)보다 늦으면 기간 앞부분에는 보존된 기록이 없습니다.
 - **비용 기준은 두 가지입니다.** `cost` 섹션은 마지막 활동 시각으로 고른 세션의 누적값(`cost_basis`)이고, 기간 안에 발생한 요청 비용은 `claude.api_request`로 조회합니다. 둘 다 청구액이 아니며, `session`의 캐시 쓰기 예상 비용은 예측이므로 여기에 더하지 않습니다.
 - **`identity`를 선언한 이벤트 Kind는** 그룹마다 ID별로 가장 이른 기록 하나를 셉니다. 저장할 때 중복을 지우는 것은 아닙니다.
+- **`--relate`로 묶어도 관련 기록이 없는 기록은 빠지지 않습니다.** 같은 identity 값의 관련 기록이 없거나 그 기록에 그룹 필드가 없으면 `—`(`key: null`) 그룹에 들어가므로, 그룹 합계는 `--relate` 없이 조회한 합계와 같습니다. 관련 Kind는 기간·프로젝트·필터와 관계없이 보존된 기록 전체에서 identity 값마다 가장 이른 기록을 읽고, 섹션의 `relation`이 그 Kind의 가장 오래된 기록(`retained_since`)과 계약별 건수(`contracts`)를 알립니다.
 
 각 Kind 섹션은 현재 계약으로 답하고, 계약이 다른 기록은 `contracts`에 `resolution`별 건수로 알립니다.
 
@@ -225,8 +227,9 @@ projects = ["/absolute/repository/path"]
 - 로컬 디코딩은 압축하지 않은 HTTP/JSON에 한정합니다. 중복 속성 키나 잘못된 타입을 빈 문자열이나 0으로 바꾸지 않습니다.
 - 프로젝트는 훅이 관찰한 세션의 저장소를 우선합니다. 시작을 보지 못한 세션은 `vcs.repository.url.full`의 브라우저 URL로 식별할 수 있습니다.
 - `tool`의 소요 시간은 호출이 반환될 때까지이므로 백그라운드 명령은 접수 시간만 담습니다. 지침 로드 기록이 없다고 그 파일이 컨텍스트에 없었던 것은 아닙니다.
-- `session` 시작 기록은 그때 체크아웃된 브랜치를 담습니다. 브랜치의 비용은 그 세션들의 `cost` 행, 즉 세션 전체의 누적값으로 봅니다.
+- `session` 시작 기록은 그때 체크아웃된 브랜치를 담습니다. 그 세션들의 `cost` 행은 세션 전체의 누적값이므로, 세션 안에서 브랜치를 옮긴 비용을 나누지 못합니다.
 - `claude.response`는 Claude Code가 응답마다 작업 디렉터리에 대해 적은 브랜치를 담으므로, 세션이나 서브에이전트가 브랜치를 오가도 토큰을 브랜치별로 나눌 수 있습니다. 이 값은 요청이 바꾼 파일이 아니라 작업 디렉터리를 따르고 디렉터리를 옮긴 직후에는 이전 브랜치로 남기도 하므로, 근사치로 읽습니다. 격리된 서브에이전트는 자기 `worktree-agent-<id>` 브랜치에서 일하고, 체크아웃된 브랜치가 없으면 `session`처럼 브랜치가 없습니다.
+- 브랜치별 요청 비용은 `claude.api_request`를 `--relate claude.response`로 이 브랜치에 묶어 보며, 브랜치와 같은 근사치입니다. 세션 기록에 남지 않는 부수 요청, 브랜치가 없는 응답, 턴이 끝나야 읽히는 진행 중인 턴의 응답에 딸린 비용은 `—` 그룹에 모입니다. 이 그룹이 어느 브랜치에도 귀속되지 않은 비용입니다.
 
 ## 운영과 개인정보
 

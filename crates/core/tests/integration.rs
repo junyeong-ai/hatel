@@ -47,6 +47,7 @@ fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
         group_by: None,
         sort_by: None,
         filters: &[],
+        relate: None,
     }
 }
 
@@ -2766,6 +2767,147 @@ fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snap
     assert!(report.cost.is_empty());
     assert_eq!(report.kinds[0].groups[0].sums[0].sum, 0.02);
     assert_eq!(report.kinds[0].groups[0].count, 1);
+}
+
+#[test]
+fn request_cost_groups_by_the_branch_of_the_response_sharing_its_id() {
+    // A side request reaches no transcript and a response can name no branch: both group under the
+    // null key, so the groups add up to the unrelated answer instead of dropping that cost. A
+    // response is timestamped before its request event, and the earliest of two represents its id.
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for (request, cost) in [("r1", 1.0), ("r2", 2.0), ("r3", 4.0), ("side", 8.0)] {
+        let payload =
+            serde_json::json!({"session_id": "S", "request_id": request, "cost_usd": cost});
+        insert_raw(
+            &cfg,
+            &reg,
+            "claude.api_request",
+            "2026-01-01T00:01:30Z",
+            payload,
+        );
+    }
+    for (request, branch, ts) in [
+        ("r1", Some("feat"), "2026-01-01T00:00:30Z"),
+        ("r2", Some("late"), "2026-01-01T00:01:20Z"),
+        ("r2", Some("feat"), "2026-01-01T00:01:10Z"),
+        ("r3", None, "2026-01-01T00:01:10Z"),
+    ] {
+        let mut payload = serde_json::json!({"session_id": "S", "request_id": request});
+        if let Some(branch) = branch {
+            payload["branch"] = branch.into();
+        }
+        insert_raw(&cfg, &reg, "claude.response", ts, payload);
+    }
+    let since = "2026-01-01T00:01:00Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    let relation = report::Relation::between(
+        reg.kind("claude.api_request").unwrap(),
+        reg.kind("claude.response").unwrap(),
+    )
+    .unwrap();
+    let related = aggregate(
+        &reg,
+        &cfg,
+        "claude.api_request",
+        &report::Query {
+            group_by: Some("branch"),
+            relate: Some(relation),
+            ..query(since, 0, None)
+        },
+    );
+    let groups: Vec<_> = related
+        .iter()
+        .map(|g| (g.key.as_deref(), g.count, g.sums[0].sum))
+        .collect();
+    assert_eq!(groups, [(None, 2, 12.0), (Some("feat"), 2, 3.0)]);
+    let unrelated = aggregate(&reg, &cfg, "claude.api_request", &query(since, 0, None));
+    let total = |groups: &[report::GroupAgg]| {
+        groups
+            .iter()
+            .map(|g| (g.count, g.sums[0].sum))
+            .fold((0, 0.0), |(n, s), (count, sum)| (n + count, s + sum))
+    };
+    assert_eq!(total(&related), total(&unrelated));
+}
+
+#[test]
+fn a_relation_needs_event_kinds_declaring_the_same_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("identities.toml");
+    std::fs::write(&plugin, "[[kind]]\nname = \"team.state\"\nmode = \"snapshot\"\nidentity = \"request_id\"\nfields = { request_id = { type = \"string\", required = true } }\ngroup_key = \"request_id\"\n\n[[kind]]\nname = \"team.request\"\nidentity = \"request_id\"\nfields = { request_id = { type = \"integer\" } }\ngroup_key = \"request_id\"\n").unwrap();
+    let reg = build_registry(&config_in(dir.path(), vec![plugin])).unwrap();
+    for (related, reason) in [
+        ("tool", "\"request_id\" and tool by \"tool_use_id\""),
+        ("session", "session declares no identity"),
+        ("team.request", "different type or hashing"),
+        ("team.state", "team.state is a snapshot Kind"),
+    ] {
+        let refusal = report::Relation::between(
+            reg.kind("claude.api_request").unwrap(),
+            reg.kind(related).unwrap(),
+        )
+        .unwrap_err();
+        assert!(refusal.contains(reason), "{refusal}");
+    }
+}
+
+#[test]
+fn a_related_record_under_an_unreadable_contract_is_counted_and_not_joined() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("relation.toml");
+    let cfg = config_in(dir.path(), vec![plugin.clone()]);
+    let define = |branch: &str| {
+        std::fs::write(&plugin, format!("[[kind]]\nname = \"team.request\"\nidentity = \"id\"\nfields = {{ id = {{ type = \"string\" }} }}\ngroup_key = \"id\"\n\n[[kind]]\nname = \"team.response\"\nidentity = \"id\"\nfields = {{ id = {{ type = \"string\" }}, branch = {{ type = \"{branch}\" }} }}\ngroup_key = \"branch\"\n")).unwrap();
+        build_registry(&cfg).unwrap()
+    };
+    let writer = define("any");
+    write(
+        &cfg,
+        &writer,
+        "team.request",
+        serde_json::json!({"id": "a"}),
+    );
+    write(
+        &cfg,
+        &writer,
+        "team.response",
+        serde_json::json!({"id": "a", "branch": "feat"}),
+    );
+    let reader = define("string");
+    let requests = reader.kind("team.request").unwrap();
+    let relation =
+        report::Relation::between(requests, reader.kind("team.response").unwrap()).unwrap();
+    let section = hatel_core::query::section(
+        &cfg,
+        requests,
+        &report::Query {
+            relate: Some(relation),
+            ..query(0, 0, None)
+        },
+    )
+    .unwrap();
+    let groups = section.groups.unwrap().groups;
+    assert_eq!(
+        groups
+            .iter()
+            .map(|g| (g.key.as_deref(), g.count))
+            .collect::<Vec<_>>(),
+        [(None, 1)]
+    );
+    let resolutions: Vec<_> = section
+        .relation
+        .unwrap()
+        .contracts
+        .iter()
+        .map(|c| (c.resolution, c.count))
+        .collect();
+    assert_eq!(
+        resolutions,
+        [(hatel_core::catalog::Resolution::Incompatible, 1)]
+    );
 }
 
 #[test]

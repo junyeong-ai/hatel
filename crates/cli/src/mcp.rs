@@ -126,9 +126,13 @@ pub struct ReportParams {
     )]
     pub top: Option<usize>,
     #[schemars(
-        description = "Group by this field instead of the Kind's declared group_key. Requires `kind`; the field must be in that Kind's allow-list."
+        description = "Group by this field instead of the Kind's declared group_key. Requires `kind`; the field must be in that Kind's allow-list, or in the related Kind's under `relate`."
     )]
     pub group_by: Option<String>,
+    #[schemars(
+        description = "Group `kind`'s records by a field of this Kind's record that shares their identity (e.g. kind \"claude.api_request\", relate \"claude.response\", group_by \"branch\"); group_by then names, and defaults to, a field of this Kind. Both must be event Kinds declaring the same identity. Records with no such record, or whose record lacks the field, group under key null, so the groups add up to every record counted. This Kind is read over every retained record: window, project and filter select only the counted records. The section's `relation` names it, with its oldest retained record and its records by contract resolution."
+    )]
+    pub relate: Option<String>,
     #[schemars(
         description = "Rank groups by this measure instead of the Kind's first declared one. Requires `kind`; the measure must be one that Kind declares."
     )]
@@ -305,6 +309,7 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
         p.group_by.as_deref(),
         p.sort_by.as_deref(),
         &p.filter.unwrap_or_default(),
+        p.relate.as_deref(),
     )?;
     let q = report::Query {
         since: hatel_core::now_epoch().saturating_sub(window_secs),
@@ -315,6 +320,7 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
         group_by: p.group_by.as_deref(),
         sort_by: p.sort_by.as_deref(),
         filters: &restrictions.filters,
+        relate: restrictions.relation,
     };
     let report = report::Report::build(&reg, &cfg, &window, &q);
     let mut result = success(machine_json(&report));

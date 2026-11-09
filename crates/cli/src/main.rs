@@ -87,6 +87,14 @@ enum Command {
         /// could only match nothing).
         #[arg(long, value_name = "field=value", requires = "kind")]
         filter: Vec<String>,
+        /// Group by a field of this Kind's record that shares each record's identity instead of a
+        /// field of the record itself (`--relate claude.response --group-by branch`): `--group-by`
+        /// then names, and defaults to, a field of this Kind. Both must be event Kinds declaring
+        /// the same identity. Records with no such record, or whose record lacks the field, group
+        /// under `—`, so the groups still add up to every record counted. This Kind is read over
+        /// every retained record; the window, project and filters select only the counted ones.
+        #[arg(long, value_name = "kind", requires = "kind")]
+        relate: Option<String>,
     },
     /// Wire this collector into Claude Code's settings.json — idempotent and
     /// non-destructive (adds the telemetry env and lifecycle hooks without touching
@@ -214,6 +222,7 @@ fn run() -> i32 {
             group_by,
             sort_by,
             filter,
+            relate,
         } => report_cmd(
             &window,
             format,
@@ -224,6 +233,7 @@ fn run() -> i32 {
             group_by.as_deref(),
             sort_by.as_deref(),
             &filter,
+            relate.as_deref(),
         ),
         Command::Init {
             scope,
@@ -506,6 +516,7 @@ fn report_cmd(
     group_by: Option<&str>,
     sort_by: Option<&str>,
     filter: &[String],
+    relate: Option<&str>,
 ) -> i32 {
     let cfg = match Config::load() {
         Ok(c) => c,
@@ -521,13 +532,14 @@ fn report_cmd(
             return 1;
         }
     };
-    let restrictions = match parse_query(&reg, &cfg, project, kind, group_by, sort_by, filter) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("report: {e}");
-            return 2;
-        }
-    };
+    let restrictions =
+        match parse_query(&reg, &cfg, project, kind, group_by, sort_by, filter, relate) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("report: {e}");
+                return 2;
+            }
+        };
     let Some(window_secs) = report::parse_window(window) else {
         eprintln!("report: invalid window {window:?} (expected e.g. 30d — days only)");
         return 2;
@@ -543,6 +555,7 @@ fn report_cmd(
         group_by,
         sort_by,
         filters: &restrictions.filters,
+        relate: restrictions.relation,
     };
     let report = report::Report::build(&reg, &cfg, window, &q);
     let failed = report.failed();
@@ -584,30 +597,47 @@ fn unknown_kind(kind: &str, reg: &Registry, cfg: &Config) -> String {
 }
 
 /// A query's restrictions as the report matches them.
-pub(crate) struct Restrictions {
+pub(crate) struct Restrictions<'r> {
     pub project: Option<String>,
     pub filters: Vec<(String, String)>,
+    pub relation: Option<report::Relation<'r>>,
 }
 
 /// Validate every restriction of a query and return it in the form the report matches. Each
 /// Kind-scoped restriction names a field the Kind declares; one that does not could only ever
 /// match nothing, so it is rejected here rather than answered with a convincing empty result.
-pub(crate) fn parse_query(
-    reg: &Registry,
+/// Under `relate`, `group_by` names a field of the related Kind instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn parse_query<'r>(
+    reg: &'r Registry,
     cfg: &Config,
     project: Option<&str>,
     kind: Option<&str>,
     group_by: Option<&str>,
     sort_by: Option<&str>,
     filter: &[String],
-) -> Result<Restrictions, String> {
+    relate: Option<&str>,
+) -> Result<Restrictions<'r>, String> {
     if let Some(k) = kind
         && reg.kind(k).is_none()
     {
         return Err(unknown_kind(k, reg, cfg));
     }
+    let relation = match relate {
+        None => None,
+        Some(related) => {
+            let spec = kind_of(reg, kind, "--relate")?;
+            let related = reg
+                .kind(related)
+                .ok_or_else(|| unknown_kind(related, reg, cfg))?;
+            Some(report::Relation::between(spec, related)?)
+        }
+    };
     if let Some(field) = group_by {
-        let spec = kind_of(reg, kind, "--group-by")?;
+        let spec = match &relation {
+            Some(relation) => relation.kind(),
+            None => kind_of(reg, kind, "--group-by")?,
+        };
         if !spec.query_field(field) {
             let accepted: Vec<&str> = spec.fields.iter().map(String::as_str).collect();
             return Err(format!(
@@ -638,6 +668,7 @@ pub(crate) fn parse_query(
     Ok(Restrictions {
         project: project.map(project_selector).transpose()?,
         filters: parse_filters(filter, kind, reg)?,
+        relation,
     })
 }
 
@@ -833,6 +864,7 @@ mod tests {
                     group_by: None,
                     sort_by: None,
                     filters: &[],
+                    relate: None,
                 },
             )
             .cost
@@ -944,6 +976,38 @@ mod tests {
     }
 
     #[test]
+    fn a_related_group_field_is_one_the_related_kind_declares() {
+        let cfg = test_cfg(vec![]);
+        let reg = build_registry(&cfg).unwrap();
+        let parse = |group_by, relate| {
+            parse_query(
+                &reg,
+                &cfg,
+                None,
+                Some("claude.api_request"),
+                Some(group_by),
+                None,
+                &[],
+                relate,
+            )
+            .map(|r| r.relation.map(|relation| relation.kind().name.clone()))
+        };
+        assert_eq!(
+            parse("branch", Some("claude.response")).unwrap(),
+            Some("claude.response".to_string())
+        );
+        let err = parse("cost_usd", Some("claude.response")).unwrap_err();
+        assert!(
+            err.starts_with("claude.response has no field \"cost_usd\""),
+            "{err}"
+        );
+        let err = parse("branch", None).unwrap_err();
+        assert!(err.starts_with("claude.api_request has no field"), "{err}");
+        let err = parse("branch", Some("claude.respons")).unwrap_err();
+        assert!(err.starts_with("unknown kind \"claude.respons\""), "{err}");
+    }
+
+    #[test]
     fn parse_filters_validates_fields_against_the_allow_list() {
         let reg = build_registry(&test_cfg(vec![])).unwrap();
         assert_eq!(
@@ -989,6 +1053,7 @@ mod tests {
             group_by: None,
             sort_by: None,
             filters: &[],
+            relate: None,
         };
         // An empty ledger still lists one entry per Kind (with empty groups), so the
         // filter is observable without seeding records.

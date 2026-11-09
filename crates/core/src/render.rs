@@ -41,11 +41,8 @@ pub fn format_text(report: &Report) -> String {
             out.push_str(&format!("  (query failed: {error})\n"));
             continue;
         }
-        if let Some(excluded) = exclusions(section) {
-            out.push_str(&format!("  ({excluded})\n"));
-        }
-        if let Some(retention) = retention(report, section) {
-            out.push_str(&format!("  ({retention})\n"));
+        for caveat in caveats(report, section) {
+            out.push_str(&format!("  ({caveat})\n"));
         }
         out.push_str(&text_table(
             &section.group_by,
@@ -87,11 +84,8 @@ pub fn format_markdown(report: &Report) -> String {
             out.push_str(&format!("Query failed: {error}\n"));
             continue;
         }
-        if let Some(excluded) = exclusions(section) {
-            out.push_str(&format!("_{excluded}_\n\n"));
-        }
-        if let Some(retention) = retention(report, section) {
-            out.push_str(&format!("_{retention}_\n\n"));
+        for caveat in caveats(report, section) {
+            out.push_str(&format!("_{caveat}_\n\n"));
         }
         out.push_str(&markdown_table(
             &section.group_by,
@@ -144,11 +138,45 @@ fn scope(report: &Report) -> String {
 /// A section's axes in the terms the query used, so a reader knows which question was answered.
 fn axes(section: &KindSection) -> String {
     let rank = section.sort_by.as_deref().unwrap_or("count");
+    let through = section
+        .relation
+        .as_ref()
+        .map(|r| {
+            format!(
+                " of the {} sharing its {}",
+                inline(&r.kind),
+                inline(&r.identity)
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "by {}, ranked by {}",
+        "by {}{through}, ranked by {}",
         inline(&section.group_by),
         inline(rank)
     )
+}
+
+/// What a reader needs before the rows: records the section or its relation could not read, and
+/// retention that leaves part of the window uncovered.
+fn caveats(report: &Report, section: &KindSection) -> Vec<String> {
+    let relation = section.relation.as_ref();
+    exclusions(section)
+        .into_iter()
+        .chain(retention(report, section))
+        .chain(relation.and_then(|r| {
+            excluded(&r.contracts, "under an incompatible contract")
+                .map(|parts| format!("relation to {} excluded {parts}", r.kind))
+        }))
+        .chain(relation.and_then(|r| {
+            let retained = r.retained_since.as_deref()?;
+            (ts_epoch(retained)? > ts_epoch(&report.since)?).then(|| {
+                format!(
+                    "oldest retained {} record {retained}; records before it relate to none",
+                    r.kind
+                )
+            })
+        }))
+        .collect()
 }
 
 /// Collapse control characters so a value stays on the line it was written to. Field and measure
@@ -197,26 +225,32 @@ fn retention(report: &Report, section: &KindSection) -> Option<String> {
 /// The records a section could not read, by reason: those under another known definition are
 /// reached by selecting its ID, and those without a known definition are not interpreted at all.
 fn exclusions(section: &KindSection) -> Option<String> {
+    excluded(
+        &section.contracts,
+        "under an incompatible contract (--contract <schema_id>)",
+    )
+    .map(|parts| format!("excluded {parts}"))
+}
+
+/// The unread records among `contracts`, by reason, or `None` when every one was read. A related
+/// Kind is answered under its current definition only, so its incompatible records name no remedy.
+fn excluded(contracts: &[crate::query::ContractCount], incompatible: &str) -> Option<String> {
     let count = |resolution| -> i64 {
-        section
-            .contracts
+        contracts
             .iter()
             .filter(|c| c.resolution == resolution)
             .map(|c| c.count)
             .sum()
     };
     let parts: Vec<String> = [
-        (
-            count(Resolution::Incompatible),
-            "under an incompatible contract (--contract <schema_id>)",
-        ),
+        (count(Resolution::Incompatible), incompatible),
         (count(Resolution::Undefined), "without a known definition"),
     ]
     .into_iter()
     .filter(|(records, _)| *records > 0)
     .map(|(records, reason)| format!("{records} records {reason}"))
     .collect();
-    (!parts.is_empty()).then(|| format!("excluded {}", parts.join("; ")))
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn text_table(
@@ -487,6 +521,7 @@ mod tests {
             identity: None,
             project_scope: ProjectScope::Unrestricted,
             retained_since: Some("2026-01-01T00:00:00Z".to_string()),
+            relation: None,
             error: None,
             group_count: Some(groups.len()),
             groups,
@@ -634,6 +669,31 @@ mod tests {
             "window starts 2026-01-02T00:00:00Z; oldest retained record 2026-01-20T08:00:00.5Z";
         assert!(format_text(&r).contains(&format!("  ({line})\n")));
         assert!(format_markdown(&r).contains(&format!("_{line}_\n")));
+    }
+
+    #[test]
+    fn a_related_section_names_its_relation_and_what_the_relation_could_not_read() {
+        let mut s = section("claude.api_request", vec![group(Some("main"), 1, 1.0)]);
+        s.group_by = "branch".to_string();
+        s.relation = Some(crate::report::RelationSection {
+            kind: "claude.response".to_string(),
+            identity: "request_id".to_string(),
+            retained_since: Some("2026-01-20T00:00:00Z".to_string()),
+            contracts: vec![crate::query::ContractCount {
+                schema_id: None,
+                kind_version: None,
+                count: 3,
+                resolution: Resolution::Undefined,
+            }],
+        });
+        let text = format_text(&report(vec![s]));
+        for line in [
+            "claude.api_request — by branch of the claude.response sharing its request_id, ranked by duration_ms\n",
+            "  (relation to claude.response excluded 3 records without a known definition)\n",
+            "  (oldest retained claude.response record 2026-01-20T00:00:00Z; records before it relate to none)\n",
+        ] {
+            assert!(text.contains(line), "{text}");
+        }
     }
 
     #[test]

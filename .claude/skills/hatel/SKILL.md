@@ -30,6 +30,7 @@ hatel report --kind check --filter outcome=failed --group-by name --top 0
 hatel report --kind check --group-by metadata.source --sort-by duration_s
 hatel report --kind claude.api_request --window 7d --group-by model --format json
 hatel report --kind claude.response --project "$PWD" --window 7d --group-by branch --format json
+hatel report --kind claude.api_request --relate claude.response --project "$PWD" --window 7d --group-by branch --format json
 hatel report --kind memory --group-by file_path --format json
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
 hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0 --format json
@@ -37,7 +38,15 @@ hatel report --project "$PWD" --format json
 ```
 
 `--filter` is repeatable exact equality; all filters must match. An empty string differs
-from an absent field. `--filter`, `--group-by` and `--sort-by` require `--kind`.
+from an absent field. `--filter`, `--group-by`, `--sort-by` and `--relate` require `--kind`.
+`--relate KIND` (MCP `relate`) groups each record by a field of KIND's record sharing its identity
+value: `--group-by` then names, and defaults to, a field of KIND, while `--filter` and `--sort-by`
+stay on `--kind`. Both must be event Kinds declaring the same identity field, type and hashing;
+anything else is refused with the reason. KIND is read over every retained record, whatever the
+window, project and filters, taking the earliest readable record per identity value. A record with
+no such record, or whose record lacks the field, groups under `key: null`, so the groups add up to
+the unrelated total. The section's `relation` gives KIND's `retained_since` (records before it
+relate to none) and its `contracts` by resolution (only `selected` and `compatible` records relate).
 `--top` cuts every list: Kind groups, `cost` sessions and `cost_groups` projects; `group_count`,
 `cost_session_count` and `cost_group_count` give totals, and `--top 0` returns all. Filter hashed
 payload fields by their original value.
@@ -86,9 +95,14 @@ Report interpretation:
   just after a directory change: an approximate apportionment. `worktree-agent-<id>` is an
   isolated subagent's own branch. An absent branch means none was checked out or an earlier hatel
   recorded the response. Branch names repeat across repositories, so scope with `--project`.
-- A `session` start records the branch its working tree had checked out. A branch's spend is the
-  `cost` rows of its sessions: whole-session totals, so a session that switched branches is not
-  apportioned. An absent branch means none was read (detached HEAD, reftable repository, no Git).
+- Request cost by branch is `claude.api_request` grouped by that `branch` through `--relate
+  claude.response`: the same approximate apportionment. The `null` group is cost attributed to no
+  branch: side requests, which reach no transcript; responses with no branch; and requests of a turn
+  still running, whose responses are read when it ends. Report it beside the branches, never spread
+  it over them.
+- A `session` start records the branch its working tree had checked out. Its sessions' `cost` rows
+  are whole-session totals, so a session that switched branches is not apportioned. An absent
+  branch means none was read (detached HEAD, reftable repository, no Git).
 - Session cache-write estimates forecast a later request; never add them to native costs.
   Never subtract active time from wall time to invent idle time or infer saved time/ROI.
 - Subagent labels can include internal agents. A missing memory-load announcement does
