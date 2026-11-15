@@ -21,14 +21,22 @@ const HOOK_BIN: &str = "hatel-hook";
 /// a transcript is read, and every event a loaded Kind binds. The rest stay in the vocabulary so a
 /// plugin can bind them — e.g. `PostToolUse` for a tool-driven Kind — without firing the hook on
 /// events nothing consumes.
-pub const EVENTS: [&str; 11] = [
+///
+/// A hook that prints nothing and exits 0, as `hatel-hook` always does, leaves Claude Code's
+/// behavior unchanged on every event here. An event whose hook takes over the default behavior,
+/// as a `WorktreeCreate` hook creates the worktree itself, never belongs in this list.
+pub const EVENTS: [&str; 15] = [
     "SessionStart",
     "Stop",
+    "StopFailure",
     "SessionEnd",
     "UserPromptExpansion",
     "PostToolUse",
     "PostToolUseFailure",
+    "PermissionDenied",
     "UserPromptSubmit",
+    "Notification",
+    "SubagentStart",
     "SubagentStop",
     "InstructionsLoaded",
     "PreCompact",
