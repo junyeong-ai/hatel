@@ -263,7 +263,7 @@ if [ "$MCP" = true ]; then
         rc=1
     fi
 else
-    echo "To give agents typed MCP tools (report / kinds / doctor / deliveries / emit / emit_batch):"
+    echo "To give agents typed MCP tools (report / records / kinds / doctor / deliveries / emit / emit_batch):"
     echo "  claude mcp add hatel -- $BIN_DIR/hatel mcp     # or re-run with --mcp"
 fi
 
