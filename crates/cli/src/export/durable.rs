@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::client::Egress;
+
 fn value(value: &Value) -> Result<Value, String> {
     Ok(match value {
         Value::String(s) => json!({"stringValue":s}),
@@ -135,9 +137,9 @@ enum Delivery {
     Failed(String),
 }
 
-async fn send(client: &reqwest::Client, target: &ExportTarget, payload: Vec<u8>) -> Delivery {
+async fn send(client: &Egress, target: &ExportTarget, payload: Vec<u8>) -> Delivery {
     let mut request = client
-        .post(format!("{}/v1/logs", target.endpoint))
+        .post(&format!("{}/v1/logs", target.endpoint))
         .header("content-type", "application/json")
         .timeout(Duration::from_millis(target.timeout_ms.unwrap_or(5000)))
         .body(payload);
@@ -237,7 +239,7 @@ pub(crate) async fn deliver(
     path: &Path,
     state: &Path,
     destination: &str,
-    client: &reqwest::Client,
+    client: &Egress,
 ) -> Result<(), String> {
     let conn = rusqlite_connection(state)?;
     let now = hatel_core::now_epoch();
@@ -356,10 +358,7 @@ pub fn spawn(
 ) {
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let client = match reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .build()
-        {
+        let client = match Egress::new() {
             Ok(client) => client,
             Err(_) => {
                 eprintln!("hatel: cannot create durable delivery client");
@@ -512,7 +511,7 @@ mod tests {
                 .write_record(record)
                 .unwrap();
         }
-        let client = reqwest::Client::new();
+        let client = Egress::new().unwrap();
         deliver(&path, home.path(), &endpoint, &client)
             .await
             .unwrap();
@@ -620,7 +619,7 @@ mod tests {
                 .queued,
             1
         );
-        let client = reqwest::Client::new();
+        let client = Egress::new().unwrap();
         deliver(&path, home.path(), &endpoint, &client)
             .await
             .unwrap();
@@ -634,7 +633,7 @@ mod tests {
         conn.execute("UPDATE deliveries SET next_attempt_at=0", [])
             .unwrap();
         drop(conn);
-        deliver(&path, home.path(), &endpoint, &reqwest::Client::new())
+        deliver(&path, home.path(), &endpoint, &Egress::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -697,7 +696,7 @@ mod tests {
             &path,
             home.path(),
             "http://127.0.0.1:1",
-            &reqwest::Client::new(),
+            &Egress::new().unwrap(),
         )
         .await
         .unwrap();
@@ -737,7 +736,7 @@ mod tests {
             &path,
             home.path(),
             "http://127.0.0.1:1",
-            &reqwest::Client::new(),
+            &Egress::new().unwrap(),
         )
         .await
         .unwrap();
@@ -779,7 +778,7 @@ mod tests {
             &path,
             home.path(),
             "http://127.0.0.1:1",
-            &reqwest::Client::new(),
+            &Egress::new().unwrap(),
         )
         .await
         .unwrap();

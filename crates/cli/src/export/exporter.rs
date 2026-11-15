@@ -13,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use hatel_core::{ExportMode, ExportTarget, SessionIndexCache};
 
+use super::client::Egress;
 use super::transform::{attribute_values, enrich_logs, enrich_metrics};
 use crate::claude::{SESSION_ID, USER_EMAIL};
 use crate::throttle::{Tally, Throttle};
@@ -35,9 +36,6 @@ const MAX_DEFERRED: usize = 64;
 /// evidently never going to be indexed (it predates the wiring). Egress privacy outranks delivery,
 /// so an unresolved body fails closed.
 const DEFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// Cap on establishing the TCP/TLS connection, so a downstream that accepts the socket but never
-/// responds can't pin the drain task past this.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Which OTLP signal a body is — selects the downstream path and the enrich walker. "Signal" is the
 /// OTel-native term (metrics / logs / traces); kept distinct from the registry's `Kind` vocabulary.
@@ -334,7 +332,7 @@ enum TargetSet {
 struct Worker {
     policy: Option<(PathBuf, BTreeSet<String>)>,
     targets: Vec<ExportTarget>,
-    client: reqwest::Client,
+    client: Egress,
     index: SessionIndexCache,
     queued_bytes: Arc<AtomicUsize>,
     /// Whether any target enriches or filters by project — both need the session→project map, so
@@ -354,10 +352,7 @@ impl Worker {
     fn new(targets: Vec<ExportTarget>, state_dir: PathBuf, queued_bytes: Arc<AtomicUsize>) -> Self {
         // The only way this fails is a broken TLS backend (the rustls provider is compiled in), so
         // a fallback `Client::new()` would fail identically — fail loud instead of pretending.
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()
-            .expect("reqwest client (rustls) initialises");
+        let client = Egress::new().expect("reqwest client (rustls) initialises");
         let index_needed = targets
             .iter()
             .any(|t| t.mode == ExportMode::Enriched || t.projects.is_filtered());
