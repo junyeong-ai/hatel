@@ -81,7 +81,8 @@ cargo audit   # after dependency updates
   query. A new question is a query, not a schema edit.
 - Field declarations own types, requiredness and units. Numbers are JSON numbers; a stored value
   its type rejects stays visible as `invalid_count`. Duration buckets are cumulative in the
-  field's `s` or `ms` unit.
+  field's `s` or `ms` unit, and a duration measure's `quantiles` are exact over its valid values,
+  interpolated as `percentile_cont` is.
 - Every record carries its Kind's contract fingerprint (`schema_id`); identity is part of it,
   query defaults are not. A record is stored only beside its contract's definition (`contracts`).
 - Readers resolve each stored contract against the answering definition (`KindSpec::reads`,

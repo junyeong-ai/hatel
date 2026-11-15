@@ -12,6 +12,7 @@ fn io(e: impl std::fmt::Display) -> crate::Error {
 
 pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    conn.create_aggregate_function("hatel_quantiles", 1, flags, Quantiles)?;
     conn.create_scalar_function("hatel_epoch", 1, flags, |c| {
         Ok(c.get::<Option<String>>(0)?
             .and_then(|value| value.parse::<jiff::Timestamp>().ok())
@@ -22,6 +23,46 @@ pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
             .and_then(|value| value.parse::<jiff::Timestamp>().ok())
             .map(|t| crate::model::timestamp_parts(t).1))
     })
+}
+
+/// `hatel_quantiles(value)`: every [`crate::report::QUANTILES`] of a group's non-NULL values, as a
+/// JSON array in that order, or NULL where the group has none. The values are held until the group
+/// ends, as an exact quantile requires.
+struct Quantiles;
+
+impl rusqlite::functions::Aggregate<Vec<f64>, Option<String>> for Quantiles {
+    fn init(&self, _: &mut rusqlite::functions::Context<'_>) -> rusqlite::Result<Vec<f64>> {
+        Ok(Vec::new())
+    }
+
+    fn step(
+        &self,
+        ctx: &mut rusqlite::functions::Context<'_>,
+        values: &mut Vec<f64>,
+    ) -> rusqlite::Result<()> {
+        values.extend(ctx.get::<Option<f64>>(0)?);
+        Ok(())
+    }
+
+    fn finalize(
+        &self,
+        _: &mut rusqlite::functions::Context<'_>,
+        values: Option<Vec<f64>>,
+    ) -> rusqlite::Result<Option<String>> {
+        let Some(mut values) = values.filter(|values| !values.is_empty()) else {
+            return Ok(None);
+        };
+        values.sort_by(f64::total_cmp);
+        let last = values.len() - 1;
+        let quantiles = crate::report::QUANTILES.map(|quantile| {
+            let rank = quantile * last as f64;
+            let (below, above) = (rank.floor() as usize, rank.ceil() as usize);
+            values[below] + (rank - below as f64) * (values[above] - values[below])
+        });
+        serde_json::to_string(&quantiles)
+            .map(Some)
+            .map_err(|e| rusqlite::Error::UserFunctionError(e.into()))
+    }
 }
 
 fn path(field: &str) -> String {
@@ -415,8 +456,16 @@ fn relation(
 struct Grouped {
     sql: String,
     args: Vec<Value>,
-    layouts: Vec<(usize, Vec<f64>)>,
+    layouts: Vec<MeasureColumns>,
     total_column: usize,
+}
+
+/// Where one measure's aggregates sit in a grouped row: six from `start`, then one count per
+/// duration bucket bound, then the duration quantiles' column.
+struct MeasureColumns {
+    start: usize,
+    bounds: Vec<f64>,
+    quantiles: Option<usize>,
 }
 
 fn grouped(
@@ -547,7 +596,17 @@ fn grouped(
                 "COUNT(CASE WHEN {valid} AND {value}<={bound} THEN 1 END)"
             ));
         }
-        layouts.push((start, bounds));
+        let quantiles = scale.map(|_| {
+            columns.push(format!(
+                "hatel_quantiles(CASE WHEN {valid} THEN CAST({value} AS REAL) END)"
+            ));
+            columns.len() - 1
+        });
+        layouts.push(MeasureColumns {
+            start,
+            bounds,
+            quantiles,
+        });
     }
     let total_column = columns.len();
     columns.push("COUNT(*) OVER ()".into());
@@ -558,7 +617,7 @@ fn grouped(
     let sort = q.sort_by.or(spec.measures.first().map(String::as_str));
     let sort_column = sort
         .and_then(|s| spec.measures.iter().position(|m| m == s))
-        .map_or(2, |i| layouts[i].0 + 1);
+        .map_or(2, |i| layouts[i].start + 1);
     sql.push_str(&format!(" ORDER BY {sort_column} DESC, key IS NULL, key"));
     if q.top_n > 0 {
         sql.push_str(&format!(" LIMIT {}", q.top_n));
@@ -596,7 +655,11 @@ impl Grouped {
                     .iter()
                     .enumerate()
                     .map(|(i, name)| {
-                        let (start, bounds) = &layouts[i];
+                        let MeasureColumns {
+                            start,
+                            bounds,
+                            quantiles,
+                        } = &layouts[i];
                         let start = *start;
                         let valid_count: i64 = row.get(start + 1)?;
                         let missing_count: i64 = row.get(start + 2)?;
@@ -633,6 +696,31 @@ impl Grouped {
                                     })
                                 })
                                 .collect::<rusqlite::Result<Vec<_>>>()?,
+                            quantiles: quantiles
+                                .map(|column| row.get::<_, Option<String>>(column))
+                                .transpose()?
+                                .flatten()
+                                .map(|values| {
+                                    serde_json::from_str::<Vec<f64>>(&values).map_err(|e| {
+                                        rusqlite::Error::FromSqlConversionFailure(
+                                            start,
+                                            rusqlite::types::Type::Text,
+                                            Box::new(e),
+                                        )
+                                    })
+                                })
+                                .transpose()?
+                                .map(|values| {
+                                    crate::report::QUANTILES
+                                        .iter()
+                                        .zip(values)
+                                        .map(|(quantile, value)| crate::report::Quantile {
+                                            quantile: *quantile,
+                                            value,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                     })
                     .collect::<rusqlite::Result<Vec<_>>>()?;

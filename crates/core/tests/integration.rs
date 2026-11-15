@@ -1816,6 +1816,44 @@ fn a_newer_state_under_an_unreadable_contract_hides_its_entity() {
 }
 
 #[test]
+fn a_duration_measure_reports_interpolated_quantiles_of_its_valid_values() {
+    let cfg = test_config(vec![]);
+    let reg = load_core().unwrap();
+    for duration in [
+        serde_json::json!(10),
+        serde_json::json!(1),
+        serde_json::json!(3),
+        serde_json::json!(2),
+        serde_json::json!(4),
+        serde_json::Value::Null,
+    ] {
+        let mut payload = serde_json::json!({"name": "lint", "outcome": "passed"});
+        if !duration.is_null() {
+            payload["duration_s"] = duration;
+        }
+        let env = make_envelope(
+            "check",
+            serde_json::from_value(payload).unwrap(),
+            &reg,
+            true,
+        )
+        .unwrap();
+        hatel_core::build_sink(&cfg, &reg)
+            .write_record(&env)
+            .unwrap();
+    }
+    let groups = aggregate(&reg, &cfg, "check", &query(i64::MIN, 0, None));
+    let duration = &groups[0].sums[0];
+    assert_eq!((duration.valid_count, duration.missing_count), (5, 1));
+    let quantiles: Vec<(f64, f64)> = duration
+        .quantiles
+        .iter()
+        .map(|q| (q.quantile, (q.value * 100.0).round() / 100.0))
+        .collect();
+    assert_eq!(quantiles, [(0.5, 3.0), (0.9, 7.6), (0.99, 9.76)]);
+}
+
+#[test]
 fn records_list_readable_occurrences_newest_first_with_declared_fields() {
     let dir = tempfile::tempdir().unwrap();
     let plugin = dir.path().join("deploy.toml");

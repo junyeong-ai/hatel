@@ -74,7 +74,7 @@ hatel doctor                        # check the wiring
 
 ## Reading results
 
-- **Read a sum with its measurement count.** Read `sum` with `valid_count`. In human tables `—` means unmeasured, `7 (1/3)` a sum over the one measured record of three, and `0` a measured zero.
+- **Read a sum with its measurement count.** Read `sum` with `valid_count`. In human tables `—` means unmeasured, `7 (1/3)` a sum over the one measured record of three, and `0` a measured zero. In JSON, a duration measure also carries the `quantiles` (p50, p90, p99) of its measured values.
 - **An empty answer is not necessarily zero.** Check the section `error`, `storage_error`, `cost_error` and `unreadable_kinds` first.
 - **Check what is retained.** `retained_since` is the time of the oldest retained record. Later than the window start (`since`), it means the window’s earlier part holds no retained record.
 - **There are two cost bases.** The `cost` section is lifetime session totals selected by last activity (`cost_basis`); request cost that occurred in the window comes from `claude.api_request`. Neither is an invoice, and the `session` cache-write estimate is a forecast never added to them.

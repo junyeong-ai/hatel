@@ -79,6 +79,7 @@ Report interpretation:
 
 - `sum` requires its `valid_count`; `missing_count` and `invalid_count` name what was
   excluded. Human `—` means unmeasured, `7 (1/3)` a sum over one measured record of three.
+  Duration measures carry `quantiles` (p50, p90, p99) of their valid values in JSON.
   A measured zero remains zero. Numeric strings are not coerced into measures.
   Aggregates use f64; integers above 2^53 can lose precision. Record identifiers as strings.
 - `retained_since` is the oldest retained record, not proof of continuous collection.

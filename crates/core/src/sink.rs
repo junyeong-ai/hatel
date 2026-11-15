@@ -240,6 +240,7 @@ fn initialize(conn: &mut Connection) -> crate::Result<()> {
 pub(crate) fn empty() -> crate::Result<Connection> {
     let mut conn = Connection::open_in_memory().map_err(io)?;
     initialize(&mut conn)?;
+    crate::query::functions(&conn).map_err(io)?;
     Ok(conn)
 }
 

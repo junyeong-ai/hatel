@@ -116,12 +116,26 @@ pub struct Measure {
     pub max: Option<f64>,
     pub unit: Option<String>,
     pub buckets: Vec<Bucket>,
+    /// The distribution of a duration measure's valid values, by [`QUANTILES`]; empty for any
+    /// other measure and where no value was valid.
+    pub quantiles: Vec<Quantile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Bucket {
     pub upper_bound: f64,
     pub count: i64,
+}
+
+/// The quantiles a duration measure reports: its median and its tail.
+pub const QUANTILES: [f64; 3] = [0.5, 0.9, 0.99];
+
+/// One quantile of a measure's valid values, linearly interpolated between the closest ranks as
+/// SQL's `percentile_cont` is.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Quantile {
+    pub quantile: f64,
+    pub value: f64,
 }
 
 /// One group's aggregate: its key, how many records it had, and the sum of each
