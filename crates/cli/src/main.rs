@@ -47,11 +47,19 @@ enum Command {
         #[arg(long)]
         wait: bool,
     },
-    /// Aggregate the ledger over a rolling window.
+    /// Aggregate the ledger over a period: a rolling window unless `--since` fixes its start.
     Report {
-        /// Rolling window in days, e.g. `30d` (days only).
-        #[arg(long, default_value = "30d")]
-        window: String,
+        /// Window in days, e.g. `30d` (days only; default 30d), ending at `--until` or now.
+        #[arg(long, conflicts_with = "since")]
+        window: Option<String>,
+        /// Start of the period instead of a window: an RFC 3339 timestamp, or a date
+        /// (`2026-11-01`) naming local midnight.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the period, exclusive: an RFC 3339 timestamp or a date naming local midnight.
+        /// Without it the period stays open.
+        #[arg(long)]
+        until: Option<String>,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         /// Restrict to one project: an absolute path names the repository it is in (a linked
@@ -214,6 +222,8 @@ fn run() -> i32 {
         },
         Command::Report {
             window,
+            since,
+            until,
             format,
             project,
             kind,
@@ -223,18 +233,30 @@ fn run() -> i32 {
             sort_by,
             filter,
             relate,
-        } => report_cmd(
-            &window,
-            format,
-            top,
-            project.as_deref(),
-            kind.as_deref(),
-            contract.as_deref(),
-            group_by.as_deref(),
-            sort_by.as_deref(),
-            &filter,
-            relate.as_deref(),
-        ),
+        } => match report::Period::resolve(
+            window.as_deref(),
+            since.as_deref(),
+            until.as_deref(),
+            jiff::Timestamp::now(),
+            &jiff::tz::TimeZone::system(),
+        ) {
+            Ok(period) => report_cmd(
+                &period,
+                format,
+                top,
+                project.as_deref(),
+                kind.as_deref(),
+                contract.as_deref(),
+                group_by.as_deref(),
+                sort_by.as_deref(),
+                &filter,
+                relate.as_deref(),
+            ),
+            Err(e) => {
+                eprintln!("report: {e}");
+                2
+            }
+        },
         Command::Init {
             scope,
             print,
@@ -507,7 +529,7 @@ fn parse_pairs(fields: &[String]) -> Result<Payload, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn report_cmd(
-    window: &str,
+    period: &report::Period,
     format: Format,
     top: usize,
     project: Option<&str>,
@@ -540,14 +562,11 @@ fn report_cmd(
                 return 2;
             }
         };
-    let Some(window_secs) = report::parse_window(window) else {
-        eprintln!("report: invalid window {window:?} (expected e.g. 30d — days only)");
-        return 2;
-    };
     // One query for the whole report — every format and the cost section share its single
-    // `since`, so they can't disagree on a record in the last second.
+    // period, so they can't disagree on a record in the last second.
     let q = report::Query {
-        since: hatel_core::now_epoch().saturating_sub(window_secs),
+        since: period.since,
+        until: period.until,
         top_n: top,
         project: restrictions.project.as_deref(),
         kind,
@@ -557,7 +576,7 @@ fn report_cmd(
         filters: &restrictions.filters,
         relate: restrictions.relation,
     };
-    let report = report::Report::build(&reg, &cfg, window, &q);
+    let report = report::Report::build(&reg, &cfg, period.window.as_deref(), &q);
     let failed = report.failed();
     match format {
         Format::Json => print!("{}", machine_json(&report)),
@@ -854,9 +873,10 @@ mod tests {
             report::Report::build(
                 &reg,
                 &cfg,
-                "1d",
+                Some("1d"),
                 &report::Query {
                     since: hatel_core::now_epoch() - 86_400,
+                    until: None,
                     top_n: 0,
                     project,
                     kind: None,
@@ -1046,6 +1066,7 @@ mod tests {
         let reg = build_registry(&cfg).unwrap();
         let q = |kind: Option<&'static str>| report::Query {
             since: 0,
+            until: None,
             top_n: 0,
             project: None,
             kind,
@@ -1060,7 +1081,7 @@ mod tests {
         let full: serde_json::Value = serde_json::from_str(&machine_json(&report::Report::build(
             &reg,
             &cfg,
-            "7d",
+            Some("7d"),
             &q(None),
         )))
         .unwrap();
@@ -1077,7 +1098,7 @@ mod tests {
         assert!(full_kinds.len() > 1);
 
         let scoped: serde_json::Value = serde_json::from_str(&machine_json(
-            &report::Report::build(&reg, &cfg, "7d", &q(Some("tool"))),
+            &report::Report::build(&reg, &cfg, Some("7d"), &q(Some("tool"))),
         ))
         .unwrap();
         let scoped_kinds: Vec<&str> = scoped["kinds"]

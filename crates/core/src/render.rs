@@ -19,12 +19,18 @@ const KEY_WIDTH: usize = 34;
 /// Space between a row's columns, and so between the bar and the key it labels.
 const GUTTER: usize = 2;
 
+/// The period a report covers, as its heading names it.
+fn period(report: &Report) -> String {
+    match (&report.window, &report.until) {
+        (Some(window), None) => format!("rolling {window}"),
+        (Some(window), Some(until)) => format!("{window} until {until}"),
+        (None, None) => format!("since {}", report.since),
+        (None, Some(until)) => format!("{} until {until}", report.since),
+    }
+}
+
 pub fn format_text(report: &Report) -> String {
-    let mut out = format!(
-        "=== hatel — rolling {}{} ===\n",
-        report.window,
-        scope(report)
-    );
+    let mut out = format!("=== hatel — {}{} ===\n", period(report), scope(report));
     if let Some(unreadable) = &report.unreadable_kinds {
         out.push_str(&format!("  ({unreadable})\n"));
     }
@@ -68,7 +74,7 @@ pub fn format_text(report: &Report) -> String {
 }
 
 pub fn format_markdown(report: &Report) -> String {
-    let mut out = format!("# hatel — rolling {}{}\n", report.window, scope(report));
+    let mut out = format!("# hatel — {}{}\n", period(report), scope(report));
     if let Some(unreadable) = &report.unreadable_kinds {
         out.push_str(&format!("\n_{unreadable}_\n"));
     }
@@ -545,8 +551,9 @@ mod tests {
         Report {
             cost_error: None,
             storage_error: None,
-            window: "30d".to_string(),
+            window: Some("30d".to_string()),
             since: "2026-01-02T00:00:00Z".to_string(),
+            until: None,
             project: None,
             filters: Vec::new(),
             top_n: 5,

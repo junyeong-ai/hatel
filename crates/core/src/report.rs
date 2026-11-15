@@ -27,6 +27,9 @@ const MAX_WINDOW_DAYS: i64 = 100_000;
 const COST_DIMENSION: &str = "project";
 const COST_RANK: &str = "cost_usd";
 
+/// The window a report covers when neither a window nor `since` is given.
+pub const DEFAULT_WINDOW: &str = "30d";
+
 /// Parse a `<n>d` window into seconds.
 pub fn parse_window(spec: &str) -> Option<i64> {
     let days: i64 = spec.strip_suffix('d')?.parse().ok()?;
@@ -34,6 +37,70 @@ pub fn parse_window(spec: &str) -> Option<i64> {
         return None;
     }
     Some(days * 86_400)
+}
+
+/// The occurrence period a report or listing covers: from `since` (inclusive) to `until`
+/// (exclusive, or open-ended), and the `<n>d` window that named it when one did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Period {
+    pub window: Option<String>,
+    pub since: i64,
+    pub until: Option<i64>,
+}
+
+impl Period {
+    /// Resolve a period from its arguments: a window (default [`DEFAULT_WINDOW`]) ending at
+    /// `until`, or now when `until` is absent, or an explicit `since`, which no window may
+    /// accompany. An instant is an RFC 3339 timestamp, or a date naming the midnight that starts it
+    /// in `zone`. Without `until` the period stays open, so a record a producer timestamped
+    /// slightly ahead of this clock still counts.
+    pub fn resolve(
+        window: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        now: jiff::Timestamp,
+        zone: &jiff::tz::TimeZone,
+    ) -> Result<Period, String> {
+        let until = until.map(|u| instant("until", u, zone)).transpose()?;
+        let (window, since) = match (window, since) {
+            (Some(_), Some(_)) => {
+                return Err("give either a window or since, not both".into());
+            }
+            (None, Some(since)) => (None, instant("since", since, zone)?),
+            (window, None) => {
+                let window = window.unwrap_or(DEFAULT_WINDOW);
+                let seconds = parse_window(window).ok_or_else(|| {
+                    format!("invalid window {window:?} (expected e.g. 30d — days only)")
+                })?;
+                let end = until.unwrap_or_else(|| now.as_second());
+                (Some(window.to_string()), end.saturating_sub(seconds))
+            }
+        };
+        if until.is_some_and(|until| since >= until) {
+            return Err("since must be earlier than until".into());
+        }
+        Ok(Period {
+            window,
+            since,
+            until,
+        })
+    }
+}
+
+fn instant(name: &str, value: &str, zone: &jiff::tz::TimeZone) -> Result<i64, String> {
+    if let Ok(timestamp) = value.parse::<jiff::Timestamp>() {
+        return Ok(timestamp.as_second());
+    }
+    value
+        .parse::<jiff::civil::Date>()
+        .ok()
+        .and_then(|date| date.to_zoned(zone.clone()).ok())
+        .map(|zoned| zoned.timestamp().as_second())
+        .ok_or_else(|| {
+            format!(
+                "invalid {name} {value:?} (expected an RFC 3339 timestamp or a YYYY-MM-DD date)"
+            )
+        })
 }
 
 /// One measure's summed value for a group.
@@ -77,13 +144,15 @@ pub struct Filter {
     pub value: String,
 }
 
-/// One report query: the window boundary plus every user restriction, carried as a unit
+/// One report query: the period's bounds plus every user restriction, carried as a unit
 /// through all output formats so they cannot disagree on what is in scope.
 #[derive(Debug, Clone, Copy)]
 pub struct Query<'a> {
-    /// Epoch-second lower bound (the rolling window's start). The caller computes it once
-    /// so every Kind AND the cost section share one boundary.
+    /// Epoch-second lower bound. The caller resolves it once, so every Kind AND the cost
+    /// section share one boundary.
     pub since: i64,
+    /// Exclusive epoch-second upper bound; `None` leaves the period open.
+    pub until: Option<i64>,
     /// Groups shown per Kind (0 = all).
     pub top_n: usize,
     /// Restrict to one project, by key or label (`project_selector` turns a path into its key).
@@ -232,10 +301,13 @@ pub struct RelationSection {
 /// every format from this one value.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
-    pub window: String,
-    /// The instant the window starts. A section whose `retained_since` is later holds no retained
-    /// record from the window's earlier part, which its totals alone do not show.
+    /// The `<n>d` window that named the period; `None` when `since` did.
+    pub window: Option<String>,
+    /// The instant the period starts. A section whose `retained_since` is later holds no retained
+    /// record from the period's earlier part, which its totals alone do not show.
     pub since: String,
+    /// The instant the period ends, exclusive; `None` when it is open.
+    pub until: Option<String>,
     pub project: Option<String>,
     pub filters: Vec<Filter>,
     pub top_n: usize,
@@ -259,7 +331,7 @@ pub struct Report {
 }
 
 impl Report {
-    pub fn build(reg: &Registry, cfg: &Config, window: &str, q: &Query) -> Report {
+    pub fn build(reg: &Registry, cfg: &Config, window: Option<&str>, q: &Query) -> Report {
         let kinds = reg
             .kinds()
             .filter(|s| q.kind.is_none_or(|k| s.name == k))
@@ -334,12 +406,17 @@ impl Report {
             Err(error) => (None, Some(error.to_string())),
         };
         Report {
-            window: window.to_string(),
-            // A window starts no later than now, so a boundary outside the representable range
+            window: window.map(str::to_string),
+            // A period starts no later than now, so a boundary outside the representable range
             // lies before its earliest instant and admits the records that instant does.
             since: jiff::Timestamp::from_second(q.since)
                 .unwrap_or(jiff::Timestamp::MIN)
                 .to_string(),
+            until: q.until.map(|until| {
+                jiff::Timestamp::from_second(until)
+                    .unwrap_or(jiff::Timestamp::MAX)
+                    .to_string()
+            }),
             project: q.project.map(str::to_string),
             filters: q
                 .filters
@@ -371,8 +448,8 @@ impl Report {
     }
 }
 
-/// Cost snapshot rows within the window, optionally restricted to one project — so the cost
-/// section honors `--window`/`--project` exactly as the Kind aggregation does.
+/// Cost snapshot rows last active within the period, optionally restricted to one project — so the
+/// cost section honors the period and `--project` exactly as the Kind aggregation does.
 fn cost_rows(state_dir: &std::path::Path, q: &Query) -> std::io::Result<Vec<CostRow>> {
     Ok(cost::read_snapshot(state_dir)?
         .into_iter()
@@ -380,7 +457,9 @@ fn cost_rows(state_dir: &std::path::Path, q: &Query) -> std::io::Result<Vec<Cost
             q.project
                 .is_none_or(|p| r.project == p || r.project_key.as_deref() == Some(p))
         })
-        .filter(|r| ts_epoch(&r.ts).is_some_and(|t| t >= q.since))
+        .filter(|r| {
+            ts_epoch(&r.ts).is_some_and(|t| t >= q.since && q.until.is_none_or(|until| t < until))
+        })
         .collect())
 }
 
@@ -498,6 +577,45 @@ fn truncate<T>(items: &mut Vec<T>, top_n: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_period_is_a_window_ending_at_until_or_an_explicit_start() {
+        let now: jiff::Timestamp = "2026-11-15T06:00:00Z".parse().unwrap();
+        let seoul = jiff::tz::TimeZone::get("Asia/Seoul").unwrap();
+        let resolve = |window, since, until| Period::resolve(window, since, until, now, &seoul);
+        let at = |instant: &str| instant.parse::<jiff::Timestamp>().unwrap().as_second();
+
+        let rolling = resolve(None, None, None).unwrap();
+        assert_eq!(rolling.window.as_deref(), Some("30d"));
+        assert_eq!(rolling.since, now.as_second() - 30 * 86_400);
+        assert_eq!(rolling.until, None);
+
+        let ending = resolve(Some("14d"), None, Some("2026-11-01")).unwrap();
+        assert_eq!(ending.until, Some(at("2026-10-31T15:00:00Z")));
+        assert_eq!(ending.since, at("2026-10-31T15:00:00Z") - 14 * 86_400);
+
+        let fixed = resolve(
+            None,
+            Some("2026-10-01T00:00:00Z"),
+            Some("2026-10-15T00:00:00+09:00"),
+        )
+        .unwrap();
+        assert_eq!(fixed.window, None);
+        assert_eq!(fixed.since, at("2026-10-01T00:00:00Z"));
+        assert_eq!(fixed.until, Some(at("2026-10-14T15:00:00Z")));
+
+        for (window, since, until) in [
+            (Some("7d"), Some("2026-10-01"), None),
+            (None, Some("2026-10-15"), Some("2026-10-15")),
+            (None, Some("yesterday"), None),
+            (Some("7 days"), None, None),
+        ] {
+            assert!(
+                resolve(window, since, until).is_err(),
+                "{window:?} {since:?} {until:?}"
+            );
+        }
+    }
 
     fn group(key: &str, count: i64, sums: &[(&str, f64)]) -> GroupAgg {
         GroupAgg {

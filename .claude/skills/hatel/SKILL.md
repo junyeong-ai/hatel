@@ -19,7 +19,8 @@ nor a receiver. `hatel-hook` runs through lifecycle wiring; do not invoke it man
 ## Query recorded facts
 
 1. Inspect `hatel kinds --json` for loaded schemas, fields, mode, identity and measures.
-2. Choose Kind, project, window, filters and grouping. Use JSON for parsing or comparison.
+2. Choose Kind, project, period, filters and grouping. Use JSON for parsing or comparison.
+   `--window` counts back from `--until` (or now); `--since`/`--until` fix a before/after period.
 3. Before interpreting totals, check section `error`, excluded `contracts`, `storage_error`,
    `cost_error`, `unreadable_kinds`, measurement counts and retention limits. An empty answer
    does not establish zero activity.
@@ -32,6 +33,7 @@ hatel report --kind claude.api_request --window 7d --group-by model --format jso
 hatel report --kind claude.response --project "$PWD" --window 7d --group-by branch --format json
 hatel report --kind claude.api_request --relate claude.response --project "$PWD" --window 7d --group-by branch --format json
 hatel report --kind memory --group-by file_path --format json
+hatel report --kind memory --group-by file_path --since 2026-11-01 --until 2026-11-15 --format json
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
 hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0 --format json
 hatel report --project "$PWD" --format json
@@ -73,7 +75,7 @@ Report interpretation:
   A measured zero remains zero. Numeric strings are not coerced into measures.
   Aggregates use f64; integers above 2^53 can lose precision. Record identifiers as strings.
 - `retained_since` is the oldest retained record, not proof of continuous collection.
-  A `retained_since` later than the report's `since` (the window's start) means the window's
+  A `retained_since` later than the report's `since` (the period's start) means the period's
   earlier part holds no retained record, whether it was quiet, uncollected or already pruned.
   `unreadable_kinds` means some stored records have no loaded schema.
 - Event mode counts records, or the earliest matching identity per group when declared.

@@ -103,8 +103,18 @@ impl Executable {
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReportParams {
-    #[schemars(description = "Rolling window in days, e.g. \"30d\" (days only; default \"30d\")")]
+    #[schemars(
+        description = "Window in days, e.g. \"30d\" (days only; default \"30d\"), ending at `until` or now. Not with `since`."
+    )]
     pub window: Option<String>,
+    #[schemars(
+        description = "Start of the period instead of a window: an RFC 3339 timestamp, or a YYYY-MM-DD date naming local midnight."
+    )]
+    pub since: Option<String>,
+    #[schemars(
+        description = "End of the period, exclusive: an RFC 3339 timestamp or a YYYY-MM-DD date naming local midnight. Without it the period stays open."
+    )]
+    pub until: Option<String>,
     #[schemars(
         description = "Restrict to one project: an absolute path names the repository it is in (a linked worktree or subdirectory included), anything else is a canonical key or label; default is all projects"
     )]
@@ -176,7 +186,7 @@ pub struct BatchParams {
 impl HatelMcp {
     #[tool(
         title = "Aggregate recorded telemetry",
-        description = "Aggregate the telemetry ledger over a rolling window: per-Kind group counts and summed measures, plus the cost snapshot: sessions ranked by spend with their tokens_by_type (cache accounting), by_model (model mix) and by_agent (subagent budget) breakdowns, and their per-project rollup in cost_groups. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`.",
+        description = "Aggregate the telemetry ledger over a period (a rolling window unless `since` fixes its start): per-Kind group counts and summed measures, plus the cost snapshot: sessions ranked by spend with their tokens_by_type (cache accounting), by_model (model mix) and by_agent (subagent budget) breakdowns, and their per-project rollup in cost_groups. Each Kind section aggregates only records whose `contracts[].resolution` is selected or compatible and counts the excluded ones. A non-null `unreadable_kinds` means the ledger holds Kinds no loaded schema declares, so this rollup covers less than was collected — report that rather than the totals alone. Same JSON as `hatel report --format json`.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn report(
@@ -295,9 +305,13 @@ impl HatelMcp {
 }
 
 fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
-    let window = p.window.unwrap_or_else(|| "30d".to_string());
-    let window_secs = report::parse_window(&window)
-        .ok_or_else(|| format!("invalid window {window:?} (expected e.g. 30d — days only)"))?;
+    let period = report::Period::resolve(
+        p.window.as_deref(),
+        p.since.as_deref(),
+        p.until.as_deref(),
+        jiff::Timestamp::now(),
+        &jiff::tz::TimeZone::system(),
+    )?;
     let cfg = Config::load().map_err(|e| e.to_string())?;
     let reg = build_query_registry(&cfg, p.kind.as_deref(), p.contract.as_deref())
         .map_err(|e| e.to_string())?;
@@ -312,7 +326,8 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
         p.relate.as_deref(),
     )?;
     let q = report::Query {
-        since: hatel_core::now_epoch().saturating_sub(window_secs),
+        since: period.since,
+        until: period.until,
         top_n: p.top.unwrap_or(report::TOP_N),
         project: restrictions.project.as_deref(),
         kind: p.kind.as_deref(),
@@ -322,7 +337,7 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
         filters: &restrictions.filters,
         relate: restrictions.relation,
     };
-    let report = report::Report::build(&reg, &cfg, &window, &q);
+    let report = report::Report::build(&reg, &cfg, period.window.as_deref(), &q);
     let mut result = success(machine_json(&report));
     result.is_error = Some(report.failed());
     Ok(result)

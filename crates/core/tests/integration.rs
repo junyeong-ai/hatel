@@ -40,6 +40,7 @@ fn example_plugin() -> PathBuf {
 fn query(since: i64, top_n: usize, project: Option<&str>) -> report::Query<'_> {
     report::Query {
         since,
+        until: None,
         top_n,
         project,
         kind: None,
@@ -1280,8 +1281,8 @@ fn a_store_written_by_a_newer_schema_is_refused() {
 }
 
 #[test]
-fn sqlite_window_filter_excludes_old_records() {
-    // The query pushes the time window into SQL; an out-of-window row is excluded.
+fn sqlite_period_bounds_exclude_records_outside_them() {
+    // The query pushes the period's bounds into SQL; a row outside either bound is excluded.
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
     // recent record via the hook's write path
@@ -1306,6 +1307,20 @@ fn sqlite_window_filter_excludes_old_records() {
         count(hatel_core::now_epoch() - 86_400),
         1,
         "ancient row excluded by SQL window"
+    );
+    let before_yesterday = aggregate(
+        &reg,
+        &cfg,
+        "prompt",
+        &report::Query {
+            until: Some(hatel_core::now_epoch() - 86_400),
+            ..query(i64::MIN, 0, None)
+        },
+    );
+    assert_eq!(
+        before_yesterday.iter().map(|g| g.count).sum::<i64>(),
+        1,
+        "recent row excluded by the period's end"
     );
 }
 
@@ -1361,7 +1376,7 @@ fn a_kind_section_says_how_far_back_its_store_reaches() {
     let reg = load_core().unwrap();
     let cfg = test_config(vec![]);
     let section = |project: Option<&str>| {
-        report::Report::build(&reg, &cfg, "30d", &query(0, 0, project))
+        report::Report::build(&reg, &cfg, Some("30d"), &query(0, 0, project))
             .kinds
             .into_iter()
             .find(|k| k.kind == "tool")
@@ -1476,7 +1491,8 @@ fn a_report_names_the_stored_kinds_no_loaded_schema_declares() {
     let cfg = test_config(vec![]);
     let reg = load_core().unwrap();
     write(&cfg, &reg, "tool", serde_json::json!({"tool_name": "Bash"}));
-    let build = |cfg: &Config, reg: &_| report::Report::build(reg, cfg, "7d", &query(0, 5, None));
+    let build =
+        |cfg: &Config, reg: &_| report::Report::build(reg, cfg, Some("7d"), &query(0, 5, None));
     assert!(
         build(&cfg, &reg).unreadable_kinds.is_none(),
         "a store holding only declared Kinds has no gap to report"
@@ -2759,7 +2775,7 @@ fn period_request_cost_uses_occurrence_records_and_never_a_session_lifetime_snap
         kind: Some("claude.api_request"),
         ..query(now - 7 * 86400, 0, None)
     };
-    let report = report::Report::build(&registry, &cfg, "7d", &q);
+    let report = report::Report::build(&registry, &cfg, Some("7d"), &q);
     assert_eq!(
         report.cost_basis,
         "session_lifetime_totals_selected_by_last_seen"

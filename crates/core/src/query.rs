@@ -160,6 +160,7 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
 fn related_scope<'a>(q: &Query<'a>) -> Query<'a> {
     Query {
         since: i64::MIN,
+        until: None,
         project: None,
         filters: &[],
         relate: None,
@@ -180,6 +181,7 @@ fn oldest(
         spec,
         &Query {
             since: i64::MIN,
+            until: None,
             ..*q
         },
         &mut args,
@@ -206,6 +208,9 @@ fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
             parameter(args, i64::from(crate::SCHEMA_VERSION))
         ),
     ];
+    if let Some(until) = q.until {
+        conditions.push(format!("occurred_seconds<{}", parameter(args, until)));
+    }
     if let Some(project) = q.project {
         let p = parameter(args, project.to_string());
         let payload = payload_project(spec, project, args);
@@ -586,6 +591,7 @@ mod tests {
         let relation = Relation::between(requests, responses).unwrap();
         let q = Query {
             since: 0,
+            until: None,
             top_n: 0,
             project: None,
             kind: Some(&requests.name),

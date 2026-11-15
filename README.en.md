@@ -65,10 +65,11 @@ hatel doctor                        # check the wiring
 | Failed checks | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
 | Successful skill calls | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | Instruction files loaded into context | `hatel report --kind memory --group-by file_path` |
+| Instruction loads in a fixed period, to compare before and after a change | `hatel report --kind memory --group-by file_path --since 2026-11-01 --until 2026-11-15` |
 | Sessions started on one branch of the current repository | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | Only the current repository | `hatel report --project "$PWD"` |
 
-`--filter` (repeatable, exact match), `--group-by`, `--sort-by` and `--relate` go with `--kind`. With `--relate <Kind>`, `--group-by` names a field of that Kind’s record sharing the same identity value. `--top` shows 5 items per list by default and all with `0`, and states the count before the cut. Use `--format json` for machines. A path given to `--project` selects the repository it is in (a linked worktree included); a path outside every repository is rejected.
+`--filter` (repeatable, exact match), `--group-by`, `--sort-by` and `--relate` go with `--kind`. With `--relate <Kind>`, `--group-by` names a field of that Kind’s record sharing the same identity value. `--window` counts back from `--until`, or from now when it is absent; `--since` fixes the start instead. A date names local midnight, and `--until` is exclusive. `--top` shows 5 items per list by default and all with `0`, and states the count before the cut. Use `--format json` for machines. A path given to `--project` selects the repository it is in (a linked worktree included); a path outside every repository is rejected.
 
 ## Reading results
 
