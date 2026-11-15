@@ -52,7 +52,7 @@ from an absent field. `--filter`, `--group-by`, `--sort-by` and `--relate` requi
 value: `--group-by` then names, and defaults to, a field of KIND, while `--filter` and `--sort-by`
 stay on `--kind`. Both must be event Kinds declaring the same identity field, type and hashing;
 anything else is refused with the reason. KIND is read over every retained record, whatever the
-window, project and filters, taking the earliest readable record per identity value. A record with
+period, project and filters, taking the earliest readable record per identity value. A record with
 no such record, or whose record lacks the field, groups under `key: null`, so the groups add up to
 the unrelated total. The section's `relation` gives KIND's `retained_since` (records before it
 relate to none) and its `contracts` by resolution (only `selected` and `compatible` records relate).
@@ -88,12 +88,12 @@ Report interpretation:
   `unreadable_kinds` means some stored records have no loaded schema.
 - Event mode counts records, or the earliest matching identity per group when declared.
   ID-less event records count individually. This is not storage deduplication.
-- Snapshot mode selects the latest occurrence per project and identity inside the window,
+- Snapshot mode selects the latest occurrence per project and identity inside the period,
   under every contract, before filtering/grouping; an entity whose latest state is unreadable
   is left out. Equal occurrences use observation time; conflicting ties fail. Unchanged
-  entities outside the window are absent: no complete-inventory claim.
+  entities outside the period are absent: no complete-inventory claim.
 - Native `cost` is lifetime session totals selected by last activity, as `cost_basis`
-  states. Use `claude.api_request` for occurrence-window request cost estimates.
+  states. Use `claude.api_request` for estimates of the request cost that occurred in a period.
   Neither is an invoice. `observed_metrics` absent means measurement coverage is unknown.
 - `claude.response` holds the billed tokens of each conversation response, main agent and
   subagents, read from session transcripts; it stays local when native telemetry goes elsewhere.
@@ -119,8 +119,8 @@ Report interpretation:
   not establish that the file was absent from context. Tool duration ends at return,
   including early acceptance of a background command.
 
-MCP server `hatel` (`claude mcp add hatel -- hatel mcp`): `hatel:report`, `hatel:kinds`,
-`hatel:doctor` and `hatel:deliveries` return the JSON their CLI commands print; `hatel:emit` and
+MCP server `hatel` (`claude mcp add hatel -- hatel mcp`): `hatel:report`, `hatel:records`,
+`hatel:kinds`, `hatel:doctor` and `hatel:deliveries` return the JSON their CLI commands print; `hatel:emit` and
 `hatel:emit_batch` share recording validation and return storage receipts or ordered per-item
 results. A failed call returns `isError` with a message naming what to correct.
 

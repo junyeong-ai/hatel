@@ -2,7 +2,7 @@
 //!
 //! A Kind declares its data — an allow-list of fields, which of them are numeric measures, and
 //! which dimension and measure a report defaults to. A query asks a question of that data: over
-//! what window, restricted how, grouped by which dimension, ranked by which measure. Keeping the
+//! what period, restricted how, grouped by which dimension, ranked by which measure. Keeping the
 //! two apart is what lets one schema answer more than one question, and what keeps every output
 //! format rendering the same computed answer rather than deriving its own.
 
@@ -193,7 +193,7 @@ pub struct Query<'a> {
 
 /// A query's records grouped by a field of another Kind's record that shares their identity value,
 /// as a request's cost by the branch its transcript response names. The related Kind is read without
-/// the window, project and filters, which select the records counted and not the record that
+/// the period, project and filters, which select the records counted and not the record that
 /// describes each one: an identity names the same entity whenever its related record occurred.
 #[derive(Debug, Clone, Copy)]
 pub struct Relation<'a> {
@@ -301,7 +301,7 @@ pub struct KindSection {
 /// Kind. A record with no such record, or whose record lacks `group_by`, groups under the `null`
 /// key, so the groups still add up to every record counted. The related Kind is read over every
 /// retained record, so `contracts` counts all of them by resolution, and only `selected` and
-/// `compatible` ones supply keys; a `retained_since` later than the window's start means the
+/// `compatible` ones supply keys; a `retained_since` later than the period's start means the
 /// records before it relate to none.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelationSection {
@@ -326,7 +326,7 @@ pub struct Report {
     pub filters: Vec<Filter>,
     pub top_n: usize,
     pub kinds: Vec<KindSection>,
-    /// The native-OTel cost snapshot, one row per session in the window, ranked by spend and cut
+    /// The native-OTel cost snapshot, one row per session in the period, ranked by spend and cut
     /// at `top_n` like every other list; `top_n = 0` keeps the whole join table a caller relates
     /// to its own records by session.
     pub cost: Vec<CostRow>,

@@ -256,11 +256,11 @@ pub fn records(cfg: &Config, spec: &KindSpec, q: &Query, limit: usize) -> crate:
     })
 }
 
-/// The records a related Kind is read over: every one retained, whatever the window, project and
+/// The records a related Kind is read over: every one retained, whatever the period, project and
 /// filters, which select the records a section counts. A related record need not occur inside the
-/// window of the record it describes: a transcript response is timestamped before the request event
-/// carrying its id, by minutes for a long one, so a window bound would leave a request at the
-/// window's start unattributed.
+/// period of the record it describes: a transcript response is timestamped before the request event
+/// carrying its id, by minutes for a long one, so a period bound would leave a request at the
+/// period's start unattributed.
 fn related_scope<'a>(q: &Query<'a>) -> Query<'a> {
     Query {
         since: i64::MIN,
@@ -272,7 +272,7 @@ fn related_scope<'a>(q: &Query<'a>) -> Query<'a> {
     }
 }
 
-/// The oldest readable record in `q`'s project scope, whatever the window.
+/// The oldest readable record in `q`'s project scope, whatever the period.
 fn oldest(
     conn: &Connection,
     spec: &KindSpec,
@@ -341,7 +341,7 @@ fn filter_conditions(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<S
     filters
 }
 
-/// Records per stored contract in the window, each with how it resolves against the answered
+/// Records per stored contract in the period, each with how it resolves against the answered
 /// definition, so what a section left out is counted rather than silently missing.
 fn contract_counts(
     conn: &Connection,

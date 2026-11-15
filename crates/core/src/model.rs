@@ -133,14 +133,14 @@ pub fn now_iso_utc() -> String {
     jiff::Timestamp::now().to_string()
 }
 
-/// Current UTC time in epoch seconds — the single source for "now" wherever a window
+/// Current UTC time in epoch seconds — the single source for "now" wherever a period
 /// cutoff is computed (reports, cost retention).
 pub fn now_epoch() -> i64 {
     jiff::Timestamp::now().as_second()
 }
 
 /// Epoch seconds for an RFC-3339 timestamp string, or `None` if unparseable. The single
-/// parser used everywhere a stored `ts` is windowed (reports, cost snapshot pruning) — an
+/// parser used everywhere a stored `ts` is bounded by a period (reports, cost snapshot pruning) — an
 /// unparseable timestamp consistently yields `None`, so the caller drops the record rather
 /// than bucketing it at epoch 0.
 pub fn ts_epoch(ts: &str) -> Option<i64> {

@@ -50,7 +50,7 @@ pub struct SessionTotals {
     /// metrics that are delta (a cumulative metric already carries its full total) even
     /// in the unusual case of a session mixing temporalities across metrics.
     cumulative_metrics: std::collections::BTreeSet<String>,
-    /// When the receiver last heard from the session. A report window and the retention sweep
+    /// When the receiver last heard from the session. A report period and the retention sweep
     /// judge a session by this, not by when its totals were last written out.
     last_seen: jiff::Timestamp,
 }

@@ -61,7 +61,7 @@ cargo audit   # after dependency updates
 ## Cost
 
 - `cost_basis` names the snapshot as lifetime session totals selected by last activity.
-  `claude.api_request` answers occurrence-window questions from native request estimates, and a
+  `claude.api_request` answers what requests cost in a period from native request estimates, and a
   missing request cost stays missing. Neither is an invoice. Session cache-write forecasts are
   never added to native costs.
 - `CostRow.observed_metrics` names the native metrics seen; an absent metric is not a measured
@@ -94,7 +94,7 @@ cargo audit   # after dependency updates
 - A pending delivery stays deliverable only under a definition that reads it and still declares
   every field it carries (`KindSpec::exports`).
 - A snapshot Kind (`mode = "snapshot"`) requires a non-empty string `identity`. Reports pick the
-  latest occurrence per project and identity in the window, under every stored contract, before
+  latest occurrence per project and identity in the period, under every stored contract, before
   filtering; an entity whose latest state is unreadable is left out. Ties fall to observation
   time; a conflicting tie, or a readable record missing identity or observation time, fails the
   section. A rolling snapshot report is not a complete inventory. Event identity selects the

@@ -115,7 +115,7 @@ pub fn format_markdown(report: &Report) -> String {
 }
 
 /// The ranked cost rollup, or `None` when the report carries no cost rows (a Kind-scoped report,
-/// or a window with no recorded spend).
+/// or a period with no recorded spend).
 fn cost_groups(report: &Report) -> Option<&[GroupAgg]> {
     (!report.cost_groups.is_empty()).then_some(report.cost_groups.as_slice())
 }
@@ -163,7 +163,7 @@ fn axes(section: &KindSection) -> String {
 }
 
 /// What a reader needs before the rows: records the section or its relation could not read, and
-/// retention that leaves part of the window uncovered.
+/// retention that leaves part of the period uncovered.
 fn caveats(report: &Report, section: &KindSection) -> Vec<String> {
     let relation = section.relation.as_ref();
     exclusions(section)
@@ -195,8 +195,8 @@ fn inline(s: &str) -> String {
 }
 
 /// What to say in place of rows, when there are none to say anything about. A scope holding no
-/// retained record at all is said to, since a quiet window and a project that was never recorded
-/// (or a mistyped one) differ. Under filters the window may hold records that simply do not
+/// retained record at all is said to, since a quiet period and a project that was never recorded
+/// (or a mistyped one) differ. Under filters the period may hold records that simply do not
 /// match, so the note says so instead of claiming none.
 fn note(section: &KindSection, filtered: bool) -> Option<&'static str> {
     section.groups.is_empty().then_some(
@@ -207,22 +207,22 @@ fn note(section: &KindSection, filtered: bool) -> Option<&'static str> {
         ) {
             (false, true, _) => "no readable records retained",
             (false, false, _) => "no records retained",
-            (true, true, true) => "no readable records match the filters in this window",
-            (true, true, false) => "no readable records in this window",
-            (true, false, true) => "no records match the filters in this window",
-            (true, false, false) => "no records in this window",
+            (true, true, true) => "no readable records match the filters in this period",
+            (true, true, false) => "no readable records in this period",
+            (true, false, true) => "no records match the filters in this period",
+            (true, false, false) => "no records in this period",
         },
     )
 }
 
-/// A section whose oldest retained record is later than the window's start says so, since its
-/// totals cover the window only from that record on. Which of a quiet period, collection not yet
+/// A section whose oldest retained record is later than the period's start says so, since its
+/// totals cover the period only from that record on. Which of a quiet period, collection not yet
 /// running and records already pruned explains the earlier part, the store cannot tell.
 fn retention(report: &Report, section: &KindSection) -> Option<String> {
     let retained = section.retained_since.as_deref()?;
     (ts_epoch(retained)? > ts_epoch(&report.since)?).then(|| {
         format!(
-            "window starts {}; oldest retained record {retained}",
+            "period starts {}; oldest retained record {retained}",
             report.since
         )
     })
@@ -649,7 +649,7 @@ mod tests {
         }];
         let text = format_text(&r);
         assert!(
-            text.contains("no records match the filters in this window"),
+            text.contains("no records match the filters in this period"),
             "{text}"
         );
     }
@@ -661,7 +661,7 @@ mod tests {
         let mut r = report(vec![s]);
         r.project = Some("acme".to_string());
         let quiet = format_text(&r);
-        assert!(quiet.contains("no records in this window"), "{quiet}");
+        assert!(quiet.contains("no records in this period"), "{quiet}");
         r.kinds[0].retained_since = None;
         let unrecorded = format_markdown(&r);
         assert!(unrecorded.contains("no records retained"), "{unrecorded}");
@@ -673,7 +673,7 @@ mod tests {
         assert!(!format_text(&r).contains("oldest retained record"));
         r.kinds[0].retained_since = Some("2026-01-20T08:00:00.5Z".to_string());
         let line =
-            "window starts 2026-01-02T00:00:00Z; oldest retained record 2026-01-20T08:00:00.5Z";
+            "period starts 2026-01-02T00:00:00Z; oldest retained record 2026-01-20T08:00:00.5Z";
         assert!(format_text(&r).contains(&format!("  ({line})\n")));
         assert!(format_markdown(&r).contains(&format!("_{line}_\n")));
     }

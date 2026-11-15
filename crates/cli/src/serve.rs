@@ -1718,7 +1718,7 @@ mod tests {
     #[test]
     fn a_flush_dates_each_session_by_when_it_was_last_heard_from() {
         // Every flush recomputes every session the receiver holds. Were a row dated by the flush, a
-        // session silent for weeks would sit inside every report window and never expire.
+        // session silent for weeks would sit inside every report period and never expire.
         use crate::claude::decode::MetricPoint;
 
         let dir = tempfile::tempdir().unwrap();

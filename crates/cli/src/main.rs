@@ -119,7 +119,7 @@ enum Command {
         /// then names, and defaults to, a field of this Kind. Both must be event Kinds declaring
         /// the same identity. Records with no such record, or whose record lacks the field, group
         /// under `—`, so the groups still add up to every record counted. This Kind is read over
-        /// every retained record; the window, project and filters select only the counted ones.
+        /// every retained record; the period, project and filters select only the counted ones.
         #[arg(long, value_name = "kind", requires = "kind")]
         relate: Option<String>,
     },

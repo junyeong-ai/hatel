@@ -140,7 +140,7 @@ pub struct ReportParams {
     )]
     pub group_by: Option<String>,
     #[schemars(
-        description = "Group `kind`'s records by a field of this Kind's record that shares their identity (e.g. kind \"claude.api_request\", relate \"claude.response\", group_by \"branch\"); group_by then names, and defaults to, a field of this Kind. Both must be event Kinds declaring the same identity. Records with no such record, or whose record lacks the field, group under key null, so the groups add up to every record counted. This Kind is read over every retained record: window, project and filter select only the counted records. The section's `relation` names it, with its oldest retained record and its records by contract resolution."
+        description = "Group `kind`'s records by a field of this Kind's record that shares their identity (e.g. kind \"claude.api_request\", relate \"claude.response\", group_by \"branch\"); group_by then names, and defaults to, a field of this Kind. Both must be event Kinds declaring the same identity. Records with no such record, or whose record lacks the field, group under key null, so the groups add up to every record counted. This Kind is read over every retained record: period, project and filter select only the counted records. The section's `relation` names it, with its oldest retained record and its records by contract resolution."
     )]
     pub relate: Option<String>,
     #[schemars(
