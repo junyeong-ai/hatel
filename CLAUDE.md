@@ -32,8 +32,8 @@ cargo audit   # after dependency updates
 - Vendor interpretation stays in adapters: `crates/core/src/claude` maps lifecycle hooks and reads
   transcripts, and `crates/cli/src/claude` decodes Claude Code metrics and safe event projections.
   Plugins add Kinds and bindings, not unused native counters. Local decode supports HTTP/JSON sums,
-  gauges and selected events; native forwarding can relay bodies it cannot decode; traces return
-  501.
+  gauges and selected events; native forwarding can relay bodies it cannot decode. Traces are never
+  stored: they are relayed to the destinations that select them and refused (501) when none does.
 - Comments state rationale and constraints, never the history of edits.
 
 ## Signals and attribution
@@ -128,8 +128,9 @@ cargo audit   # after dependency updates
 
 ## Delivery
 
-- `signals` selects native OTLP input per destination; `kinds` is an exact opt-in allow-list of
-  sanitized local records. Omitted keys mean metrics and logs, and no local Kinds.
+- `signals` selects native OTLP input (metrics, logs, traces) per destination; `kinds` is an exact
+  opt-in allow-list of sanitized local records. Omitted keys mean metrics and logs, and no local
+  Kinds.
 - A local record, its delivery rows and the queue counters commit together; retention deletes
   delivery references and releases capacity with the records. Network work belongs to the
   receiver; a durable retry reuses `record_id` and rechecks current policy. Native forwarding stays

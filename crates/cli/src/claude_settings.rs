@@ -6,6 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
+use hatel_core::OtlpSignal;
 use serde_json::{Value, json};
 
 /// The hook binary spawned on every lifecycle event. Doubles as the structural marker that
@@ -288,49 +289,67 @@ pub fn effective_env(
     }
     // A generic managed destination shadows developer per-signal overrides. Credentials also
     // remove developer destinations, so they cannot be redirected to a different collector.
-    for (generic, suffix) in [
-        ("OTEL_EXPORTER_OTLP_ENDPOINT", "ENDPOINT"),
-        ("OTEL_EXPORTER_OTLP_PROTOCOL", "PROTOCOL"),
-        ("OTEL_EXPORTER_OTLP_HEADERS", "HEADERS"),
-        (
-            "OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE",
-            "CLIENT_CERTIFICATE",
-        ),
-        ("OTEL_EXPORTER_OTLP_CLIENT_KEY", "CLIENT_KEY"),
-    ] {
-        if env
-            .get(generic)
-            .is_some_and(|(_, scope)| *scope == "managed")
-        {
-            for signal in ["METRICS", "LOGS", "TRACES"] {
-                remove_developer_value(&mut env, &format!("OTEL_EXPORTER_OTLP_{signal}_{suffix}"));
+    const CREDENTIALS: [&str; 3] = ["HEADERS", "CLIENT_CERTIFICATE", "CLIENT_KEY"];
+    for suffix in ["ENDPOINT", "PROTOCOL"].into_iter().chain(CREDENTIALS) {
+        if managed(&env, &format!("OTEL_EXPORTER_OTLP_{suffix}")) {
+            for signal in OtlpSignal::ALL {
+                remove_developer_value(&mut env, &otlp_signal_variable(signal, suffix));
             }
         }
     }
-    for signal in [None, Some("METRICS"), Some("LOGS"), Some("TRACES")] {
-        let prefix = signal.map_or_else(
-            || "OTEL_EXPORTER_OTLP".to_string(),
-            |s| format!("OTEL_EXPORTER_OTLP_{s}"),
-        );
-        if ["HEADERS", "CLIENT_CERTIFICATE", "CLIENT_KEY"]
-            .iter()
-            .any(|suffix| {
-                env.get(&format!("{prefix}_{suffix}"))
-                    .is_some_and(|(_, scope)| *scope == "managed")
-            })
-        {
-            remove_developer_value(&mut env, &format!("{prefix}_ENDPOINT"));
-            if signal.is_none() {
-                for signal in ["METRICS", "LOGS", "TRACES"] {
-                    remove_developer_value(
-                        &mut env,
-                        &format!("OTEL_EXPORTER_OTLP_{signal}_ENDPOINT"),
-                    );
-                }
-            }
+    if CREDENTIALS
+        .iter()
+        .any(|suffix| managed(&env, &format!("OTEL_EXPORTER_OTLP_{suffix}")))
+    {
+        remove_developer_value(&mut env, "OTEL_EXPORTER_OTLP_ENDPOINT");
+        for signal in OtlpSignal::ALL {
+            remove_developer_value(&mut env, &otlp_signal_variable(signal, "ENDPOINT"));
         }
+    }
+    for signal in OtlpSignal::ALL {
+        if CREDENTIALS
+            .iter()
+            .any(|suffix| managed(&env, &otlp_signal_variable(signal, suffix)))
+        {
+            remove_developer_value(&mut env, &otlp_signal_variable(signal, "ENDPOINT"));
+        }
+    }
+    // Detailed beta tracing exports logs and traces to `BETA_TRACING_ENDPOINT`, so Claude Code
+    // drops a developer-set one whenever managed settings decide where either signal goes.
+    let decides_logs_or_traces = ["ENDPOINT"]
+        .into_iter()
+        .chain(CREDENTIALS)
+        .flat_map(|suffix| {
+            [
+                format!("OTEL_EXPORTER_OTLP_{suffix}"),
+                otlp_signal_variable(OtlpSignal::Logs, suffix),
+                otlp_signal_variable(OtlpSignal::Traces, suffix),
+            ]
+        })
+        .any(|key| managed(&env, &key))
+        || ["OTEL_LOGS_EXPORTER", "OTEL_TRACES_EXPORTER"]
+            .iter()
+            .any(|key| {
+                env.get(*key).is_some_and(|(value, scope)| {
+                    *scope == "managed" && matches!(value.trim(), "" | "none" | "console")
+                })
+            })
+        || env
+            .get("CLAUDE_CODE_ENABLE_TELEMETRY")
+            .is_some_and(|(value, scope)| *scope == "managed" && !env_enabled(value))
+        || files
+            .iter()
+            .filter(|f| f.name == "managed")
+            .filter_map(|f| f.load.value())
+            .any(|settings| settings.get("otelHeadersHelper").is_some());
+    if decides_logs_or_traces {
+        remove_developer_value(&mut env, "BETA_TRACING_ENDPOINT");
     }
     env
+}
+
+fn managed(env: &Env, key: &str) -> bool {
+    env.get(key).is_some_and(|(_, scope)| *scope == "managed")
 }
 
 fn remove_developer_value(env: &mut Env, key: &str) {
@@ -400,14 +419,27 @@ pub fn repository_off_value(key: &str, value: &str) -> bool {
 
 pub fn telemetry_matches(key: &str, value: &str, expected: &str) -> bool {
     match key {
-        "OTEL_METRICS_EXPORTER" | "OTEL_LOGS_EXPORTER" => {
+        "OTEL_METRICS_EXPORTER" | "OTEL_LOGS_EXPORTER" | "OTEL_TRACES_EXPORTER" => {
             value.split(',').any(|exporter| exporter.trim() == expected)
         }
-        "CLAUDE_CODE_ENABLE_TELEMETRY" if expected == "1" => ["1", "true", "yes", "on"]
-            .iter()
-            .any(|on| value.eq_ignore_ascii_case(on)),
+        "CLAUDE_CODE_ENABLE_TELEMETRY" if expected == "1" => env_enabled(value),
         _ => value == expected,
     }
+}
+
+/// Whether a Claude Code on/off variable is on.
+pub fn env_enabled(value: &str) -> bool {
+    ["1", "true", "yes", "on"]
+        .iter()
+        .any(|on| value.eq_ignore_ascii_case(on))
+}
+
+/// A per-signal OTLP exporter variable, such as `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`.
+pub fn otlp_signal_variable(signal: OtlpSignal, suffix: &str) -> String {
+    format!(
+        "OTEL_EXPORTER_OTLP_{}_{suffix}",
+        signal.as_str().to_ascii_uppercase()
+    )
 }
 
 pub fn managed_hooks_only(files: &[ScopeFile]) -> bool {
@@ -1118,6 +1150,41 @@ mod tests {
         );
         assert!(!env.contains_key("OTEL_EXPORTER_OTLP_ENDPOINT"));
         assert!(!env.contains_key("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"));
+    }
+
+    #[test]
+    fn a_developer_beta_tracing_endpoint_yields_only_to_managed_logs_or_traces_destinations() {
+        for (managed, removed) in [
+            (json!({}), false),
+            (
+                json!({"env": {"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT": "https://m.example"}}),
+                false,
+            ),
+            (
+                json!({"env": {"OTEL_EXPORTER_OTLP_ENDPOINT": "https://corp.example"}}),
+                true,
+            ),
+            (
+                json!({"env": {"OTEL_EXPORTER_OTLP_TRACES_HEADERS": "authorization=secret"}}),
+                true,
+            ),
+            (json!({"env": {"OTEL_LOGS_EXPORTER": "none"}}), true),
+            (json!({"env": {"CLAUDE_CODE_ENABLE_TELEMETRY": "0"}}), true),
+            (json!({"otelHeadersHelper": "/usr/local/bin/headers"}), true),
+        ] {
+            let files = vec![
+                scope(
+                    "user",
+                    json!({"env": {"BETA_TRACING_ENDPOINT": "https://debug.example"}}),
+                ),
+                scope("managed", managed.clone()),
+            ];
+            assert_eq!(
+                !effective_env(&files, []).contains_key("BETA_TRACING_ENDPOINT"),
+                removed,
+                "{managed}"
+            );
+        }
     }
 
     #[test]

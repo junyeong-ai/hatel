@@ -11,10 +11,10 @@ use bytes::Bytes;
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
-use hatel_core::{ExportMode, ExportTarget, SessionIndexCache};
+use hatel_core::{ExportMode, ExportTarget, OtlpSignal, SessionIndexCache};
 
 use super::client::Egress;
-use super::transform::{attribute_values, enrich_logs, enrich_metrics};
+use super::transform::{attribute_values, enrich};
 use crate::claude::{SESSION_ID, USER_EMAIL};
 use crate::throttle::{Tally, Throttle};
 
@@ -36,23 +36,6 @@ const MAX_DEFERRED: usize = 64;
 /// evidently never going to be indexed (it predates the wiring). Egress privacy outranks delivery,
 /// so an unresolved body fails closed.
 const DEFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// Which OTLP signal a body is — selects the downstream path and the enrich walker. "Signal" is the
-/// OTel-native term (metrics / logs / traces); kept distinct from the registry's `Kind` vocabulary.
-#[derive(Clone, Copy)]
-pub enum OtlpSignal {
-    Metrics,
-    Logs,
-}
-
-impl OtlpSignal {
-    fn path(self) -> &'static str {
-        match self {
-            OtlpSignal::Metrics => "/v1/metrics",
-            OtlpSignal::Logs => "/v1/logs",
-        }
-    }
-}
 
 /// One received body queued for forwarding. `content_type`/`content_encoding` are the inbound
 /// headers, preserved for raw forwarding (so a compressed or protobuf tee stays byte-faithful);
@@ -78,7 +61,7 @@ pub struct Exporter {
 struct Route {
     tx: mpsc::Sender<Outbound>,
     queued_bytes: Arc<AtomicUsize>,
-    signals: BTreeSet<String>,
+    signals: BTreeSet<OtlpSignal>,
 }
 
 impl Exporter {
@@ -150,10 +133,6 @@ impl Exporter {
         content_type: Option<String>,
         content_encoding: Option<String>,
     ) {
-        let signal_name = match signal {
-            OtlpSignal::Metrics => "metrics",
-            OtlpSignal::Logs => "logs",
-        };
         let per_target_bytes = MAX_QUEUED_BYTES / self.routes.len().max(1);
         let out = Outbound {
             signal,
@@ -161,11 +140,7 @@ impl Exporter {
             content_type,
             content_encoding,
         };
-        for route in self
-            .routes
-            .iter()
-            .filter(|r| r.signals.contains(signal_name))
-        {
+        for route in self.routes.iter().filter(|r| r.signals.contains(&signal)) {
             let len = out.body.len();
             let reserved =
                 route
@@ -182,6 +157,11 @@ impl Exporter {
                 self.record_drop();
             }
         }
+    }
+
+    /// Whether some destination takes `signal` from the native stream.
+    pub fn forwards(&self, signal: OtlpSignal) -> bool {
+        self.routes.iter().any(|r| r.signals.contains(&signal))
     }
 
     fn record_drop(&self) {
@@ -541,8 +521,7 @@ impl Worker {
         if matches!(&policy, Some(Err(_))) {
             return;
         }
-        let metrics = matches!(out.signal, OtlpSignal::Metrics);
-        let native = crate::claude::decode::repository_projects(&out.body, metrics).ok();
+        let native = crate::claude::decode::repository_projects(&out.body, out.signal).ok();
         let index = &self.index;
         let client = &self.client;
         let targets = &self.targets;
@@ -565,11 +544,7 @@ impl Worker {
             } else {
                 original
             };
-            let signal = match out.signal {
-                OtlpSignal::Metrics => "metrics",
-                OtlpSignal::Logs => "logs",
-            };
-            if !target.signals.contains(signal) {
+            if !target.signals.contains(&out.signal) {
                 continue;
             }
             let filtered = target.projects.is_filtered();
@@ -592,7 +567,7 @@ impl Worker {
             }
             if target.accounts.is_filtered() {
                 let emails = accounts
-                    .get_or_insert_with(|| attribute_values(&out.body, metrics, USER_EMAIL));
+                    .get_or_insert_with(|| attribute_values(&out.body, out.signal, USER_EMAIL));
                 let allowed = emails
                     .as_ref()
                     .is_some_and(|emails| emails.iter().all(|e| target.accounts.allows(e)));
@@ -622,11 +597,7 @@ impl Worker {
                                 }
                             })
                         };
-                        match out.signal {
-                            OtlpSignal::Metrics => enrich_metrics(&out.body, &resolve),
-                            OtlpSignal::Logs => enrich_logs(&out.body, &resolve),
-                        }
-                        .map(Bytes::from)
+                        enrich(&out.body, out.signal, &resolve).map(Bytes::from)
                     });
                     match body {
                         // Enriched output is freshly serialized JSON — no inbound encoding carries over.
@@ -694,13 +665,10 @@ impl Worker {
     /// datapoint carries one and a single export body is a single session, so the set is one
     /// project the filter then accepts or rejects.
     fn resolve_batch_projects(&self, body: &[u8], signal: OtlpSignal) -> BatchProjects {
-        let Some(ids) = attribute_values(body, matches!(signal, OtlpSignal::Metrics), SESSION_ID)
-        else {
+        let Some(ids) = attribute_values(body, signal, SESSION_ID) else {
             return BatchProjects::Unattributable;
         };
-        let native =
-            crate::claude::decode::repository_projects(body, matches!(signal, OtlpSignal::Metrics))
-                .ok();
+        let native = crate::claude::decode::repository_projects(body, signal).ok();
         let mut projects = BTreeSet::new();
         let mut missing = BTreeSet::new();
         for sid in ids {
@@ -745,28 +713,32 @@ fn note_unresolved(count: u64) {
 mod tests {
     use super::*;
 
-    /// A stub downstream OTLP collector on a loopback port, recording every body it receives.
-    async fn stub_collector() -> (
-        std::net::SocketAddr,
-        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
+    /// Every body a stub collector received, with the path it was posted to.
+    type Received = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
+    /// A stub downstream OTLP collector on a loopback port, recording every body it receives on
+    /// any signal's path.
+    async fn stub_collector() -> (std::net::SocketAddr, Received, tokio::task::JoinHandle<()>) {
         use axum::Router;
         use axum::routing::post;
-        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let app = Router::new().route(
-            "/v1/metrics",
-            post({
-                let received = received.clone();
-                move |body: Bytes| {
+        let received = Received::default();
+        let mut app = Router::new();
+        for signal in OtlpSignal::ALL {
+            let received = received.clone();
+            app = app.route(
+                signal.path(),
+                post(move |body: Bytes| {
                     let received = received.clone();
                     async move {
-                        received.lock().unwrap().push(body.to_vec());
+                        received
+                            .lock()
+                            .unwrap()
+                            .push((signal.path().to_string(), body.to_vec()));
                         axum::http::StatusCode::OK
                     }
-                }
-            }),
-        );
+                }),
+            );
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1005,7 +977,7 @@ mod tests {
             1,
             "an unlisted or unnamed account fails closed"
         );
-        assert!(String::from_utf8_lossy(&received[0]).contains("Me@Company.example"));
+        assert!(String::from_utf8_lossy(&received[0].1).contains("Me@Company.example"));
         let destination = &worker.tallies.destinations[&format!("http://{addr}")];
         assert_eq!(destination.delivered.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -1432,10 +1404,71 @@ mod tests {
         })
         .await
         .expect("fast destination drains independently");
-        assert_eq!(exporter.routes[0].signals, ["metrics".into()].into());
+        assert_eq!(exporter.routes[0].signals, [OtlpSignal::Metrics].into());
         assert_eq!(received.lock().unwrap().len(), 2);
         handle.abort();
         slow_server.abort();
         fast_server.abort();
+    }
+
+    #[tokio::test]
+    async fn traces_reach_only_the_destinations_that_select_them_enriched_per_span() {
+        let (traced, traced_received, traced_server) = stub_collector().await;
+        let (untraced, untraced_received, untraced_server) = stub_collector().await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("session_index.jsonl"),
+            "{\"session_id\":\"S1\",\"project_key\":\"/k/alpha\",\"project_label\":\"alpha\"}\n",
+        )
+        .unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[export]]\nendpoint='http://{traced}'\nmode='enriched'\nsignals=['traces']\nprojects=['alpha']\n\
+                 [[export]]\nendpoint='http://{untraced}'\nmode='raw'\n"
+            ),
+        )
+        .unwrap();
+        let config =
+            hatel_core::ExportConfig::from_settings(&hatel_core::Settings::read(&path).unwrap())
+                .unwrap();
+        let (exporter, handle) = Exporter::spawn(config.targets, home.path().to_path_buf());
+        assert!(exporter.forwards(OtlpSignal::Traces));
+        let spans = serde_json::json!({"resourceSpans": [{"scopeSpans": [{"spans": [{
+            "name": "claude_code.tool",
+            "attributes": [{"key": "session.id", "value": {"stringValue": "S1"}}]
+        }]}]}]});
+        exporter.enqueue(
+            OtlpSignal::Traces,
+            Bytes::from(serde_json::to_vec(&spans).unwrap()),
+            Some("application/json".into()),
+            None,
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while traced_received.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the destination selecting traces received the batch");
+        exporter.shutdown();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        traced_server.abort();
+        untraced_server.abort();
+
+        let received = traced_received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0, "/v1/traces");
+        let body: serde_json::Value = serde_json::from_slice(&received[0].1).unwrap();
+        let attributes = &body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"];
+        assert!(
+            attributes
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|a| a["key"] == "project" && a["value"]["stringValue"] == "alpha")
+        );
+        assert!(untraced_received.lock().unwrap().is_empty());
     }
 }

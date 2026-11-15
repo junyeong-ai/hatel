@@ -4,12 +4,15 @@
 //! repointed elsewhere, so it is safe to re-run. `--print` emits the block for managed/org
 //! settings instead of writing.
 
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use hatel_core::export::parse_otlp_headers;
-use hatel_core::{AccountFilter, ExportConfig, ExportMode, ExportTarget, ProjectFilter};
+use hatel_core::{
+    AccountFilter, ExportConfig, ExportMode, ExportTarget, OtlpSignal, ProjectFilter,
+};
 use serde_json::{Value, json};
 
 use crate::claude_settings as cs;
@@ -304,7 +307,13 @@ pub fn insert(mode: InsertMode) -> i32 {
         );
     }
 
-    if let Err(error) = repoint(&mut settings, &env, scope) {
+    // The destination keeps every signal the general endpoint carried to it, traces included
+    // unless their own endpoint already sends them elsewhere.
+    let mut signals = hatel_core::export::default_signals();
+    if !env.contains_key(&cs::otlp_signal_variable(OtlpSignal::Traces, "ENDPOINT")) {
+        signals.insert(OtlpSignal::Traces);
+    }
+    if let Err(error) = repoint(&mut settings, &env, scope, &signals) {
         eprintln!("init --insert: {error}");
         return 1;
     }
@@ -345,7 +354,7 @@ pub fn insert(mode: InsertMode) -> i32 {
     export.upsert(ExportTarget {
         endpoint: endpoint.clone(),
         mode: mode.as_export(),
-        signals: hatel_core::export::default_signals(),
+        signals,
         kinds: Default::default(),
         retry_attempts: 8,
         queue_days: 7,
@@ -391,15 +400,20 @@ pub fn insert(mode: InsertMode) -> i32 {
     i32::from(!rep.env_blocked.is_empty())
 }
 
-fn repoint(settings: &mut Value, env: &cs::Env, scope: &str) -> Result<(), String> {
+fn repoint(
+    settings: &mut Value,
+    env: &cs::Env,
+    scope: &str,
+    signals: &BTreeSet<OtlpSignal>,
+) -> Result<(), String> {
     let generic = "OTEL_EXPORTER_OTLP_PROTOCOL";
-    let signals = [
-        "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
-        "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-    ];
-    for signal in signals {
+    let signals: Vec<String> = signals
+        .iter()
+        .map(|signal| cs::otlp_signal_variable(*signal, "PROTOCOL"))
+        .collect();
+    for signal in &signals {
         let key = if env.contains_key(signal) {
-            signal
+            signal.as_str()
         } else {
             generic
         };
@@ -422,8 +436,8 @@ fn repoint(settings: &mut Value, env: &cs::Env, scope: &str) -> Result<(), Strin
     );
     values.insert(generic.to_string(), json!("http/json"));
     for signal in signals {
-        if values.contains_key(signal) {
-            values.insert(signal.to_string(), json!("http/json"));
+        if values.contains_key(&signal) {
+            values.insert(signal, json!("http/json"));
         }
     }
     Ok(())
@@ -565,7 +579,12 @@ mod insert_tests {
             )]
             .into_iter()
             .collect();
-            let result = repoint(&mut settings, &env, "user");
+            let result = repoint(
+                &mut settings,
+                &env,
+                "user",
+                &hatel_core::export::default_signals(),
+            );
             if source == "user" {
                 assert!(result.is_ok());
                 assert_eq!(
@@ -581,5 +600,19 @@ mod insert_tests {
                 assert_eq!(settings, before);
             }
         }
+    }
+
+    #[test]
+    fn repoint_requires_http_json_for_every_signal_it_routes_through_the_receiver() {
+        let env: cs::Env = [(
+            "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL".to_string(),
+            ("grpc".to_string(), "process"),
+        )]
+        .into_iter()
+        .collect();
+        let mut signals = hatel_core::export::default_signals();
+        assert!(repoint(&mut json!({"env": {}}), &env, "user", &signals).is_ok());
+        signals.insert(OtlpSignal::Traces);
+        assert!(repoint(&mut json!({"env": {}}), &env, "user", &signals).is_err());
     }
 }

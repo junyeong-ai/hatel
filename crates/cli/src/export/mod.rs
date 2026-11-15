@@ -8,4 +8,4 @@ pub mod durable;
 pub mod exporter;
 pub mod transform;
 
-pub use exporter::{Exporter, OtlpSignal};
+pub use exporter::Exporter;

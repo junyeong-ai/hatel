@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use hatel_core::config::InvalidVariable;
 use hatel_core::schema::UnreadableKinds;
-use hatel_core::{Config, ExportConfig, ExportMode, SessionIndex, Settings};
+use hatel_core::{Config, ExportConfig, ExportMode, OtlpSignal, SessionIndex, Settings};
 
 use crate::receiver;
 
@@ -162,6 +162,12 @@ pub(crate) fn report(local: bool) -> Report {
     check_endpoint_present(&mut native, &env);
     advise_protocol(&mut native, &env);
     advise_session_id(&mut native, &env);
+    advise_detailed_tracing(&mut native, &env);
+    advise_traces(
+        &mut native,
+        &env,
+        ExportConfig::from_settings(&resolved).ok().as_ref(),
+    );
     if !local {
         advise_native_coverage(&mut native, &env, &cfg);
     }
@@ -500,10 +506,9 @@ fn report_receiver(
     settings: &hatel_core::Result<Settings>,
     cfg: &Config,
 ) -> Option<Section> {
-    let (metrics, logs) = effective_otlp_endpoints(env);
-    let mut authorities: Vec<String> = [metrics, logs]
+    let mut authorities: Vec<String> = DECODED_SIGNALS
         .into_iter()
-        .flatten()
+        .filter_map(|signal| otlp_endpoint(env, signal))
         .filter(|(endpoint, _)| cs::is_local_receiver(endpoint))
         .filter_map(|(endpoint, _)| receiver::authority(endpoint))
         .collect();
@@ -828,13 +833,14 @@ fn report_export(
             .describe_filters()
             .map(|d| format!(", {d}"))
             .unwrap_or_default();
+        let signals: std::collections::BTreeSet<_> =
+            t.signals.iter().map(|signal| signal.as_str()).collect();
         sec.note(format!(
-            "{} ({}{}{}; signals={:?}; kinds={:?})",
+            "{} ({}{}{}; signals={signals:?}; kinds={:?})",
             t.endpoint,
             t.mode.as_str(),
             filter,
             headers,
-            t.signals,
             t.kinds
         ));
     }
@@ -857,55 +863,46 @@ fn report_export(
     // Both enriching and filtering read the JSON body (to inject, or to attribute a batch by its
     // session.id or user.email); a non-JSON protocol makes an enriched target skip and a filtered
     // target fail closed (forward nothing). Flag the protocol that would do so.
-    let needs_json = export.targets.iter().any(|t| {
-        !t.signals.is_empty()
-            && (t.mode == ExportMode::Enriched
-                || t.projects.is_filtered()
-                || t.accounts.is_filtered())
-    });
-    if needs_json {
-        let mut checked = std::collections::BTreeSet::new();
-        for signal in [
-            "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
-            "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
-        ] {
-            let key = if env.contains_key(signal) {
-                signal
-            } else {
-                "OTEL_EXPORTER_OTLP_PROTOCOL"
-            };
-            let proto = env.get(key).map(|(v, _)| v.as_str());
-            if checked.insert(key) && proto != Some("http/json") {
-                sec.warn(format!(
-                    "enriched/filtered export needs http/json input — {key} is {} → those targets skip that signal's batches",
-                    proto.unwrap_or("unset")
-                ));
-            }
+    let mut checked = std::collections::BTreeSet::new();
+    for signal in export
+        .targets
+        .iter()
+        .filter(|t| {
+            t.mode == ExportMode::Enriched || t.projects.is_filtered() || t.accounts.is_filtered()
+        })
+        .flat_map(|t| t.signals.iter().copied())
+    {
+        let key = otlp_protocol_variable(env, signal);
+        let proto = env.get(&key).map(|(v, _)| v.as_str());
+        if proto != Some("http/json") && checked.insert(key.clone()) {
+            sec.warn(format!(
+                "enriched/filtered export needs http/json input — {key} is {} → those targets skip that signal's batches",
+                proto.unwrap_or("unset")
+            ));
         }
     }
 
     // The decisive check: export forwards from this receiver, so the OTel stream must reach it.
-    // A signal-specific endpoint (metrics/logs) overrides the general one, so check each — a
+    // A signal-specific endpoint overrides the general one, so check each selected signal — a
     // per-signal override could send one signal past hatel while the general endpoint looks clean.
-    let (metrics, logs) = effective_otlp_endpoints(env);
-    let same_destination = match (metrics, logs) {
-        (Some((m, _)), Some((l, _))) => {
-            hatel_core::export::normalize_endpoint(m) == hatel_core::export::normalize_endpoint(l)
-        }
-        (None, None) => true,
-        _ => false,
+    let routes: Vec<_> = OtlpSignal::ALL
+        .into_iter()
+        .filter(|signal| export.targets.iter().any(|t| t.signals.contains(signal)))
+        .map(|signal| (signal, otlp_endpoint(env, signal)))
+        .collect();
+    let destination = |endpoint: Option<EnvEntry<'_>>| {
+        endpoint.map(|(v, _)| hatel_core::export::normalize_endpoint(v))
     };
-    let metrics_selected = export.targets.iter().any(|t| t.signals.contains("metrics"));
-    let logs_selected = export.targets.iter().any(|t| t.signals.contains("logs"));
-    if metrics_selected && !logs_selected {
-        report_route(&mut sec, Some("metrics"), metrics);
-    } else if logs_selected && !metrics_selected {
-        report_route(&mut sec, Some("logs"), logs);
-    } else if same_destination {
-        report_route(&mut sec, None, metrics); // one effective endpoint for both signals (the common case)
+    let shared = routes.len() > 1
+        && routes
+            .windows(2)
+            .all(|pair| destination(pair[0].1) == destination(pair[1].1));
+    if shared {
+        report_route(&mut sec, None, routes[0].1);
     } else {
-        report_route(&mut sec, Some("metrics"), metrics);
-        report_route(&mut sec, Some("logs"), logs);
+        for (signal, endpoint) in routes {
+            report_route(&mut sec, Some(signal.as_str()), endpoint);
+        }
     }
     Some(sec)
 }
@@ -992,33 +989,44 @@ fn report_repository_telemetry(sec: &mut Section, files: &[cs::ScopeFile]) {
 
 /// Validate the destinations actually used by each signal, including partial configurations.
 fn check_endpoint_present(sec: &mut Section, env: &cs::Env) {
-    let (metrics, logs) = effective_otlp_endpoints(env);
-    for (signal, endpoint) in [("metrics", metrics), ("logs", logs)] {
-        match endpoint {
+    for signal in DECODED_SIGNALS {
+        let signal_name = signal.as_str();
+        match otlp_endpoint(env, signal) {
             Some((value, scope)) => {
                 let valid = reqwest::Url::parse(value).is_ok_and(|url| {
                     matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
                 });
                 if valid {
-                    sec.ok(format!("{signal} OTLP endpoint={value} (from {scope})"));
+                    sec.ok(format!("{signal_name} OTLP endpoint={value} (from {scope})"));
                 } else {
-                    sec.fail(format!("{signal} OTLP endpoint from {scope} must be an absolute HTTP(S) URL"));
+                    sec.fail(format!("{signal_name} OTLP endpoint from {scope} must be an absolute HTTP(S) URL"));
                 }
             }
-            None => sec.fail(format!("no {signal} OTLP endpoint set (set OTEL_EXPORTER_OTLP_ENDPOINT or its per-signal override)")),
+            None => sec.fail(format!("no {signal_name} OTLP endpoint set (set OTEL_EXPORTER_OTLP_ENDPOINT or its per-signal override)")),
         }
     }
 }
 
-/// The effective OTLP endpoint per signal: a per-signal override (`…_METRICS_ENDPOINT` /
-/// `…_LOGS_ENDPOINT`) wins over the general `OTEL_EXPORTER_OTLP_ENDPOINT`. Returned as
-/// `(metrics, logs)` so the protocol check and the export bypass check both reason per signal,
-/// not just on the general endpoint.
-fn effective_otlp_endpoints(env: &cs::Env) -> (Option<EnvEntry<'_>>, Option<EnvEntry<'_>>) {
-    let general = env.get("OTEL_EXPORTER_OTLP_ENDPOINT");
-    let metrics = env.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").or(general);
-    let logs = env.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT").or(general);
-    (metrics, logs)
+/// The signals hatel itself decodes; traces are only relayed.
+const DECODED_SIGNALS: [OtlpSignal; 2] = [OtlpSignal::Metrics, OtlpSignal::Logs];
+
+/// The endpoint a signal is exported to: its per-signal override wins over the general
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`, so every check reasons per signal rather than on the general
+/// endpoint alone.
+fn otlp_endpoint(env: &cs::Env, signal: OtlpSignal) -> Option<EnvEntry<'_>> {
+    env.get(&cs::otlp_signal_variable(signal, "ENDPOINT"))
+        .or_else(|| env.get("OTEL_EXPORTER_OTLP_ENDPOINT"))
+}
+
+/// The variable that decides a signal's protocol: its per-signal override when set, else the
+/// general `OTEL_EXPORTER_OTLP_PROTOCOL`.
+fn otlp_protocol_variable(env: &cs::Env, signal: OtlpSignal) -> String {
+    let specific = cs::otlp_signal_variable(signal, "PROTOCOL");
+    if env.contains_key(&specific) {
+        specific
+    } else {
+        "OTEL_EXPORTER_OTLP_PROTOCOL".into()
+    }
 }
 
 /// `http/json` is mandatory only when the exporter points at the local receiver (it decodes
@@ -1027,29 +1035,21 @@ fn effective_otlp_endpoints(env: &cs::Env) -> (Option<EnvEntry<'_>>, Option<EnvE
 fn advise_protocol(sec: &mut Section, env: &cs::Env) {
     // `http/json` is mandatory if EITHER effective signal endpoint reaches the local receiver — a
     // per-signal override could route one signal to hatel even when the general endpoint is remote.
-    let (metrics, logs) = effective_otlp_endpoints(env);
-    let generic = "OTEL_EXPORTER_OTLP_PROTOCOL";
-    if env.contains_key("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL")
-        || env.contains_key("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL")
+    let reaches_receiver = |signal| {
+        otlp_endpoint(env, signal).is_some_and(|(endpoint, _)| cs::is_local_receiver(endpoint))
+    };
+    if DECODED_SIGNALS
+        .iter()
+        .any(|signal| env.contains_key(&cs::otlp_signal_variable(*signal, "PROTOCOL")))
     {
-        for (key, endpoint) in [
-            ("OTEL_EXPORTER_OTLP_METRICS_PROTOCOL", metrics),
-            ("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL", logs),
-        ] {
-            let key = if env.contains_key(key) { key } else { generic };
-            report_protocol(
-                sec,
-                key,
-                env.get(key),
-                endpoint.is_some_and(|(v, _)| cs::is_local_receiver(v)),
-            );
+        for signal in DECODED_SIGNALS {
+            let key = otlp_protocol_variable(env, signal);
+            report_protocol(sec, &key, env.get(&key), reaches_receiver(signal));
         }
         return;
     }
-    let local = [metrics, logs]
-        .into_iter()
-        .flatten()
-        .any(|(v, _)| cs::is_local_receiver(v));
+    let generic = "OTEL_EXPORTER_OTLP_PROTOCOL";
+    let local = DECODED_SIGNALS.into_iter().any(reaches_receiver);
     report_protocol(sec, generic, env.get(generic), local);
 }
 
@@ -1081,6 +1081,63 @@ fn report_protocol(
                 "{key} unset; set it to http/json for the local receiver"
             ));
         }
+    }
+}
+
+/// Detailed beta tracing exports Claude Code's logs and traces to `BETA_TRACING_ENDPOINT` instead
+/// of through the OTLP exporters. Interactive sessions need organization allowlisting for it, which
+/// no setting shows, so the diversion is a warning rather than a definite gap.
+fn advise_detailed_tracing(sec: &mut Section, env: &cs::Env) {
+    let Some((endpoint, scope)) = env.get("BETA_TRACING_ENDPOINT") else {
+        return;
+    };
+    let detailed = env
+        .get("ENABLE_BETA_TRACING_DETAILED")
+        .is_some_and(|(value, _)| cs::env_enabled(value));
+    if detailed && !cs::is_local_receiver(endpoint) {
+        sec.warn(format!(
+            "ENABLE_BETA_TRACING_DETAILED with BETA_TRACING_ENDPOINT={endpoint} (from {scope}): \
+             where detailed beta tracing is active, Claude Code sends its logs and traces there \
+             instead of the OTLP exporters, so this receiver gets no native events"
+        ));
+    }
+}
+
+/// Spans reach this receiver only under Claude Code's beta tracing flag with an OTLP traces
+/// exporter routed here. hatel stores none: it relays them to the destinations selecting `traces`
+/// and refuses them otherwise.
+fn advise_traces(sec: &mut Section, env: &cs::Env, export: Option<&ExportConfig>) {
+    let flagged = [
+        "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+        "ENABLE_ENHANCED_TELEMETRY_BETA",
+    ]
+    .iter()
+    .any(|key| {
+        env.get(*key)
+            .is_some_and(|(value, _)| cs::env_enabled(value))
+    });
+    let exported = env
+        .get("OTEL_TRACES_EXPORTER")
+        .is_some_and(|(value, _)| cs::telemetry_matches("OTEL_TRACES_EXPORTER", value, "otlp"));
+    let routed_here = otlp_endpoint(env, OtlpSignal::Traces)
+        .is_some_and(|(endpoint, _)| cs::is_local_receiver(endpoint));
+    if !(flagged && exported && routed_here) {
+        return;
+    }
+    let relayed = export.is_some_and(|export| {
+        export
+            .targets
+            .iter()
+            .any(|t| t.signals.contains(&OtlpSignal::Traces))
+    });
+    if relayed {
+        sec.ok("traces reach this receiver, which relays them to the destinations selecting `traces` and stores none");
+    } else {
+        sec.warn(
+            "Claude Code exports traces to this receiver, which stores none and refuses them \
+             while no [[export]] destination selects `traces` — add `traces` to a destination's \
+             signals, or set OTEL_EXPORTER_OTLP_TRACES_ENDPOINT to a trace collector",
+        );
     }
 }
 
@@ -1222,6 +1279,65 @@ mod tests {
                     .filter(|f| f.status == Status::Fail)
                     .count(),
                 failures
+            );
+        }
+    }
+
+    #[test]
+    fn traces_routed_here_are_flagged_until_a_destination_relays_them() {
+        let env = |pairs: &[(&str, &str)]| -> cs::Env {
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), (value.to_string(), "user")))
+                .collect()
+        };
+        let traced = [
+            ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1"),
+            ("OTEL_TRACES_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", cs::DEFAULT_ENDPOINT),
+        ];
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[export]]\nendpoint='https://corp.example'\nmode='raw'\nsignals=['traces']\n",
+        )
+        .unwrap();
+        let relaying = ExportConfig::from_settings(&Settings::read(&path).unwrap()).unwrap();
+        let elsewhere = [
+            ("CLAUDE_CODE_ENHANCED_TELEMETRY_BETA", "1"),
+            ("OTEL_TRACES_EXPORTER", "otlp"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", cs::DEFAULT_ENDPOINT),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+                "https://traces.example/v1/traces",
+            ),
+        ];
+        for (pairs, export, expected) in [
+            (&traced[..], None, Some(Status::Warn)),
+            (&traced[..], Some(&relaying), Some(Status::Ok)),
+            (&traced[1..], None, None),
+            (&elsewhere[..], None, None),
+        ] {
+            let mut section = Section::new("native_telemetry", "native telemetry:");
+            advise_traces(&mut section, &env(pairs), export);
+            assert_eq!(section.findings.first().map(|f| f.status), expected);
+        }
+        for (endpoint, warned) in [
+            ("https://debug.example", true),
+            (cs::DEFAULT_ENDPOINT, false),
+        ] {
+            let mut section = Section::new("native_telemetry", "native telemetry:");
+            advise_detailed_tracing(
+                &mut section,
+                &env(&[
+                    ("ENABLE_BETA_TRACING_DETAILED", "1"),
+                    ("BETA_TRACING_ENDPOINT", endpoint),
+                ]),
+            );
+            assert_eq!(
+                section.findings.iter().any(|f| f.status == Status::Warn),
+                warned
             );
         }
     }

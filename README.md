@@ -190,7 +190,7 @@ retention_days = 14
 
 ```mermaid
 flowchart LR
-  N["Claude Code 지표·로그"] -->|"signals"| F{"목적지 필터<br/>projects · exclude_projects · accounts"}
+  N["Claude Code 지표·로그·추적"] -->|"signals"| F{"목적지 필터<br/>projects · exclude_projects · accounts"}
   K["로컬 기록"] -->|"kinds"| F
   F -->|"기본 신호"| M["메모리 대기열<br/>best-effort"] --> T["팀 수집기"]
   F -->|"로컬 기록"| Q["원장 전달 대기열<br/>재시도 · 용량 · 기한"] --> T
@@ -207,11 +207,11 @@ projects = ["/absolute/repository/path"]
 # headers = { authorization = "Bearer ..." }
 ```
 
-- `signals`를 생략하면 지표와 로그를 보내고, `kinds`를 생략하면 로컬 기록을 보내지 않습니다. `signals = []`이면 로컬 기록만 보냅니다.
+- `signals`를 생략하면 지표와 로그를 보내고, `traces`는 목록에 넣었을 때만 보냅니다. `kinds`를 생략하면 로컬 기록을 보내지 않습니다. `signals = []`이면 로컬 기록만 보냅니다.
 - `raw`는 받은 원문을 그대로, `enriched`는 프로젝트 표시 이름을 더한 JSON을 보냅니다. 기본 신호의 원문에는 로컬 해시 처리가 적용되지 않습니다.
 - `kinds`의 기록은 원장과 같은 트랜잭션으로 대기열에 들어가고, 수신기가 같은 `record_id`로 재시도합니다. 응답이 유실되면 중복 전달될 수 있습니다. 상태는 `hatel deliveries --json`으로 확인합니다.
 - `accounts`는 Claude 로그인 이메일의 허용 목록입니다. 기본 신호에만 적용되므로 `kinds`와 함께 쓸 수 없습니다.
-- 기존 조직 수집기 앞에 끼우려면 `hatel init --insert --mode enriched`를 실행하고 생성된 `[[export]]`를 검토합니다.
+- 기존 조직 수집기 앞에 끼우려면 `hatel init --insert --mode enriched`를 실행하고 생성된 `[[export]]`를 검토합니다. 생성된 목적지는 추적을 포함해 그 수집기가 받던 신호를 모두 받습니다.
 
 ## Claude Code 어댑터
 
@@ -222,7 +222,7 @@ projects = ["/absolute/repository/path"]
 | `hook_execution_complete` 이벤트 | `claude.hook`의 완료 묶음 수와 총 소요 시간 | 개별 훅의 지연으로 나눌 수 없습니다 |
 | 세션 기록 | 턴·서브에이전트·세션이 끝날 때 응답별 토큰을 `claude.response`로 기록 | 관리 설정이 기본 신호를 다른 곳으로 보내도 남지만, 부수 요청과 비용은 없습니다 |
 | 라이프사이클 훅 | 도구 호출·프롬프트 길이·세션 시작·서브에이전트·명령·지침 로드 | 재개할 때마다 다시 발생하는 이벤트가 있습니다 |
-| OTLP traces | 지원하지 않음 (HTTP 501) | 별도의 추적 수집기를 씁니다 |
+| OTLP traces | 저장하지 않고, `signals`에 `traces`가 있는 목적지로만 중계하며 그런 목적지가 없으면 거부합니다 (HTTP 501) | Claude Code는 베타 추적 설정에서만 추적을 내보냅니다 |
 
 - 로컬 디코딩은 압축하지 않은 HTTP/JSON에 한정합니다. 중복 속성 키나 잘못된 타입을 빈 문자열이나 0으로 바꾸지 않습니다.
 - 프로젝트는 훅이 관찰한 세션의 저장소를 우선합니다. 시작을 보지 못한 세션은 `vcs.repository.url.full`의 브라우저 URL로 식별할 수 있습니다.

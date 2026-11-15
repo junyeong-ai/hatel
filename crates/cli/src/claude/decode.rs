@@ -192,7 +192,7 @@ pub(super) fn repository(
 
 pub fn repository_projects(
     bytes: &[u8],
-    metrics: bool,
+    signal: hatel_core::OtlpSignal,
 ) -> Result<std::collections::BTreeMap<String, hatel_core::ProjectRef>, String> {
     let mut projects = std::collections::BTreeMap::new();
     let mut add = |resource: &[KeyValue], attrs: &[KeyValue]| -> Result<(), String> {
@@ -212,38 +212,53 @@ pub fn repository_projects(
         }
         Ok(())
     };
-    if metrics {
-        let request: MetricsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        for resource in request.resource_metrics {
-            for scope in resource.scope_metrics {
-                for metric in scope.metrics {
-                    if let Some(sum) = metric.sum {
-                        for point in sum.data_points {
-                            add(&resource.resource.attributes, &point.attributes)?;
+    match signal {
+        hatel_core::OtlpSignal::Metrics => {
+            let request: MetricsRequest =
+                serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            for resource in request.resource_metrics {
+                for scope in resource.scope_metrics {
+                    for metric in scope.metrics {
+                        if let Some(sum) = metric.sum {
+                            for point in sum.data_points {
+                                add(&resource.resource.attributes, &point.attributes)?;
+                            }
                         }
-                    }
-                    for shape in [
-                        metric.gauge,
-                        metric.histogram,
-                        metric.exponential_histogram,
-                        metric.summary,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        for point in shape.data_points {
-                            add(&resource.resource.attributes, &point.attributes)?;
+                        for shape in [
+                            metric.gauge,
+                            metric.histogram,
+                            metric.exponential_histogram,
+                            metric.summary,
+                        ]
+                        .into_iter()
+                        .flatten()
+                        {
+                            for point in shape.data_points {
+                                add(&resource.resource.attributes, &point.attributes)?;
+                            }
                         }
                     }
                 }
             }
         }
-    } else {
-        let request: LogsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        for resource in request.resource_logs {
-            for scope in resource.scope_logs {
-                for record in scope.log_records {
-                    add(&resource.resource.attributes, &record.attributes)?;
+        hatel_core::OtlpSignal::Logs => {
+            let request: LogsRequest = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            for resource in request.resource_logs {
+                for scope in resource.scope_logs {
+                    for record in scope.log_records {
+                        add(&resource.resource.attributes, &record.attributes)?;
+                    }
+                }
+            }
+        }
+        hatel_core::OtlpSignal::Traces => {
+            let request: TracesRequest =
+                serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            for resource in request.resource_spans {
+                for scope in resource.scope_spans {
+                    for span in scope.spans {
+                        add(&resource.resource.attributes, &span.attributes)?;
+                    }
                 }
             }
         }
@@ -327,6 +342,33 @@ impl DataPoint {
             _ => Err("datapoint must contain exactly one finite asInt or asDouble".into()),
         }
     }
+}
+
+/// The span attributes a trace body is attributed by; nothing else of a span is read.
+#[derive(Debug, Default, Deserialize)]
+struct TracesRequest {
+    #[serde(default, rename = "resourceSpans")]
+    resource_spans: Vec<ResourceSpans>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ResourceSpans {
+    #[serde(default)]
+    resource: Resource,
+    #[serde(default, rename = "scopeSpans")]
+    scope_spans: Vec<ScopeSpans>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ScopeSpans {
+    #[serde(default)]
+    spans: Vec<Span>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Span {
+    #[serde(default, deserialize_with = "attributes")]
+    attributes: Vec<KeyValue>,
 }
 
 #[derive(Debug, Default, Deserialize)]

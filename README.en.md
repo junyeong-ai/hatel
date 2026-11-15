@@ -190,7 +190,7 @@ Each destination is one `[[export]]` choosing Claude Code’s native signals (`s
 
 ```mermaid
 flowchart LR
-  N["Claude Code metrics · logs"] -->|"signals"| F{"destination filters<br/>projects · exclude_projects · accounts"}
+  N["Claude Code metrics · logs · traces"] -->|"signals"| F{"destination filters<br/>projects · exclude_projects · accounts"}
   K["local records"] -->|"kinds"| F
   F -->|"native signals"| M["memory queue<br/>best-effort"] --> T["team collector"]
   F -->|"local records"| Q["ledger delivery queue<br/>retries · capacity · age"] --> T
@@ -207,11 +207,11 @@ projects = ["/absolute/repository/path"]
 # headers = { authorization = "Bearer ..." }
 ```
 
-- Omitted `signals` sends metrics and logs; omitted `kinds` sends no local records. `signals = []` sends local records alone.
+- Omitted `signals` sends metrics and logs; `traces` is sent only when listed. Omitted `kinds` sends no local records. `signals = []` sends local records alone.
 - `raw` forwards the received body as is; `enriched` sends JSON with the project label added. Native bodies are not hashed locally.
 - Records selected by `kinds` enter the queue in the same transaction as the ledger, and the receiver retries them under the same `record_id`. A lost acknowledgement can duplicate a delivery. Check states with `hatel deliveries --json`.
 - `accounts` allow-lists Claude sign-in emails. It applies to native signals only, so it cannot be combined with `kinds`.
-- To insert hatel in front of an existing organization collector, run `hatel init --insert --mode enriched` and review the generated `[[export]]`.
+- To insert hatel in front of an existing organization collector, run `hatel init --insert --mode enriched` and review the generated `[[export]]`. It takes every signal that collector received, traces included.
 
 ## The Claude Code adapter
 
@@ -222,7 +222,7 @@ projects = ["/absolute/repository/path"]
 | `hook_execution_complete` events | Completed batch counts and total duration in `claude.hook` | Cannot be split into individual hook latency |
 | Session transcripts | Per-response tokens as `claude.response` when a turn, subagent or session ends | Kept even when managed settings send native signals elsewhere, but without side requests or cost |
 | Lifecycle hooks | Tool calls, prompt length, session starts, subagents, commands, instruction loads | Some events fire again on every resume |
-| OTLP traces | Unsupported (HTTP 501) | Use a separate tracing collector |
+| OTLP traces | Never stored; relayed only to destinations whose `signals` include `traces`, refused (HTTP 501) otherwise | Claude Code exports traces only under its beta tracing settings |
 
 - Local decoding covers uncompressed HTTP/JSON. Duplicate attribute keys and wrong types are never turned into empty strings or zeros.
 - A project comes first from the repository hooks observed for the session. A session whose start was not seen can be identified by the browser URL in `vcs.repository.url.full`.

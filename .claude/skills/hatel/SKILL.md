@@ -190,9 +190,10 @@ kinds = []
 ```
 
 To include selected local records, set `kinds = ["check", "team.deploy"]`; native selection
-is independent. Omitted `signals` means metrics+logs, omitted `kinds` means no local records.
-`signals=[]` can send domain records alone. `projects` or `exclude_projects` match key/label;
-unresolved attribution fails closed for filtered targets. Duplicate endpoints are rejected.
+is independent. Omitted `signals` means metrics+logs (`traces` is opt-in), omitted `kinds` means
+no local records. `signals=[]` can send domain records alone. `projects` or `exclude_projects`
+match key/label; unresolved attribution fails closed for filtered targets. Duplicate endpoints are
+rejected.
 `accounts` lists Claude sign-in emails, case-insensitive, for native signals only and rejects
 `kinds`; a batch passes only when every record carries a listed email.
 
@@ -218,7 +219,8 @@ signals/Kinds. Respect managed endpoint and hook locks.
 
 The receiver locally supports uncompressed HTTP/JSON sums, gauges and selected safe events.
 It drops session-less metrics; compound metric dimensions are explicitly unsupported locally.
-Duplicate keys and invalid attribute types are errors, not default values. Traces return 501.
+Duplicate keys and invalid attribute types are errors, not default values. Traces are never
+stored: they are relayed to destinations selecting `traces` and refused (501) otherwise.
 Hook-observed project attribution takes precedence; explicit VCS browser URLs can identify
 unseen sessions, without guessing equality with local paths. Cost needs a running receiver.
 `/healthz` names build, configuration, store, capabilities and what native forwarding

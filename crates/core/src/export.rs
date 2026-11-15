@@ -42,6 +42,41 @@ impl ExportMode {
     }
 }
 
+/// A signal of Claude Code's native OTLP stream, as a destination's `signals` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OtlpSignal {
+    Metrics,
+    Logs,
+    Traces,
+}
+
+impl OtlpSignal {
+    pub const ALL: [OtlpSignal; 3] = [Self::Metrics, Self::Logs, Self::Traces];
+
+    /// Parse a `signals` entry. Mirrors [`ExportMode::parse`] — an unknown value is `None`,
+    /// surfaced as a loud config error rather than a silent default.
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|signal| signal.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metrics => "metrics",
+            Self::Logs => "logs",
+            Self::Traces => "traces",
+        }
+    }
+
+    /// The OTLP/HTTP path a body of this signal is posted to.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::Metrics => "/v1/metrics",
+            Self::Logs => "/v1/logs",
+            Self::Traces => "/v1/traces",
+        }
+    }
+}
+
 /// Which projects a destination accepts. A destination forwards a batch only when its project
 /// (joined from `session.id`) passes this filter — so a project's telemetry can be kept off a
 /// downstream (e.g. a personal project off the corporate collector). The type encodes the
@@ -134,10 +169,10 @@ fn join(set: &BTreeSet<String>) -> String {
 /// One validated downstream destination.
 #[derive(Debug, Clone)]
 pub struct ExportTarget {
-    /// OTLP/HTTP base endpoint; `/v1/metrics` and `/v1/logs` are appended per signal.
+    /// OTLP/HTTP base endpoint; each signal's [`OtlpSignal::path`] is appended to it.
     pub endpoint: String,
     pub mode: ExportMode,
-    pub signals: BTreeSet<String>,
+    pub signals: BTreeSet<OtlpSignal>,
     pub kinds: BTreeSet<String>,
     pub retry_attempts: u32,
     pub queue_days: u32,
@@ -252,15 +287,18 @@ impl ExportConfig {
                      without `accounts`"
                 )));
             }
-            let signals = raw.signals.unwrap_or_else(default_signals);
-            if signals
-                .iter()
-                .any(|s| !matches!(s.as_str(), "metrics" | "logs"))
-            {
-                return Err(Error::InvalidExport(
-                    "signals must contain only metrics or logs".into(),
-                ));
-            }
+            let signals = match raw.signals {
+                None => default_signals(),
+                Some(names) => names
+                    .iter()
+                    .map(|name| OtlpSignal::parse(name))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| {
+                        Error::InvalidExport(format!(
+                            "export endpoint {endpoint:?}: signals must name metrics, logs or traces"
+                        ))
+                    })?,
+            };
             if raw
                 .kinds
                 .iter()
@@ -354,7 +392,12 @@ impl ExportConfig {
                 ExportTargetRaw {
                     endpoint: t.endpoint.clone(),
                     mode: t.mode.as_str().to_string(),
-                    signals: (t.signals != default_signals()).then(|| t.signals.clone()),
+                    signals: (t.signals != default_signals()).then(|| {
+                        t.signals
+                            .iter()
+                            .map(|signal| signal.as_str().to_string())
+                            .collect()
+                    }),
                     kinds: t.kinds.clone(),
                     retry_attempts: (t.retry_attempts != 8).then_some(t.retry_attempts),
                     queue_days: (t.queue_days != 7).then_some(t.queue_days),
@@ -370,8 +413,10 @@ impl ExportConfig {
     }
 }
 
-pub fn default_signals() -> BTreeSet<String> {
-    ["metrics".into(), "logs".into()].into()
+/// What an `[[export]]` without `signals` takes. Traces are opt-in, so a destination written
+/// before hatel relayed them does not start receiving a signal it never selected.
+pub fn default_signals() -> BTreeSet<OtlpSignal> {
+    [OtlpSignal::Metrics, OtlpSignal::Logs].into()
 }
 
 impl ExportTarget {
@@ -795,7 +840,11 @@ mod tests {
             "[[export]]\nendpoint='https://company'\nmode='raw'\nsignals=['metrics']\nkinds=[]\n",
         )
         .unwrap();
-        assert_eq!(selected.targets[0].signals, ["metrics".into()].into());
+        assert_eq!(selected.targets[0].signals, [OtlpSignal::Metrics].into());
+        let traced =
+            parse("[[export]]\nendpoint='https://company'\nmode='raw'\nsignals=['traces']\n")
+                .unwrap();
+        assert_eq!(traced.targets[0].signals, [OtlpSignal::Traces].into());
         assert!(selected.targets[0].kinds.is_empty());
         for entry in [
             "signals=['metricz']",

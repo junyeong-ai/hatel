@@ -22,11 +22,12 @@ use hatel_core::config::Retention;
 use hatel_core::cost::{self, CostRow};
 use hatel_core::schema::build_registry;
 use hatel_core::{
-    Config, ExportConfig, Registry, SessionIndex, SessionIndexCache, Settings, resolve_project,
+    Config, ExportConfig, OtlpSignal, Registry, SessionIndex, SessionIndexCache, Settings,
+    resolve_project,
 };
 
 use crate::claude::{Accumulator, SessionTotals, UNATTRIBUTED, parse_logs, parse_metrics};
-use crate::export::{Exporter, OtlpSignal};
+use crate::export::Exporter;
 use crate::receiver;
 use crate::throttle::{Tally, Throttle};
 
@@ -268,7 +269,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     let app = Router::new()
         .route("/v1/metrics", post(ingest_metrics))
         .route("/v1/logs", post(ingest_logs))
-        .route("/v1/traces", post(|| async { (StatusCode::NOT_IMPLEMENTED,Json(serde_json::json!({"code":12,"message":"traces are not supported; route traces directly to a trace collector"}))) }))
+        .route("/v1/traces", post(ingest_traces))
         .route(receiver::IDENTITY_PATH, get(identity))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state.clone());
@@ -370,11 +371,13 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
     0
 }
 
-/// The receiver always answers 200: the status reflects that the body was *received* (and, when
+/// An accepted body is answered 200: the status reflects that the body was *received* (and, when
 /// forwarding, queued for egress), not whether this build could decode it. An undecodable body is
 /// noted to stderr and surfaced by `doctor` (which detects a wrong protocol from the settings),
 /// never via a status code — so a raw tee of a protobuf body the local view can't read still
-/// succeeds, and an OTLP client never retries (a retry would inflate downstream delta counts).
+/// succeeds, and an OTLP client never retries (a retry would inflate downstream delta counts). The
+/// non-retryable refusals are a body that claims OTLP/JSON but does not parse (400) and traces no
+/// destination relays (501).
 type IngestResponse = (StatusCode, Json<serde_json::Value>);
 
 fn ok() -> IngestResponse {
@@ -396,7 +399,14 @@ async fn ingest_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> IngestResponse {
-    ingest(st, permit, OtlpSignal::Metrics, headers, body).await
+    if let Err(refused) = accept(&st, OtlpSignal::Metrics, &headers, &body) {
+        return refused;
+    }
+    let undecodable = st.undecodable.clone();
+    decode(permit, &undecodable.metrics, "metrics", move || {
+        record_metrics(&st, &body)
+    })
+    .await
 }
 
 async fn ingest_logs(
@@ -405,7 +415,41 @@ async fn ingest_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> IngestResponse {
-    ingest(st, permit, OtlpSignal::Logs, headers, body).await
+    if let Err(refused) = accept(&st, OtlpSignal::Logs, &headers, &body) {
+        return refused;
+    }
+    let undecodable = st.undecodable.clone();
+    decode(permit, &undecodable.logs, "logs", move || {
+        record_logs(&st, &body)
+    })
+    .await
+}
+
+/// Traces are relayed, never decoded or stored, so they are accepted only while a destination
+/// takes them; otherwise the client learns at once that nothing here keeps them.
+async fn ingest_traces(
+    State(st): State<AppState>,
+    _permit: IngestPermit,
+    headers: HeaderMap,
+    body: Bytes,
+) -> IngestResponse {
+    if !st
+        .exporter
+        .as_ref()
+        .is_some_and(|exporter| exporter.forwards(OtlpSignal::Traces))
+    {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "code": 12,
+                "message": "hatel stores no traces, and no [[export]] destination selects them",
+            })),
+        );
+    }
+    match accept(&st, OtlpSignal::Traces, &headers, &body) {
+        Ok(()) => ok(),
+        Err(refused) => refused,
+    }
 }
 
 struct IngestPermit(OwnedSemaphorePermit);
@@ -427,13 +471,15 @@ impl FromRequestParts<AppState> for IngestPermit {
     }
 }
 
-async fn ingest(
-    st: AppState,
-    permit: IngestPermit,
+/// Refuse a body that claims OTLP/JSON but does not parse, then queue it for every destination
+/// taking its signal. Forwarding is independent of local decode: a body this build cannot read
+/// still reaches raw destinations.
+fn accept(
+    st: &AppState,
     signal: OtlpSignal,
-    headers: HeaderMap,
-    body: Bytes,
-) -> IngestResponse {
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(), IngestResponse> {
     let is_json = headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
@@ -446,72 +492,80 @@ async fn ingest(
         .get("content-encoding")
         .and_then(|v| v.to_str().ok())
         .is_none_or(|v| v.eq_ignore_ascii_case("identity"));
-    if is_json && uncompressed && serde_json::from_slice::<serde_json::Value>(&body).is_err() {
-        return (
+    if is_json && uncompressed && serde_json::from_slice::<serde_json::Value>(body).is_err() {
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"code":3,"message":"invalid OTLP/JSON body"})),
-        );
+        ));
     }
-    // Raw forwarding is independent of local decode; unsupported bodies still reach raw targets.
     if let Some(exporter) = &st.exporter {
-        let (ct, ce) = body_headers(&headers);
+        let (ct, ce) = body_headers(headers);
         exporter.enqueue(signal, body.clone(), ct, ce);
     }
-    let counters = st.undecodable.clone();
-    let (counter, name) = match signal {
-        OtlpSignal::Metrics => (&counters.metrics, "metrics"),
-        OtlpSignal::Logs => (&counters.logs, "logs"),
-    };
+    Ok(())
+}
+
+/// Run a signal's local decode off the async runtime while holding the ingest slot, noting a body
+/// this build cannot read.
+async fn decode(
+    permit: IngestPermit,
+    undecodable: &Throttle,
+    signal: &str,
+    work: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> IngestResponse {
     let decoded = tokio::task::spawn_blocking(move || {
         let IngestPermit(_permit) = permit;
-        match signal {
-            OtlpSignal::Metrics => parse_metrics(&body, &st.tracked).map(|points| {
-                if !points.is_empty() {
-                    lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
-                }
-            }),
-            OtlpSignal::Logs => parse_logs(&body, &st.counted).and_then(|events| {
-                if !events.is_empty() {
-                    lock(&st.acc).update_events(events, jiff::Timestamp::now());
-                }
-                let mut records = crate::claude::projection::records(&body, &st.registry)?;
-                let mut index = lock(&st.index_cache);
-                index.refresh();
-                for record in &mut records {
-                    if let Some(session) = record.payload.get("session_id").and_then(|v| v.as_str())
-                    {
-                        if let Some(row) = index.get(session) {
-                            record.metadata.project = Some(hatel_core::ProjectRef {
-                                key: row.project_key.clone(),
-                                label: row.project_label.clone(),
-                            });
-                        } else if index.contains(session) {
-                            record.metadata.project = None;
-                        }
-                    }
-                }
-                drop(index);
-                let mut sink = hatel_core::build_sink(&st.cfg, &st.registry);
-                for record in records {
-                    note_failed_write(
-                        &st.failed_writes.records,
-                        "native projection",
-                        sink.write_record(&record)
-                            .map(|_| ())
-                            .map_err(|e| std::io::Error::other(e.to_string())),
-                    );
-                }
-                Ok(())
-            }),
-        }
+        work()
     })
     .await;
     match decoded {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => note_undecodable(counter, name, &e),
-        Err(e) => note_undecodable(counter, name, &e.to_string()),
+        Ok(Err(e)) => note_undecodable(undecodable, signal, &e),
+        Err(e) => note_undecodable(undecodable, signal, &e.to_string()),
     }
     ok()
+}
+
+fn record_metrics(st: &AppState, body: &[u8]) -> Result<(), String> {
+    let points = parse_metrics(body, &st.tracked)?;
+    if !points.is_empty() {
+        lock(&st.acc).update_metrics(points, jiff::Timestamp::now());
+    }
+    Ok(())
+}
+
+fn record_logs(st: &AppState, body: &[u8]) -> Result<(), String> {
+    let events = parse_logs(body, &st.counted)?;
+    if !events.is_empty() {
+        lock(&st.acc).update_events(events, jiff::Timestamp::now());
+    }
+    let mut records = crate::claude::projection::records(body, &st.registry)?;
+    let mut index = lock(&st.index_cache);
+    index.refresh();
+    for record in &mut records {
+        if let Some(session) = record.payload.get("session_id").and_then(|v| v.as_str()) {
+            if let Some(row) = index.get(session) {
+                record.metadata.project = Some(hatel_core::ProjectRef {
+                    key: row.project_key.clone(),
+                    label: row.project_label.clone(),
+                });
+            } else if index.contains(session) {
+                record.metadata.project = None;
+            }
+        }
+    }
+    drop(index);
+    let mut sink = hatel_core::build_sink(&st.cfg, &st.registry);
+    for record in records {
+        note_failed_write(
+            &st.failed_writes.records,
+            "native projection",
+            sink.write_record(&record)
+                .map(|_| ())
+                .map_err(|e| std::io::Error::other(e.to_string())),
+        );
+    }
+    Ok(())
 }
 
 /// The inbound `Content-Type` and `Content-Encoding`, preserved so a raw tee forwards a body
@@ -1714,14 +1768,49 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let state = test_state(home.path());
         let permit = IngestPermit(state.ingest_slots.clone().acquire_owned().await.unwrap());
-        let response = ingest(
-            state,
+        let response = ingest_metrics(
+            State(state),
             permit,
-            OtlpSignal::Metrics,
             HeaderMap::new(),
             Bytes::from_static(b"{bad"),
         )
         .await;
         assert_eq!(response.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn traces_are_accepted_only_while_a_destination_relays_them() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = test_state(home.path());
+        let spans = Bytes::from_static(br#"{"resourceSpans":[]}"#);
+        let permit =
+            || async { IngestPermit(state.ingest_slots.clone().acquire_owned().await.unwrap()) };
+        let refused = ingest_traces(
+            State(state.clone()),
+            permit().await,
+            HeaderMap::new(),
+            spans.clone(),
+        )
+        .await;
+        assert_eq!(refused.0, StatusCode::NOT_IMPLEMENTED);
+
+        let path = home.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[[export]]\nendpoint='http://127.0.0.1:9'\nmode='raw'\nsignals=['traces']\n",
+        )
+        .unwrap();
+        let config = ExportConfig::from_settings(&Settings::read(&path).unwrap()).unwrap();
+        let (exporter, drain) = Exporter::spawn(config.targets, home.path().to_path_buf());
+        state.exporter = Some(exporter);
+        let accepted = ingest_traces(
+            State(state.clone()),
+            permit().await,
+            HeaderMap::new(),
+            spans,
+        )
+        .await;
+        assert_eq!(accepted.0, StatusCode::OK);
+        drain.abort();
     }
 }

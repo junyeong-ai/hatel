@@ -77,7 +77,6 @@ pub struct Capabilities {
     pub local_metric_types: Vec<String>,
     pub forward_signals: Vec<String>,
     pub durable_local_records: bool,
-    pub traces: bool,
 }
 
 /// The settings that decide which records a store holds: where it is and how long it keeps them.
@@ -116,9 +115,11 @@ impl Identity {
             capabilities: Some(Capabilities {
                 local_decode_protocol: "http/json".into(),
                 local_metric_types: vec!["sum".into(), "gauge".into()],
-                forward_signals: vec!["metrics".into(), "logs".into()],
+                forward_signals: hatel_core::OtlpSignal::ALL
+                    .iter()
+                    .map(|signal| signal.as_str().to_string())
+                    .collect(),
                 durable_local_records: true,
-                traces: false,
             }),
         }
     }
