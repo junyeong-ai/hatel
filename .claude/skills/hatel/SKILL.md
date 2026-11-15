@@ -1,7 +1,7 @@
 ---
 name: hatel
 version: 0.29.0
-description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code cost and token usage, instruction loads, storage diagnosis, disk usage and retention, and selective downstream delivery. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
+description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code cost and token usage, instruction loads, duration percentiles, individual records over fixed before/after periods, storage diagnosis, disk usage and retention, and selective downstream delivery including Claude Code traces. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
 allowed-tools: Bash, Read, Edit
 ---
 
