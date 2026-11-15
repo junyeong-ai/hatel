@@ -152,6 +152,69 @@ pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Sectio
     })
 }
 
+/// One Kind's readable records in a query's period, project and filters, newest first.
+pub struct Records {
+    pub records: Vec<crate::Envelope>,
+    /// How many records matched before `limit` cut them.
+    pub total: usize,
+    pub retained_since: Option<String>,
+    pub contracts: Vec<ContractCount>,
+}
+
+/// List `spec`'s records as stored occurrences, whatever its mode, cut at `limit` (0 = all). A
+/// record is listed only when the answering definition reads its contract, and with only the
+/// payload fields that definition declares; the others are counted per resolution, as a report
+/// section counts them.
+pub fn records(cfg: &Config, spec: &KindSpec, q: &Query, limit: usize) -> crate::Result<Records> {
+    let mut conn = connection(cfg)?;
+    let transaction = conn.transaction().map_err(io)?;
+    let resolved = Contracts::resolve(&transaction, spec)?;
+    let retained_since = oldest(&transaction, spec, q, &resolved)?;
+    let mut args = Vec::new();
+    let mut conditions = scope(spec, q, &mut args);
+    conditions.extend(filter_conditions(spec, q, &mut args));
+    let contracts = counts_by_contract(&transaction, &conditions, &args, &resolved)?;
+    conditions.push(readable(&resolved, &mut args));
+    let conditions = conditions.join(" AND ");
+    let total: i64 = transaction
+        .query_row(
+            &format!("SELECT COUNT(*) FROM envelopes WHERE {conditions}"),
+            rusqlite::params_from_iter(&args),
+            |r| r.get(0),
+        )
+        .map_err(io)?;
+    let cut = match limit {
+        0 => String::new(),
+        n => format!(" LIMIT {n}"),
+    };
+    let mut stmt = transaction
+        .prepare(&format!(
+            "SELECT {} FROM envelopes e WHERE {conditions} \
+             ORDER BY e.occurred_seconds DESC, e.occurred_nanos DESC, e.id DESC{cut}",
+            crate::sink::ENVELOPE_COLUMNS
+        ))
+        .map_err(io)?;
+    let records = stmt
+        .query_map(rusqlite::params_from_iter(&args), crate::sink::envelope)
+        .map_err(io)?
+        .map(|row| {
+            row.map(|mut envelope| {
+                envelope
+                    .payload
+                    .retain(|field, _| spec.fields.contains(field));
+                envelope
+            })
+        })
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(io)?;
+    Ok(Records {
+        records,
+        total: usize::try_from(total).unwrap_or(usize::MAX),
+        retained_since,
+        contracts,
+    })
+}
+
 /// The records a related Kind is read over: every one retained, whatever the window, project and
 /// filters, which select the records a section counts. A related record need not occur inside the
 /// window of the record it describes: a transcript response is timestamped before the request event
@@ -250,6 +313,16 @@ fn contract_counts(
     if spec.mode == crate::registry::KindMode::Event {
         conditions.extend(filter_conditions(spec, q, &mut args));
     }
+    counts_by_contract(conn, &conditions, &args, resolved)
+}
+
+/// The records matching `conditions` per stored contract, each with its resolution.
+fn counts_by_contract(
+    conn: &Connection,
+    conditions: &[String],
+    args: &[Value],
+    resolved: &Contracts,
+) -> crate::Result<Vec<ContractCount>> {
     let mut stmt = conn
         .prepare(&format!(
             "SELECT schema_id, kind_version, COUNT(*) FROM envelopes WHERE {} GROUP BY 1, 2 ORDER BY 1, 2",

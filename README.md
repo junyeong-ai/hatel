@@ -63,13 +63,14 @@ hatel doctor                        # 연결 상태 확인
 | 현재 저장소에서 지난 7일의 브랜치별 대화 토큰 | `hatel report --kind claude.response --project "$PWD" --group-by branch --window 7d` |
 | 현재 저장소에서 지난 7일의 브랜치별 요청 비용 | `hatel report --kind claude.api_request --relate claude.response --project "$PWD" --group-by branch --window 7d` |
 | 실패한 검사 | `hatel report --kind check --filter outcome=failed --group-by name --top 0` |
+| 실패한 검사 하나하나의 시각, 프로젝트, 실행을 최근 순으로 | `hatel records --kind check --filter outcome=failed` |
 | 성공한 스킬 호출 | `hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill` |
 | 컨텍스트에 로드된 지침 파일 | `hatel report --kind memory --group-by file_path` |
 | 변경 전후를 비교할 고정 기간의 지침 로드 | `hatel report --kind memory --group-by file_path --since 2026-11-01 --until 2026-11-15` |
 | 현재 저장소의 한 브랜치에서 시작한 세션 | `hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0` |
 | 현재 저장소만 | `hatel report --project "$PWD"` |
 
-`--filter`(반복 가능, 정확히 일치), `--group-by`, `--sort-by`, `--relate`는 `--kind`와 함께 씁니다. `--relate <Kind>`를 주면 `--group-by`는 같은 identity 값을 가진 그 Kind 기록의 필드를 가리킵니다. `--window`는 `--until`부터, 없으면 지금부터 거슬러 셉니다. `--since`를 주면 시작 시각을 고정합니다. 날짜는 로컬 시간대의 자정이며, `--until`의 시각은 기간에 포함되지 않습니다. `--top`은 목록마다 기본 5개를 보여 주고 `0`이면 전부 보여 주며, 자르기 전 개수도 함께 알립니다. 기계가 읽을 때는 `--format json`을 씁니다. `--project`에 경로를 주면 그 경로가 속한 저장소(linked worktree 포함)를 고르고, 저장소 밖의 경로는 거부합니다.
+`--filter`(반복 가능, 정확히 일치), `--group-by`, `--sort-by`, `--relate`는 `--kind`와 함께 씁니다. `--relate <Kind>`를 주면 `--group-by`는 같은 identity 값을 가진 그 Kind 기록의 필드를 가리킵니다. `--window`는 `--until`부터, 없으면 지금부터 거슬러 셉니다. `--since`를 주면 시작 시각을 고정합니다. 날짜는 로컬 시간대의 자정이며, `--until`의 시각은 기간에 포함되지 않습니다. `--top`은 목록마다 기본 5개를 보여 주고 `0`이면 전부 보여 주며, 자르기 전 개수도 함께 알립니다. 기계가 읽을 때는 `--format json`을 씁니다. `records`는 같은 기간, `--project`, `--filter` 옵션을 받아 한 Kind의 기록을 최근 순으로 JSON으로 나열하며, 기본 20개이고 `--limit 0`이면 전부 보여 주고, `total`에 일치한 개수를 적습니다. `--project`에 경로를 주면 그 경로가 속한 저장소(linked worktree 포함)를 고르고, 저장소 밖의 경로는 거부합니다.
 
 ## 결과 읽는 법
 

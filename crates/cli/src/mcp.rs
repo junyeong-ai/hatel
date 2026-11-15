@@ -173,6 +173,41 @@ pub struct DoctorParams {
     pub local: Option<bool>,
 }
 
+#[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordsParams {
+    #[schemars(description = "The registered Kind to list (e.g. \"check\")")]
+    pub kind: String,
+    #[schemars(
+        description = "Window in days, e.g. \"30d\" (days only; default \"30d\"), ending at `until` or now. Not with `since`."
+    )]
+    pub window: Option<String>,
+    #[schemars(
+        description = "Start of the period instead of a window: an RFC 3339 timestamp, or a YYYY-MM-DD date naming local midnight."
+    )]
+    pub since: Option<String>,
+    #[schemars(
+        description = "End of the period, exclusive: an RFC 3339 timestamp or a YYYY-MM-DD date naming local midnight. Without it the period stays open."
+    )]
+    pub until: Option<String>,
+    #[schemars(
+        description = "Restrict to one project: an absolute path names the repository it is in (a linked worktree or subdirectory included), anything else is a canonical key or label"
+    )]
+    pub project: Option<String>,
+    #[schemars(
+        description = "Read the records under this stored schema ID (see stored_contracts in kinds) instead of the Kind's current contract"
+    )]
+    pub contract: Option<String>,
+    #[schemars(
+        description = "Exact-match restrictions, each \"field=value\" (every one must match); the field must be in the Kind's allow-list. A redacted field is matched by its original value."
+    )]
+    pub filter: Option<Vec<String>>,
+    #[schemars(
+        description = "Records listed, newest first (0 = all; default 20). `total` states how many matched before the cut."
+    )]
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BatchParams {
@@ -194,6 +229,18 @@ impl HatelMcp {
         Parameters(p): Parameters<ReportParams>,
     ) -> Result<CallToolResult, McpError> {
         self.answer(move || report_tool(p)).await
+    }
+
+    #[tool(
+        title = "List recorded occurrences",
+        description = "List one Kind's records over a period, newest first: each with its occurrence time (`ts`), its `metadata` (project, source, run_id, correlation_id, schema_id) and the payload fields the Kind's definition declares. Use it for what happened — individual outcomes, timestamps, joins on run_id — and `report` for how much. Only records whose contract the definition reads are listed; `contracts` counts every record by resolution, and `total` states how many matched before `limit` cut them. Same JSON as `hatel records`.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn records(
+        &self,
+        Parameters(p): Parameters<RecordsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.answer(move || records_tool(p)).await
     }
 
     #[tool(
@@ -343,6 +390,30 @@ fn report_tool(p: ReportParams) -> Result<CallToolResult, String> {
     Ok(result)
 }
 
+fn records_tool(p: RecordsParams) -> Result<CallToolResult, String> {
+    let period = report::Period::resolve(
+        p.window.as_deref(),
+        p.since.as_deref(),
+        p.until.as_deref(),
+        jiff::Timestamp::now(),
+        &jiff::tz::TimeZone::system(),
+    )?;
+    let list = crate::record_list(
+        &p.kind,
+        &period,
+        p.project.as_deref(),
+        p.contract.as_deref(),
+        &p.filter.unwrap_or_default(),
+        p.limit.unwrap_or(report::RECORD_LIMIT),
+    )
+    .map_err(|refusal| match refusal {
+        crate::Refusal::Configuration(e) | crate::Refusal::Arguments(e) => e,
+    })?;
+    let mut result = success(machine_json(&list));
+    result.is_error = Some(list.failed());
+    Ok(result)
+}
+
 fn kinds_tool() -> Result<CallToolResult, String> {
     let cfg = Config::load().map_err(|e| e.to_string())?;
     let reg = build_registry(&cfg).map_err(|e| e.to_string())?;
@@ -380,7 +451,8 @@ impl ServerHandler for HatelMcp {
                  recording and storage only). `kinds` lists the queryable record Kinds, their \
                  fields and stored contracts; `report` aggregates them, cuts each list at `top` \
                  while stating its total, and adds the Claude Code cost snapshot unless a Kind is \
-                 given; `deliveries` shows downstream delivery states. `emit` and `emit_batch` \
+                 given; `records` lists one Kind's individual records, newest first; \
+                 `deliveries` shows downstream delivery states. `emit` and `emit_batch` \
                  record domain signals for registered Kinds and return storage receipts. A \
                  failed call returns an error result whose text names the problem.",
             );

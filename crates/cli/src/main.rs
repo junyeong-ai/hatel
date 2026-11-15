@@ -28,6 +28,34 @@ struct Cli {
     command: Command,
 }
 
+/// The occurrence period a query covers, shared by `report` and `records`.
+#[derive(clap::Args, Debug)]
+struct PeriodArgs {
+    /// Window in days, e.g. `30d` (days only; default 30d), ending at `--until` or now.
+    #[arg(long, conflicts_with = "since")]
+    window: Option<String>,
+    /// Start of the period instead of a window: an RFC 3339 timestamp, or a date (`2026-11-01`)
+    /// naming local midnight.
+    #[arg(long)]
+    since: Option<String>,
+    /// End of the period, exclusive: an RFC 3339 timestamp or a date naming local midnight.
+    /// Without it the period stays open.
+    #[arg(long)]
+    until: Option<String>,
+}
+
+impl PeriodArgs {
+    fn resolve(&self) -> Result<report::Period, String> {
+        report::Period::resolve(
+            self.window.as_deref(),
+            self.since.as_deref(),
+            self.until.as_deref(),
+            jiff::Timestamp::now(),
+            &jiff::tz::TimeZone::system(),
+        )
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Run the OTLP/HTTP receiver and the live per-session rollup.
@@ -49,17 +77,8 @@ enum Command {
     },
     /// Aggregate the ledger over a period: a rolling window unless `--since` fixes its start.
     Report {
-        /// Window in days, e.g. `30d` (days only; default 30d), ending at `--until` or now.
-        #[arg(long, conflicts_with = "since")]
-        window: Option<String>,
-        /// Start of the period instead of a window: an RFC 3339 timestamp, or a date
-        /// (`2026-11-01`) naming local midnight.
-        #[arg(long)]
-        since: Option<String>,
-        /// End of the period, exclusive: an RFC 3339 timestamp or a date naming local midnight.
-        /// Without it the period stays open.
-        #[arg(long)]
-        until: Option<String>,
+        #[command(flatten)]
+        period: PeriodArgs,
         #[arg(long, value_enum, default_value_t = Format::Md)]
         format: Format,
         /// Restrict to one project: an absolute path names the repository it is in (a linked
@@ -103,6 +122,29 @@ enum Command {
         /// every retained record; the window, project and filters select only the counted ones.
         #[arg(long, value_name = "kind", requires = "kind")]
         relate: Option<String>,
+    },
+    /// List one Kind's records over a period, newest first, as JSON: when each occurred, under
+    /// which project and run, with the fields its definition declares.
+    Records {
+        /// The registered Kind to list (e.g. `check`).
+        #[arg(long)]
+        kind: String,
+        #[command(flatten)]
+        period: PeriodArgs,
+        /// Restrict to one project: an absolute path names the repository it is in (a linked
+        /// worktree or subdirectory included), anything else is a canonical key or label.
+        #[arg(long)]
+        project: Option<String>,
+        /// Read the records under this stored schema ID instead of the Kind's current contract.
+        #[arg(long)]
+        contract: Option<String>,
+        /// Restrict to records whose field equals a value (`--filter outcome=failed`;
+        /// repeatable — every filter must match), as `report --filter` does.
+        #[arg(long, value_name = "field=value")]
+        filter: Vec<String>,
+        /// Records listed, newest first (0 = all); `total` states how many matched.
+        #[arg(long, default_value_t = report::RECORD_LIMIT)]
+        limit: usize,
     },
     /// Wire this collector into Claude Code's settings.json — idempotent and
     /// non-destructive (adds the telemetry env and lifecycle hooks without touching
@@ -221,9 +263,7 @@ fn run() -> i32 {
             }
         },
         Command::Report {
-            window,
-            since,
-            until,
+            period,
             format,
             project,
             kind,
@@ -233,13 +273,7 @@ fn run() -> i32 {
             sort_by,
             filter,
             relate,
-        } => match report::Period::resolve(
-            window.as_deref(),
-            since.as_deref(),
-            until.as_deref(),
-            jiff::Timestamp::now(),
-            &jiff::tz::TimeZone::system(),
-        ) {
+        } => match period.resolve() {
             Ok(period) => report_cmd(
                 &period,
                 format,
@@ -254,6 +288,27 @@ fn run() -> i32 {
             ),
             Err(e) => {
                 eprintln!("report: {e}");
+                2
+            }
+        },
+        Command::Records {
+            kind,
+            period,
+            project,
+            contract,
+            filter,
+            limit,
+        } => match period.resolve() {
+            Ok(period) => records_cmd(
+                &kind,
+                &period,
+                project.as_deref(),
+                contract.as_deref(),
+                &filter,
+                limit,
+            ),
+            Err(e) => {
+                eprintln!("records: {e}");
                 2
             }
         },
@@ -584,6 +639,74 @@ fn report_cmd(
         Format::Text => print!("{}", render::format_text(&report)),
     }
     i32::from(failed)
+}
+
+fn records_cmd(
+    kind: &str,
+    period: &report::Period,
+    project: Option<&str>,
+    contract: Option<&str>,
+    filter: &[String],
+    limit: usize,
+) -> i32 {
+    match record_list(kind, period, project, contract, filter, limit) {
+        Ok(list) => {
+            print!("{}", machine_json(&list));
+            i32::from(list.failed())
+        }
+        Err(Refusal::Configuration(e)) => {
+            eprintln!("records: {e}");
+            1
+        }
+        Err(Refusal::Arguments(e)) => {
+            eprintln!("records: {e}");
+            2
+        }
+    }
+}
+
+/// Why a query was not answered: an unusable configuration or registry, or arguments it rejects.
+pub(crate) enum Refusal {
+    Configuration(String),
+    Arguments(String),
+}
+
+/// The listing `hatel records` prints and the MCP `records` tool returns.
+pub(crate) fn record_list(
+    kind: &str,
+    period: &report::Period,
+    project: Option<&str>,
+    contract: Option<&str>,
+    filter: &[String],
+    limit: usize,
+) -> Result<report::RecordList, Refusal> {
+    let cfg = Config::load().map_err(|e| Refusal::Configuration(e.to_string()))?;
+    let reg = build_query_registry(&cfg, Some(kind), contract)
+        .map_err(|e| Refusal::Configuration(e.to_string()))?;
+    let restrictions = parse_query(&reg, &cfg, project, Some(kind), None, None, filter, None)
+        .map_err(Refusal::Arguments)?;
+    let spec = reg
+        .kind(kind)
+        .expect("parse_query admits only a registered kind");
+    let q = report::Query {
+        since: period.since,
+        until: period.until,
+        top_n: 0,
+        project: restrictions.project.as_deref(),
+        kind: Some(kind),
+        contract,
+        group_by: None,
+        sort_by: None,
+        filters: &restrictions.filters,
+        relate: None,
+    };
+    Ok(report::RecordList::build(
+        &cfg,
+        spec,
+        period.window.as_deref(),
+        &q,
+        limit,
+    ))
 }
 
 /// Why a Kind name did not resolve. A name the store already holds records for is not a typo but

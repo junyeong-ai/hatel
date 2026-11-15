@@ -407,25 +407,10 @@ impl Report {
         };
         Report {
             window: window.map(str::to_string),
-            // A period starts no later than now, so a boundary outside the representable range
-            // lies before its earliest instant and admits the records that instant does.
-            since: jiff::Timestamp::from_second(q.since)
-                .unwrap_or(jiff::Timestamp::MIN)
-                .to_string(),
-            until: q.until.map(|until| {
-                jiff::Timestamp::from_second(until)
-                    .unwrap_or(jiff::Timestamp::MAX)
-                    .to_string()
-            }),
+            since: since_text(q),
+            until: until_text(q),
             project: q.project.map(str::to_string),
-            filters: q
-                .filters
-                .iter()
-                .map(|(field, value)| Filter {
-                    field: field.clone(),
-                    value: value.clone(),
-                })
-                .collect(),
+            filters: filters(q),
             top_n: q.top_n,
             kinds,
             // The cost snapshot is not a Kind, so a Kind-scoped report leaves it out entirely
@@ -445,6 +430,96 @@ impl Report {
         self.storage_error.is_some()
             || self.cost_error.is_some()
             || self.kinds.iter().any(|kind| kind.error.is_some())
+    }
+}
+
+/// The instant a query's period starts. A period starts no later than now, so a boundary outside
+/// the representable range lies before its earliest instant and admits the records that instant
+/// does.
+fn since_text(q: &Query) -> String {
+    jiff::Timestamp::from_second(q.since)
+        .unwrap_or(jiff::Timestamp::MIN)
+        .to_string()
+}
+
+fn until_text(q: &Query) -> Option<String> {
+    q.until.map(|until| {
+        jiff::Timestamp::from_second(until)
+            .unwrap_or(jiff::Timestamp::MAX)
+            .to_string()
+    })
+}
+
+fn filters(q: &Query) -> Vec<Filter> {
+    q.filters
+        .iter()
+        .map(|(field, value)| Filter {
+            field: field.clone(),
+            value: value.clone(),
+        })
+        .collect()
+}
+
+/// How many records a listing shows when no limit is given.
+pub const RECORD_LIMIT: usize = 20;
+
+/// One Kind's stored occurrences over a period, newest first: the answer to what happened, where
+/// a report answers how much. Records are listed with the payload fields the answering definition
+/// declares, only under the contracts it reads, and the rest are counted per resolution.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordList {
+    pub kind: String,
+    /// The stored contract the records are read under.
+    pub contract: String,
+    pub window: Option<String>,
+    pub since: String,
+    pub until: Option<String>,
+    pub project: Option<String>,
+    pub filters: Vec<Filter>,
+    /// The cut the listing applied; 0 lists every record.
+    pub limit: usize,
+    /// Records matching before `limit` cut them; `None` when the store could not be read.
+    pub total: Option<usize>,
+    pub records: Vec<crate::Envelope>,
+    pub retained_since: Option<String>,
+    pub contracts: Vec<crate::query::ContractCount>,
+    pub storage_error: Option<String>,
+}
+
+impl RecordList {
+    pub fn build(
+        cfg: &Config,
+        spec: &crate::KindSpec,
+        window: Option<&str>,
+        q: &Query,
+        limit: usize,
+    ) -> RecordList {
+        let (listed, storage_error) = match crate::query::records(cfg, spec, q, limit) {
+            Ok(listed) => (Some(listed), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        RecordList {
+            kind: spec.name.clone(),
+            contract: q.contract.unwrap_or(&spec.schema_id).into(),
+            window: window.map(str::to_string),
+            since: since_text(q),
+            until: until_text(q),
+            project: q.project.map(str::to_string),
+            filters: filters(q),
+            limit,
+            total: listed.as_ref().map(|listed| listed.total),
+            retained_since: listed.as_ref().and_then(|l| l.retained_since.clone()),
+            contracts: listed
+                .as_ref()
+                .map(|l| l.contracts.clone())
+                .unwrap_or_default(),
+            records: listed.map(|l| l.records).unwrap_or_default(),
+            storage_error,
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        self.storage_error.is_some()
     }
 }
 

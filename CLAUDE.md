@@ -98,6 +98,9 @@ cargo audit   # after dependency updates
   time; a conflicting tie, or a readable record missing identity or observation time, fails the
   section. A rolling snapshot report is not a complete inventory. Event identity selects the
   earliest readable matching record per group.
+- `records` lists stored occurrences under the same scope, filters and contract resolution as a
+  report section, newest first; snapshot selection and identity counting are report semantics
+  and do not apply to a listing.
 - `check` records producer-observed outcomes and seconds. Producers keep command exit, timeout,
   spawn error, signal and reuse distinct; missing durations or exit codes stay absent. It implies
   no defect, flakiness or saved time.

@@ -37,7 +37,14 @@ hatel report --kind memory --group-by file_path --since 2026-11-01 --until 2026-
 hatel report --kind tool --filter tool_name=Skill --filter ok=1 --group-by skill
 hatel report --kind session --project "$PWD" --filter branch=main --group-by session_id --top 0 --format json
 hatel report --project "$PWD" --format json
+hatel records --kind check --filter outcome=failed --limit 0
 ```
+
+`records` answers what happened where `report` answers how much: one Kind's stored records,
+newest first, each with `ts`, `metadata` (project, source, run_id, correlation_id, schema_id) and
+the declared payload fields. It takes the report's period, project, filter and contract options,
+lists only readable contracts, counts the rest in `contracts`, and states `total` before
+`--limit` (default 20). It lists occurrences as stored: no snapshot or identity selection.
 
 `--filter` is repeatable exact equality; all filters must match. An empty string differs
 from an absent field. `--filter`, `--group-by`, `--sort-by` and `--relate` require `--kind`.

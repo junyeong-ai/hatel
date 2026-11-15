@@ -1816,6 +1816,115 @@ fn a_newer_state_under_an_unreadable_contract_hides_its_entity() {
 }
 
 #[test]
+fn records_list_readable_occurrences_newest_first_with_declared_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let plugin = dir.path().join("deploy.toml");
+    let cfg = config_in(dir.path(), vec![plugin.clone()]);
+    let define = |fields: &str| {
+        std::fs::write(&plugin, format!("[[kind]]\nname = \"team.deploy\"\nfields = {{ service = {{ type = \"string\", required = true }}, {fields} }}\ngroup_key = \"service\"\n")).unwrap();
+        build_registry(&cfg).unwrap()
+    };
+    let record = |reg: &Registry, payload: serde_json::Value, second: u8| {
+        let mut env = make_envelope(
+            "team.deploy",
+            serde_json::from_value(payload).unwrap(),
+            reg,
+            true,
+        )
+        .unwrap();
+        env.ts = format!("2026-01-01T00:00:0{second}Z");
+        hatel_core::build_sink(&cfg, reg)
+            .write_record(&env)
+            .unwrap();
+    };
+    let noted = define("outcome = { type = \"string\" }, note = { type = \"string\" }");
+    record(
+        &noted,
+        serde_json::json!({"service": "api", "outcome": "failed", "note": "first"}),
+        1,
+    );
+    let untyped = define("outcome = { type = \"any\" }");
+    record(
+        &untyped,
+        serde_json::json!({"service": "api", "outcome": "failed"}),
+        2,
+    );
+    let reader = define("outcome = { type = \"string\" }");
+    record(
+        &reader,
+        serde_json::json!({"service": "api", "outcome": "passed"}),
+        3,
+    );
+    record(
+        &reader,
+        serde_json::json!({"service": "web", "outcome": "failed"}),
+        4,
+    );
+    record(
+        &reader,
+        serde_json::json!({"service": "web", "outcome": "failed"}),
+        5,
+    );
+
+    let spec = reader.kind("team.deploy").unwrap();
+    let failed = [("outcome".to_string(), "failed".to_string())];
+    let list = |until: Option<i64>, limit: usize| {
+        hatel_core::query::records(
+            &cfg,
+            spec,
+            &report::Query {
+                until,
+                filters: &failed,
+                ..query(0, 0, None)
+            },
+            limit,
+        )
+        .unwrap()
+    };
+    let newest = list(None, 2);
+    assert_eq!(
+        newest.total, 3,
+        "the readable failures, the compatible one included"
+    );
+    let seconds: Vec<&str> = newest.records.iter().map(|r| r.ts.as_str()).collect();
+    assert_eq!(seconds, ["2026-01-01T00:00:05Z", "2026-01-01T00:00:04Z"]);
+    let all = list(None, 0);
+    let first = all.records.last().unwrap();
+    assert_eq!(
+        first.payload.get("outcome"),
+        Some(&serde_json::json!("failed"))
+    );
+    assert!(
+        !first.payload.contains_key("note"),
+        "a field only its writer declared is not read"
+    );
+    let mut resolutions: Vec<_> = all
+        .contracts
+        .iter()
+        .map(|c| (format!("{:?}", c.resolution), c.count))
+        .collect();
+    resolutions.sort();
+    assert_eq!(
+        resolutions,
+        [
+            ("Compatible".to_string(), 1),
+            ("Incompatible".to_string(), 1),
+            ("Selected".to_string(), 2)
+        ],
+        "a matching record under a contract the reader cannot read is counted, not listed"
+    );
+    let before_last = "2026-01-01T00:00:05Z"
+        .parse::<jiff::Timestamp>()
+        .unwrap()
+        .as_second();
+    assert_eq!(
+        list(Some(before_last), 0).total,
+        2,
+        "the period's end is exclusive"
+    );
+}
+
+#[test]
 fn a_snapshot_whose_identity_changed_is_not_read_as_the_same_entities() {
     // Each stored state belongs to the entity its writer's identity named. Reading it under another
     // identity would merge or fail entities, so the records are excluded and counted instead.
