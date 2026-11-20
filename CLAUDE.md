@@ -15,7 +15,7 @@ run its gates with the same `RUSTFLAGS` before calling work done:
 RUSTFLAGS="-D warnings" cargo test --workspace --locked
 RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features --workspace --locked -- -D warnings
 cargo fmt --all --check
-RUSTFLAGS="-D warnings" cargo +1.98.0 check --workspace --all-targets --all-features --locked
+RUSTFLAGS="-D warnings" cargo +1.100.0 check --workspace --all-targets --all-features --locked
 cargo audit   # after dependency updates
 ```
 

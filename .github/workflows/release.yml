@@ -32,7 +32,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
         with:
-          toolchain: "1.98.0,1.100.0"
+          toolchain: "1.100.0"
           components: rustfmt
           cache: false
 
@@ -48,7 +48,7 @@ jobs:
           PYTHON
 
       - run: cargo fmt --all --check
-      - run: cargo +1.98.0 check --workspace --all-targets --all-features --locked
+      - run: cargo +1.100.0 check --workspace --all-targets --all-features --locked
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
       - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
         with:

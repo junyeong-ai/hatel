@@ -5,7 +5,7 @@ members = ["crates/core", "crates/hook", "crates/cli"]
 [workspace.package]
 version = "0.30.2"
 edition = "2024"
-rust-version = "1.98.0"
+rust-version = "1.100.0"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
