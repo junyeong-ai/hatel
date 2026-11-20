@@ -184,14 +184,16 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 fn enable_wal(conn: &Connection) -> crate::Result<()> {
     let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
     loop {
-        match conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+            Ok(mode) if mode == "wal" => return Ok(()),
+            Ok(mode) => return Err(io(format!("SQLite refused WAL mode: journal_mode={mode}"))),
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DatabaseBusy
                     && std::time::Instant::now() < deadline =>
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            result => return result.map_err(io),
+            Err(error) => return Err(io(error)),
         }
     }
 }
@@ -491,7 +493,7 @@ impl SqliteSink {
     fn init(path: &Path) -> crate::Result<Connection> {
         let mut conn = connect(path)?;
         match layout(&conn)? {
-            Layout::Current => {}
+            Layout::Current => enable_wal(&conn)?,
             Layout::Other(version) => return Err(unsupported(version)),
             Layout::Empty => {
                 // The retention sweep returns deleted records' pages through incremental vacuum.
@@ -729,6 +731,79 @@ mod tests {
             }
             drop(conn);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_existing_rollback_store_is_opened_in_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let conn = SqliteSink::init(&path).unwrap();
+        conn.execute("INSERT INTO kinds(name) VALUES ('sample')", [])
+            .unwrap();
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        drop(conn);
+
+        let reader = read(&path).unwrap();
+        assert_eq!(
+            reader
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        drop(reader);
+        let writer = SqliteSink::init(&path).unwrap();
+        assert_eq!(
+            writer
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            writer
+                .query_row("SELECT name FROM kinds", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "sample"
+        );
+        assert_eq!(
+            writer
+                .pragma_query_value(None, "auto_vacuum", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_unsupported_wal_mode_is_rejected() {
+        let conn = Connection::open_in_memory().unwrap();
+        let error = enable_wal(&conn).unwrap_err();
+        assert!(error.to_string().contains("memory"), "{error}");
+    }
+
+    #[test]
+    fn an_unsupported_layout_keeps_its_journal_mode() {
+        for version in [0, DATABASE_VERSION + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("telemetry.db");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE records(value TEXT)")
+                .unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
+            drop(conn);
+            assert!(SqliteSink::init(&path).is_err());
+            let conn = Connection::open(path).unwrap();
+            assert_eq!(
+                conn.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                    .unwrap(),
+                "delete"
+            );
+            assert_eq!(
+                conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version
+            );
         }
     }
 
