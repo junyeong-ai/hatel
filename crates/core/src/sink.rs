@@ -146,7 +146,7 @@ fn layout(conn: &Connection) -> crate::Result<Layout> {
 
 fn unsupported(version: i64) -> crate::Error {
     io(format!(
-        "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION}); move telemetry.db aside to start a new store"
+        "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION}); to start a new store, stop the receiver and move telemetry.db aside with its -wal and -shm files"
     ))
 }
 

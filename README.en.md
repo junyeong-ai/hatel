@@ -173,7 +173,7 @@ retention_days = 14
 - `retention_days` is every Kind’s default number of days kept; `[storage.kinds."<Kind>"]` sets one Kind’s own.
 - The receiver periodically deletes records past their retention and returns the freed space to the file system. A shortened retention applies once the receiver restarts, and nothing is deleted while the configuration file cannot be read.
 - `hatel doctor --local` names the actual configuration file and ledger, the ledger’s size and the Kinds holding the most records.
-- A store at a schema this build did not create is refused for reads and writes and never altered. Moving `telemetry.db` aside starts a new store. Back up a live ledger with the [SQLite backup API](https://www.sqlite.org/backup.html).
+- A store at a schema this build did not create is refused for reads and writes and never altered. To start a new store, stop the receiver and move `telemetry.db` aside together with `telemetry.db-wal` and `telemetry.db-shm`. Back up a live ledger with the [SQLite backup API](https://www.sqlite.org/backup.html).
 
 | Variable | Purpose |
 |---|---|

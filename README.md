@@ -173,7 +173,7 @@ retention_days = 14
 - `retention_days`는 모든 Kind의 기본 보존 일수이고, `[storage.kinds."<Kind>"]`는 그 Kind만의 일수를 정합니다.
 - 수신기가 보존 기간이 지난 기록을 주기적으로 지우고 비워진 공간을 파일 시스템에 돌려줍니다. 줄인 보존 기간은 수신기를 재시작한 뒤부터 적용되며, 설정 파일을 읽지 못하면 아무것도 지우지 않습니다.
 - `hatel doctor --local`이 실제 설정 파일과 원장, 원장 크기, 기록이 가장 많은 Kind를 알려 줍니다.
-- 이 빌드가 만들지 않은 스키마의 저장소는 읽기와 쓰기를 거부하고 변경하지 않습니다. `telemetry.db`를 옮기면 새 저장소로 시작합니다. 실행 중인 원장은 [SQLite backup API](https://www.sqlite.org/backup.html)로 백업합니다.
+- 이 빌드가 만들지 않은 스키마의 저장소는 읽기와 쓰기를 거부하고 변경하지 않습니다. 새 저장소로 시작하려면 수신기를 멈춘 뒤 `telemetry.db`를 `telemetry.db-wal`, `telemetry.db-shm`과 함께 옮깁니다. 실행 중인 원장은 [SQLite backup API](https://www.sqlite.org/backup.html)로 백업합니다.
 
 | 변수 | 용도 |
 |---|---|
