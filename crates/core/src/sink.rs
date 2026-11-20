@@ -152,7 +152,11 @@ fn unsupported(version: i64) -> crate::Error {
 
 /// Open an initialized, supported ledger for writing without creating an absent database.
 pub fn open_existing(path: &Path, timeout: std::time::Duration) -> crate::Result<Connection> {
-    let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_WRITE, timeout)?;
+    let conn = connect(
+        path,
+        OpenFlags::default().difference(OpenFlags::SQLITE_OPEN_CREATE),
+        timeout,
+    )?;
     match layout(&conn)? {
         Layout::Current => enable_wal(&conn, timeout)?,
         Layout::Empty => return Err(io("SQLite ledger is not initialized")),
@@ -176,7 +180,6 @@ fn connect(
     if conn.is_readonly(rusqlite::MAIN_DB)? {
         return Err(io("SQLite ledger is read-only"));
     }
-    check_version(&conn)?;
     crate::query::functions(&conn)?;
     Ok(conn)
 }
@@ -221,14 +224,6 @@ fn enable_wal(conn: &Connection, timeout: std::time::Duration) -> crate::Result<
             Err(error) => return Err(error.into()),
         }
     }
-}
-
-pub(crate) fn check_version(conn: &Connection) -> crate::Result<i64> {
-    let version = conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?;
-    if version > DATABASE_VERSION {
-        return Err(newer(version));
-    }
-    Ok(version)
 }
 
 fn newer(version: i64) -> crate::Error {
