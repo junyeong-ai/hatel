@@ -118,6 +118,8 @@ cargo audit   # after dependency updates
 - The ledger is one SQLite database with raw timestamps beside normalized seconds and nanoseconds.
   A record references its Kind, contract and project by id; readers read the `envelopes` view, so
   only the write path knows the tables behind it. Reports aggregate inside SQLite.
+- Only SQLite opens database file descriptors. Closing a separately opened descriptor releases
+  the process's POSIX locks, even while its other database connections remain open.
 - Each ledger layout has its own `DATABASE_VERSION`, read in one statement with the records table
   (`sink::layout`). Hooks never convert data: a store at another layout is refused
   (`sink::write_readiness`), never altered. A layout change takes the next number

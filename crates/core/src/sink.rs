@@ -157,18 +157,15 @@ fn connect(path: &Path) -> crate::Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)
-            .map_err(io)?;
-    }
     let conn = Connection::open(path).map_err(io)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path).map_err(io)?.permissions().mode() & 0o7777 != 0o600 {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+        }
+    }
     check_version(&conn)?;
     crate::query::functions(&conn).map_err(io)?;
     Ok(conn)
@@ -658,6 +655,82 @@ fn project_id(conn: &Connection, project: &ProjectRef) -> rusqlite::Result<i64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opening_another_sink_preserves_process_locks() {
+        const DATABASE: &str = "HATEL_TEST_LOCK_DATABASE";
+        if let Some(path) = std::env::var_os(DATABASE) {
+            let conn = Connection::open(path).unwrap();
+            conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+            conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+                .unwrap();
+            let result = conn.query_row("SELECT COUNT(*) FROM records", [], |r| r.get::<_, i64>(0));
+            assert!(
+                matches!(result, Err(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy),
+                "another process must not take exclusive access to a live ledger"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        let first = SqliteSink::init(&path).unwrap();
+        let second = SqliteSink::init(&path).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sink::tests::opening_another_sink_preserves_process_locks",
+                "--nocapture",
+            ])
+            .env(DATABASE, &path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        drop(second);
+        first
+            .execute("INSERT INTO kinds(name) VALUES ('sample')", [])
+            .unwrap();
+        drop(first);
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM kinds", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_and_wal_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        for _ in 0..2 {
+            let conn = SqliteSink::init(&path).unwrap();
+            for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] {
+                let mode = std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                assert_eq!(mode, 0o600, "{name}");
+            }
+            drop(conn);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+    }
 
     /// A store's number is how a build tells which layout it holds, so a layout change that keeps
     /// the number reaches a build as the first statement that fails on the other layout. When this
