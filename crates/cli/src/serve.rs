@@ -244,8 +244,7 @@ async fn serve(port: u16, project: Option<String>, show_all: bool, wait: bool) -
         );
         (Some(e), Some(h))
     };
-    let durable =
-        Settings::path().map(|path| crate::export::durable::spawn(path, cfg.state_dir.clone()));
+    let durable = Settings::path().map(|path| crate::export::durable::spawn(path, cfg.database()));
     let state = AppState {
         ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_REQUESTS)),
         acc: Arc::new(Mutex::new(Accumulator::default())),

@@ -117,10 +117,10 @@ impl Policy {
     }
 }
 
-fn policy(path: &Path, state: &Path) -> Result<Policy, String> {
+fn policy(path: &Path, database: &Path) -> Result<Policy, String> {
     let settings = Settings::read(path).map_err(|e| e.to_string())?;
     let (cfg, invalid) = hatel_core::Config::from_settings(&settings);
-    if !invalid.is_empty() || cfg.state_dir != state {
+    if !invalid.is_empty() || cfg.database() != database {
         return Err("running store differs from current configuration".into());
     }
     let registry = hatel_core::schema::build_registry(&cfg).map_err(|e| e.to_string())?;
@@ -237,19 +237,19 @@ async fn send(client: &Egress, target: &ExportTarget, payload: Vec<u8>) -> Deliv
 
 pub(crate) async fn deliver(
     path: &Path,
-    state: &Path,
+    database: &Path,
     destination: &str,
     client: &Egress,
 ) -> Result<(), String> {
-    let conn = rusqlite_connection(state)?;
+    let conn = ledger(database)?;
     let now = hatel_core::now_epoch();
     let pending = outbox::due(&conn, destination, now).map_err(|e| e.to_string())?;
     drop(conn);
     if pending.is_empty() {
         return Ok(());
     }
-    let current = policy(path, state)?;
-    let conn = rusqlite_connection(state)?;
+    let current = policy(path, database)?;
+    let conn = ledger(database)?;
     let Some(target) = current
         .export
         .targets
@@ -297,7 +297,7 @@ pub(crate) async fn deliver(
     if records.is_empty() {
         return Ok(());
     }
-    let latest = policy(path, state)?;
+    let latest = policy(path, database)?;
     let now = hatel_core::now_epoch();
     let Some(target) = latest.export.targets.iter().find(|target| {
         target.endpoint == destination
@@ -308,7 +308,7 @@ pub(crate) async fn deliver(
         return Ok(());
     };
     let delivery = send(client, target, body(logs)).await;
-    let conn = rusqlite_connection(state)?;
+    let conn = ledger(database)?;
     let now = hatel_core::now_epoch();
     for pending in records {
         let id = pending
@@ -338,14 +338,14 @@ pub(crate) async fn deliver(
     Ok(())
 }
 
-fn rusqlite_connection(state: &Path) -> Result<rusqlite::Connection, String> {
-    hatel_core::sink::open_existing(&state.join("telemetry.db"), Duration::from_millis(100))
+fn ledger(database: &Path) -> Result<rusqlite::Connection, String> {
+    hatel_core::sink::open_existing(database, Duration::from_millis(100))
         .map_err(|error| error.to_string())
 }
 
 pub fn spawn(
     path: PathBuf,
-    state: PathBuf,
+    database: PathBuf,
 ) -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
@@ -378,15 +378,15 @@ pub fn spawn(
                     }
                 },
                 _ = interval.tick() => {
-                    if !state.join("telemetry.db").exists() { continue; }
-                    let destinations = rusqlite_connection(&state).and_then(|conn| outbox::destinations(&conn).map_err(|e| e.to_string()));
+                    if !database.exists() { continue; }
+                    let destinations = ledger(&database).and_then(|conn| outbox::destinations(&conn).map_err(|e| e.to_string()));
                     let destinations = match destinations { Ok(destinations) => destinations, Err(error) => { if errors.insert(String::new()) { eprintln!("hatel: cannot read durable deliveries: {error}"); } continue; } };
                     errors.remove("");
                     for destination in destinations {
                         if active.len() >= 32 { break; }
                         if !active.insert(destination.clone()) { continue; }
-                        let path = path.clone(); let state = state.clone(); let client = client.clone();
-                        tasks.spawn(async move { let result = deliver(&path,&state,&destination,&client).await; (destination,result) });
+                        let path = path.clone(); let database = database.clone(); let client = client.clone();
+                        tasks.spawn(async move { let result = deliver(&path,&database,&destination,&client).await; (destination,result) });
                     }
                 }
             }
@@ -506,11 +506,11 @@ mod tests {
                 .unwrap();
         }
         let client = Egress::new().unwrap();
-        deliver(&path, home.path(), &endpoint, &client)
+        deliver(&path, &cfg.database(), &endpoint, &client)
             .await
             .unwrap();
         let state = |id: &str| {
-            rusqlite_connection(home.path())
+            ledger(&cfg.database())
                 .unwrap()
                 .query_row(
                     "SELECT status,attempts FROM deliveries WHERE record_id=?1",
@@ -543,7 +543,7 @@ mod tests {
         hatel_core::build_sink(&cfg, &hatel_core::schema::build_registry(&cfg).unwrap())
             .write_record(&exhausted)
             .unwrap();
-        let conn = rusqlite_connection(home.path()).unwrap();
+        let conn = ledger(&cfg.database()).unwrap();
         conn.execute(
             "UPDATE deliveries SET attempts=5 WHERE record_id=?1",
             [exhausted.metadata.record_id.as_deref().unwrap()],
@@ -551,7 +551,7 @@ mod tests {
         .unwrap();
         drop(conn);
         configure(home.path(), &endpoint, "retry_attempts=1\n");
-        deliver(&path, home.path(), &endpoint, &client)
+        deliver(&path, &cfg.database(), &endpoint, &client)
             .await
             .unwrap();
         assert_eq!(
@@ -559,7 +559,7 @@ mod tests {
             ("failed".into(), 5)
         );
         assert_eq!(received.lock().unwrap().len(), 1);
-        let failures = outbox::states(&home.path().join("telemetry.db"))
+        let failures = outbox::states(&cfg.database())
             .unwrap()
             .into_iter()
             .filter(|state| state.status == "failed")
@@ -614,10 +614,10 @@ mod tests {
             1
         );
         let client = Egress::new().unwrap();
-        deliver(&path, home.path(), &endpoint, &client)
+        deliver(&path, &cfg.database(), &endpoint, &client)
             .await
             .unwrap();
-        let conn = rusqlite_connection(home.path()).unwrap();
+        let conn = ledger(&cfg.database()).unwrap();
         assert_eq!(
             conn.query_row("SELECT status FROM deliveries", [], |r| r
                 .get::<_, String>(0))
@@ -627,11 +627,11 @@ mod tests {
         conn.execute("UPDATE deliveries SET next_attempt_at=0", [])
             .unwrap();
         drop(conn);
-        deliver(&path, home.path(), &endpoint, &Egress::new().unwrap())
+        deliver(&path, &cfg.database(), &endpoint, &Egress::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
-            outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
+            outbox::states(&cfg.database()).unwrap()[0].status,
             "delivered"
         );
         {
@@ -645,17 +645,43 @@ mod tests {
             .write_record(&env)
             .unwrap();
         configure(home.path(), &endpoint, "projects=['company']\n");
-        deliver(&path, home.path(), &endpoint, &client)
+        deliver(&path, &cfg.database(), &endpoint, &client)
             .await
             .unwrap();
         assert_eq!(received.lock().unwrap().len(), 2);
         assert!(
-            outbox::states(&home.path().join("telemetry.db"))
+            outbox::states(&cfg.database())
                 .unwrap()
                 .iter()
                 .any(|s| s.status == "cancelled")
         );
         server.abort();
+    }
+    #[tokio::test]
+    async fn a_ledger_the_configuration_no_longer_names_delivers_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let (path, cfg) = configure(home.path(), "http://127.0.0.1:1", "");
+        let registry = hatel_core::schema::build_registry(&cfg).unwrap();
+        let env = hatel_core::make_envelope("prompt", Default::default(), &registry, true).unwrap();
+        hatel_core::build_sink(&cfg, &registry)
+            .write_record(&env)
+            .unwrap();
+        std::fs::create_dir(home.path().join("moved")).unwrap();
+        configure(&home.path().join("moved"), "http://127.0.0.1:1", "");
+        std::fs::rename(home.path().join("moved/config.toml"), &path).unwrap();
+        let error = deliver(
+            &path,
+            &cfg.database(),
+            "http://127.0.0.1:1",
+            &Egress::new().unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("running store differs"), "{error}");
+        assert_eq!(
+            outbox::states(&cfg.database()).unwrap()[0].status,
+            "pending"
+        );
     }
     #[tokio::test]
     async fn a_changed_redaction_contract_cancels_pending_data_even_without_a_version_bump() {
@@ -688,14 +714,14 @@ mod tests {
         std::fs::write(&plugin,"[[kind]]\nname='secret'\nfields={ label = { type = 'any' }, secret = { type = 'any' } }\ngroup_key='label'\nredact=['secret']\n").unwrap();
         deliver(
             &path,
-            home.path(),
+            &cfg.database(),
             "http://127.0.0.1:1",
             &Egress::new().unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(
-            outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
+            outbox::states(&cfg.database()).unwrap()[0].status,
             "cancelled"
         );
     }
@@ -728,13 +754,13 @@ mod tests {
         std::fs::write(&plugin, kind.replace(", secret = { type = 'any' }", "")).unwrap();
         deliver(
             &path,
-            home.path(),
+            &cfg.database(),
             "http://127.0.0.1:1",
             &Egress::new().unwrap(),
         )
         .await
         .unwrap();
-        let state = &outbox::states(&home.path().join("telemetry.db")).unwrap()[0];
+        let state = &outbox::states(&cfg.database()).unwrap()[0];
         assert_eq!(state.status, "cancelled");
         assert_eq!(
             state.error.as_deref(),
@@ -770,14 +796,14 @@ mod tests {
         .unwrap();
         deliver(
             &path,
-            home.path(),
+            &cfg.database(),
             "http://127.0.0.1:1",
             &Egress::new().unwrap(),
         )
         .await
         .unwrap();
         assert_eq!(
-            outbox::states(&home.path().join("telemetry.db")).unwrap()[0].status,
+            outbox::states(&cfg.database()).unwrap()[0].status,
             "pending"
         );
     }
