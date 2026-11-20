@@ -339,14 +339,8 @@ pub(crate) async fn deliver(
 }
 
 fn rusqlite_connection(state: &Path) -> Result<rusqlite::Connection, String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        state.join("telemetry.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .map_err(|error| hatel_core::Error::from(error).to_string())?;
-    conn.busy_timeout(Duration::from_millis(100))
-        .map_err(|error| hatel_core::Error::from(error).to_string())?;
-    Ok(conn)
+    hatel_core::sink::open_existing(&state.join("telemetry.db"), Duration::from_millis(100))
+        .map_err(|error| error.to_string())
 }
 
 pub fn spawn(

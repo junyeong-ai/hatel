@@ -150,12 +150,32 @@ fn unsupported(version: i64) -> crate::Error {
     ))
 }
 
-fn connect(path: &Path) -> crate::Result<Connection> {
-    if let Some(parent) = path.parent() {
+/// Open an initialized, supported ledger for writing without creating an absent database.
+pub fn open_existing(path: &Path, timeout: std::time::Duration) -> crate::Result<Connection> {
+    let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_WRITE, timeout)?;
+    match layout(&conn)? {
+        Layout::Current => enable_wal(&conn, timeout)?,
+        Layout::Empty => return Err(io("SQLite ledger is not initialized")),
+        Layout::Other(version) => return Err(unsupported(version)),
+    }
+    Ok(conn)
+}
+
+fn connect(
+    path: &Path,
+    flags: OpenFlags,
+    timeout: std::time::Duration,
+) -> crate::Result<Connection> {
+    if flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
+        && let Some(parent) = path.parent()
+    {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(timeout)?;
+    if conn.is_readonly(rusqlite::MAIN_DB)? {
+        return Err(io("SQLite ledger is read-only"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -178,8 +198,8 @@ const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// SQLite answers a concurrent switch with BUSY at once instead of waiting on the busy timeout.
 /// Once one switch lands the mode is stored in the file, so retrying lets every first writer
 /// through.
-fn enable_wal(conn: &Connection) -> crate::Result<()> {
-    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+fn enable_wal(conn: &Connection, timeout: std::time::Duration) -> crate::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
             Ok(mode) if mode == "wal" => return Ok(()),
@@ -354,13 +374,8 @@ pub fn prune(cfg: &Config, retention: &crate::config::Retention) -> usize {
     if !path.exists() {
         return 0;
     }
-    if let Err(error) = write_readiness(&path) {
-        eprintln!("hatel: sqlite retention skipped: {error}");
-        return 0;
-    }
-    let result = (|| -> rusqlite::Result<usize> {
-        let mut conn = Connection::open(&path)?;
-        conn.busy_timeout(BUSY_TIMEOUT)?;
+    let result = (|| -> crate::Result<usize> {
+        let mut conn = open_existing(&path, BUSY_TIMEOUT)?;
         conn.execute_batch("CREATE TEMP TABLE prune_records (id INTEGER PRIMARY KEY);")?;
         let kinds = conn
             .prepare("SELECT id, name FROM kinds")?
@@ -376,10 +391,7 @@ pub fn prune(cfg: &Config, retention: &crate::config::Retention) -> usize {
     match result {
         Ok(count) => count,
         Err(error) => {
-            eprintln!(
-                "hatel: sqlite retention failed: {}",
-                crate::Error::from(error)
-            );
+            eprintln!("hatel: sqlite retention failed: {error}");
             0
         }
     }
@@ -479,16 +491,16 @@ impl SqliteSink {
     }
 
     fn init(path: &Path) -> crate::Result<Connection> {
-        let mut conn = connect(path)?;
+        let mut conn = connect(path, OpenFlags::default(), BUSY_TIMEOUT)?;
         match layout(&conn)? {
-            Layout::Current => enable_wal(&conn)?,
+            Layout::Current => enable_wal(&conn, BUSY_TIMEOUT)?,
             Layout::Other(version) => return Err(unsupported(version)),
             Layout::Empty => {
                 // The retention sweep returns deleted records' pages through incremental vacuum.
                 // SQLite fixes the auto-vacuum mode when it writes the first page, which the WAL
                 // switch does.
                 conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-                enable_wal(&conn)?;
+                enable_wal(&conn, BUSY_TIMEOUT)?;
                 initialize(&mut conn)?;
             }
         }
@@ -659,6 +671,7 @@ mod tests {
         let path = dir.path().join("telemetry.db");
         let first = SqliteSink::init(&path).unwrap();
         let second = SqliteSink::init(&path).unwrap();
+        let third = open_existing(&path, BUSY_TIMEOUT).unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -675,6 +688,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         drop(second);
+        drop(third);
         first
             .execute("INSERT INTO kinds(name) VALUES ('sample')", [])
             .unwrap();
@@ -712,6 +726,24 @@ mod tests {
             drop(conn);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_store_stays_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        drop(SqliteSink::init(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(open_existing(&path, BUSY_TIMEOUT).is_err());
+        assert!(SqliteSink::init(&path).is_err());
+        assert!(read(&path).is_ok());
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            0o400
+        );
     }
 
     #[test]
@@ -758,7 +790,7 @@ mod tests {
     #[test]
     fn an_unsupported_wal_mode_is_rejected() {
         let conn = Connection::open_in_memory().unwrap();
-        let error = enable_wal(&conn).unwrap_err();
+        let error = enable_wal(&conn, BUSY_TIMEOUT).unwrap_err();
         assert!(error.to_string().contains("memory"), "{error}");
     }
 
@@ -773,6 +805,7 @@ mod tests {
             conn.pragma_update(None, "user_version", version).unwrap();
             drop(conn);
             assert!(SqliteSink::init(&path).is_err());
+            assert!(open_existing(&path, BUSY_TIMEOUT).is_err());
             let conn = Connection::open(path).unwrap();
             assert_eq!(
                 conn.pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
@@ -785,6 +818,50 @@ mod tests {
                 version
             );
         }
+    }
+
+    #[test]
+    fn an_existing_writer_never_creates_or_initializes_a_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent/telemetry.db");
+        assert!(open_existing(&path, BUSY_TIMEOUT).is_err());
+        assert!(!path.parent().unwrap().exists());
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, []).unwrap();
+        let error = open_existing(&path, BUSY_TIMEOUT).unwrap_err();
+        assert!(error.to_string().contains("not initialized"), "{error}");
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_existing_writer_honors_its_timeout_and_restores_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("telemetry.db");
+        drop(SqliteSink::init(&path).unwrap());
+        let blocker = Connection::open(&path).unwrap();
+        blocker
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        blocker
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM records")
+            .unwrap();
+        let error = open_existing(&path, std::time::Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("Error code 5:"), "{error}");
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        let writer = open_existing(&path, std::time::Duration::from_millis(100)).unwrap();
+        assert_eq!(
+            writer
+                .pragma_query_value(None, "journal_mode", |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            writer
+                .pragma_query_value(None, "busy_timeout", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            100
+        );
     }
 
     /// A store's number is how a build tells which layout it holds, so a layout change that keeps
