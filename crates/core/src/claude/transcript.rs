@@ -81,7 +81,7 @@ fn remember_subagent(positions: &Path, session: &str, agent: &Path) {
     }
     let mut line = agent.as_os_str().as_encoded_bytes().to_vec();
     line.push(b'\n');
-    let written = std::fs::create_dir_all(positions).and_then(|()| {
+    let written = crate::config::create_state_dir(positions).and_then(|()| {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -355,7 +355,7 @@ impl Position {
         };
         let path = Self::path(positions, transcript);
         let staged = path.with_extension(format!("{}.tmp", std::process::id()));
-        let written = std::fs::create_dir_all(positions)
+        let written = crate::config::create_state_dir(positions)
             .and_then(|()| std::fs::write(&staged, serde_json::to_vec(&position)?))
             .and_then(|()| std::fs::rename(&staged, &path));
         if let Err(e) = written {

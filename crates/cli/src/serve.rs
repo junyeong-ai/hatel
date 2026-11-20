@@ -606,7 +606,7 @@ pub(crate) enum LockOutcome {
 #[cfg(unix)]
 pub(crate) fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
     use std::os::unix::io::AsRawFd as _;
-    if let Err(e) = std::fs::create_dir_all(state_dir) {
+    if let Err(e) = hatel_core::config::create_state_dir(state_dir) {
         return LockOutcome::Failed(format!(
             "cannot create state dir {}: {e}",
             state_dir.display()
@@ -647,7 +647,7 @@ pub(crate) fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
 #[cfg(windows)]
 pub(crate) fn acquire_state_lock(state_dir: &Path) -> LockOutcome {
     use std::os::windows::fs::OpenOptionsExt as _;
-    if let Err(e) = std::fs::create_dir_all(state_dir) {
+    if let Err(e) = hatel_core::config::create_state_dir(state_dir) {
         return LockOutcome::Failed(format!(
             "cannot create state dir {}: {e}",
             state_dir.display()

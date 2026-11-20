@@ -192,6 +192,7 @@ pub(crate) fn report(local: bool) -> Report {
             cfg.state_dir.display()
         )),
     }
+    advise_private_state_dir(&mut storage, &cfg.state_dir);
     report_invalid_variables(&mut storage, &invalid, &settings_env);
     advise_split_environment(&mut storage, &|key| std::env::var_os(key), &settings_env);
     report_registry(&mut storage, &settings, &cfg, &registry);
@@ -1227,8 +1228,30 @@ fn native_settle_s(env: &cs::Env) -> i64 {
     2 * longest / 1_000 + crate::serve::FLUSH_INTERVAL.as_secs() as i64
 }
 
+/// A state directory hatel creates is owner-only, and one that already exists keeps its owner's
+/// mode, so a directory other local users can enter is named here with the command that closes it
+/// rather than tightened behind the owner's back.
+#[cfg(unix)]
+fn advise_private_state_dir(sec: &mut Section, dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = std::fs::metadata(dir) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        sec.warn(format!(
+            "state dir is open to other local users (mode {mode:o}) — its ledger, session index \
+             and transcript positions name repositories and sessions; `chmod 700 {dir:?}` keeps \
+             them private"
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn advise_private_state_dir(_sec: &mut Section, _dir: &Path) {}
+
 fn writable(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    hatel_core::config::create_state_dir(dir)?;
     let probe = dir.join(".doctor_write_probe");
     std::fs::write(&probe, b"")?;
     std::fs::remove_file(&probe)
@@ -1607,6 +1630,34 @@ mod tests {
         assert!(sec.findings[1].message.starts_with(
             r#"HATEL_DISABLED="true" in the user settings.json env: must be 1 or 0;"#
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_dir_other_users_can_enter_is_named_with_its_remedy() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let findings = |dir: &Path| {
+            let mut sec = Section::new("storage", "storage:");
+            advise_private_state_dir(&mut sec, dir);
+            sec.findings
+                .into_iter()
+                .map(|f| (f.status, f.message))
+                .collect::<Vec<_>>()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        assert!(findings(&dir.path().join("absent")).is_empty());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(findings(dir.path()).is_empty());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let open = findings(dir.path());
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].0, Status::Warn);
+        assert!(
+            open[0].1.contains("mode 750") && open[0].1.contains("chmod 700"),
+            "{}",
+            open[0].1
+        );
     }
 
     #[test]

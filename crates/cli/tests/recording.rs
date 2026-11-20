@@ -619,6 +619,12 @@ fn batch_returns_each_storage_outcome_and_only_stored_rows_are_queryable() {
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(rows[0]["status"], "stored");
     assert!(rows[0]["receipt"]["record_id"].is_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = std::fs::metadata(home.path().join("state")).unwrap();
+        assert_eq!(state.permissions().mode() & 0o777, 0o700);
+    }
     for i in 1..4 {
         assert_eq!(rows[i]["status"], "rejected");
     }

@@ -120,6 +120,9 @@ cargo audit   # after dependency updates
   only the write path knows the tables behind it. Reports aggregate inside SQLite.
 - Only SQLite opens database file descriptors. Closing a separately opened descriptor releases
   the process's POSIX locks, even while its other database connections remain open.
+- Every state writer creates its directory through `config::create_state_dir` (owner-only), and a
+  new ledger is owner-only. An existing directory or ledger keeps its owner's mode: `doctor` names
+  a state directory other users can enter rather than tightening it.
 - Each ledger layout has its own `DATABASE_VERSION`, read in one statement with the records table
   (`sink::layout`). Hooks never convert data: a store at another layout is refused
   (`sink::write_readiness`), never altered. A layout change takes the next number

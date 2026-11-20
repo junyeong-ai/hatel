@@ -173,7 +173,7 @@ fn connect(
     if flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
         && let Some(parent) = path.parent()
     {
-        std::fs::create_dir_all(parent).map_err(io)?;
+        crate::config::create_state_dir(parent).map_err(io)?;
     }
     let conn = Connection::open_with_flags(path, flags)?;
     conn.busy_timeout(timeout)?;

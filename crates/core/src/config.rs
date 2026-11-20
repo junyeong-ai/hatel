@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU64;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::settings::Settings;
 use crate::{Error, Result};
@@ -398,6 +398,22 @@ fn xdg_state_dir() -> PathBuf {
     }
 }
 
+/// Create `dir` and its missing parents, as `create_dir_all` does, each owner-only (`0o700` on
+/// Unix). The state holds repository paths, session costs and the transcript positions read from
+/// Claude Code's owner-only project directory, so every directory hatel creates for it is private;
+/// one that already exists keeps the mode its owner gave it. Every state writer creates its
+/// directory through this, since any of them can be the first to run.
+pub fn create_state_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -528,5 +544,26 @@ mod tests {
         for (value, set) in [("1", true), ("0", false), ("", false)] {
             assert_eq!(resolved("", &[("HATEL_DISABLED", value)]).disabled, set);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_created_state_dir_is_private_and_an_existing_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state/hatel");
+        super::create_state_dir(&state.join("transcripts")).unwrap();
+        for dir in [
+            root.path().join("state"),
+            state.clone(),
+            state.join("transcripts"),
+        ] {
+            assert_eq!(mode(&dir), 0o700, "{}", dir.display());
+        }
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o750)).unwrap();
+        super::create_state_dir(&state).unwrap();
+        assert_eq!(mode(&state), 0o750);
     }
 }

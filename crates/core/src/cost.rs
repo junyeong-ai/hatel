@@ -272,7 +272,7 @@ fn write_rows<'a>(
             _ => Ok(()),
         };
     }
-    std::fs::create_dir_all(state_dir)?;
+    crate::config::create_state_dir(state_dir)?;
     // A unique temp name (pid + sequence) means two overlapping writes — e.g. the periodic flush
     // and the shutdown flush — never share a temp path, so neither rename can fail on the other's.
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);

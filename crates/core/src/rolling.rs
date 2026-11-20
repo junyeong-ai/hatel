@@ -50,7 +50,7 @@ static ROTATION: Mutex<()> = Mutex::new(());
 /// first when it has reached `rotate_bytes`. Rotation is best-effort: a failure — including a peer
 /// process rotating first — never aborts, and thus never drops, the line being written.
 pub fn append(dir: &Path, base: &str, line: &str, rotate_bytes: u64) -> std::io::Result<()> {
-    fs::create_dir_all(dir)?;
+    crate::config::create_state_dir(dir)?;
     let path = dir.join(base);
     let _ = rotate_when(&path, base, |meta| meta.len() >= rotate_bytes);
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
