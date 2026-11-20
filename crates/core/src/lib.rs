@@ -67,6 +67,12 @@ pub enum Error {
     InvalidExport(String),
     #[error("invalid environment: {0}")]
     InvalidEnvironment(String),
+    /// The ledger could not be opened, read or written: SQLite's own errors, its layout, journal
+    /// mode and permissions, and the contracts stored in it.
+    #[error("storage error: {0}")]
+    Storage(String),
+    /// A file outside the ledger, such as the configuration, a plugin or a transcript, could not
+    /// be read or written.
     #[error("io error: {0}")]
     Io(String),
 }
@@ -77,7 +83,7 @@ impl From<rusqlite::Error> for Error {
             rusqlite::Error::SqliteFailure(code, Some(message)) => format!("{message} ({code})"),
             _ => error.to_string(),
         };
-        Self::Io(message)
+        Self::Storage(message)
     }
 }
 
@@ -103,7 +109,7 @@ mod tests {
         assert!(message.contains("2067"), "{message}");
         assert_eq!(
             super::Error::from(rusqlite::Error::QueryReturnedNoRows).to_string(),
-            "io error: Query returned no rows"
+            "storage error: Query returned no rows"
         );
     }
 }

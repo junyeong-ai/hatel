@@ -71,8 +71,8 @@ pub fn envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<Envelope> {
     })
 }
 
-fn io(error: impl std::fmt::Display) -> crate::Error {
-    crate::Error::Io(error.to_string())
+fn storage(error: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Storage(error.to_string())
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -102,7 +102,7 @@ pub fn write_readiness(path: &Path) -> crate::Result<()> {
 /// or created and not yet initialized by its first writer — reads as the empty ledger, as a fresh
 /// file would; one holding records under another layout is refused with the error a write gets.
 pub(crate) fn read(path: &Path) -> crate::Result<Connection> {
-    if path.try_exists().map_err(io)? {
+    if path.try_exists().map_err(storage)? {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         match layout(&conn)? {
             Layout::Empty => {}
@@ -145,7 +145,7 @@ fn layout(conn: &Connection) -> crate::Result<Layout> {
 }
 
 fn unsupported(version: i64) -> crate::Error {
-    io(format!(
+    storage(format!(
         "SQLite schema {version} is not one this build created (it reads {DATABASE_VERSION}); to start a new store, stop the receiver and move telemetry.db aside with its -wal and -shm files"
     ))
 }
@@ -159,7 +159,7 @@ pub fn open_existing(path: &Path, timeout: std::time::Duration) -> crate::Result
     )?;
     match layout(&conn)? {
         Layout::Current => enable_wal(&conn, timeout)?,
-        Layout::Empty => return Err(io("SQLite ledger is not initialized")),
+        Layout::Empty => return Err(storage("SQLite ledger is not initialized")),
         Layout::Other(version) => return Err(unsupported(version)),
     }
     Ok(conn)
@@ -173,12 +173,12 @@ fn connect(
     if flags.contains(OpenFlags::SQLITE_OPEN_CREATE)
         && let Some(parent) = path.parent()
     {
-        crate::config::create_state_dir(parent).map_err(io)?;
+        crate::config::create_state_dir(parent).map_err(storage)?;
     }
     let conn = Connection::open_with_flags(path, flags)?;
     conn.busy_timeout(timeout)?;
     if conn.is_readonly(rusqlite::MAIN_DB)? {
-        return Err(io("SQLite ledger is read-only"));
+        return Err(storage("SQLite ledger is read-only"));
     }
     crate::query::functions(&conn)?;
     Ok(conn)
@@ -191,7 +191,7 @@ fn connect(
 #[cfg(unix)]
 fn make_private(path: &Path) -> crate::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(storage)
 }
 
 #[cfg(not(unix))]
@@ -214,7 +214,11 @@ fn enable_wal(conn: &Connection, timeout: std::time::Duration) -> crate::Result<
     loop {
         match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
             Ok(mode) if mode == "wal" => return Ok(()),
-            Ok(mode) => return Err(io(format!("SQLite refused WAL mode: journal_mode={mode}"))),
+            Ok(mode) => {
+                return Err(storage(format!(
+                    "SQLite refused WAL mode: journal_mode={mode}"
+                )));
+            }
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DatabaseBusy
                     && std::time::Instant::now() < deadline =>
@@ -227,7 +231,7 @@ fn enable_wal(conn: &Connection, timeout: std::time::Duration) -> crate::Result<
 }
 
 fn newer(version: i64) -> crate::Error {
-    io(format!(
+    storage(format!(
         "SQLite schema {version} is newer than supported {DATABASE_VERSION}"
     ))
 }
@@ -310,7 +314,7 @@ pub fn usage(cfg: &Config) -> crate::Result<Usage> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut wal = path.clone().into_os_string();
     wal.push("-wal");
-    let bytes = file_len(&path).map_err(io)? + file_len(Path::new(&wal)).map_err(io)?;
+    let bytes = file_len(&path).map_err(storage)? + file_len(Path::new(&wal)).map_err(storage)?;
     Ok(Usage { bytes, records })
 }
 
@@ -584,7 +588,7 @@ fn insert(
     targets: &[crate::ExportTarget],
     env: &Envelope,
 ) -> crate::Result<Option<crate::outbox::Enqueued>> {
-    let payload = serde_json::to_string(&env.payload).map_err(io)?;
+    let payload = serde_json::to_string(&env.payload).map_err(storage)?;
     let occurred = env
         .ts
         .parse::<jiff::Timestamp>()

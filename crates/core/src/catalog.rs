@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS contracts (
     kind_id INTEGER NOT NULL REFERENCES kinds (id), definition TEXT NOT NULL
 );";
 
-fn io(error: impl std::fmt::Display) -> crate::Error {
-    crate::Error::Io(error.to_string())
+fn storage(error: impl std::fmt::Display) -> crate::Error {
+    crate::Error::Storage(error.to_string())
 }
 
 /// The id of the Kind named `name`, registered on first use.
@@ -64,7 +64,7 @@ pub(crate) fn contract_id(
                 env.kind
             ))
         })?;
-    let definition = serde_json::to_string(&spec.definition()).map_err(io)?;
+    let definition = serde_json::to_string(&spec.definition()).map_err(storage)?;
     conn.query_row(
         "INSERT INTO contracts (schema_id, kind_id, definition) VALUES (?1, ?2, ?3) RETURNING id",
         rusqlite::params![schema_id, kind_id, definition],
@@ -102,7 +102,7 @@ pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
 
 pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSpec> {
     let missing = || {
-        io(format!(
+        storage(format!(
             "no stored definition for {kind} contract {schema_id}; load its exact schema explicitly"
         ))
     };
@@ -221,10 +221,12 @@ impl Contracts {
 }
 
 fn decode(schema_id: String, kind: String, json: String) -> crate::Result<StoredContract> {
-    let definition: KindSpecRaw = serde_json::from_str(&json).map_err(io)?;
+    let definition: KindSpecRaw = serde_json::from_str(&json).map_err(storage)?;
     let spec = KindSpec::from_raw(definition.clone())?;
     if spec.schema_id != schema_id || spec.name != kind {
-        return Err(io("stored contract definition does not match its identity"));
+        return Err(storage(
+            "stored contract definition does not match its identity",
+        ));
     }
     Ok(StoredContract {
         schema_id,

@@ -42,7 +42,7 @@ fn a_store_this_build_did_not_create_is_reported_and_left_unchanged() {
     assert_eq!(emitted.status.code(), Some(1));
     assert!(
         String::from_utf8_lossy(&emitted.stderr)
-            .starts_with("emit: io error: SQLite schema 0 is not one this build created")
+            .starts_with("emit: storage error: SQLite schema 0 is not one this build created")
     );
     for args in [
         vec!["report", "--format", "json"],
