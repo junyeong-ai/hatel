@@ -51,8 +51,7 @@ pub(crate) fn contract_id(
             [schema_id],
             |r| r.get(0),
         )
-        .optional()
-        .map_err(io)?;
+        .optional()?;
     if stored.is_some() {
         return Ok(stored);
     }
@@ -72,7 +71,7 @@ pub(crate) fn contract_id(
         |r| r.get(0),
     )
     .map(Some)
-    .map_err(io)
+    .map_err(crate::Error::from)
 }
 
 #[derive(Debug, Serialize)]
@@ -83,23 +82,19 @@ pub struct StoredContract {
 
 pub fn stored(cfg: &Config) -> crate::Result<Vec<StoredContract>> {
     let conn = crate::sink::read(&cfg.database())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.schema_id, k.name, c.definition FROM contracts c \
+    let mut stmt = conn.prepare(
+        "SELECT c.schema_id, k.name, c.definition FROM contracts c \
              JOIN kinds k ON k.id = c.kind_id ORDER BY k.name, c.schema_id",
-        )
-        .map_err(io)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(io)?;
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })?;
     rows.map(|row| {
-        let (schema_id, kind, json) = row.map_err(io)?;
+        let (schema_id, kind, json) = row?;
         decode(schema_id, kind, json)
     })
     .collect()
@@ -119,8 +114,7 @@ pub fn select(cfg: &Config, kind: &str, schema_id: &str) -> crate::Result<KindSp
             [schema_id, kind],
             |r| r.get(0),
         )
-        .optional()
-        .map_err(io)?
+        .optional()?
         .ok_or_else(missing)?;
     let stored = decode(schema_id.into(), kind.into(), json)?;
     KindSpec::from_raw(stored.definition)
@@ -170,19 +164,16 @@ impl Contracts {
 
     /// Resolve `spec` against the definitions stored in an open ledger.
     pub(crate) fn resolve(conn: &Connection, spec: &KindSpec) -> crate::Result<Self> {
-        let mut stmt = conn
-            .prepare(
-                "SELECT c.schema_id, c.definition FROM contracts c \
+        let mut stmt = conn.prepare(
+            "SELECT c.schema_id, c.definition FROM contracts c \
                  JOIN kinds k ON k.id = c.kind_id WHERE k.name = ?1",
-            )
-            .map_err(io)?;
+        )?;
         let stored = stmt
             .query_map([&spec.name], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })
-            .map_err(io)?
+            })?
             .map(|row| {
-                let (schema_id, json) = row.map_err(io)?;
+                let (schema_id, json) = row?;
                 KindSpec::from_raw(decode(schema_id, spec.name.clone(), json)?.definition)
             })
             .collect::<crate::Result<Vec<_>>>()?;

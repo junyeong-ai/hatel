@@ -6,10 +6,6 @@ use crate::report::{GroupAgg, Measure, Query, Relation, RelationSection};
 use crate::{Config, KindSpec};
 use rusqlite::{Connection, functions::FunctionFlags, types::Value};
 
-fn io(e: impl std::fmt::Display) -> crate::Error {
-    crate::Error::Io(e.to_string())
-}
-
 pub(crate) fn functions(conn: &Connection) -> rusqlite::Result<()> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_aggregate_function("hatel_quantiles", 1, flags, Quantiles)?;
@@ -111,11 +107,9 @@ impl Field {
 
 fn connection(cfg: &Config) -> crate::Result<Connection> {
     let conn = crate::sink::read(&cfg.database())?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(io)?;
-    conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")
-        .map_err(io)?;
-    functions(&conn).map_err(io)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA cache_size=-4096; PRAGMA temp_store=FILE;")?;
+    functions(&conn)?;
     Ok(conn)
 }
 
@@ -156,7 +150,7 @@ pub fn aggregate(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<Vec<
 
 pub fn section(cfg: &Config, spec: &KindSpec, q: &Query) -> crate::Result<SectionResult> {
     let mut conn = connection(cfg)?;
-    let transaction = conn.transaction().map_err(io)?;
+    let transaction = conn.transaction()?;
     let resolved = Contracts::resolve(&transaction, spec)?;
     let retained_since = oldest(&transaction, spec, q, &resolved)?;
     let contracts = contract_counts(&transaction, spec, q, &resolved)?;
@@ -208,7 +202,7 @@ pub struct Records {
 /// section counts them.
 pub fn records(cfg: &Config, spec: &KindSpec, q: &Query, limit: usize) -> crate::Result<Records> {
     let mut conn = connection(cfg)?;
-    let transaction = conn.transaction().map_err(io)?;
+    let transaction = conn.transaction()?;
     let resolved = Contracts::resolve(&transaction, spec)?;
     let retained_since = oldest(&transaction, spec, q, &resolved)?;
     let mut args = Vec::new();
@@ -217,27 +211,22 @@ pub fn records(cfg: &Config, spec: &KindSpec, q: &Query, limit: usize) -> crate:
     let contracts = counts_by_contract(&transaction, &conditions, &args, &resolved)?;
     conditions.push(readable(&resolved, &mut args));
     let conditions = conditions.join(" AND ");
-    let total: i64 = transaction
-        .query_row(
-            &format!("SELECT COUNT(*) FROM envelopes WHERE {conditions}"),
-            rusqlite::params_from_iter(&args),
-            |r| r.get(0),
-        )
-        .map_err(io)?;
+    let total: i64 = transaction.query_row(
+        &format!("SELECT COUNT(*) FROM envelopes WHERE {conditions}"),
+        rusqlite::params_from_iter(&args),
+        |r| r.get(0),
+    )?;
     let cut = match limit {
         0 => String::new(),
         n => format!(" LIMIT {n}"),
     };
-    let mut stmt = transaction
-        .prepare(&format!(
-            "SELECT {} FROM envelopes e WHERE {conditions} \
+    let mut stmt = transaction.prepare(&format!(
+        "SELECT {} FROM envelopes e WHERE {conditions} \
              ORDER BY e.occurred_seconds DESC, e.occurred_nanos DESC, e.id DESC{cut}",
-            crate::sink::ENVELOPE_COLUMNS
-        ))
-        .map_err(io)?;
+        crate::sink::ENVELOPE_COLUMNS
+    ))?;
     let records = stmt
-        .query_map(rusqlite::params_from_iter(&args), crate::sink::envelope)
-        .map_err(io)?
+        .query_map(rusqlite::params_from_iter(&args), crate::sink::envelope)?
         .map(|row| {
             row.map(|mut envelope| {
                 envelope
@@ -246,8 +235,7 @@ pub fn records(cfg: &Config, spec: &KindSpec, q: &Query, limit: usize) -> crate:
                 envelope
             })
         })
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(io)?;
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Records {
         records,
         total: usize::try_from(total).unwrap_or(usize::MAX),
@@ -300,7 +288,7 @@ fn oldest(
         |r| r.get(0),
     )
     .optional()
-    .map_err(io)
+    .map_err(crate::Error::from)
 }
 
 fn scope(spec: &KindSpec, q: &Query, args: &mut Vec<Value>) -> Vec<String> {
@@ -369,7 +357,7 @@ fn counts_by_contract(
             "SELECT schema_id, kind_version, COUNT(*) FROM envelopes WHERE {} GROUP BY 1, 2 ORDER BY 1, 2",
             conditions.join(" AND ")
         ))
-        .map_err(io)?;
+        ?;
     stmt.query_map(rusqlite::params_from_iter(args), |r| {
         let schema_id: Option<String> = r.get(0)?;
         Ok(ContractCount {
@@ -378,10 +366,9 @@ fn counts_by_contract(
             kind_version: r.get(1)?,
             count: r.get(2)?,
         })
-    })
-    .map_err(io)?
+    })?
     .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(io)
+    .map_err(crate::Error::from)
 }
 
 /// The alternative that matches a record without common project metadata by its payload's own
@@ -518,7 +505,7 @@ fn grouped(
         let invalid = conn.query_row(
             &format!("{sql} SELECT EXISTS(SELECT 1 FROM scoped WHERE readable AND (identity IS NULL OR identity='' OR hatel_epoch(observed_at) IS NULL))"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
-        ).map_err(io)?;
+        )?;
         if invalid {
             return Err(crate::Error::InvalidPayload(format!(
                 "snapshot Kind '{}' contains a record without a non-empty string identity or valid observation time",
@@ -535,7 +522,7 @@ fn grouped(
         let ambiguous = conn.query_row(
             &format!("{sql} SELECT EXISTS(SELECT 1 FROM latest GROUP BY {entity} HAVING COUNT(DISTINCT payload)>1)"),
             rusqlite::params_from_iter(args.iter()), |row| row.get::<_, bool>(0),
-        ).map_err(io)?;
+        )?;
         if ambiguous {
             return Err(crate::Error::InvalidPayload(format!(
                 "snapshot Kind '{}' has conflicting states with identical occurrence and observation times",
@@ -638,100 +625,98 @@ impl Grouped {
             layouts,
             total_column,
         } = self;
-        let mut stmt = conn.prepare(&sql).map_err(io)?;
+        let mut stmt = conn.prepare(&sql)?;
         let mut total = 0;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(args), |row| {
-                total = usize::try_from(row.get::<_, i64>(total_column)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        total_column,
-                        rusqlite::types::Type::Integer,
-                        Box::new(e),
-                    )
-                })?;
-                let count: i64 = row.get(1)?;
-                let sums = spec
-                    .measures
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let MeasureColumns {
+        let rows = stmt.query_map(rusqlite::params_from_iter(args), |row| {
+            total = usize::try_from(row.get::<_, i64>(total_column)?).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    total_column,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })?;
+            let count: i64 = row.get(1)?;
+            let sums = spec
+                .measures
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let MeasureColumns {
+                        start,
+                        bounds,
+                        quantiles,
+                    } = &layouts[i];
+                    let start = *start;
+                    let valid_count: i64 = row.get(start + 1)?;
+                    let missing_count: i64 = row.get(start + 2)?;
+                    let sum: Option<f64> = row.get(start)?;
+                    let avg: Option<f64> = row.get(start + 3)?;
+                    if (valid_count > 0 && (sum.is_none() || avg.is_none()))
+                        || [sum, avg].into_iter().flatten().any(|n| !n.is_finite())
+                    {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
                             start,
-                            bounds,
-                            quantiles,
-                        } = &layouts[i];
-                        let start = *start;
-                        let valid_count: i64 = row.get(start + 1)?;
-                        let missing_count: i64 = row.get(start + 2)?;
-                        let sum: Option<f64> = row.get(start)?;
-                        let avg: Option<f64> = row.get(start + 3)?;
-                        if (valid_count > 0 && (sum.is_none() || avg.is_none()))
-                            || [sum, avg].into_iter().flatten().any(|n| !n.is_finite())
-                        {
-                            return Err(rusqlite::Error::FromSqlConversionFailure(
-                                start,
-                                rusqlite::types::Type::Real,
-                                Box::new(std::io::Error::other(format!(
-                                    "{name} aggregate exceeds the finite numeric range"
-                                ))),
-                            ));
-                        }
-                        Ok(Measure {
-                            name: name.clone(),
-                            sum: sum.unwrap_or(0.0),
-                            valid_count,
-                            missing_count,
-                            invalid_count: count - valid_count - missing_count,
-                            avg,
-                            min: row.get(start + 4)?,
-                            max: row.get(start + 5)?,
-                            unit: spec.field_specs[name].unit.clone(),
-                            buckets: bounds
-                                .iter()
-                                .enumerate()
-                                .map(|(j, upper_bound)| {
-                                    Ok(crate::report::Bucket {
-                                        upper_bound: *upper_bound,
-                                        count: row.get(start + 6 + j)?,
+                            rusqlite::types::Type::Real,
+                            Box::new(std::io::Error::other(format!(
+                                "{name} aggregate exceeds the finite numeric range"
+                            ))),
+                        ));
+                    }
+                    Ok(Measure {
+                        name: name.clone(),
+                        sum: sum.unwrap_or(0.0),
+                        valid_count,
+                        missing_count,
+                        invalid_count: count - valid_count - missing_count,
+                        avg,
+                        min: row.get(start + 4)?,
+                        max: row.get(start + 5)?,
+                        unit: spec.field_specs[name].unit.clone(),
+                        buckets: bounds
+                            .iter()
+                            .enumerate()
+                            .map(|(j, upper_bound)| {
+                                Ok(crate::report::Bucket {
+                                    upper_bound: *upper_bound,
+                                    count: row.get(start + 6 + j)?,
+                                })
+                            })
+                            .collect::<rusqlite::Result<Vec<_>>>()?,
+                        quantiles: quantiles
+                            .map(|column| row.get::<_, Option<String>>(column))
+                            .transpose()?
+                            .flatten()
+                            .map(|values| {
+                                serde_json::from_str::<Vec<f64>>(&values).map_err(|e| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        start,
+                                        rusqlite::types::Type::Text,
+                                        Box::new(e),
+                                    )
+                                })
+                            })
+                            .transpose()?
+                            .map(|values| {
+                                crate::report::QUANTILES
+                                    .iter()
+                                    .zip(values)
+                                    .map(|(quantile, value)| crate::report::Quantile {
+                                        quantile: *quantile,
+                                        value,
                                     })
-                                })
-                                .collect::<rusqlite::Result<Vec<_>>>()?,
-                            quantiles: quantiles
-                                .map(|column| row.get::<_, Option<String>>(column))
-                                .transpose()?
-                                .flatten()
-                                .map(|values| {
-                                    serde_json::from_str::<Vec<f64>>(&values).map_err(|e| {
-                                        rusqlite::Error::FromSqlConversionFailure(
-                                            start,
-                                            rusqlite::types::Type::Text,
-                                            Box::new(e),
-                                        )
-                                    })
-                                })
-                                .transpose()?
-                                .map(|values| {
-                                    crate::report::QUANTILES
-                                        .iter()
-                                        .zip(values)
-                                        .map(|(quantile, value)| crate::report::Quantile {
-                                            quantile: *quantile,
-                                            value,
-                                        })
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
-                        })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     })
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(GroupAgg {
-                    key: row.get(0)?,
-                    count,
-                    sums,
                 })
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(GroupAgg {
+                key: row.get(0)?,
+                count,
+                sums,
             })
-            .map_err(io)?;
-        let groups = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)?;
+        })?;
+        let groups = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Groups { groups, total })
     }
 }

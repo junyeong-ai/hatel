@@ -62,33 +62,31 @@ pub struct Pending {
 }
 
 pub fn destinations(conn: &Connection) -> crate::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT DISTINCT destination FROM deliveries WHERE status='pending' ORDER BY destination").map_err(io)?;
-    stmt.query_map([], |r| r.get(0))
-        .map_err(io)?
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT destination FROM deliveries WHERE status='pending' ORDER BY destination",
+    )?;
+    stmt.query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(io)
+        .map_err(crate::Error::from)
 }
 
 pub fn due(conn: &Connection, destination: &str, now: i64) -> crate::Result<Vec<Pending>> {
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT {}, d.attempts, d.created_at FROM deliveries d \
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {}, d.attempts, d.created_at FROM deliveries d \
              JOIN envelopes e ON e.record_id = d.record_id \
              WHERE d.destination = ?1 AND d.status = 'pending' AND d.next_attempt_at <= ?2 \
              ORDER BY d.created_at, d.record_id LIMIT 16",
-            crate::sink::ENVELOPE_COLUMNS
-        ))
-        .map_err(io)?;
-    let rows = stmt
-        .query_map(rusqlite::params![destination, now], |r| {
-            Ok(Pending {
-                record: crate::sink::envelope(r)?,
-                attempts: r.get(14)?,
-                created_at: r.get(15)?,
-            })
+        crate::sink::ENVELOPE_COLUMNS
+    ))?;
+    let rows = stmt.query_map(rusqlite::params![destination, now], |r| {
+        Ok(Pending {
+            record: crate::sink::envelope(r)?,
+            attempts: r.get(14)?,
+            created_at: r.get(15)?,
         })
-        .map_err(io)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(io)
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(crate::Error::from)
 }
 
 pub enum Outcome<'a> {
@@ -122,26 +120,25 @@ pub fn finish(
         Outcome::Cancelled(error) => ("cancelled", now, 0, Some(error)),
     };
     use rusqlite::OptionalExtension;
-    let tx = conn.unchecked_transaction().map_err(io)?;
-    let size: Option<i64> = tx.query_row("UPDATE deliveries SET status=?1,updated_at=?2,next_attempt_at=?3,attempts=attempts+?4,last_error=?5 WHERE record_id=?6 AND destination=?7 AND status='pending' RETURNING size_bytes", rusqlite::params![status,now,next,attempted,error,id,destination], |r| r.get(0)).optional().map_err(io)?;
+    let tx = conn.unchecked_transaction()?;
+    let size: Option<i64> = tx.query_row("UPDATE deliveries SET status=?1,updated_at=?2,next_attempt_at=?3,attempts=attempts+?4,last_error=?5 WHERE record_id=?6 AND destination=?7 AND status='pending' RETURNING size_bytes", rusqlite::params![status,now,next,attempted,error,id,destination], |r| r.get(0)).optional()?;
     if status != "pending"
         && let Some(size) = size
     {
-        tx.execute("UPDATE delivery_queues SET pending_records=pending_records-1,pending_bytes=pending_bytes-?1 WHERE destination=?2", rusqlite::params![size,destination]).map_err(io)?;
+        tx.execute("UPDATE delivery_queues SET pending_records=pending_records-1,pending_bytes=pending_bytes-?1 WHERE destination=?2", rusqlite::params![size,destination])?;
     }
-    tx.commit().map_err(io)?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn cancel_destination(conn: &Connection, destination: &str, now: i64) -> crate::Result<()> {
-    let tx = conn.unchecked_transaction().map_err(io)?;
-    tx.execute("UPDATE deliveries SET status='cancelled',updated_at=?1,last_error='destination removed or custom delivery disabled' WHERE destination=?2 AND status='pending'", rusqlite::params![now,destination]).map_err(io)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE deliveries SET status='cancelled',updated_at=?1,last_error='destination removed or custom delivery disabled' WHERE destination=?2 AND status='pending'", rusqlite::params![now,destination])?;
     tx.execute(
         "UPDATE delivery_queues SET pending_records=0,pending_bytes=0 WHERE destination=?1",
         [destination],
-    )
-    .map_err(io)?;
-    tx.commit().map_err(io)?;
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -157,7 +154,7 @@ pub struct DeliveryState {
 
 pub fn states(path: &std::path::Path) -> crate::Result<Vec<DeliveryState>> {
     let conn = crate::sink::read(path)?;
-    let mut stmt = conn.prepare("SELECT destination,status,COUNT(*),SUM(size_bytes),MIN(created_at),last_error FROM deliveries GROUP BY destination,status,last_error ORDER BY destination,status,last_error").map_err(io)?;
+    let mut stmt = conn.prepare("SELECT destination,status,COUNT(*),SUM(size_bytes),MIN(created_at),last_error FROM deliveries GROUP BY destination,status,last_error ORDER BY destination,status,last_error")?;
     stmt.query_map([], |r| {
         Ok(DeliveryState {
             destination: r.get(0)?,
@@ -167,12 +164,7 @@ pub fn states(path: &std::path::Path) -> crate::Result<Vec<DeliveryState>> {
             bytes: r.get(3)?,
             oldest_created_at: r.get(4)?,
         })
-    })
-    .map_err(io)?
+    })?
     .collect::<rusqlite::Result<Vec<_>>>()
-    .map_err(io)
-}
-
-fn io(e: impl std::fmt::Display) -> crate::Error {
-    crate::Error::Io(e.to_string())
+    .map_err(crate::Error::from)
 }

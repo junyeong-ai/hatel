@@ -103,8 +103,7 @@ pub fn write_readiness(path: &Path) -> crate::Result<()> {
 /// file would; one holding records under another layout is refused with the error a write gets.
 pub(crate) fn read(path: &Path) -> crate::Result<Connection> {
     if path.try_exists().map_err(io)? {
-        let conn =
-            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(io)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         match layout(&conn)? {
             Layout::Empty => {}
             Layout::Current => return Ok(conn),
@@ -129,14 +128,12 @@ enum Layout {
 /// from one snapshot: read apart, a first writer committing between the reads would show its table
 /// under the stamp from before its commit.
 fn layout(conn: &Connection) -> crate::Result<Layout> {
-    let (version, records): (i64, bool) = conn
-        .query_row(
-            "SELECT (SELECT user_version FROM pragma_user_version),
+    let (version, records): (i64, bool) = conn.query_row(
+        "SELECT (SELECT user_version FROM pragma_user_version),
                  EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'records')",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map_err(io)?;
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
     if version > DATABASE_VERSION {
         return Err(newer(version));
     }
@@ -157,8 +154,8 @@ fn connect(path: &Path) -> crate::Result<Connection> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io)?;
     }
-    let conn = Connection::open(path).map_err(io)?;
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(io)?;
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -167,7 +164,7 @@ fn connect(path: &Path) -> crate::Result<Connection> {
         }
     }
     check_version(&conn)?;
-    crate::query::functions(&conn).map_err(io)?;
+    crate::query::functions(&conn)?;
     Ok(conn)
 }
 
@@ -193,15 +190,13 @@ fn enable_wal(conn: &Connection) -> crate::Result<()> {
             {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            Err(error) => return Err(io(error)),
+            Err(error) => return Err(error.into()),
         }
     }
 }
 
 pub(crate) fn check_version(conn: &Connection) -> crate::Result<i64> {
-    let version = conn
-        .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
-        .map_err(io)?;
+    let version = conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?;
     if version > DATABASE_VERSION {
         return Err(newer(version));
     }
@@ -217,29 +212,26 @@ fn newer(version: i64) -> crate::Error {
 /// Create the schema in a store that has none. A store holding records under another layout is
 /// refused rather than altered: a hook writing on every lifecycle event must never convert data.
 fn initialize(conn: &mut Connection) -> crate::Result<()> {
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(io)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     match layout(&tx)? {
         Layout::Empty => {
-            tx.execute_batch(crate::catalog::SCHEMA).map_err(io)?;
-            tx.execute_batch(SCHEMA).map_err(io)?;
-            tx.execute_batch(crate::outbox::SCHEMA).map_err(io)?;
-            tx.pragma_update(None, "user_version", DATABASE_VERSION)
-                .map_err(io)?;
+            tx.execute_batch(crate::catalog::SCHEMA)?;
+            tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(crate::outbox::SCHEMA)?;
+            tx.pragma_update(None, "user_version", DATABASE_VERSION)?;
         }
         Layout::Current => {}
         Layout::Other(version) => return Err(unsupported(version)),
     }
-    tx.commit().map_err(io)
+    tx.commit().map_err(crate::Error::from)
 }
 
 /// An empty in-memory ledger at the current schema, which answers a read of a store that has
 /// never been written exactly as an empty file would.
 pub(crate) fn empty() -> crate::Result<Connection> {
-    let mut conn = Connection::open_in_memory().map_err(io)?;
+    let mut conn = Connection::open_in_memory()?;
     initialize(&mut conn)?;
-    crate::query::functions(&conn).map_err(io)?;
+    crate::query::functions(&conn)?;
     Ok(conn)
 }
 
@@ -249,7 +241,7 @@ pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelop
         [id],
         envelope,
     )
-    .map_err(io)
+    .map_err(crate::Error::from)
 }
 
 /// Every Kind the ledger holds records for, sorted — an exact statement about storage, which is
@@ -260,7 +252,7 @@ pub(crate) fn record_by_id(conn: &Connection, id: &str) -> crate::Result<Envelop
 /// diagnostic must never confuse.
 pub fn stored_kinds(cfg: &Config) -> std::io::Result<Vec<String>> {
     let conn = read(&cfg.database()).map_err(std::io::Error::other)?;
-    let io = |e: rusqlite::Error| std::io::Error::other(e.to_string());
+    let io = |e: rusqlite::Error| std::io::Error::other(crate::Error::from(e));
     let mut stmt = conn
         .prepare(
             "SELECT name FROM kinds k WHERE EXISTS (SELECT 1 FROM records WHERE kind_id = k.id) \
@@ -286,17 +278,13 @@ pub struct Usage {
 pub fn usage(cfg: &Config) -> crate::Result<Usage> {
     let path = cfg.database();
     let conn = read(&path)?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT k.name, COUNT(*) FROM records r JOIN kinds k ON k.id = r.kind_id \
+    let mut stmt = conn.prepare(
+        "SELECT k.name, COUNT(*) FROM records r JOIN kinds k ON k.id = r.kind_id \
              GROUP BY r.kind_id ORDER BY 2 DESC, 1",
-        )
-        .map_err(io)?;
+    )?;
     let records = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .map_err(io)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(io)?;
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut wal = path.clone().into_os_string();
     wal.push("-wal");
     let bytes = file_len(&path).map_err(io)? + file_len(Path::new(&wal)).map_err(io)?;
@@ -320,20 +308,17 @@ pub fn sessions_since(
     since: i64,
 ) -> crate::Result<std::collections::BTreeMap<String, i64>> {
     let conn = read(&cfg.database())?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT json_extract(payload, '$.session_id'), MIN(occurred_seconds) FROM records \
+    let mut stmt = conn.prepare(
+        "SELECT json_extract(payload, '$.session_id'), MIN(occurred_seconds) FROM records \
              WHERE kind_id = (SELECT id FROM kinds WHERE name = ?1) AND occurred_seconds >= ?2 \
              AND typeof(json_extract(payload, '$.session_id')) = 'text' \
              GROUP BY json_extract(payload, '$.session_id')",
-        )
-        .map_err(io)?;
+    )?;
     stmt.query_map(rusqlite::params![kind, since], |r| {
         Ok((r.get(0)?, r.get(1)?))
-    })
-    .map_err(io)?
+    })?
     .collect::<rusqlite::Result<_>>()
-    .map_err(io)
+    .map_err(crate::Error::from)
 }
 
 /// When the ledger last recorded an occurrence of `kind`, in epoch seconds, or `None` when it holds
@@ -391,7 +376,10 @@ pub fn prune(cfg: &Config, retention: &crate::config::Retention) -> usize {
     match result {
         Ok(count) => count,
         Err(error) => {
-            eprintln!("hatel: sqlite retention failed: {error}");
+            eprintln!(
+                "hatel: sqlite retention failed: {}",
+                crate::Error::from(error)
+            );
             0
         }
     }
@@ -499,8 +487,7 @@ impl SqliteSink {
                 // The retention sweep returns deleted records' pages through incremental vacuum.
                 // SQLite fixes the auto-vacuum mode when it writes the first page, which the WAL
                 // switch does.
-                conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
-                    .map_err(io)?;
+                conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
                 enable_wal(&conn)?;
                 initialize(&mut conn)?;
             }
@@ -512,9 +499,7 @@ impl SqliteSink {
         let conn = self.conn.as_mut().map_err(|e| e.clone())?;
         // Immediate, because the ids looked up first decide what is inserted: a deferred
         // transaction that read before another writer committed could not take the write lock.
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(io)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(delivery) = insert(&tx, &self.registry, &self.targets, env)? else {
             let id = env.metadata.record_id.as_deref().ok_or_else(|| {
                 crate::Error::InvalidPayload("duplicate record without id".into())
@@ -525,13 +510,13 @@ impl SqliteSink {
                     "record id already describes different data".into(),
                 ));
             }
-            tx.commit().map_err(io)?;
+            tx.commit()?;
             return Ok(WriteReceipt {
                 record_id: Some(id.into()),
                 delivery: Default::default(),
             });
         };
-        tx.commit().map_err(io)?;
+        tx.commit()?;
         Ok(WriteReceipt {
             record_id: env.metadata.record_id.clone(),
             delivery,
@@ -547,9 +532,7 @@ impl SqliteSink {
         let conn = self.conn.as_mut().map_err(|e| e.clone())?;
         let mut written = NewRecords::default();
         for batch in envs.chunks(WRITE_BATCH) {
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(io)?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for env in batch {
                 if env.metadata.record_id.is_none() {
                     return Err(crate::Error::InvalidPayload(
@@ -562,7 +545,7 @@ impl SqliteSink {
                     written.delivery.not_queued += delivery.not_queued;
                 }
             }
-            tx.commit().map_err(io)?;
+            tx.commit()?;
         }
         Ok(written)
     }
@@ -591,48 +574,45 @@ fn insert(
         .parse::<jiff::Timestamp>()
         .map_err(|_| crate::Error::InvalidPayload("invalid record timestamp".into()))?;
     let (seconds, nanos) = crate::model::timestamp_parts(occurred);
-    let kind_id = crate::catalog::kind_id(tx, &env.kind).map_err(io)?;
+    let kind_id = crate::catalog::kind_id(tx, &env.kind)?;
     let contract_id = crate::catalog::contract_id(tx, registry, env, kind_id)?;
     let project_id = env
         .metadata
         .project
         .as_ref()
         .map(|project| project_id(tx, project))
-        .transpose()
-        .map_err(io)?;
+        .transpose()?;
     let m = &env.metadata;
-    let inserted = tx
-        .execute(
-            "INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
+    let inserted = tx.execute(
+        "INSERT INTO records (kind_id, occurred_seconds, occurred_nanos, ts, schema_version, \
              contract_id, kind_version, record_id, observed_at, project_id, source, run_id, \
              correlation_id, projection, payload) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
              ON CONFLICT DO NOTHING",
-            rusqlite::params![
-                kind_id,
-                seconds,
-                nanos,
-                env.ts,
-                env.schema_version,
-                contract_id,
-                m.kind_version,
-                m.record_id,
-                m.observed_at,
-                project_id,
-                m.source,
-                m.run_id,
-                m.correlation_id,
-                m.projection,
-                payload,
-            ],
-        )
-        .map_err(io)?;
+        rusqlite::params![
+            kind_id,
+            seconds,
+            nanos,
+            env.ts,
+            env.schema_version,
+            contract_id,
+            m.kind_version,
+            m.record_id,
+            m.observed_at,
+            project_id,
+            m.source,
+            m.run_id,
+            m.correlation_id,
+            m.projection,
+            payload,
+        ],
+    )?;
     if inserted == 0 {
         return Ok(None);
     }
     crate::outbox::enqueue(tx, env, targets, crate::now_epoch())
         .map(Some)
-        .map_err(io)
+        .map_err(crate::Error::from)
 }
 
 fn project_id(conn: &Connection, project: &ProjectRef) -> rusqlite::Result<i64> {

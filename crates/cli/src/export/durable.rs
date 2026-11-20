@@ -343,9 +343,9 @@ fn rusqlite_connection(state: &Path) -> Result<rusqlite::Connection, String> {
         state.join("telemetry.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|error| hatel_core::Error::from(error).to_string())?;
     conn.busy_timeout(Duration::from_millis(100))
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| hatel_core::Error::from(error).to_string())?;
     Ok(conn)
 }
 

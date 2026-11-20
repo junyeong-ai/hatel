@@ -71,4 +71,39 @@ pub enum Error {
     Io(String),
 }
 
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        let message = match &error {
+            rusqlite::Error::SqliteFailure(code, Some(message)) => format!("{message} ({code})"),
+            _ => error.to_string(),
+        };
+        Self::Io(message)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sqlite_errors_keep_the_message_and_extended_code() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sample(value TEXT UNIQUE); INSERT INTO sample VALUES ('a')",
+        )
+        .unwrap();
+        let error = conn
+            .execute("INSERT INTO sample VALUES ('a')", [])
+            .unwrap_err();
+        let message = super::Error::from(error).to_string();
+        assert!(
+            message.contains("UNIQUE constraint failed: sample.value"),
+            "{message}"
+        );
+        assert!(message.contains("2067"), "{message}");
+        assert_eq!(
+            super::Error::from(rusqlite::Error::QueryReturnedNoRows).to_string(),
+            "io error: Query returned no rows"
+        );
+    }
+}
