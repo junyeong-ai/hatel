@@ -94,7 +94,7 @@ fn instant(name: &str, value: &str, zone: &jiff::tz::TimeZone) -> Result<i64, St
     value
         .parse::<jiff::civil::Date>()
         .ok()
-        .and_then(|date| date.to_zoned(zone.clone()).ok())
+        .and_then(|date| date.to_zoned_datetime(zone.clone()).ok())
         .map(|zoned| zoned.timestamp().as_second())
         .ok_or_else(|| {
             format!(
