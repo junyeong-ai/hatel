@@ -1,6 +1,6 @@
 ---
 name: hatel
-version: 0.30.1
+version: 0.30.2
 description: Records and queries local telemetry with hatel, including custom domain Kinds, check executions, state snapshots, Claude Code cost and token usage, instruction loads, duration percentiles, individual records over fixed before/after periods, storage diagnosis, disk usage and retention, and selective downstream delivery including Claude Code traces. Use when configuring hatel, investigating missing measurements, or reporting recorded usage and outcomes.
 allowed-tools: Bash, Read, Edit
 ---
@@ -8,7 +8,7 @@ allowed-tools: Bash, Read, Edit
 # Hatel
 
 Use the installed contract: `hatel --version`, `hatel <command> --help`, and
-`hatel kinds --json`. This skill targets 0.30.1. A running receiver or MCP server
+`hatel kinds --json`. This skill targets 0.30.2. A running receiver or MCP server
 keeps the build it started, and an MCP server whose binary was replaced refuses calls until
 reconnected. After upgrading, restart the receiver and reconnect Hatel through Claude Code's
 `/mcp` → `hatel` → `Reconnect`; the conversation can stay open.
