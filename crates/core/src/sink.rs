@@ -176,16 +176,24 @@ fn connect(
     if conn.is_readonly(rusqlite::MAIN_DB)? {
         return Err(io("SQLite ledger is read-only"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if std::fs::metadata(path).map_err(io)?.permissions().mode() & 0o7777 != 0o600 {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
-        }
-    }
     check_version(&conn)?;
     crate::query::functions(&conn)?;
     Ok(conn)
+}
+
+/// A store this build initializes is owner-only; one that already holds the schema keeps the mode
+/// its owner gave it. SQLite creates the WAL and shared-memory files with the database's mode, so
+/// this runs before the WAL switch creates them. It changes the mode by path: closing a separately
+/// opened descriptor would release the locks this process's connections hold.
+#[cfg(unix)]
+fn make_private(path: &Path) -> crate::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(io)
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) -> crate::Result<()> {
+    Ok(())
 }
 
 /// How long a writer waits for another one's lock. A slow disk stretches every commit by its fsync
@@ -500,6 +508,7 @@ impl SqliteSink {
                 // SQLite fixes the auto-vacuum mode when it writes the first page, which the WAL
                 // switch does.
                 conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+                make_private(path)?;
                 enable_wal(&conn, BUSY_TIMEOUT)?;
                 initialize(&mut conn)?;
             }
@@ -708,24 +717,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn database_and_wal_files_are_private() {
+    fn a_new_store_is_private_and_an_existing_one_keeps_its_mode() {
         use std::os::unix::fs::PermissionsExt;
 
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("telemetry.db");
-        for _ in 0..2 {
-            let conn = SqliteSink::init(&path).unwrap();
-            for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] {
-                let mode = std::fs::metadata(dir.path().join(name))
-                    .unwrap()
-                    .permissions()
-                    .mode()
-                    & 0o7777;
-                assert_eq!(mode, 0o600, "{name}");
-            }
-            drop(conn);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let conn = SqliteSink::init(&path).unwrap();
+        for name in ["telemetry.db", "telemetry.db-wal", "telemetry.db-shm"] {
+            assert_eq!(mode(&dir.path().join(name)), 0o600, "{name}");
         }
+        drop(conn);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        drop(SqliteSink::init(&path).unwrap());
+        drop(open_existing(&path, BUSY_TIMEOUT).unwrap());
+        assert_eq!(mode(&path), 0o640);
     }
 
     #[cfg(unix)]
@@ -734,16 +740,22 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("telemetry.db");
-        drop(SqliteSink::init(&path).unwrap());
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
-        assert!(open_existing(&path, BUSY_TIMEOUT).is_err());
-        assert!(SqliteSink::init(&path).is_err());
-        assert!(read(&path).is_ok());
-        assert_eq!(
-            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777,
-            0o400
-        );
+        let initialized = dir.path().join("initialized.db");
+        drop(SqliteSink::init(&initialized).unwrap());
+        let uninitialized = dir.path().join("uninitialized.db");
+        std::fs::write(&uninitialized, []).unwrap();
+        for path in [initialized, uninitialized] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(open_existing(&path, BUSY_TIMEOUT).is_err());
+            assert!(SqliteSink::init(&path).is_err());
+            assert!(read(&path).is_ok());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                0o400,
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]
